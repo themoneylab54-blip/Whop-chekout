@@ -13,7 +13,8 @@
     "admin:create": "tsx scripts/create-admin.ts",
     "postinstall": "prisma generate",
     "db:deploy": "prisma migrate deploy",
-    "db:push": "prisma db push"
+    "db:push": "prisma db push",
+    "vercel-build": "prisma generate && prisma migrate deploy && next build"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

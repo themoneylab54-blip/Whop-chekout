@@ -39,16 +39,23 @@ Copie `.env.example` en `.env` (ou dans les réglages Vercel) :
 | `ENCRYPTION_KEY` | `openssl rand -base64 32`. Chiffre les secrets Shopify et Whop. **Ne la change plus jamais** une fois des boutiques connectées. |
 | `SESSION_SECRET` | `openssl rand -base64 32` |
 
-### 3. Déploiement
+### 3. Déploiement sur Vercel (sans terminal)
+
+1. Sur **vercel.com** : **Add New → Project**, puis importe ce dépôt (GitHub ou GitLab).
+2. Onglet **Storage → Create Database → Neon (Postgres)**, et connecte la base au projet. Vérifie que la variable s'appelle bien `DATABASE_URL`.
+3. Dans **Settings → Environment Variables**, ajoute `APP_URL`, `ENCRYPTION_KEY` et `SESSION_SECRET`.
+4. Clique sur **Deploy**. Les tables sont créées automatiquement : le script `vercel-build` lance `prisma migrate deploy`.
+5. Ouvre `APP_URL/setup` pour créer ton compte admin. **Cette page ne sert qu'une fois** : elle se désactive dès que le compte existe.
+
+Sur un autre hébergeur :
 
 ```bash
 npm install
-npm run db:deploy                       # crée les tables
-npm run admin:create -- toi@mail.com 'un-mot-de-passe-solide'
-npm run build && npm start              # ou : déploiement Vercel
+npm run db:deploy        # crée les tables
+npm run build && npm start
 ```
 
-Connecte-toi ensuite sur `APP_URL/login`.
+Le compte admin se crée ensuite via `/setup`. Pour réinitialiser un mot de passe : `npm run admin:create -- toi@mail.com 'nouveau-mot-de-passe'`.
 
 ## Ajouter une boutique (environ 5 minutes)
 
