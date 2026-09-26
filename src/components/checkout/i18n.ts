@@ -1,0 +1,115 @@
+export const LABELS = {
+  fr: {
+    contact: "Contact",
+    email: "E-mail",
+    marketing: "Recevoir nos offres et nouveautés par e-mail",
+    delivery: "Livraison",
+    country: "Pays",
+    firstName: "Prénom",
+    lastName: "Nom",
+    address1: "Adresse",
+    address2: "Appartement, suite, etc. (facultatif)",
+    city: "Ville",
+    province: "Région / État (facultatif)",
+    zip: "Code postal",
+    phone: "Téléphone (facultatif)",
+    shippingMethod: "Mode de livraison",
+    shippingPending: "Saisissez votre adresse pour voir les modes de livraison.",
+    noShipping: "Nous ne livrons pas encore dans ce pays.",
+    free: "Offert",
+    addons: "Ajouter à votre commande",
+    payment: "Paiement",
+    paymentSecure: "Toutes les transactions sont sécurisées et chiffrées.",
+    continueToPayment: "Continuer vers le paiement",
+    editInfo: "Modifier mes informations",
+    discountCode: "Code promo",
+    apply: "Appliquer",
+    remove: "Retirer",
+    subtotal: "Sous-total",
+    discount: "Réduction",
+    shipping: "Livraison",
+    addonsTotal: "Options",
+    total: "Total",
+    items: (n: number) => `${n} article${n > 1 ? "s" : ""}`,
+    summary: "Récapitulatif",
+    showSummary: "Afficher le récapitulatif",
+    hideSummary: "Masquer le récapitulatif",
+    endsIn: "Fin dans",
+    thankYou: (name: string) => (name ? `Merci, ${name} !` : "Merci !"),
+    orderConfirmed: "Votre commande est confirmée.",
+    orderProcessing: "Paiement reçu, confirmation de la commande en cours…",
+    confirmationSent: (email: string) => `Un e-mail de confirmation est envoyé à ${email}.`,
+    order: "Commande",
+    shipTo: "Livraison à",
+    continueShopping: "Continuer mes achats",
+    required: "Champ obligatoire",
+    invalidEmail: "E-mail invalide",
+  },
+  en: {
+    contact: "Contact",
+    email: "Email",
+    marketing: "Email me with news and offers",
+    delivery: "Delivery",
+    country: "Country",
+    firstName: "First name",
+    lastName: "Last name",
+    address1: "Address",
+    address2: "Apartment, suite, etc. (optional)",
+    city: "City",
+    province: "State / Region (optional)",
+    zip: "ZIP / Postal code",
+    phone: "Phone (optional)",
+    shippingMethod: "Shipping method",
+    shippingPending: "Enter your address to see shipping methods.",
+    noShipping: "We don't ship to this country yet.",
+    free: "Free",
+    addons: "Add to your order",
+    payment: "Payment",
+    paymentSecure: "All transactions are secure and encrypted.",
+    continueToPayment: "Continue to payment",
+    editInfo: "Edit my details",
+    discountCode: "Discount code",
+    apply: "Apply",
+    remove: "Remove",
+    subtotal: "Subtotal",
+    discount: "Discount",
+    shipping: "Shipping",
+    addonsTotal: "Add-ons",
+    total: "Total",
+    items: (n: number) => `${n} item${n > 1 ? "s" : ""}`,
+    summary: "Order summary",
+    showSummary: "Show order summary",
+    hideSummary: "Hide order summary",
+    endsIn: "Ends in",
+    thankYou: (name: string) => (name ? `Thank you, ${name}!` : "Thank you!"),
+    orderConfirmed: "Your order is confirmed.",
+    orderProcessing: "Payment received, confirming your order…",
+    confirmationSent: (email: string) => `A confirmation email is on its way to ${email}.`,
+    order: "Order",
+    shipTo: "Ship to",
+    continueShopping: "Continue shopping",
+    required: "Required",
+    invalidEmail: "Invalid email",
+  },
+};
+
+export type Labels = (typeof LABELS)["fr"];
+
+export function labelsFor(lang: "fr" | "en"): Labels {
+  return LABELS[lang] as Labels;
+}
+
+/** Countries offered when a shipping rate covers "all countries". */
+export const DEFAULT_COUNTRIES = [
+  "FR", "BE", "CH", "LU", "MC", "DE", "AT", "NL", "ES", "PT", "IT", "IE", "GB", "DK", "SE", "NO", "FI",
+  "PL", "CZ", "SK", "HU", "RO", "BG", "GR", "HR", "SI", "EE", "LV", "LT", "CY", "MT", "IS",
+  "US", "CA", "AU", "NZ", "JP", "SG", "HK", "AE", "IL", "MA", "TN", "DZ", "SN", "CI", "RE", "GP", "MQ", "GF", "YT", "NC", "PF",
+];
+
+export function countryName(code: string, lang: "fr" | "en") {
+  try {
+    return new Intl.DisplayNames([lang], { type: "region" }).of(code) ?? code;
+  } catch {
+    return code;
+  }
+}

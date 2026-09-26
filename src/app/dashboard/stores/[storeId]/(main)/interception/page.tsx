@@ -1,0 +1,103 @@
+import { notFound } from "next/navigation";
+import { db } from "@/lib/db";
+import { loadInterception } from "@/lib/layout";
+import { loaderUrl } from "@/lib/shopify";
+import { Badge, Card, CopyField, Flash, Label, PageHeader, SubmitButton, Textarea, Toggle } from "@/components/ui";
+import { reinstallScriptAction, saveInterceptionAction } from "../../../../actions";
+
+export default async function InterceptionPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ storeId: string }>;
+  searchParams: Promise<{ ok?: string; error?: string }>;
+}) {
+  const { storeId } = await params;
+  const sp = await searchParams;
+  const store = await db.store.findUnique({ where: { id: storeId } });
+  if (!store) notFound();
+  const i = loadInterception(store.interception);
+  const shopUrl = store.storefrontHost ? `https://${store.storefrontHost}` : store.shopDomain ? `https://${store.shopDomain}` : null;
+
+  return (
+    <>
+      <PageHeader
+        title="Interception"
+        description="Choisissez quels boutons de la boutique ouvrent votre checkout Whop. Tout est automatique : aucune modification du thème."
+      />
+      <Flash ok={sp.ok} error={sp.error} />
+
+      <div className="grid gap-6 lg:grid-cols-[1.3fr_1fr]">
+        <Card title="Boutons interceptés" description="Les changements sont actifs sur la boutique en quelques secondes.">
+          <form action={saveInterceptionAction.bind(null, store.id)}>
+            <div className="divide-y divide-zinc-100">
+              <Toggle name="cartCheckout" defaultChecked={i.cartCheckout} label="Bouton « Paiement » de la page panier" hint="Le bouton Checkout de /cart." />
+              <Toggle name="cartDrawer" defaultChecked={i.cartDrawer} label="Bouton « Paiement » du tiroir panier" hint="Cart drawer et notification d'ajout au panier." />
+              <Toggle name="buyNow" defaultChecked={i.buyNow} label="« Acheter maintenant » sur la fiche produit" hint="Envoie uniquement ce produit au checkout, sans toucher au panier." />
+              <Toggle
+                name="addToCartDirect"
+                defaultChecked={i.addToCartDirect}
+                label="« Ajouter au panier » → checkout direct"
+                hint="Pour les boutiques mono-produit : l'ajout au panier ouvre directement le paiement."
+              />
+            </div>
+            <div className="mt-4 space-y-4 border-t border-zinc-100 pt-4">
+              <div>
+                <Label htmlFor="customSelectors" hint="Pour un thème exotique : un sélecteur CSS par ligne (ex. .mon-bouton-paiement).">
+                  Sélecteurs personnalisés
+                </Label>
+                <Textarea id="customSelectors" name="customSelectors" rows={3} defaultValue={i.customSelectors} className="font-mono text-xs" />
+              </div>
+              <div>
+                <Label htmlFor="excludedHandles" hint="Handles de produits qui gardent le checkout Shopify (un par ligne). Si le panier en contient un, on laisse Shopify gérer.">
+                  Produits exclus
+                </Label>
+                <Textarea id="excludedHandles" name="excludedHandles" rows={3} defaultValue={i.excludedHandles.join("\n")} className="font-mono text-xs" />
+              </div>
+              <SubmitButton>Enregistrer</SubmitButton>
+            </div>
+          </form>
+        </Card>
+
+        <div className="space-y-6">
+          <Card title="Script sur la boutique" actions={<Badge color={store.scriptTagId ? "green" : "amber"}>{store.scriptTagId ? "Installé" : "Non installé"}</Badge>}>
+            <p className="mb-4 text-sm text-zinc-600">
+              Le script est injecté automatiquement via l&apos;API Shopify à la connexion. S&apos;il a été supprimé, réinstallez-le en un clic.
+            </p>
+            <form action={reinstallScriptAction.bind(null, store.id)}>
+              <SubmitButton variant="secondary" disabled={!store.shopifyConnectedAt}>
+                Vérifier / réinstaller le script
+              </SubmitButton>
+            </form>
+          </Card>
+
+          <Card title="Tester l'interception">
+            <p className="mb-4 text-sm text-zinc-600">
+              Ouvre la boutique en mode test : les boutons détectés sont entourés en vert et un badge confirme que l&apos;interception est active.
+            </p>
+            {shopUrl ? (
+              <a
+                href={`${shopUrl}/?whopco_debug=1`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-800"
+              >
+                Ouvrir la boutique en mode test ↗
+              </a>
+            ) : (
+              <p className="text-sm text-zinc-500">Connectez d&apos;abord Shopify.</p>
+            )}
+          </Card>
+
+          <Card title="Plan B : installation manuelle" description="Seulement si votre thème bloque le script automatique.">
+            <p className="mb-3 text-sm text-zinc-600">
+              Shopify → Boutique en ligne → Thèmes → Modifier le code → <code>theme.liquid</code>, collez cette ligne juste avant{" "}
+              <code>&lt;/head&gt;</code> :
+            </p>
+            <CopyField value={`<script src="${loaderUrl(store.publicId)}" defer></script>`} />
+          </Card>
+        </div>
+      </div>
+    </>
+  );
+}
