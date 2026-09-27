@@ -107,30 +107,67 @@ export async function teardownWhop(store: Pick<Store, "whopApiKey" | "testMode" 
   await storeClient(store).webhooks.delete({ id: store.whopWebhookId });
 }
 
+/** Wallets and methods offered on every checkout, on top of the account's defaults. */
+export const CHECKOUT_PAYMENT_METHODS = ["card", "apple_pay", "google_pay", "paypal"] as const;
+
 /** Creates the one-off checkout for a session; the embed is rendered with its id. */
 export async function createCheckoutConfiguration(
   store: Pick<Store, "whopApiKey" | "testMode" | "whopAccountId" | "whopProductId">,
   opts: { sessionId: string; storeId: string; totalCents: number; currency: string; title: string; redirectUrl: string },
 ) {
   if (!store.whopAccountId || !store.whopProductId) throw new Error("Compte Whop non configuré");
-  const config = await storeClient(store).checkoutConfigurations.create({
+  const client = storeClient(store);
+  const base = {
     account_id: store.whopAccountId,
     currency: opts.currency.toLowerCase(),
     redirect_url: opts.redirectUrl,
     metadata: { checkout_session_id: opts.sessionId, store_id: opts.storeId },
     plan: {
       product_id: store.whopProductId,
-      plan_type: "one_time",
+      plan_type: "one_time" as const,
       initial_price: Number(centsToDecimal(opts.totalCents)),
       currency: opts.currency.toLowerCase(),
       title: opts.title.slice(0, 80),
-      visibility: "hidden",
+      visibility: "hidden" as const,
       unlimited_stock: true,
       force_create_new_plan: true,
       metadata: { checkout_session_id: opts.sessionId },
     },
-  });
+  };
+  let config;
+  try {
+    config = await client.checkoutConfigurations.create({
+      ...base,
+      payment_method_configuration: { enabled: [...CHECKOUT_PAYMENT_METHODS], include_platform_defaults: true },
+    });
+  } catch (err) {
+    // A method the account isn't eligible for (e.g. PayPal) must never block the sale:
+    // fall back to the account's default methods.
+    console.warn("Whop rejected the payment method configuration, using account defaults", err);
+    config = await client.checkoutConfigurations.create(base);
+  }
   return { id: config.id, purchaseUrl: config.purchase_url ?? null };
+}
+
+/**
+ * Registers the checkout hostname for Apple Pay with Whop. Apple fetches
+ * /.well-known/apple-developer-merchantid-domain-association from this app to verify it.
+ */
+export async function registerApplePayDomain(
+  store: Pick<Store, "whopApiKey" | "testMode" | "whopAccountId">,
+  hostname: string,
+) {
+  const client = storeClient(store);
+  let existing: { id: string; status: string } | null = null;
+  for await (const d of await client.paymentMethodDomains.list({ account_id: store.whopAccountId ?? undefined, hostname })) {
+    if (d.hostname === hostname) {
+      existing = d;
+      break;
+    }
+  }
+  if (existing?.status === "verified") return existing;
+  if (existing) return client.paymentMethodDomains.verify({ id: existing.id });
+  return client.paymentMethodDomains.create({ account_id: store.whopAccountId ?? undefined, hostname });
 }
 
 export async function refundPayment(

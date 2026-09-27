@@ -16,7 +16,8 @@ import {
   type Theme,
 } from "@/lib/layout";
 import { ensureScriptTag, installUrl, normalizeShopDomain, removeScriptTag } from "@/lib/shopify";
-import { refundPayment, setupWhop, teardownWhop } from "@/lib/whop";
+import { refundPayment, registerApplePayDomain, setupWhop, teardownWhop } from "@/lib/whop";
+import { env } from "@/lib/env";
 import { syncOrder } from "@/lib/checkout";
 
 /* ------------------------------------------------------------------ */
@@ -265,6 +266,32 @@ export async function disconnectWhopAction(storeId: string) {
   });
   revalidatePath(storePath(storeId), "layout");
   back(storePath(storeId, "whop"), { ok: "Whop déconnecté." });
+}
+
+/** Saves Apple's domain-association file (from Whop) and registers the checkout domain. */
+export async function setupApplePayAction(storeId: string, fd: FormData) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "whop");
+  const file = String(fd.get("association") ?? "").trim();
+  if (file) {
+    if (file.length > 20000) back(path, { error: "Fichier Apple Pay trop volumineux : collez uniquement son contenu" });
+    await db.appSetting.upsert({
+      where: { key: "apple_pay_domain_association" },
+      update: { value: file },
+      create: { key: "apple_pay_domain_association", value: file },
+    });
+  }
+  let status = "pending";
+  try {
+    const domain = await registerApplePayDomain(store, new URL(env.appUrl).hostname);
+    status = domain.status;
+  } catch (err) {
+    back(path, { error: `Whop n'a pas pu enregistrer le domaine : ${errorMessage(err)}` });
+  }
+  if (status === "verified") back(path, { ok: "Apple Pay est activé sur votre checkout ✓" });
+  back(path, {
+    error: "Domaine enregistré mais pas encore vérifié par Apple. Vérifiez le fichier collé, puis réessayez dans quelques minutes.",
+  });
 }
 
 /* ------------------------------------------------------------------ */

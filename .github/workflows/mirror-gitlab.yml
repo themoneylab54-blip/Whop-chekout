@@ -1,0 +1,26 @@
+# Copies every push on GitHub to the GitLab project Vercel deploys from.
+# One-time setup: add a GitLab access token (scope: write_repository) as the
+# GitHub secret GITLAB_TOKEN. Without it, this job does nothing.
+name: Mirror to GitLab
+
+on:
+  push:
+    branches: ["**"]
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Push to GitLab
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_REPO: ${{ vars.GITLAB_REPO || 'gitlab.com/themoneylab54/Whop-chekout-v2.git' }}
+        run: |
+          if [ -z "$GITLAB_TOKEN" ]; then
+            echo "GITLAB_TOKEN secret not set: skipping mirror."
+            exit 0
+          fi
+          git push "https://oauth2:${GITLAB_TOKEN}@${GITLAB_REPO}" "HEAD:refs/heads/${GITHUB_REF_NAME}"

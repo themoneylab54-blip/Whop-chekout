@@ -40,6 +40,9 @@ export const themeSchema = z.object({
   logoUrl: url.default(""),
   logoHeight: z.number().int().min(16).max(120).default(40),
   trustLine: z.string().max(200).default(""),
+  // Apple Pay / Google Pay buttons at the top of the checkout
+  expressCheckout: z.boolean().default(true),
+  payButtonText: z.string().max(40).default(""),
   policyLinks: z.array(z.object({ label: z.string().max(60), url })).max(8).default([]),
 });
 export type Theme = z.infer<typeof themeSchema>;

@@ -1,7 +1,8 @@
 import { db } from "@/lib/db";
 import { json, readJson } from "@/lib/http";
-import { CheckoutError, paySchema, startPayment } from "@/lib/checkout";
+import { CheckoutError, confirmSession, paySchema } from "@/lib/checkout";
 
+/** Saves the buyer's details just before the embedded Whop form is submitted. */
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
   const parsed = paySchema.safeParse(await readJson(req));
@@ -11,11 +12,11 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const session = await db.checkoutSession.findUnique({ where: { id }, include: { store: true } });
   if (!session) return json({ error: "Session introuvable" }, { status: 404 });
   try {
-    const result = await startPayment(session, parsed.data);
+    const result = await confirmSession(session, parsed.data);
     return json({ ...result, environment: session.store.testMode ? "sandbox" : "production" });
   } catch (err) {
     if (err instanceof CheckoutError) return json({ error: err.message }, { status: 400 });
-    console.error("startPayment failed", err);
+    console.error("confirmSession failed", err);
     return json({ error: "Le paiement n'a pas pu être initialisé. Réessayez." }, { status: 502 });
   }
 }

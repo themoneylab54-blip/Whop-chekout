@@ -1,12 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
-import { WhopCheckoutEmbed } from "@whop/checkout/react";
 import type { Block, Layout, Theme } from "@/lib/layout";
 import { computeTotals, formatMoney, ratesForCountry, type CartLine, type RateInput, type Totals } from "@/lib/pricing";
 import { ContentBlock, Placeholder, StyledBlock, type ContentContext } from "./blocks";
 import { countryName, DEFAULT_COUNTRIES, labelsFor, type Labels } from "./i18n";
+import { ExpressCheckout, ExpressPreview, PaymentPanel, PaymentPreview, type ConfirmResult, type Prepared } from "./Payment";
 
 export type AddOnView = { id: string; title: string; description: string | null; priceCents: number; imageUrl: string | null };
 
@@ -46,7 +46,6 @@ type QuoteState = {
   appliedCode: string | null;
 };
 
-type PayState = { configId: string; environment: "sandbox" | "production" };
 
 export function themeVars(theme: Theme): CSSProperties {
   return {
@@ -137,9 +136,9 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
   const [addOnIds, setAddOnIds] = useState<string[]>([]);
   const [quote, setQuote] = useState<QuoteState | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [formError, setFormError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const [pay, setPay] = useState<PayState | null>(null);
+  const [prepared, setPrepared] = useState<Prepared | null>(null);
+  const [preparing, setPreparing] = useState(false);
+  const [prepareError, setPrepareError] = useState<string | null>(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
 
   /* ---------- totals ---------- */
@@ -187,6 +186,37 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
     };
   }, [liveSessionId, address.countryCode, rateId, appliedCode, addOnIds]);
 
+  // One-page checkout: keep a Whop checkout ready for the current total, so the
+  // payment form and wallet buttons are on the page from the start.
+  const quoteBlocking = !!quote && (!!quote.discountError || (quote.rates.length === 0 && lines.some((l) => l.requiresShipping)));
+  useEffect(() => {
+    if (!liveSessionId || quoteBlocking) return;
+    const ctrl = new AbortController();
+    const t = setTimeout(async () => {
+      setPreparing(true);
+      try {
+        const res = await fetch(`/api/public/sessions/${liveSessionId}/prepare`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ countryCode: address.countryCode, shippingRateId: rateId, discountCode: appliedCode, addOnIds }),
+          signal: ctrl.signal,
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.error ?? "Erreur");
+        setPrepareError(null);
+        setPrepared((p) => (p?.configId === body.checkoutConfigurationId ? p : { configId: body.checkoutConfigurationId, environment: body.environment }));
+      } catch (err) {
+        if (!ctrl.signal.aborted) setPrepareError(err instanceof Error ? err.message : "Erreur");
+      } finally {
+        if (!ctrl.signal.aborted) setPreparing(false);
+      }
+    }, 500);
+    return () => {
+      clearTimeout(t);
+      ctrl.abort();
+    };
+  }, [liveSessionId, quoteBlocking, address.countryCode, rateId, appliedCode, addOnIds]);
+
   const q = live ? (quote ?? localQuote) : localQuote;
   const totals = q.totals;
   const lowestInventory = useMemo(() => {
@@ -196,7 +226,15 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
 
   /* ---------- payment ---------- */
 
-  const locked = pay !== null;
+  const locked = false;
+  const thankYouUrl = liveSessionId ? `/c/${liveSessionId}/merci` : "#";
+  // Whop needs an absolute return URL; the origin is only known in the browser.
+  const origin = useSyncExternalStore(
+    noopSubscribe,
+    () => window.location.origin,
+    () => "",
+  );
+  const onPaid = () => router.push(thankYouUrl);
 
   function validate(): boolean {
     const e: Record<string, string> = {};
@@ -205,37 +243,53 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
       if (!address[k].trim()) e[k] = L.required;
     }
     setErrors(e);
+    if (Object.keys(e).length) {
+      document.querySelector(`[data-field="${Object.keys(e)[0]}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
     return Object.keys(e).length === 0;
   }
 
-  async function startPayment() {
-    if (mode.kind !== "live") return;
-    setFormError(null);
-    if (!validate()) return;
-    setSubmitting(true);
-    try {
-      const res = await fetch(`/api/public/sessions/${mode.sessionId}/pay`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          email,
-          acceptsMarketing: marketing,
-          address,
-          countryCode: address.countryCode,
-          shippingRateId: q.shippingRateId,
-          discountCode: appliedCode,
-          addOnIds,
-        }),
-      });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error ?? "Erreur");
-      setPay({ configId: body.checkoutConfigurationId, environment: body.environment });
-    } catch (err) {
-      setFormError(err instanceof Error ? err.message : "Erreur");
-    } finally {
-      setSubmitting(false);
+  async function confirm(): Promise<ConfirmResult> {
+    if (!liveSessionId) return { ok: false };
+    if (!validate()) return { ok: false };
+    const res = await fetch(`/api/public/sessions/${liveSessionId}/pay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email,
+        acceptsMarketing: marketing,
+        address,
+        countryCode: address.countryCode,
+        shippingRateId: q.shippingRateId,
+        discountCode: appliedCode,
+        addOnIds,
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) return { ok: false, error: body.error ?? "Erreur" };
+    if (!body.ready) {
+      setPrepared({ configId: body.checkoutConfigurationId, environment: body.environment });
+      return { ok: false, refreshedConfigId: body.checkoutConfigurationId };
     }
+    return {
+      ok: true,
+      buyer: {
+        email,
+        address: {
+          name: `${address.firstName} ${address.lastName}`.trim(),
+          line1: address.address1,
+          line2: address.address2 || undefined,
+          city: address.city,
+          state: address.province,
+          postalCode: address.zip,
+          country: address.countryCode,
+          phone: address.phone || undefined,
+        },
+      },
+    };
   }
+
+  const payLabel = `${theme.payButtonText || L.payNow} · ${money(totals.totalCents)}`;
 
   /* ---------- rendering helpers ---------- */
 
@@ -275,8 +329,22 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
     switch (block.type) {
       case "contact":
         return (
+          <>
+            {theme.expressCheckout &&
+              (mode.kind === "live" ? (
+                <ExpressCheckout
+                  prepared={prepared}
+                  theme={theme}
+                  labels={L}
+                  returnUrl={`${origin}${thankYouUrl}`}
+                  email={email}
+                  onPaid={onPaid}
+                />
+              ) : (
+                <ExpressPreview labels={L} />
+              ))}
           <Section title={block.props.title || L.contact}>
-            <Field label={L.email} error={errors.email}>
+            <Field label={L.email} error={errors.email} field="email">
               <input type="email" autoComplete="email" value={email} disabled={locked} onChange={(e) => setEmail(e.target.value)} className={inputCls} />
             </Field>
             <label className="mt-3 flex items-center gap-2 text-sm">
@@ -284,12 +352,13 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
               {L.marketing}
             </label>
           </Section>
+          </>
         );
       case "delivery":
         return (
           <Section title={block.props.title || L.delivery}>
             <div className="grid grid-cols-2 gap-3">
-              <Field label={L.country} className="col-span-2" error={errors.countryCode}>
+              <Field label={L.country} className="col-span-2" error={errors.countryCode} field="countryCode">
                 <select
                   autoComplete="country"
                   value={address.countryCode}
@@ -316,7 +385,7 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
                   ["phone", L.phone, "tel", 2],
                 ] as const
               ).map(([k, label, auto, span]) => (
-                <Field key={k} label={label} className={span === 2 ? "col-span-2" : ""} error={errors[k]}>
+                <Field key={k} label={label} className={span === 2 ? "col-span-2" : ""} error={errors[k]} field={k}>
                   <input
                     autoComplete={auto}
                     type={k === "phone" ? "tel" : "text"}
@@ -400,53 +469,21 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
       case "payment":
         return (
           <Section title={block.props.title || L.payment}>
-            <p className="-mt-1 mb-3 text-sm text-neutral-500">{L.paymentSecure}</p>
-            {formError && <p className="mb-3 rounded-[var(--radius)] bg-red-50 px-4 py-3 text-sm text-red-700">{formError}</p>}
-            {mode.kind === "live" && pay ? (
-              <div className="space-y-3">
-                <div className="overflow-hidden rounded-[var(--radius)] border border-neutral-200 bg-white p-1">
-                  <WhopCheckoutEmbed
-                    key={pay.configId}
-                    sessionId={pay.configId}
-                    environment={pay.environment}
-                    theme="light"
-                    locale={theme.language}
-                    themeOptions={{ accentColor: theme.accentColor, borderRadius: theme.radius }}
-                    prefill={{
-                      email,
-                      address: {
-                        name: `${address.firstName} ${address.lastName}`.trim(),
-                        line1: address.address1,
-                        line2: address.address2 || undefined,
-                        city: address.city,
-                        state: address.province,
-                        postalCode: address.zip,
-                        country: address.countryCode,
-                      },
-                    }}
-                    disableEmail
-                    returnUrl={`${window.location.origin}/c/${mode.sessionId}/merci`}
-                    skipRedirect
-                    onComplete={() => router.push(`/c/${mode.sessionId}/merci`)}
-                  />
-                </div>
-                <button type="button" onClick={() => setPay(null)} className="text-sm text-neutral-500 underline underline-offset-2">
-                  {L.editInfo}
-                </button>
-              </div>
+            {mode.kind === "live" ? (
+              <PaymentPanel
+                prepared={prepared}
+                preparing={preparing}
+                prepareError={prepareError}
+                theme={theme}
+                labels={L}
+                payLabel={payLabel}
+                returnUrl={`${origin}${thankYouUrl}`}
+                testMode={mode.testMode}
+                confirm={confirm}
+                onPaid={onPaid}
+              />
             ) : (
-              <button
-                type="button"
-                disabled={submitting}
-                onClick={startPayment}
-                className="flex w-full items-center justify-center gap-2 rounded-[var(--radius)] bg-[var(--accent)] px-5 py-4 text-base font-semibold text-[var(--accent-fg)] transition hover:opacity-90 disabled:opacity-60"
-              >
-                {submitting && <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-r-transparent" />}
-                {L.continueToPayment} · {money(totals.totalCents)}
-              </button>
-            )}
-            {mode.kind === "live" && mode.testMode && (
-              <p className="mt-3 rounded bg-amber-50 px-3 py-2 text-xs text-amber-800">Mode test : paiement sandbox Whop, aucune somme réelle débitée.</p>
+              <PaymentPreview labels={L} payLabel={payLabel} />
             )}
           </Section>
         );
@@ -509,6 +546,8 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
   );
 }
 
+const noopSubscribe = () => () => {};
+
 function isSection(b: Block) {
   return b.type === "contact" || b.type === "delivery" || b.type === "shipping_method" || b.type === "payment" || b.type === "order_addons";
 }
@@ -525,9 +564,21 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-function Field({ label, error, className = "", children }: { label: string; error?: string; className?: string; children: ReactNode }) {
+function Field({
+  label,
+  error,
+  field,
+  className = "",
+  children,
+}: {
+  label: string;
+  error?: string;
+  field?: string;
+  className?: string;
+  children: ReactNode;
+}) {
   return (
-    <label className={`block ${className}`}>
+    <label className={`block ${className}`} data-field={field}>
       <span className="mb-1 block text-xs font-medium text-neutral-600">{label}</span>
       {children}
       {error && <span className="mt-1 block text-xs text-red-600">{error}</span>}

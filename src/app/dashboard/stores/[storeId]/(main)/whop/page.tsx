@@ -1,8 +1,9 @@
 import { notFound } from "next/navigation";
 import { db } from "@/lib/db";
 import { whopWebhookUrl, WHOP_WEBHOOK_EVENTS } from "@/lib/whop";
-import { Badge, Card, CopyField, Flash, Input, Label, PageHeader, SubmitButton } from "@/components/ui";
-import { connectWhopAction, disconnectWhopAction } from "../../../../actions";
+import { Badge, Card, CopyField, Flash, Input, Label, PageHeader, SubmitButton, Textarea } from "@/components/ui";
+import { env as appEnv } from "@/lib/env";
+import { connectWhopAction, disconnectWhopAction, setupApplePayAction } from "../../../../actions";
 
 export default async function WhopPage({
   params,
@@ -13,9 +14,13 @@ export default async function WhopPage({
 }) {
   const { storeId } = await params;
   const sp = await searchParams;
-  const store = await db.store.findUnique({ where: { id: storeId } });
+  const [store, applePayFile] = await Promise.all([
+    db.store.findUnique({ where: { id: storeId } }),
+    db.appSetting.findUnique({ where: { key: "apple_pay_domain_association" } }),
+  ]);
   if (!store) notFound();
   const connected = !!store.whopConnectedAt;
+  const checkoutHost = new URL(appEnv.appUrl).hostname;
   const env = store.testMode ? "sandbox" : "production";
 
   return (
@@ -48,6 +53,47 @@ export default async function WhopPage({
             </form>
           </div>
         </Card>
+      )}
+
+      {connected && (
+        <div className="mb-6 grid gap-6 lg:grid-cols-2">
+          <Card
+            title="Apple Pay"
+            description={`Affiche le bouton Apple Pay sur Safari, iPhone et Mac. Domaine : ${checkoutHost}`}
+            actions={<Badge color={applePayFile ? "blue" : "zinc"}>{applePayFile ? "Fichier installé" : "À configurer"}</Badge>}
+          >
+            <ol className="mb-4 list-decimal space-y-1.5 pl-5 text-sm text-zinc-700">
+              <li>
+                Dans Whop : <strong>Paramètres → Checkout → Apple Pay for embedded checkout</strong> → <strong>Self-hosted verification</strong>.
+              </li>
+              <li>Téléchargez le fichier de vérification, ouvrez-le avec un éditeur de texte et copiez tout son contenu.</li>
+              <li>Collez-le ci-dessous puis cliquez sur le bouton : on l&apos;installe et on enregistre le domaine chez Whop.</li>
+            </ol>
+            <form action={setupApplePayAction.bind(null, store.id)} className="space-y-3">
+              <Textarea
+                name="association"
+                rows={4}
+                placeholder={applePayFile ? "Fichier déjà installé — collez-en un nouveau pour le remplacer" : "Contenu du fichier apple-developer-merchantid-domain-association"}
+                className="font-mono text-xs"
+              />
+              <SubmitButton>{applePayFile ? "Vérifier le domaine" : "Installer et vérifier"}</SubmitButton>
+            </form>
+          </Card>
+          <Card title="PayPal, Google Pay & autres" description="Proposés automatiquement dans le formulaire de paiement dès qu'ils sont actifs sur votre compte Whop.">
+            <ul className="space-y-2 text-sm text-zinc-700">
+              <li>
+                <strong>PayPal</strong> : activez-le dans Whop → <strong>Paramètres → Moyens de paiement</strong>. Il apparaît ensuite tout seul au checkout.
+              </li>
+              <li>
+                <strong>Google Pay</strong> : s&apos;affiche automatiquement sur Chrome et Android quand le client a une carte enregistrée.
+              </li>
+              <li>
+                <strong>Paiement express</strong> : les boutons Apple Pay / Google Pay en haut du checkout s&apos;activent ou se masquent dans{" "}
+                <strong>Design du checkout → Thème &amp; textes</strong>.
+              </li>
+            </ul>
+          </Card>
+        </div>
       )}
 
       {(!connected || sp.edit === "1") && (

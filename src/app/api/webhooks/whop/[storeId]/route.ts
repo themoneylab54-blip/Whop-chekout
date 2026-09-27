@@ -2,7 +2,7 @@ import { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
 import { decrypt } from "@/lib/crypto";
 import { json } from "@/lib/http";
-import { markPaid, recordDispute, recordRefund } from "@/lib/checkout";
+import { markPaid, recordDispute, recordRefund, type PaymentBuyer } from "@/lib/checkout";
 import { eventType, moneyToCents, verifyWhopWebhook, type WhopEvent } from "@/lib/whop";
 
 export const dynamic = "force-dynamic";
@@ -54,10 +54,16 @@ async function handle(type: string, data: Record<string, unknown>, storeId: stri
       const sessionId = await sessionIdFor(data, storeId);
       if (!sessionId) return; // not one of our checkouts (e.g. another product on this Whop account)
       const total = (data.total ?? data.final_amount) as { currency?: string } | number | undefined;
+      const user = (data.user ?? null) as { email?: string } | null;
       await markPaid(sessionId, {
         id: String(data.id),
         totalCents: moneyToCents(total),
         currency: typeof total === "object" && total?.currency ? total.currency : typeof data.currency === "string" ? data.currency : null,
+        buyer: {
+          email: (typeof data.customer_email === "string" ? data.customer_email : null) ?? user?.email ?? null,
+          address: (data.shipping_address ?? data.billing_address ?? null) as PaymentBuyer["address"],
+          phone: typeof data.customer_phone === "string" ? data.customer_phone : null,
+        },
       });
       return;
     }

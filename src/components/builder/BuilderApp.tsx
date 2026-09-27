@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { DndContext, KeyboardSensor, PointerSensor, closestCenter, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
@@ -18,7 +19,8 @@ import {
   type Layout,
   type Theme,
 } from "@/lib/layout";
-import type { CartLine, RateInput } from "@/lib/pricing";
+import type { RateInput } from "@/lib/pricing";
+import { SAMPLE_LINES, sampleThankYou } from "@/lib/sample";
 import { CheckoutView, type AddOnView } from "@/components/checkout/CheckoutView";
 import { ThankYouView } from "@/components/checkout/ThankYouView";
 import { BlockContentEditor, ColorInput, F, Num, Pick, Segmented, StyleEditor, Text } from "./BlockEditor";
@@ -44,36 +46,6 @@ export const BLOCK_META: Record<BlockType, { label: string; icon: string; descri
   why_us: { label: "Pourquoi nous ?", icon: "🏅", description: "Lignes avec icônes" },
 };
 
-const SAMPLE_LINES: CartLine[] = [
-  {
-    variantId: "sample-1",
-    productId: "p1",
-    productHandle: "sweat",
-    title: "Sweat à capuche",
-    variantTitle: "M / Noir",
-    sku: null,
-    imageUrl: null,
-    quantity: 1,
-    unitPriceCents: 4990,
-    compareAtCents: 6990,
-    inventory: 6,
-    requiresShipping: true,
-  },
-  {
-    variantId: "sample-2",
-    productId: "p2",
-    productHandle: "casquette",
-    title: "Casquette",
-    variantTitle: null,
-    sku: null,
-    imageUrl: null,
-    quantity: 2,
-    unitPriceCents: 1999,
-    compareAtCents: null,
-    inventory: null,
-    requiresShipping: true,
-  },
-];
 
 type Page = "checkout" | "thank-you";
 type SaveState = "saved" | "dirty" | "saving" | "error";
@@ -104,17 +76,40 @@ export function BuilderApp(props: {
 
   /* ---------- autosave ---------- */
 
-  const doSave = useCallback(async () => {
+  const doSave = useCallback(async (): Promise<boolean> => {
     setState("saving");
-    const res = await props.save(theme, layout);
-    if (res.ok) {
-      setState("saved");
-      setError(null);
-    } else {
+    try {
+      const res = await props.save(theme, layout);
+      if (res.ok) {
+        setState("saved");
+        setError(null);
+        return true;
+      }
       setState("error");
       setError(res.error);
+    } catch {
+      // Network loss, or the page was opened before a new version was deployed.
+      setState("error");
+      setError("connexion perdue — rechargez la page pour continuer (vos réglages déjà enregistrés sont conservés)");
     }
+    return false;
   }, [props, theme, layout]);
+
+  // Never lose edits: save right away when leaving the builder or hiding the tab.
+  const router = useRouter();
+  const pending = state === "dirty" || state === "error";
+  async function leaveTo(e: React.MouseEvent, href: string) {
+    if (!pending) return;
+    e.preventDefault();
+    if (await doSave()) router.push(href);
+  }
+  useEffect(() => {
+    const flush = () => {
+      if (document.visibilityState === "hidden" && pending) void doSave();
+    };
+    document.addEventListener("visibilitychange", flush);
+    return () => document.removeEventListener("visibilitychange", flush);
+  }, [pending, doSave]);
 
   useEffect(() => {
     if (first.current) {
@@ -122,7 +117,7 @@ export function BuilderApp(props: {
       return;
     }
     setState("dirty");
-    const t = setTimeout(doSave, 1200);
+    const t = setTimeout(doSave, 700);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [theme, layout]);
@@ -201,21 +196,7 @@ export function BuilderApp(props: {
         theme={theme}
         layout={layout}
         preview={{ selectedBlockId: selected, onSelectBlock: setSelected }}
-        data={{
-          status: "PAID",
-          orderName: "#1024",
-          email: "alex@exemple.fr",
-          firstName: "Alex",
-          address: { name: "Alex Martin", lines: ["12 rue des Lilas", "75011 Paris"], countryCode: "FR" },
-          lines: SAMPLE_LINES,
-          currency: props.currency,
-          subtotalCents: 8988,
-          discountCents: 0,
-          shippingCents: 490,
-          addOnsCents: 0,
-          totalCents: 9478,
-          continueUrl: "#",
-        }}
+        data={sampleThankYou(props.currency)}
       />
     );
 
@@ -224,14 +205,14 @@ export function BuilderApp(props: {
       {font && <link rel="stylesheet" href={font} />}
       {/* Top bar */}
       <header className="flex flex-wrap items-center gap-3 border-b border-zinc-200 bg-white px-4 py-2.5">
-        <Link href={base} className="text-sm text-zinc-500 hover:text-zinc-900">
+        <Link href={base} onClick={(e) => leaveTo(e, base)} className="text-sm text-zinc-500 hover:text-zinc-900">
           ← {props.storeName}
         </Link>
         <nav className="ml-2 flex rounded-lg bg-zinc-100 p-0.5 text-sm">
-          <Link href={`${base}/builder/checkout`} className={`rounded-md px-3 py-1 ${page === "checkout" ? "bg-white font-medium shadow-sm" : "text-zinc-600"}`}>
+          <Link href={`${base}/builder/checkout`} onClick={(e) => leaveTo(e, `${base}/builder/checkout`)} className={`rounded-md px-3 py-1 ${page === "checkout" ? "bg-white font-medium shadow-sm" : "text-zinc-600"}`}>
             Checkout
           </Link>
-          <Link href={`${base}/builder/thank-you`} className={`rounded-md px-3 py-1 ${page === "thank-you" ? "bg-white font-medium shadow-sm" : "text-zinc-600"}`}>
+          <Link href={`${base}/builder/thank-you`} onClick={(e) => leaveTo(e, `${base}/builder/thank-you`)} className={`rounded-md px-3 py-1 ${page === "thank-you" ? "bg-white font-medium shadow-sm" : "text-zinc-600"}`}>
             Page de remerciement
           </Link>
         </nav>
@@ -254,7 +235,21 @@ export function BuilderApp(props: {
             {state === "saving" && "Enregistrement…"}
             {state === "error" && `Erreur : ${error}`}
           </span>
-          <button type="button" onClick={doSave} disabled={state === "saving" || state === "saved"} className="rounded-lg bg-zinc-900 px-4 py-1.5 text-sm font-medium text-white disabled:opacity-40">
+          {state === "error" && (
+            <button type="button" onClick={() => window.location.reload()} className="rounded-lg border border-zinc-300 px-3 py-1.5 text-sm">
+              Recharger
+            </button>
+          )}
+          <a
+            href={`${base}/preview/${page}`}
+            target="_blank"
+            rel="noreferrer"
+            onClick={() => pending && void doSave()}
+            className="rounded-lg border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-50"
+          >
+            Aperçu plein écran ↗
+          </a>
+          <button type="button" onClick={() => void doSave()} disabled={state === "saving" || state === "saved"} className="rounded-lg bg-zinc-900 px-4 py-1.5 text-sm font-medium text-white disabled:opacity-40">
             Enregistrer
           </button>
         </div>
@@ -289,6 +284,17 @@ export function BuilderApp(props: {
                   </F>
                   <F label="Fond colonne récapitulatif">
                     <ColorInput value={theme.summaryBackground} onChange={(v) => setT("summaryBackground", v)} />
+                  </F>
+                </>
+              )}
+              {page === "checkout" && (
+                <>
+                  <label className="flex items-center gap-2 text-xs font-medium text-zinc-700">
+                    <input type="checkbox" checked={theme.expressCheckout} onChange={(e) => setT("expressCheckout", e.target.checked)} />
+                    Boutons Apple Pay / Google Pay en haut du checkout
+                  </label>
+                  <F label="Texte du bouton de paiement" hint="Vide = « Payer maintenant ». Le montant est ajouté automatiquement.">
+                    <Text value={theme.payButtonText} placeholder="Payer maintenant" onChange={(v) => setT("payButtonText", v)} />
                   </F>
                 </>
               )}

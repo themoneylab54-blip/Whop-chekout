@@ -105,31 +105,77 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
 }
 
 /* ------------------------------------------------------------------ */
-/* Pay: freeze totals and open a Whop checkout                         */
+/* One-page checkout: prepare the Whop checkout, then confirm & pay    */
 /* ------------------------------------------------------------------ */
 
 export class CheckoutError extends Error {}
 
-export async function startPayment(session: SessionWithStore, input: PayInput) {
+function assertPayable(session: SessionWithStore, quote: Quote, input: QuoteInput) {
   if (session.status === "PAID") throw new CheckoutError("Cette commande est déjà payée");
   const lines = session.lines as unknown as CartLine[];
   if (lines.length === 0) throw new CheckoutError("Votre panier est vide");
-
-  const quote = await quoteSession(session, { ...input, countryCode: input.address.countryCode });
   if (input.discountCode && quote.discountError) throw new CheckoutError(quote.discountError);
-  const needsShipping = lines.some((l) => l.requiresShipping);
-  if (needsShipping && !quote.shippingRateId) throw new CheckoutError("Nous ne livrons pas encore dans ce pays");
+  if (lines.some((l) => l.requiresShipping) && !quote.shippingRateId) {
+    throw new CheckoutError("Nous ne livrons pas encore dans ce pays");
+  }
   if (quote.totals.totalCents < 50) throw new CheckoutError("Montant minimum non atteint");
+}
 
-  const store = session.store;
-  const whop = await createCheckoutConfiguration(store, {
-    sessionId: session.id,
-    storeId: store.id,
-    totalCents: quote.totals.totalCents,
-    currency: session.currency,
-    title: `Commande ${store.name}`,
-    redirectUrl: `${env.appUrl}/c/${session.id}/merci`,
+/**
+ * Freezes the current quote on the session and returns a Whop checkout configuration
+ * for exactly that total. Called when the page opens and whenever the total changes;
+ * reuses the existing configuration when nothing that affects the price moved.
+ */
+export async function prepareSession(session: SessionWithStore, input: QuoteInput) {
+  const quote = await quoteSession(session, input);
+  assertPayable(session, quote, input);
+  const total = quote.totals.totalCents;
+
+  let checkoutConfigurationId = session.whopCheckoutId;
+  if (!checkoutConfigurationId || session.preparedTotalCents !== total) {
+    const whop = await createCheckoutConfiguration(session.store, {
+      sessionId: session.id,
+      storeId: session.storeId,
+      totalCents: total,
+      currency: session.currency,
+      title: `Commande ${session.store.name}`,
+      redirectUrl: `${env.appUrl}/c/${session.id}/merci`,
+    });
+    checkoutConfigurationId = whop.id;
+  }
+
+  await db.checkoutSession.update({
+    where: { id: session.id },
+    data: {
+      shippingRateId: quote.shippingRateId,
+      discountCode: quote.discount?.code ?? null,
+      addOnIds: quote.addOnIds,
+      subtotalCents: quote.totals.subtotalCents,
+      discountCents: quote.totals.discountCents,
+      shippingCents: quote.totals.shippingCents,
+      addOnsCents: quote.totals.addOnsCents,
+      totalCents: total,
+      preparedTotalCents: total,
+      whopCheckoutId: checkoutConfigurationId,
+    },
   });
+  return { checkoutConfigurationId, totals: quote.totals, quote };
+}
+
+/**
+ * Saves the buyer's details right before the embedded Whop form is submitted.
+ * If the total no longer matches the prepared checkout, returns a fresh one instead
+ * so the buyer is never charged a stale amount.
+ */
+export async function confirmSession(session: SessionWithStore, input: PayInput) {
+  const quoteInput = { ...input, countryCode: input.address.countryCode };
+  const quote = await quoteSession(session, quoteInput);
+  assertPayable(session, quote, quoteInput);
+
+  if (!session.whopCheckoutId || session.preparedTotalCents !== quote.totals.totalCents) {
+    const prepared = await prepareSession(session, quoteInput);
+    return { ready: false as const, checkoutConfigurationId: prepared.checkoutConfigurationId, totals: prepared.totals };
+  }
 
   await db.checkoutSession.update({
     where: { id: session.id },
@@ -138,19 +184,9 @@ export async function startPayment(session: SessionWithStore, input: PayInput) {
       email: input.email,
       acceptsMarketing: input.acceptsMarketing,
       shippingAddress: input.address as Prisma.InputJsonValue,
-      shippingRateId: quote.shippingRateId,
-      discountCode: quote.discount?.code ?? null,
-      addOnIds: quote.addOnIds,
-      subtotalCents: quote.totals.subtotalCents,
-      discountCents: quote.totals.discountCents,
-      shippingCents: quote.totals.shippingCents,
-      addOnsCents: quote.totals.addOnsCents,
-      totalCents: quote.totals.totalCents,
-      whopCheckoutId: whop.id,
     },
   });
-
-  return { checkoutConfigurationId: whop.id, purchaseUrl: whop.purchaseUrl, totals: quote.totals };
+  return { ready: true as const, checkoutConfigurationId: session.whopCheckoutId, totals: quote.totals };
 }
 
 /* ------------------------------------------------------------------ */
@@ -158,12 +194,54 @@ export async function startPayment(session: SessionWithStore, input: PayInput) {
 /* ------------------------------------------------------------------ */
 
 /** Marks the session paid and creates the Shopify order. Safe to call repeatedly. */
+export type PaymentBuyer = {
+  email: string | null;
+  address: {
+    name: string | null;
+    line1: string | null;
+    line2: string | null;
+    city: string | null;
+    state: string | null;
+    postal_code: string | null;
+    country: string | null;
+  } | null;
+  phone: string | null;
+};
+
+/** Express wallets (Apple Pay, Google Pay) pay without our form: take the buyer from the payment. */
+export function addressFromPayment(buyer: PaymentBuyer): Address | null {
+  const a = buyer.address;
+  if (!a?.line1 || !a.city || !a.country) return null;
+  const [firstName, ...rest] = (a.name ?? "").trim().split(/\s+/);
+  return {
+    firstName: firstName || "Client",
+    lastName: rest.join(" ") || "-",
+    address1: a.line1,
+    address2: a.line2,
+    city: a.city,
+    province: a.state,
+    zip: a.postal_code ?? "",
+    countryCode: a.country.toUpperCase().slice(0, 2),
+    phone: buyer.phone,
+  };
+}
+
 export async function markPaid(
   sessionId: string,
-  payment: { id: string; totalCents: number | null; currency: string | null },
+  payment: { id: string; totalCents: number | null; currency: string | null; buyer?: PaymentBuyer },
 ) {
-  const session = await db.checkoutSession.findUnique({ where: { id: sessionId } });
+  let session = await db.checkoutSession.findUnique({ where: { id: sessionId } });
   if (!session) throw new Error(`Session ${sessionId} introuvable`);
+  if (payment.buyer && (!session.email || !session.shippingAddress)) {
+    const address = session.shippingAddress ? null : addressFromPayment(payment.buyer);
+    session = await db.checkoutSession.update({
+      where: { id: sessionId },
+      data: {
+        ...(!session.email && payment.buyer.email ? { email: payment.buyer.email } : {}),
+        ...(address ? { shippingAddress: address as Prisma.InputJsonValue } : {}),
+      },
+    });
+  }
   const sameCurrency = payment.currency?.toUpperCase() === session.currency.toUpperCase();
   if (sameCurrency && payment.totalCents != null && payment.totalCents < session.totalCents) {
     // Never create a paid order for less than the frozen total.

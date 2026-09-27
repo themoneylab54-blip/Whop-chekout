@@ -154,8 +154,9 @@ model CheckoutSession {
   returnUrl String?
   utm       Json?
 
-  // Whop
-  whopCheckoutId String?
+  // Whop — checkout configuration prepared for `preparedTotalCents` (one-page checkout)
+  whopCheckoutId     String?
+  preparedTotalCents Int?
   whopPaymentId  String? @unique
 
   // Shopify sync
@@ -176,4 +177,11 @@ model WebhookEvent {
   storeId    String
   type       String
   receivedAt DateTime @default(now())
+}
+
+/// App-wide settings (e.g. the Apple Pay domain-association file served on this domain).
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
 }
