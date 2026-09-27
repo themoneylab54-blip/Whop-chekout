@@ -50,6 +50,16 @@ function cents(value: string): number | null {
   return Number.isFinite(n) && n >= 0 ? Math.round(n * 100) : null;
 }
 
+/** Encrypts before any external call so a misconfigured key fails cleanly, with nothing half-created. */
+function encryptOrBack(value: string, path: string): string {
+  try {
+    return encrypt(value);
+  } catch (err) {
+    console.error("encryption failed", err);
+    back(path, { error: `Chiffrement impossible : ${errorMessage(err)}` });
+  }
+}
+
 function errorMessage(err: unknown) {
   if (err && typeof err === "object" && "body" in err) {
     const body = (err as { body?: { error?: { message?: string }; message?: string } }).body;
@@ -161,6 +171,7 @@ export async function startShopifyInstallAction(storeId: string, fd: FormData) {
   const other = await db.store.findFirst({ where: { shopDomain: shop, NOT: { id: storeId } } });
   if (other) back(path, { error: `${shop} est déjà connectée à la boutique « ${other.name} ».` });
 
+  const encryptedSecret = clientSecret ? encryptOrBack(clientSecret, path) : null;
   const state = `${storeId}.${randomToken()}`;
   const domainChanged = store.shopDomain && store.shopDomain !== shop;
   if (domainChanged && store.scriptTagId && store.shopifyAccessToken) {
@@ -171,7 +182,7 @@ export async function startShopifyInstallAction(storeId: string, fd: FormData) {
     data: {
       shopDomain: shop,
       shopifyClientId: clientId,
-      ...(clientSecret ? { shopifyClientSecret: encrypt(clientSecret) } : {}),
+      ...(encryptedSecret ? { shopifyClientSecret: encryptedSecret } : {}),
       shopifyOauthState: state,
       ...(domainChanged
         ? { shopifyAccessToken: null, scriptTagId: null, shopifyConnectedAt: null, enabled: false, storefrontHost: null }
@@ -214,6 +225,7 @@ export async function connectWhopAction(storeId: string, fd: FormData) {
   const path = storePath(storeId, "whop");
   const apiKey = str(fd, "apiKey");
   if (!apiKey) back(path, { error: "Collez votre clé API Whop" });
+  const encryptedKey = encryptOrBack(apiKey, path);
   let result;
   try {
     if (store.whopConnectedAt) await teardownWhop(store).catch(() => undefined);
@@ -224,11 +236,11 @@ export async function connectWhopAction(storeId: string, fd: FormData) {
   await db.store.update({
     where: { id: storeId },
     data: {
-      whopApiKey: encrypt(apiKey),
+      whopApiKey: encryptedKey,
       whopAccountId: result.accountId,
       whopProductId: result.productId,
       whopWebhookId: result.webhookId,
-      whopWebhookSecret: encrypt(result.webhookSecret),
+      whopWebhookSecret: encryptOrBack(result.webhookSecret, path),
       whopConnectedAt: new Date(),
     },
   });

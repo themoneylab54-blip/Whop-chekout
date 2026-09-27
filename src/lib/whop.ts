@@ -39,18 +39,24 @@ export async function setupWhop(opts: { apiKey: string; testMode: boolean; store
   const client = whopClient(opts.apiKey, opts.testMode);
   const account = await client.accounts.me();
 
-  const product = await client.products.create({
-    account_id: account.id,
-    title: `${opts.storeName || "Boutique"} — Checkout`,
-    description: "Commandes de la boutique Shopify (créé automatiquement par Whop Checkout).",
-    visibility: "hidden",
-    collect_shipping_address: false,
-    send_welcome_message: false,
-    metadata: { source: "whop-checkout", store_id: opts.storeId },
-  });
+  // Idempotent: reuse this store's product and replace its webhook if a previous
+  // attempt (or an older connection) already created them.
+  const product =
+    (await findStoreProduct(client, account.id, opts.storeId)) ??
+    (await client.products.create({
+      account_id: account.id,
+      title: `${opts.storeName || "Boutique"} — Checkout`,
+      description: "Commandes de la boutique Shopify (créé automatiquement par Whop Checkout).",
+      visibility: "hidden",
+      collect_shipping_address: false,
+      send_welcome_message: false,
+      metadata: { source: "whop-checkout", store_id: opts.storeId },
+    }));
 
+  const url = whopWebhookUrl(opts.storeId);
+  await deleteWebhooksForUrl(client, account.id, url);
   const webhook = await client.webhooks.create({
-    url: whopWebhookUrl(opts.storeId),
+    url,
     resource_id: account.id,
     enabled: true,
     events: [...WHOP_WEBHOOK_EVENTS],
@@ -64,6 +70,36 @@ export async function setupWhop(opts: { apiKey: string; testMode: boolean; store
     webhookId: webhook.id,
     webhookSecret: webhook.webhook_secret,
   };
+}
+
+type Client = ReturnType<typeof whopClient>;
+const MAX_SCAN = 200;
+
+async function findStoreProduct(client: Client, accountId: string, storeId: string) {
+  try {
+    let seen = 0;
+    for await (const p of await client.products.list({ account_id: accountId, first: 50 })) {
+      if (p.metadata?.store_id === storeId && p.metadata?.source === "whop-checkout") return p;
+      if (++seen >= MAX_SCAN) break;
+    }
+  } catch (err) {
+    console.warn("Whop product lookup failed, creating a new one", err);
+  }
+  return null;
+}
+
+async function deleteWebhooksForUrl(client: Client, accountId: string, url: string) {
+  try {
+    const stale: string[] = [];
+    let seen = 0;
+    for await (const w of await client.webhooks.list({ account_id: accountId, first: 50 })) {
+      if (w.url === url) stale.push(w.id);
+      if (++seen >= MAX_SCAN) break;
+    }
+    await Promise.all(stale.map((id) => client.webhooks.delete({ id })));
+  } catch (err) {
+    console.warn("Whop webhook cleanup failed", err);
+  }
 }
 
 export async function teardownWhop(store: Pick<Store, "whopApiKey" | "testMode" | "whopWebhookId">) {

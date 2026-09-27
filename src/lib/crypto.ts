@@ -1,12 +1,25 @@
-import { createCipheriv, createDecipheriv, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { env } from "./env";
 
 const ALGO = "aes-256-gcm";
 
-function key(raw = env.encryptionKey): Buffer {
-  const buf = Buffer.from(raw, "base64");
-  if (buf.length !== 32) throw new Error("ENCRYPTION_KEY must be 32 bytes, base64-encoded");
-  return buf;
+/**
+ * Derives the 32-byte AES key from ENCRYPTION_KEY. Accepts 32 bytes in base64
+ * (`openssl rand -base64 32`) or hex (64 chars); any other secret of 16+ characters
+ * (e.g. a generator's hex string or a passphrase) is hashed with SHA-256.
+ */
+export function deriveKey(raw: string): Buffer {
+  const value = raw.trim();
+  if (value.length < 16) {
+    throw new Error("ENCRYPTION_KEY manquante ou trop courte (16 caractères minimum) : vérifiez les variables d'environnement.");
+  }
+  if (/^[0-9a-f]{64}$/i.test(value)) return Buffer.from(value, "hex");
+  if (/^[A-Za-z0-9+/]{43}=$/.test(value)) return Buffer.from(value, "base64");
+  return createHash("sha256").update(value, "utf8").digest();
+}
+
+function key(raw?: string): Buffer {
+  return deriveKey(raw ?? env.encryptionKey);
 }
 
 /** Encrypts a secret for storage: `v1.<iv>.<tag>.<ciphertext>` (base64url parts). */
