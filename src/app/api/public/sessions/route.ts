@@ -1,9 +1,11 @@
+import { clientIp, rateLimit } from "@/lib/ratelimit";
 import { z } from "zod";
 import type { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
 import { env } from "@/lib/env";
 import { json, preflight, readJson } from "@/lib/http";
 import { priceCart } from "@/lib/shopify";
+import { loadInterception } from "@/lib/layout";
 
 export const OPTIONS = preflight;
 
@@ -14,11 +16,17 @@ const bodySchema = z.object({
     .min(1)
     .max(100),
   returnUrl: z.string().url().max(2000).optional(),
-  utm: z.record(z.string(), z.string().max(300)).optional(),
+  utm: z
+    .record(z.string().max(40), z.string().max(300))
+    .refine((u) => Object.keys(u).length <= 10)
+    .optional(),
 });
 
 /** Called by the storefront loader with the contents of /cart.js. */
 export async function POST(req: Request) {
+  if (!rateLimit(`session:ip:${clientIp(req)}`, 20)) {
+    return json({ error: "Trop de requêtes", fallback: true }, { status: 429, cors: true });
+  }
   const parsed = bodySchema.safeParse(await readJson(req));
   if (!parsed.success) return json({ error: "Panier invalide" }, { status: 400, cors: true });
   const { store: publicId, items, returnUrl, utm } = parsed.data;
@@ -40,6 +48,11 @@ export async function POST(req: Request) {
     return json({ error: "Impossible de charger le panier", fallback: true }, { status: 502, cors: true });
   }
   if (lines.length === 0) return json({ error: "Panier vide", fallback: true }, { status: 400, cors: true });
+  // Excluded products keep Shopify's checkout, whatever the storefront script did.
+  const excluded = loadInterception(store.interception).excludedHandles;
+  if (lines.some((l) => excluded.includes(l.productHandle))) {
+    return json({ error: "Produit géré par le checkout Shopify", fallback: true }, { status: 409, cors: true });
+  }
 
   const session = await db.checkoutSession.create({
     data: {

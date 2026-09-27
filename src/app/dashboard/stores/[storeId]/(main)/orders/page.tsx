@@ -2,6 +2,7 @@ import { ExternalLink, Receipt } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import type { SessionStatus } from "@prisma/client";
+import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { centsToDecimal, formatMoney } from "@/lib/pricing";
 import { orderAdminUrl } from "@/lib/shopify";
@@ -21,6 +22,7 @@ export default async function OrdersPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string; filter?: string }>;
 }) {
+  await requireAdmin();
   const { storeId } = await params;
   const sp = await searchParams;
   const filter = FILTERS.find((f) => f.key === sp.filter) ?? FILTERS[0];
@@ -81,17 +83,26 @@ export default async function OrdersPage({
                     <StatusBadge status={s.status} disputed={s.disputed} />
                   </td>
                   <td className="px-4 py-3">
+                    {s.reviewNote && (
+                      <p className="mb-1.5 max-w-xs rounded-lg bg-amber-50 px-2.5 py-1.5 text-xs break-words whitespace-pre-line text-amber-900 ring-1 ring-amber-600/20">
+                        {s.reviewNote}
+                      </p>
+                    )}
                     {s.shopifyOrderId && store.shopDomain ? (
                       <a href={orderAdminUrl(store.shopDomain, s.shopifyOrderId)} target="_blank" rel="noreferrer" className="font-medium underline">
                         {s.shopifyOrderName} <ExternalLink className="inline h-3 w-3" />
                       </a>
                     ) : s.status === "PAID" ? (
                       <div className="max-w-xs space-y-1.5">
-                        <Badge color="red">Non synchronisée</Badge>
+                        <Badge color={s.reviewNote ? "amber" : "red"}>{s.reviewNote ? "À vérifier" : "Non synchronisée"}</Badge>
                         {s.syncError && <p className="text-xs break-words text-red-600">{s.syncError}</p>}
                         <form action={resyncOrderAction.bind(null, store.id, s.id)}>
-                          <SubmitButton size="sm" variant="secondary">
-                            Re-synchroniser
+                          <SubmitButton
+                            size="sm"
+                            variant="secondary"
+                            confirm={s.reviewNote ? "Créer quand même la commande dans Shopify ?" : undefined}
+                          >
+                            {s.reviewNote ? "Créer la commande" : "Re-synchroniser"}
                           </SubmitButton>
                         </form>
                       </div>

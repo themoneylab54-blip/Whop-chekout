@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { ChevronDown, Tag } from "lucide-react";
 import type { Block, Layout, Theme } from "@/lib/layout";
 import { computeTotals, formatMoney, ratesForCountry, type CartLine, type RateInput, type Totals } from "@/lib/pricing";
-import { ContentBlock, Placeholder, StyledBlock, type ContentContext } from "./blocks";
+import { ContentBlock, isEmptyInLive, Placeholder, StyledBlock, type ContentContext } from "./blocks";
 import { countryName, DEFAULT_COUNTRIES, labelsFor, type Labels } from "./i18n";
 import { ExpressCheckout, ExpressPreview, PaymentPanel, PaymentPreview, type ConfirmResult, type Prepared } from "./Payment";
 
@@ -152,6 +152,9 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
   const [rateId, setRateId] = useState<string | null>(null);
   const [codeInput, setCodeInput] = useState("");
   const [appliedCode, setAppliedCode] = useState<string | null>(null);
+  // A rejected code is dropped right away (so it never blocks payment) but its message stays.
+  const [codeError, setCodeError] = useState<string | null>(null);
+  const [mountedAt] = useState(() => Date.now());
   const [addOnIds, setAddOnIds] = useState<string[]>([]);
   const [quote, setQuote] = useState<QuoteState | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -195,6 +198,11 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
         });
         if (!res.ok) return;
         const q = await res.json();
+        if (q.discountError) {
+          setCodeError(q.discountError);
+          setAppliedCode(null);
+          return;
+        }
         setQuote({ ...q, appliedCode: q.discount?.code ?? null });
       } catch {
         /* aborted */
@@ -234,6 +242,8 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
     return () => {
       clearTimeout(t);
       ctrl.abort();
+      // The aborted request's finally skips this; without it the spinner could stay forever.
+      setPreparing(false);
     };
   }, [liveSessionId, quoteBlocking, address.countryCode, rateId, appliedCode, addOnIds]);
 
@@ -280,6 +290,7 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
         acceptsMarketing: marketing,
         address,
         note: note.trim() || null,
+        checkoutConfigurationId: prepared?.configId ?? null,
         countryCode: address.countryCode,
         shippingRateId: q.shippingRateId,
         discountCode: appliedCode,
@@ -334,7 +345,7 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
   const summaryBlocks = visible.filter((b) => b.placement === "summary" && !isSection(b));
 
   function wrap(block: Block, node: ReactNode) {
-    if (node === null) return null;
+    if (node === null || isEmptyInLive(block, ctx, mountedAt)) return null;
     const selectable = mode.kind === "preview" && mode.onSelectBlock;
     const selected = mode.kind === "preview" && mode.selectedBlockId === block.id;
     return (
@@ -541,10 +552,14 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
       codeInput={codeInput}
       setCodeInput={setCodeInput}
       appliedCode={live ? q.appliedCode : null}
-      discountError={live ? q.discountError : null}
-      onApply={() => setAppliedCode(codeInput.trim() || null)}
+      discountError={live ? (codeError ?? q.discountError) : null}
+      onApply={() => {
+        setCodeError(null);
+        setAppliedCode(codeInput.trim() || null);
+      }}
       onRemove={() => {
         setAppliedCode(null);
+        setCodeError(null);
         setCodeInput("");
       }}
       locked={locked}

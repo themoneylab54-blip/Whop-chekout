@@ -1,5 +1,6 @@
 import { PackagePlus, Percent, Plus, Ticket, Trash2 } from "lucide-react";
 import { notFound } from "next/navigation";
+import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { formatMoney } from "@/lib/pricing";
 import { Badge, Card, Flash, Input, Label, PageHeader, Select, SubmitButton } from "@/components/ui";
@@ -19,6 +20,7 @@ export default async function OffersPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string }>;
 }) {
+  await requireAdmin();
   const { storeId } = await params;
   const sp = await searchParams;
   const store = await db.store.findUnique({

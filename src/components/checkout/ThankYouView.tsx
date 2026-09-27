@@ -4,7 +4,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Check } from "lucide-react";
 import type { Layout, Theme } from "@/lib/layout";
 import { formatMoney, type CartLine } from "@/lib/pricing";
-import { ContentBlock, StyledBlock, type ContentContext } from "./blocks";
+import { ContentBlock, isEmptyInLive, StyledBlock, type ContentContext } from "./blocks";
 import { Footer, StoreHeader, themeVars } from "./CheckoutView";
 import { countryName, labelsFor } from "./i18n";
 
@@ -35,6 +35,7 @@ type Props = {
 export function ThankYouView({ theme, layout, data: initial, sessionId, preview }: Props) {
   const L = labelsFor(theme.language);
   const [data, setData] = useState(initial);
+  const [mountedAt] = useState(() => Date.now());
   const money = (c: number) => formatMoney(c, data.currency, theme.language === "fr" ? "fr-FR" : "en-US");
 
   useEffect(() => {
@@ -42,11 +43,16 @@ export function ThankYouView({ theme, layout, data: initial, sessionId, preview 
     let tries = 0;
     const t = setInterval(async () => {
       tries += 1;
-      const res = await fetch(`/api/public/sessions/${sessionId}/status`, { cache: "no-store" });
-      if (res.ok) {
+      if (tries > 40) clearInterval(t);
+      try {
+        const res = await fetch(`/api/public/sessions/${sessionId}/status`, { cache: "no-store" });
+        if (!res.ok) return;
         const s = await res.json();
-        setData((d) => ({ ...d, status: s.status, orderName: s.shopifyOrderName }));
-        if (s.shopifyOrderName || tries > 40) clearInterval(t);
+        // Until the webhook lands the session can still read OPEN: keep showing "processing".
+        setData((d) => ({ ...d, status: s.status === "OPEN" ? d.status : s.status, orderName: s.shopifyOrderName }));
+        if (s.shopifyOrderName) clearInterval(t);
+      } catch {
+        /* offline for a moment: try again on the next tick */
       }
     }, 3000);
     return () => clearInterval(t);
@@ -66,7 +72,7 @@ export function ThankYouView({ theme, layout, data: initial, sessionId, preview 
   const blocks = layout.blocks.filter((b) => !b.hidden);
   const render = (pos: "above" | "below") =>
     blocks
-      .filter((b) => b.position === pos)
+      .filter((b) => b.position === pos && !isEmptyInLive(b, ctx, mountedAt))
       .map((b) => {
         const selected = preview?.selectedBlockId === b.id;
         const node: ReactNode = (

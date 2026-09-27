@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { notFound, redirect } from "next/navigation";
 import { db } from "@/lib/db";
-import { fontHref, loadCheckoutLayout, loadTheme } from "@/lib/layout";
+import { themeFontHrefs, loadCheckoutLayout, loadTheme } from "@/lib/layout";
 import type { CartLine } from "@/lib/pricing";
 import { CheckoutView } from "@/components/checkout/CheckoutView";
 
@@ -22,11 +22,13 @@ export default async function CheckoutPage({ params }: { params: Promise<{ id: s
     db.discountCode.count({ where: { storeId: store.id, active: true } }),
   ]);
   const theme = loadTheme(store.theme, store.name);
-  const font = fontHref(theme.font);
+  const fonts = themeFontHrefs(theme);
 
   return (
     <>
-      {font && <link rel="stylesheet" href={font} />}
+      {fonts.map((href) => (
+        <link key={href} rel="stylesheet" href={href} />
+      ))}
       <CheckoutView
         theme={theme}
         layout={loadCheckoutLayout(store.checkoutLayout)}

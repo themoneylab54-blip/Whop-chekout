@@ -116,7 +116,11 @@ export const DEFAULT_COUNTRIES = [
   "US", "CA", "AU", "NZ", "JP", "SG", "HK", "AE", "IL", "MA", "TN", "DZ", "SN", "CI", "RE", "GP", "MQ", "GF", "YT", "NC", "PF",
 ];
 
+// Server (Node ICU) and browsers disagree on a few names: pin them to avoid hydration mismatches.
+const PINNED_NAMES: Record<string, string> = { HK: "Hong Kong", MO: "Macao", PS: "Palestine" };
+
 export function countryName(code: string, lang: "fr" | "en") {
+  if (PINNED_NAMES[code]) return PINNED_NAMES[code];
   try {
     return new Intl.DisplayNames([lang], { type: "region" }).of(code) ?? code;
   } catch {

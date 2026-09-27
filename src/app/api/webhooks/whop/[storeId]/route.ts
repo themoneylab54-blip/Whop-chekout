@@ -59,8 +59,10 @@ async function handle(type: string, data: Record<string, unknown>, storeId: stri
         id: String(data.id),
         totalCents: moneyToCents(total),
         currency: typeof total === "object" && total?.currency ? total.currency : typeof data.currency === "string" ? data.currency : null,
+        checkoutConfigurationId: typeof data.checkout_configuration_id === "string" ? data.checkout_configuration_id : null,
         buyer: {
           email: (typeof data.customer_email === "string" ? data.customer_email : null) ?? user?.email ?? null,
+          shippingAddress: (data.shipping_address ?? null) as PaymentBuyer["address"],
           address: (data.shipping_address ?? data.billing_address ?? null) as PaymentBuyer["address"],
           phone: typeof data.customer_phone === "string" ? data.customer_phone : null,
         },
@@ -93,8 +95,7 @@ async function handle(type: string, data: Record<string, unknown>, storeId: stri
         throw err;
       }
       try {
-        const fresh = await db.checkoutSession.findUniqueOrThrow({ where: { id: session.id } });
-        await recordRefund(session.id, fresh.refundedCents + amount);
+        await recordRefund(session.id, amount);
       } catch (err) {
         await db.webhookEvent.delete({ where: { id: marker } });
         throw err;
@@ -121,7 +122,10 @@ async function sessionIdFor(data: Record<string, unknown>, storeId: string): Pro
   const session = await db.checkoutSession.findFirst({
     where: {
       storeId,
-      OR: [...(fromMeta ? [{ id: fromMeta }] : []), ...(configId ? [{ whopCheckoutId: configId }] : [])],
+      OR: [
+        ...(fromMeta ? [{ id: fromMeta }] : []),
+        ...(configId ? [{ whopCheckoutId: configId }, { quotes: { some: { whopCheckoutId: configId } } }] : []),
+      ],
     },
     select: { id: true },
   });

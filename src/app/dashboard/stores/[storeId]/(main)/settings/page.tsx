@@ -1,5 +1,6 @@
 import { Settings, Store, Trash2 } from "lucide-react";
 import { notFound } from "next/navigation";
+import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { Card, Flash, Input, Label, PageHeader, SubmitButton, Toggle } from "@/components/ui";
 import { deleteStoreAction, saveSettingsAction } from "../../../../actions";
@@ -11,6 +12,7 @@ export default async function SettingsPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string }>;
 }) {
+  await requireAdmin();
   const { storeId } = await params;
   const sp = await searchParams;
   const store = await db.store.findUnique({ where: { id: storeId } });

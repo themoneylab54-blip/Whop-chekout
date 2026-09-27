@@ -87,7 +87,7 @@ import type { RateInput } from "@/lib/pricing";
 import { SAMPLE_LINES, sampleThankYou } from "@/lib/sample";
 import { CheckoutView, type AddOnView } from "@/components/checkout/CheckoutView";
 import { ThankYouView } from "@/components/checkout/ThankYouView";
-import { BlockContentEditor, ColorInput, F, Num, Pick, Segmented, StyleEditor, Text } from "./BlockEditor";
+import { BlockContentEditor, ColorInput, F, Num, Pick, Segmented, StyleEditor, Text, UrlText } from "./BlockEditor";
 
 export const BLOCK_META: Record<BlockType, { label: string; icon: LucideIcon; description: string; group: "section" | "conversion" | "trust" | "content" | "after" }> = {
   contact: { label: "Contact", icon: Mail, description: "E-mail et opt-in marketing", group: "section" },
@@ -156,32 +156,51 @@ export function BuilderApp(props: {
 
   /* ---------- autosave ---------- */
 
-  const doSave = useCallback(async (): Promise<boolean> => {
-    setState("saving");
-    try {
-      const res = await props.save(theme, layout);
-      if (res.ok) {
-        setState("saved");
-        setError(null);
-        return true;
+  // Saves run one after another and always send the latest edits, so a save that
+  // finishes late can never overwrite newer changes.
+  const [initial] = useState(() => ({ theme: props.theme, layout: props.layout }));
+  const latest = useRef(initial);
+  const saved = useRef(initial);
+  const chain = useRef<Promise<boolean>>(Promise.resolve(true));
+  useEffect(() => {
+    latest.current = { theme, layout };
+  }, [theme, layout]);
+
+  const { save } = props;
+  const doSave = useCallback((): Promise<boolean> => {
+    const run = chain.current.then(async () => {
+      const snap = latest.current;
+      if (snap === saved.current) return true;
+      setState("saving");
+      try {
+        const res = await save(snap.theme, snap.layout);
+        if (res.ok) {
+          saved.current = snap;
+          setState(latest.current === snap ? "saved" : "dirty");
+          setError(null);
+          return true;
+        }
+        setState("error");
+        setError(res.error);
+      } catch {
+        // Network loss, or the page was opened before a new version was deployed.
+        setState("error");
+        setError("connexion perdue — rechargez la page pour continuer (vos réglages déjà enregistrés sont conservés)");
       }
-      setState("error");
-      setError(res.error);
-    } catch {
-      // Network loss, or the page was opened before a new version was deployed.
-      setState("error");
-      setError("connexion perdue — rechargez la page pour continuer (vos réglages déjà enregistrés sont conservés)");
-    }
-    return false;
-  }, [props, theme, layout]);
+      return false;
+    });
+    chain.current = run.catch(() => false);
+    return run;
+  }, [save]);
 
   // Never lose edits: save right away when leaving the builder or hiding the tab.
   const router = useRouter();
-  const pending = state === "dirty" || state === "error";
+  const pending = state !== "saved";
   async function leaveTo(e: React.MouseEvent, href: string) {
     if (!pending) return;
     e.preventDefault();
     if (await doSave()) router.push(href);
+    else if (window.confirm("Certaines modifications n'ont pas pu être enregistrées. Quitter quand même ?")) router.push(href);
   }
   useEffect(() => {
     const flush = () => {
@@ -204,7 +223,7 @@ export function BuilderApp(props: {
 
   useEffect(() => {
     const warn = (e: BeforeUnloadEvent) => {
-      if (state === "dirty" || state === "saving") e.preventDefault();
+      if (state !== "saved") e.preventDefault();
     };
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
@@ -603,7 +622,7 @@ function StylePanel({
         </F>
         <Check label="Afficher le nom dans l'en-tête" checked={theme.showStoreName} onChange={(v) => setT("showStoreName", v)} />
         <F label="Logo (URL)" hint="Astuce : décochez le nom pour un en-tête logo seul.">
-          <Text value={theme.logoUrl} placeholder="https://…/logo.png" onChange={(v) => setT("logoUrl", v)} />
+          <UrlText value={theme.logoUrl} placeholder="https://…/logo.png" onChange={(v) => setT("logoUrl", v)} />
         </F>
         <div className="grid grid-cols-2 gap-3">
           <F label="Hauteur du logo">
@@ -780,9 +799,11 @@ function SortableRow(props: {
             <button type="button" className={iconBtn} onClick={props.onHide} aria-label={block.hidden ? "Afficher" : "Masquer"} title={block.hidden ? "Afficher" : "Masquer"}>
               {block.hidden ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
             </button>
-            <button type="button" className={iconBtn} onClick={props.onDuplicate} aria-label="Dupliquer" title="Dupliquer">
-              <Copy className="h-3.5 w-3.5" />
-            </button>
+            {block.type !== "order_addons" && (
+              <button type="button" className={iconBtn} onClick={props.onDuplicate} aria-label="Dupliquer" title="Dupliquer">
+                <Copy className="h-3.5 w-3.5" />
+              </button>
+            )}
             <button type="button" className={`${iconBtn} hover:!text-red-600`} onClick={props.onRemove} aria-label="Supprimer" title="Supprimer">
               <Trash2 className="h-3.5 w-3.5" />
             </button>

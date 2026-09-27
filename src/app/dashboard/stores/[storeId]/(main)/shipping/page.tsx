@@ -1,5 +1,6 @@
 import { Pencil, Plus, Truck } from "lucide-react";
 import { notFound } from "next/navigation";
+import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { centsToDecimal, formatMoney } from "@/lib/pricing";
 import { Badge, Card, EmptyState, Flash, Input, Label, PageHeader, SubmitButton } from "@/components/ui";
@@ -12,6 +13,7 @@ export default async function ShippingPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string }>;
 }) {
+  await requireAdmin();
   const { storeId } = await params;
   const sp = await searchParams;
   const store = await db.store.findUnique({ where: { id: storeId }, include: { shippingRates: { orderBy: { position: "asc" } } } });

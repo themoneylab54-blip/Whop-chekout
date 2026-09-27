@@ -1,5 +1,6 @@
 import { Code2, Crosshair, ExternalLink, LifeBuoy, MousePointerClick, ScanEye } from "lucide-react";
 import { notFound } from "next/navigation";
+import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { loadInterception } from "@/lib/layout";
 import { loaderUrl } from "@/lib/shopify";
@@ -13,6 +14,7 @@ export default async function InterceptionPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string }>;
 }) {
+  await requireAdmin();
   const { storeId } = await params;
   const sp = await searchParams;
   const store = await db.store.findUnique({ where: { id: storeId } });

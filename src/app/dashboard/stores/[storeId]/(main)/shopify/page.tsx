@@ -1,5 +1,6 @@
 import { AlertTriangle, ArrowRight, Blocks, CheckCircle2, PlugZap, ShoppingBag } from "lucide-react";
 import { notFound } from "next/navigation";
+import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { env } from "@/lib/env";
 import { SHOPIFY_SCOPES, oauthCallbackUrl } from "@/lib/shopify";
@@ -13,6 +14,7 @@ export default async function ShopifyPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string; connected?: string; edit?: string }>;
 }) {
+  await requireAdmin();
   const { storeId } = await params;
   const sp = await searchParams;
   const store = await db.store.findUnique({ where: { id: storeId } });

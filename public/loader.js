@@ -31,8 +31,16 @@
     if (DEBUG && window.console) console.log.apply(console, ["[whop-checkout]"].concat([].slice.call(arguments)));
   }
 
-  // After a successful payment the thank-you page links back here: empty the cart once.
-  if (params.get("whopco_paid") === "1") {
+  // After a successful payment the thank-you page links back here: empty the cart once,
+  // only if this tab really went to our checkout (a shared link can't wipe someone's cart).
+  var pending = false;
+  try {
+    pending = sessionStorage.getItem("whopco_pending") === "1";
+  } catch (e) {}
+  if (params.get("whopco_paid") === "1" && pending) {
+    try {
+      sessionStorage.removeItem("whopco_pending");
+    } catch (e) {}
     fetch("/cart/clear.js", { method: "POST", credentials: "same-origin" }).finally(function () {
       params.delete("whopco_paid");
       var q = params.toString();
@@ -205,6 +213,9 @@
         return res.json().then(function (body) {
           if (!res.ok || !body.url) throw new Error(body.error || "session failed");
           log("redirect", body.url);
+          try {
+            sessionStorage.setItem("whopco_pending", "1");
+          } catch (e) {}
           location.href = body.url;
         });
       })

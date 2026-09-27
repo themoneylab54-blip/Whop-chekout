@@ -169,6 +169,12 @@ model CheckoutSession {
   syncStartedAt    DateTime?
   refundedCents    Int     @default(0)
   disputed         Boolean @default(false)
+  // Set when a payment needs a human look (amount/country/code mismatch, extra payment):
+  // the Shopify order is then only created by a manual "sync" from the dashboard.
+  reviewNote       String?
+  // Snapshot of the exact quote the buyer paid (see CheckoutQuote)
+  paidQuoteId      String?
+  quotes           CheckoutQuote[]
 
   @@index([storeId, createdAt])
   @@index([storeId, status])
@@ -186,4 +192,32 @@ model AppSetting {
   key       String   @id
   value     String
   updatedAt DateTime @updatedAt
+}
+
+/// One row per Whop checkout configuration: the exact quote it charges.
+/// The paid configuration — not the session's latest state — drives the Shopify order.
+model CheckoutQuote {
+  id                   String          @id @default(cuid())
+  sessionId            String
+  session              CheckoutSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  whopCheckoutId       String          @unique
+  fingerprint          String
+  currency             String
+  subtotalCents        Int
+  discountCents        Int
+  shippingCents        Int
+  addOnsCents          Int
+  totalCents           Int
+  shippingRateId       String?
+  shippingRateName     String?
+  // Countries the rate covers (empty = everywhere)
+  shippingCountries    String[]
+  discountCode         String?
+  discountFreeShipping Boolean         @default(false)
+  // [{ id, title, priceCents, variantId }]
+  addOns               Json
+  addOnIds             String[]
+  createdAt            DateTime        @default(now())
+
+  @@index([sessionId, fingerprint])
 }

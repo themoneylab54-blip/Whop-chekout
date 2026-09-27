@@ -66,6 +66,13 @@ export function fontHref(font: Theme["font"]) {
   return `https://fonts.googleapis.com/css2?family=${encodeURIComponent(font)}:wght@400;500;600;700&display=swap`;
 }
 
+/** Stylesheets for the body font and, when different, the heading font. */
+export function themeFontHrefs(theme: Pick<Theme, "font" | "headingFont">): string[] {
+  const fonts = [fontHref(theme.font)];
+  if (theme.headingFont !== "same" && theme.headingFont !== theme.font) fonts.push(fontHref(theme.headingFont));
+  return fonts.filter((f): f is string => !!f);
+}
+
 /** Icon keys available in blocks (rendered with Lucide in src/components/icons.tsx). */
 export const ICON_KEYS = [
   "shield",
@@ -605,7 +612,9 @@ function loadBlocks(raw: unknown): Block[] {
 
 export function loadCheckoutLayout(raw: unknown): Layout {
   if (raw == null) return defaultCheckoutLayout();
-  const blocks = loadBlocks(raw).filter((b, i, all) => !isFixed(b.type) || all.findIndex((x) => x.type === b.type) === i);
+  // Fixed sections and the order-bump list exist at most once.
+  const single = (t: Block["type"]) => isFixed(t) || t === "order_addons";
+  const blocks = loadBlocks(raw).filter((b, i, all) => !single(b.type) || all.findIndex((x) => x.type === b.type) === i);
   // Every fixed section must exist exactly once: re-add missing ones before "payment".
   for (const type of FIXED_CHECKOUT_BLOCKS) {
     if (!blocks.some((b) => b.type === type)) {

@@ -21,8 +21,8 @@ export function SubmitButton({
   return (
     <button
       type="submit"
-      disabled={pending || props.disabled}
       {...props}
+      disabled={pending || props.disabled}
       onClick={(e) => {
         if (confirm && !window.confirm(confirm)) e.preventDefault();
         props.onClick?.(e);

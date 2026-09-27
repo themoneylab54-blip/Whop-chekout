@@ -164,7 +164,7 @@ type VariantNode = {
   inventoryQuantity: number | null;
   inventoryItem: { tracked: boolean; requiresShipping: boolean } | null;
   image: { url: string } | null;
-  product: { id: string; title: string; handle: string; hasOnlyDefaultVariant: boolean; featuredImage: { url: string } | null };
+  product: { id: string; title: string; handle: string; status: string; hasOnlyDefaultVariant: boolean; featuredImage: { url: string } | null };
 };
 
 export function variantGid(id: string | number): string {
@@ -193,14 +193,15 @@ export async function priceCart(
           id title sku price compareAtPrice availableForSale inventoryQuantity
           inventoryItem { tracked requiresShipping }
           image { url }
-          product { id title handle hasOnlyDefaultVariant featuredImage { url } }
+          product { id title handle status hasOnlyDefaultVariant featuredImage { url } }
         }
       }
     }`,
     { ids },
   );
   return data.nodes
-    .filter((n): n is VariantNode => n?.__typename === "ProductVariant" && n.availableForSale)
+    // Draft/archived products are never sellable through the checkout, even by variant id.
+    .filter((n): n is VariantNode => n?.__typename === "ProductVariant" && n.availableForSale && n.product.status === "ACTIVE")
     .map((n) => ({
       variantId: n.id,
       productId: n.product.id,

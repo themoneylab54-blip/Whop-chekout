@@ -150,11 +150,11 @@ function Faq({ items }: BlockOf<"faq">["props"]) {
   );
 }
 
-function Countdown({ label, endsAt, labels }: BlockOf<"countdown">["props"] & { labels: Labels }) {
+function Countdown({ label, endsAt, labels, preview }: BlockOf<"countdown">["props"] & { labels: Labels; preview: boolean }) {
   const end = Date.parse(endsAt);
   const now = useNow(1000);
   if (!endsAt || Number.isNaN(end)) {
-    return <p className="text-sm text-neutral-400 italic">Minuteur : choisissez une date de fin</p>;
+    return preview ? <Placeholder>Minuteur : choisissez une date de fin</Placeholder> : null;
   }
   if (now === null) return null;
   const left = Math.max(0, end - now);
@@ -174,8 +174,8 @@ function Countdown({ label, endsAt, labels }: BlockOf<"countdown">["props"] & { 
   );
 }
 
-function LowStock({ message, threshold, lowest }: BlockOf<"low_stock">["props"] & { lowest: number | null }) {
-  if (lowest == null) return <p className="text-sm text-neutral-400 italic">Stock bas : s&apos;affiche quand le stock réel est ≤ {threshold}</p>;
+function LowStock({ message, threshold, lowest, preview }: BlockOf<"low_stock">["props"] & { lowest: number | null; preview: boolean }) {
+  if (lowest == null) return preview ? <Placeholder>Stock bas : s&apos;affiche quand le stock réel est ≤ {threshold}</Placeholder> : null;
   if (lowest > threshold || lowest <= 0) return null;
   return (
     <div className="space-y-2">
@@ -379,6 +379,33 @@ export type ContentContext = {
 };
 
 /** Renders every non-section block. Returns null for fixed sections / add-ons. */
+/**
+ * True when a block has nothing to show buyers, so the page can skip its wrapper
+ * (card background, padding) instead of drawing an empty box. The builder preview
+ * always renders blocks so the merchant sees placeholders.
+ */
+export function isEmptyInLive(block: Block, ctx: ContentContext, now: number): boolean {
+  if (ctx.preview) return false;
+  switch (block.type) {
+    case "image":
+      return !block.props.url;
+    case "video":
+      return !block.props.url || !videoEmbed(block.props.url);
+    case "logos":
+      return block.props.logos.length === 0;
+    case "countdown": {
+      const end = Date.parse(block.props.endsAt);
+      return !block.props.endsAt || Number.isNaN(end) || end <= now;
+    }
+    case "low_stock":
+      return ctx.lowestInventory == null || ctx.lowestInventory <= 0 || ctx.lowestInventory > block.props.threshold;
+    case "free_shipping_bar":
+      return !(block.props.threshold > 0 || ctx.freeShippingThresholdCents);
+    default:
+      return false;
+  }
+}
+
 export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext }) {
   switch (block.type) {
     case "text":
@@ -482,9 +509,9 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
         </div>
       );
     case "countdown":
-      return <Countdown {...block.props} labels={ctx.labels} />;
+      return <Countdown {...block.props} labels={ctx.labels} preview={ctx.preview} />;
     case "low_stock":
-      return <LowStock {...block.props} lowest={ctx.lowestInventory} />;
+      return <LowStock {...block.props} lowest={ctx.lowestInventory} preview={ctx.preview} />;
     case "why_us":
       return (
         <div className="space-y-3 text-left">

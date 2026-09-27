@@ -1,5 +1,6 @@
 import { CreditCard, KeyRound, PlugZap, Smartphone, Wallet } from "lucide-react";
 import { notFound } from "next/navigation";
+import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { whopWebhookUrl, WHOP_WEBHOOK_EVENTS } from "@/lib/whop";
 import { Badge, Card, CopyField, Flash, Input, Label, PageHeader, SubmitButton, Textarea, buttonClass } from "@/components/ui";
@@ -13,6 +14,7 @@ export default async function WhopPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string; edit?: string }>;
 }) {
+  await requireAdmin();
   const { storeId } = await params;
   const sp = await searchParams;
   const [store, applePayFile] = await Promise.all([

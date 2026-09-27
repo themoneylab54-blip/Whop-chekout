@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { fontHref, loadCheckoutLayout, loadTheme, loadThankYouLayout } from "@/lib/layout";
+import { themeFontHrefs, loadCheckoutLayout, loadTheme, loadThankYouLayout } from "@/lib/layout";
 import { SAMPLE_LINES, sampleThankYou } from "@/lib/sample";
 import { CheckoutView } from "@/components/checkout/CheckoutView";
 import { ThankYouView } from "@/components/checkout/ThankYouView";
@@ -25,11 +25,13 @@ export default async function PreviewPage({ params }: { params: Promise<{ storeI
   });
   if (!store) notFound();
   const theme = loadTheme(store.theme, store.name);
-  const font = fontHref(theme.font);
+  const fonts = themeFontHrefs(theme);
 
   return (
     <>
-      {font && <link rel="stylesheet" href={font} />}
+      {fonts.map((href) => (
+        <link key={href} rel="stylesheet" href={href} />
+      ))}
       <div className="sticky top-0 z-50 bg-zinc-900 px-4 py-2 text-center text-xs text-white">
         Aperçu du design enregistré · données d&apos;exemple · rien n&apos;est facturé
       </div>

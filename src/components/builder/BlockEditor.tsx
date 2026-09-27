@@ -1,6 +1,6 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { ICON_KEYS, type Block, type BlockOf, type BlockStyle, type IconKey } from "@/lib/layout";
 import { X } from "lucide-react";
 import { BlockIcon, ICON_LABELS, isIconKey } from "@/components/icons";
@@ -24,6 +24,41 @@ export function F({ label, hint, children }: { label: string; hint?: string; chi
 
 export function Text({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder?: string }) {
   return <input className={input} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />;
+}
+
+const isHttpUrl = (v: string) => /^https?:\/\/[^\s]+\.[^\s]+/i.test(v) && URL.canParse(v);
+
+/**
+ * URL field that only commits a value the checkout accepts (http(s) or empty), so one
+ * half-typed address can never make the whole design fail to save.
+ */
+export function UrlText({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder?: string }) {
+  const [draft, setDraft] = useState(value);
+  const [seen, setSeen] = useState(value);
+  if (value !== seen) {
+    setSeen(value);
+    setDraft(value);
+  }
+  const invalid = draft.trim() !== "" && !isHttpUrl(draft.trim());
+  return (
+    <div>
+      <input
+        className={`${input} ${invalid ? "border-amber-400 focus:border-amber-500" : ""}`}
+        value={draft}
+        placeholder={placeholder ?? "https://…"}
+        inputMode="url"
+        onChange={(e) => {
+          const v = e.target.value;
+          setDraft(v);
+          if (v.trim() === "" || isHttpUrl(v.trim())) onChange(v.trim());
+        }}
+        onBlur={() => {
+          if (invalid) setDraft(value);
+        }}
+      />
+      {invalid && <p className="mt-1 text-[11px] text-amber-700">Adresse complète attendue, commençant par https://</p>}
+    </div>
+  );
 }
 
 export function Area({ value, onChange, rows = 3 }: { value: string; onChange: (v: string) => void; rows?: number }) {
@@ -76,7 +111,23 @@ export function Segmented<T extends string>({ value, options, onChange }: { valu
   );
 }
 
+/** "#abc" → "#aabbcc"; null when not a hex color. */
+function normalizeHex(v: string): string | null {
+  const t = v.trim();
+  const m = /^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.exec(t);
+  if (!m) return null;
+  const h = m[1].length === 3 ? m[1].replace(/./g, (c) => c + c) : m[1];
+  return `#${h.toLowerCase()}`;
+}
+
+/** Color picker + hex field. The text field is a free draft; only valid colors are committed. */
 export function ColorInput({ value, onChange, allowEmpty = true }: { value: string; onChange: (v: string) => void; allowEmpty?: boolean }) {
+  const [draft, setDraft] = useState(value);
+  const [seen, setSeen] = useState(value);
+  if (value !== seen) {
+    setSeen(value);
+    setDraft(value);
+  }
   return (
     <div className="flex items-center gap-2">
       <input
@@ -85,7 +136,24 @@ export function ColorInput({ value, onChange, allowEmpty = true }: { value: stri
         onChange={(e) => onChange(e.target.value)}
         className="h-8 w-10 cursor-pointer rounded border border-zinc-300 bg-white p-0.5"
       />
-      <input className={`${input} font-mono text-xs`} value={value} placeholder="par défaut" onChange={(e) => onChange(e.target.value)} />
+      <input
+        className={`${input} font-mono text-xs`}
+        value={draft}
+        placeholder="par défaut"
+        spellCheck={false}
+        onChange={(e) => {
+          const v = e.target.value;
+          setDraft(v);
+          const hex = normalizeHex(v);
+          if (hex && hex.length === 7 && v.replace("#", "").length === 6) onChange(hex);
+          else if (allowEmpty && v.trim() === "") onChange("");
+        }}
+        onBlur={() => {
+          const hex = normalizeHex(draft);
+          if (hex) onChange(hex);
+          else if (!(allowEmpty && draft.trim() === "")) setDraft(value);
+        }}
+      />
       {allowEmpty && value && (
         <button type="button" onClick={() => onChange("")} className="text-xs text-zinc-500 underline">
           effacer
@@ -206,7 +274,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
       return (
         <div className="space-y-3">
           <F label="URL de l'image">
-            <Text value={block.props.url} placeholder="https://…" onChange={(url) => props(block, { url })} />
+            <UrlText value={block.props.url} placeholder="https://…" onChange={(url) => props(block, { url })} />
           </F>
           <F label="Texte alternatif">
             <Text value={block.props.alt} onChange={(alt) => props(block, { alt })} />
@@ -235,7 +303,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
             <Text value={block.props.author} onChange={(author) => props(block, { author })} />
           </F>
           <F label="Photo (URL, facultatif)">
-            <Text value={block.props.photoUrl} onChange={(photoUrl) => props(block, { photoUrl })} />
+            <UrlText value={block.props.photoUrl} onChange={(photoUrl) => props(block, { photoUrl })} />
           </F>
           <F label="Étoiles">
             <Num value={block.props.stars} min={1} max={5} onChange={(stars) => props(block, { stars })} />
@@ -269,7 +337,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           render={(b, set) => (
             <>
               <Text value={b.label} onChange={(label) => set({ ...b, label })} />
-              <Text value={b.iconUrl} placeholder="Icône (URL, facultatif)" onChange={(iconUrl) => set({ ...b, iconUrl })} />
+              <UrlText value={b.iconUrl} placeholder="Icône (URL, facultatif)" onChange={(iconUrl) => set({ ...b, iconUrl })} />
             </>
           )}
         />
@@ -496,7 +564,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
       return (
         <div className="space-y-3">
           <F label="Lien de la vidéo" hint="YouTube, Vimeo ou fichier .mp4">
-            <Text value={block.props.url} placeholder="https://youtube.com/watch?v=…" onChange={(url) => props(block, { url })} />
+            <UrlText value={block.props.url} placeholder="https://youtube.com/watch?v=…" onChange={(url) => props(block, { url })} />
           </F>
           <F label="Légende (facultatif)">
             <Text value={block.props.caption} onChange={(caption) => props(block, { caption })} />
@@ -517,7 +585,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
             onChange={(logos) => props(block, { logos })}
             render={(l, set) => (
               <>
-                <Text value={l.imageUrl} placeholder="URL du logo (PNG/SVG)" onChange={(imageUrl) => set({ ...l, imageUrl })} />
+                <UrlText value={l.imageUrl} placeholder="URL du logo (PNG/SVG)" onChange={(imageUrl) => set({ ...l, imageUrl })} />
                 <Text value={l.alt} placeholder="Nom du média" onChange={(alt) => set({ ...l, alt })} />
               </>
             )}
@@ -626,7 +694,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
             <Text value={block.props.label} onChange={(label) => props(block, { label })} />
           </F>
           <F label="Lien">
-            <Text value={block.props.url} placeholder="https://…" onChange={(url) => props(block, { url })} />
+            <UrlText value={block.props.url} placeholder="https://…" onChange={(url) => props(block, { url })} />
           </F>
           <F label="Style">
             <Segmented value={block.props.variant} options={[["solid", "Plein"], ["outline", "Contour"]]} onChange={(variant) => props(block, { variant })} />
@@ -655,7 +723,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           </F>
           {(["instagram", "tiktok", "facebook", "youtube"] as const).map((k) => (
             <F key={k} label={k[0].toUpperCase() + k.slice(1)}>
-              <Text value={block.props[k]} placeholder="https://…" onChange={(v) => props(block, { [k]: v })} />
+              <UrlText value={block.props[k]} placeholder="https://…" onChange={(v) => props(block, { [k]: v })} />
             </F>
           ))}
         </div>

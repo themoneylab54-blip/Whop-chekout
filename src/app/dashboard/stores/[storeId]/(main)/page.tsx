@@ -16,6 +16,7 @@ import {
   Wallet,
   type LucideIcon,
 } from "lucide-react";
+import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { formatMoney } from "@/lib/pricing";
 import { IconTile } from "@/components/icons";
@@ -34,45 +35,59 @@ export default async function OverviewPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ range?: string; ok?: string; error?: string }>;
 }) {
+  await requireAdmin();
   const { storeId } = await params;
   const sp = await searchParams;
   const range: Range = sp.range && sp.range in RANGES ? (sp.range as Range) : "30d";
   const store = await db.store.findUnique({ where: { id: storeId }, include: { _count: { select: { shippingRates: true } } } });
   if (!store) notFound();
 
-  const since = new Date();
-  since.setHours(0, 0, 0, 0);
-  since.setDate(since.getDate() - (RANGES[range] - 1));
+  // Days are the merchant's days (Paris), not the server's UTC days.
+  const today = parisDay(new Date());
+  const sinceKey = addDays(today, -(RANGES[range] - 1));
+  const days = Math.max(RANGES[range], 7);
+  const chartStartKey = addDays(today, -(days - 1));
+  // Fetch a little before the earliest day so time-zone edges are included, then bucket precisely.
+  const fetchFrom = new Date(`${chartStartKey < sinceKey ? chartStartKey : sinceKey}T00:00:00Z`);
+  fetchFrom.setUTCHours(fetchFrom.getUTCHours() - 14);
+  const since = new Date(`${sinceKey}T00:00:00Z`);
+  since.setUTCHours(since.getUTCHours() - 14);
 
-  const [paid, started, abandoned] = await Promise.all([
+  const [paidRows, startedRows, abandonedRows] = await Promise.all([
     db.checkoutSession.findMany({
-      where: { storeId, status: "PAID", paidAt: { gte: since } },
+      where: { storeId, status: "PAID", paidAt: { gte: fetchFrom } },
       select: { paidAt: true, totalCents: true, refundedCents: true },
     }),
-    db.checkoutSession.count({ where: { storeId, createdAt: { gte: since } } }),
-    db.checkoutSession.count({ where: { storeId, createdAt: { gte: since }, status: { in: ["OPEN", "PAYING", "FAILED"] } } }),
+    db.checkoutSession.findMany({ where: { storeId, createdAt: { gte: since } }, select: { createdAt: true } }),
+    db.checkoutSession.findMany({
+      where: { storeId, createdAt: { gte: since }, status: { in: ["OPEN", "PAYING", "FAILED"] } },
+      select: { createdAt: true },
+    }),
   ]);
+  const inRange = (d: Date | null) => !!d && parisDay(d) >= sinceKey;
+  const paid = paidRows.filter((p) => inRange(p.paidAt));
+  const started = startedRows.filter((r) => inRange(r.createdAt)).length;
+  const abandoned = abandonedRows.filter((r) => inRange(r.createdAt)).length;
   const gross = paid.reduce((s, p) => s + p.totalCents, 0);
   const revenue = gross - paid.reduce((s, p) => s + p.refundedCents, 0);
   const orders = paid.length;
   const money = (c: number) => formatMoney(c, store.shopCurrency);
 
-  // Daily series for the chart (store-local days as rendered by the server).
-  const days = Math.max(RANGES[range], 7);
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
-  start.setDate(start.getDate() - (days - 1));
   const points: DailyPoint[] = Array.from({ length: days }, (_, i) => {
-    const d = new Date(start);
-    d.setDate(start.getDate() + i);
-    return { date: d.toISOString().slice(0, 10), label: d.toLocaleDateString("fr-FR", { day: "numeric", month: "short" }), cents: 0, orders: 0 };
+    const key = addDays(chartStartKey, i);
+    return {
+      date: key,
+      label: new Date(`${key}T12:00:00Z`).toLocaleDateString("fr-FR", { day: "numeric", month: "short", timeZone: "UTC" }),
+      cents: 0,
+      orders: 0,
+    };
   });
-  for (const p of paid) {
-    if (!p.paidAt) continue;
-    const idx = Math.floor((p.paidAt.getTime() - start.getTime()) / 86_400_000);
-    if (points[idx]) {
-      points[idx].cents += p.totalCents - p.refundedCents;
-      points[idx].orders += 1;
+  const byDay = new Map(points.map((p) => [p.date, p]));
+  for (const p of paidRows) {
+    const point = p.paidAt ? byDay.get(parisDay(p.paidAt)) : undefined;
+    if (point) {
+      point.cents += p.totalCents - p.refundedCents;
+      point.orders += 1;
     }
   }
 
@@ -271,4 +286,17 @@ function Connection({ label, detail, ok, href }: { label: string; detail: string
       <Badge color={ok ? "green" : "amber"}>{ok ? "Connecté" : "À connecter"}</Badge>
     </Link>
   );
+}
+
+const parisFormat = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Paris", year: "numeric", month: "2-digit", day: "2-digit" });
+
+/** "YYYY-MM-DD" of a moment in Paris. */
+function parisDay(d: Date): string {
+  return parisFormat.format(d);
+}
+
+function addDays(key: string, n: number): string {
+  const d = new Date(`${key}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
 }

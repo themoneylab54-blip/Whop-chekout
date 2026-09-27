@@ -2,8 +2,10 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
+import { headers } from "next/headers";
+import { rateLimit } from "@/lib/ratelimit";
 import { z } from "zod";
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import { login, logout, requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { encrypt, randomToken } from "@/lib/crypto";
@@ -44,11 +46,14 @@ function str(fd: FormData, key: string) {
   return String(fd.get(key) ?? "").trim();
 }
 
-/** "12,50" | "12.5" | "12" → 1250 cents. Returns null when empty or invalid. */
+/** Largest amount accepted anywhere in the dashboard (1 000 000.00). */
+const MAX_CENTS = 100_000_000;
+
+/** "12,50" | "12.5" | "12" → 1250 cents. Returns null when empty, invalid or absurdly large. */
 function cents(value: string): number | null {
   if (!value) return null;
   const n = Number(value.replace(/\s/g, "").replace(",", "."));
-  return Number.isFinite(n) && n >= 0 ? Math.round(n * 100) : null;
+  return Number.isFinite(n) && n >= 0 && n * 100 <= MAX_CENTS ? Math.round(n * 100) : null;
 }
 
 /** Encrypts before any external call so a misconfigured key fails cleanly, with nothing half-created. */
@@ -75,6 +80,9 @@ function errorMessage(err: unknown) {
 /* ------------------------------------------------------------------ */
 
 export async function loginAction(fd: FormData) {
+  const h = await headers();
+  const ip = h.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  if (!rateLimit(`login:${ip}`, 10)) back("/login", { error: "Trop de tentatives. Réessayez dans une minute." });
   const ok = await login(str(fd, "email"), String(fd.get("password") ?? ""));
   if (!ok) back("/login", { error: "E-mail ou mot de passe incorrect" });
   redirect("/dashboard");
@@ -229,10 +237,13 @@ export async function connectWhopAction(storeId: string, fd: FormData) {
   const encryptedKey = encryptOrBack(apiKey, path);
   let result;
   try {
-    if (store.whopConnectedAt) await teardownWhop(store).catch(() => undefined);
+    // Set up with the new key first: a wrong key must not break a working connection.
     result = await setupWhop({ apiKey, testMode: store.testMode, storeId, storeName: store.name });
   } catch (err) {
     back(path, { error: `Whop a refusé la connexion : ${errorMessage(err)}` });
+  }
+  if (store.whopConnectedAt && store.whopWebhookId && store.whopWebhookId !== result.webhookId) {
+    await teardownWhop(store).catch(() => undefined);
   }
   await db.store.update({
     where: { id: storeId },
@@ -345,11 +356,15 @@ export async function saveBuilderAction(
 /* Shipping                                                            */
 /* ------------------------------------------------------------------ */
 
-const countriesField = (v: string) =>
-  v
+/** "FR, BE de" → ["FR","BE","DE"]; null when a token isn't a 2-letter ISO code. */
+const countriesField = (v: string): string[] | null => {
+  const tokens = v
     .split(/[\s,;]+/)
     .map((c) => c.trim().toUpperCase())
-    .filter((c) => /^[A-Z]{2}$/.test(c));
+    .filter(Boolean);
+  if (tokens.some((c) => !/^[A-Z]{2}$/.test(c))) return null;
+  return [...new Set(tokens)];
+};
 
 export async function saveRateAction(storeId: string, fd: FormData) {
   await getStore(storeId);
@@ -357,13 +372,18 @@ export async function saveRateAction(storeId: string, fd: FormData) {
   const id = str(fd, "id");
   const name = str(fd, "name").slice(0, 80);
   const price = cents(str(fd, "price"));
-  if (!name || price == null) back(path, { error: "Nom et prix obligatoires" });
+  if (!name || price == null) back(path, { error: "Nom et prix obligatoires (prix valide, max 1 000 000)" });
+  const countries = countriesField(str(fd, "countries"));
+  if (!countries) back(path, { error: "Pays : utilisez les codes à 2 lettres séparés par des virgules (ex. FR, BE, CH)" });
+  const freeOverRaw = str(fd, "freeOver");
+  const freeOver = cents(freeOverRaw);
+  if (freeOverRaw && freeOver == null) back(path, { error: "Seuil de livraison gratuite invalide" });
   const data = {
     name,
     deliveryTime: str(fd, "deliveryTime").slice(0, 80) || null,
-    countries: countriesField(str(fd, "countries")),
+    countries,
     priceCents: price,
-    freeOverCents: cents(str(fd, "freeOver")),
+    freeOverCents: freeOver,
     active: fd.get("active") === "on",
   };
   if (id) await db.shippingRate.update({ where: { id, storeId }, data });
@@ -388,8 +408,8 @@ const discountForm = z.object({
   code: z
     .string()
     .trim()
-    .min(2)
-    .max(40)
+    .min(2, "Le code doit faire au moins 2 caractères")
+    .max(40, "Le code doit faire au plus 40 caractères")
     .regex(/^[A-Za-z0-9_-]+$/, "Lettres, chiffres, - et _ uniquement")
     .transform((c) => c.toUpperCase()),
   type: z.enum(["PERCENT", "FIXED", "FREE_SHIPPING"]),
@@ -413,19 +433,34 @@ export async function createDiscountAction(storeId: string, fd: FormData) {
     value = cents(f.value) ?? 0;
     if (value <= 0) back(path, { error: "Montant de réduction invalide" });
   }
+  if (f.minSubtotal && cents(f.minSubtotal) == null) back(path, { error: "Minimum de commande invalide" });
+  const usageLimit = f.usageLimit ? parseInt(f.usageLimit, 10) : null;
+  if (usageLimit != null && !(usageLimit >= 1 && usageLimit <= 1_000_000)) {
+    back(path, { error: "Limite d'utilisation entre 1 et 1 000 000" });
+  }
+  // "Expire le 31/12" means usable all day on the 31st (Paris time, the merchant's zone).
+  const endsAt = f.endsAt ? endOfDayParis(f.endsAt) : null;
+  if (f.endsAt && !endsAt) back(path, { error: "Date d'expiration invalide" });
   const exists = await db.discountCode.findUnique({ where: { storeId_code: { storeId, code: f.code } } });
   if (exists) back(path, { error: `Le code ${f.code} existe déjà` });
-  await db.discountCode.create({
-    data: {
-      storeId,
-      code: f.code,
-      type: f.type,
-      value,
-      minSubtotalCents: cents(f.minSubtotal),
-      endsAt: f.endsAt ? new Date(f.endsAt) : null,
-      usageLimit: f.usageLimit ? Math.max(1, parseInt(f.usageLimit, 10)) : null,
-    },
-  });
+  try {
+    await db.discountCode.create({
+      data: {
+        storeId,
+        code: f.code,
+        type: f.type,
+        value,
+        minSubtotalCents: cents(f.minSubtotal),
+        endsAt,
+        usageLimit,
+      },
+    });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      back(path, { error: `Le code ${f.code} existe déjà` });
+    }
+    throw err;
+  }
   back(path, { ok: `Code ${f.code} créé` });
 }
 
@@ -449,6 +484,11 @@ export async function createAddOnAction(storeId: string, fd: FormData) {
   const price = cents(str(fd, "price"));
   if (!title || price == null || price <= 0) back(path, { error: "Titre et prix obligatoires" });
   const variant = str(fd, "variantId");
+  // Accepts a bare id, a gid, or a Shopify admin URL (…/variants/456): the last number wins.
+  const variantNum = variant.startsWith("gid://") ? null : variant.match(/(\d+)\D*$/)?.[1];
+  if (variant && !variant.startsWith("gid://shopify/ProductVariant/") && !variantNum) {
+    back(path, { error: "ID de variante invalide : collez le numéro de la variante Shopify" });
+  }
   const count = await db.addOn.count({ where: { storeId } });
   await db.addOn.create({
     data: {
@@ -456,7 +496,7 @@ export async function createAddOnAction(storeId: string, fd: FormData) {
       title,
       description: str(fd, "description").slice(0, 200) || null,
       priceCents: price,
-      variantId: variant ? (variant.startsWith("gid://") ? variant : `gid://shopify/ProductVariant/${variant.replace(/\D/g, "")}`) : null,
+      variantId: variant ? (variant.startsWith("gid://") ? variant : `gid://shopify/ProductVariant/${variantNum}`) : null,
       imageUrl: /^https?:\/\//i.test(str(fd, "imageUrl")) ? str(fd, "imageUrl") : null,
       position: count,
     },
@@ -484,8 +524,8 @@ export async function deleteAddOnAction(storeId: string, id: string) {
 export async function resyncOrderAction(storeId: string, sessionId: string) {
   await getStore(storeId);
   const path = storePath(storeId, "orders");
-  // Manual retry: release any stale lease first.
-  await db.checkoutSession.updateMany({ where: { id: sessionId, storeId }, data: { syncStartedAt: null } });
+  // Manual sync is the merchant's decision on an order held for review.
+  await db.checkoutSession.updateMany({ where: { id: sessionId, storeId }, data: { reviewNote: null } });
   try {
     await syncOrder(sessionId);
   } catch (err) {
@@ -500,8 +540,9 @@ export async function refundOrderAction(storeId: string, sessionId: string, fd: 
   const session = await db.checkoutSession.findUnique({ where: { id: sessionId, storeId } });
   if (!session?.whopPaymentId) back(path, { error: "Paiement introuvable" });
   const remaining = session.totalCents - session.refundedCents;
-  const amount = cents(str(fd, "amount")) ?? remaining;
-  if (amount <= 0 || amount > remaining) back(path, { error: "Montant de remboursement invalide" });
+  const raw = str(fd, "amount");
+  const amount = raw ? cents(raw) : remaining;
+  if (amount == null || amount <= 0 || amount > remaining) back(path, { error: "Montant de remboursement invalide" });
   try {
     await refundPayment(store, session.whopPaymentId, amount === session.totalCents ? undefined : amount);
   } catch (err) {
@@ -509,4 +550,18 @@ export async function refundOrderAction(storeId: string, sessionId: string, fd: 
   }
   // The refund.created webhook records it in Shopify.
   back(path, { ok: "Remboursement demandé à Whop. Il apparaîtra dans Shopify dès confirmation." });
+}
+
+/** "2026-12-31" → 2026-12-31T23:59:59.999 Europe/Paris, as a UTC Date. */
+function endOfDayParis(day: string): Date | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+  const utc = new Date(`${day}T23:59:59.999Z`);
+  if (Number.isNaN(utc.getTime())) return null;
+  // Offset of Paris vs UTC on that day (+1h winter, +2h summer).
+  const parisHour = Number(
+    new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Paris", hour: "2-digit", hourCycle: "h23" }).format(
+      new Date(`${day}T12:00:00Z`),
+    ),
+  );
+  return new Date(utc.getTime() - (parisHour - 12) * 3600_000);
 }

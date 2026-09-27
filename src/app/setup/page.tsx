@@ -30,6 +30,14 @@ export default async function SetupPage({ searchParams }: { searchParams: Promis
           <Label htmlFor="confirm">Confirmer le mot de passe</Label>
           <Input id="confirm" name="confirm" type="password" autoComplete="new-password" minLength={10} required />
         </div>
+        {process.env.SETUP_TOKEN && (
+          <div>
+            <Label htmlFor="token" hint="La valeur de la variable SETUP_TOKEN définie sur Vercel">
+              Code d&apos;installation
+            </Label>
+            <Input id="token" name="token" type="password" autoComplete="off" required />
+          </div>
+        )}
         <SubmitButton className="w-full py-2.5">Créer mon compte</SubmitButton>
       </form>
     </AuthShell>
