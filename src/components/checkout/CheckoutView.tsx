@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
+import { ChevronDown, Tag } from "lucide-react";
 import type { Block, Layout, Theme } from "@/lib/layout";
 import { computeTotals, formatMoney, ratesForCountry, type CartLine, type RateInput, type Totals } from "@/lib/pricing";
 import { ContentBlock, Placeholder, StyledBlock, type ContentContext } from "./blocks";
@@ -47,12 +48,26 @@ type QuoteState = {
 };
 
 
+function fontStack(font: string) {
+  return font === "System" ? "system-ui, -apple-system, Segoe UI, sans-serif" : `"${font}", system-ui, sans-serif`;
+}
+
 export function themeVars(theme: Theme): CSSProperties {
+  const body = fontStack(theme.font);
   return {
     "--accent": theme.accentColor,
+    "--accent-bg": theme.accentColor2 ? `linear-gradient(135deg, ${theme.accentColor}, ${theme.accentColor2})` : `linear-gradient(${theme.accentColor}, ${theme.accentColor})`,
     "--accent-fg": readableOn(theme.accentColor),
     "--radius": `${theme.radius}px`,
-    fontFamily: theme.font === "System" ? "system-ui, -apple-system, Segoe UI, sans-serif" : `"${theme.font}", system-ui, sans-serif`,
+    "--btn-radius": theme.buttonShape === "pill" ? "999px" : theme.buttonShape === "square" ? "0px" : `${theme.radius}px`,
+    "--btn-shadow": theme.buttonShadow ? `0 10px 24px -10px ${theme.accentColor}b3, inset 0 1px 0 rgba(255,255,255,.18)` : "none",
+    "--text": theme.textColor,
+    "--muted": `color-mix(in srgb, ${theme.textColor} 60%, white)`,
+    "--border": theme.borderColor,
+    "--heading-font": theme.headingFont === "same" ? body : fontStack(theme.headingFont),
+    fontFamily: body,
+    fontSize: { sm: "14px", md: "15px", lg: "16px" }[theme.fontScale],
+    color: theme.textColor,
     background: theme.pageBackground || "#ffffff",
   } as CSSProperties;
 }
@@ -66,13 +81,17 @@ function readableOn(hex: string) {
 export function StoreHeader({ theme }: { theme: Theme }) {
   const justify = { left: "justify-start", center: "justify-center", right: "justify-end" }[theme.headerAlign];
   return (
-    <header className="border-b border-neutral-200 bg-white">
+    <header className={theme.headerBorder ? "border-b border-[var(--border)]" : ""} style={{ background: theme.headerBackground }}>
       <div className={`mx-auto flex max-w-[1100px] items-center gap-3 px-5 py-4 ${justify}`}>
         {theme.logoUrl && (
           // eslint-disable-next-line @next/next/no-img-element
           <img src={theme.logoUrl} alt={theme.storeName} style={{ height: theme.logoHeight }} className="w-auto object-contain" />
         )}
-        {theme.showStoreName && theme.storeName && <span className="text-xl font-semibold tracking-tight">{theme.storeName}</span>}
+        {theme.showStoreName && theme.storeName && (
+          <span className="font-[family-name:var(--heading-font)] text-xl font-semibold tracking-tight" style={{ color: readableOn(theme.headerBackground) === "#ffffff" ? "#fff" : undefined }}>
+            {theme.storeName}
+          </span>
+        )}
         {!theme.logoUrl && !theme.storeName && <span className="text-xl font-semibold text-neutral-300">Ma boutique</span>}
       </div>
     </header>
@@ -136,6 +155,7 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
   const [addOnIds, setAddOnIds] = useState<string[]>([]);
   const [quote, setQuote] = useState<QuoteState | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [note, setNote] = useState("");
   const [prepared, setPrepared] = useState<Prepared | null>(null);
   const [preparing, setPreparing] = useState(false);
   const [prepareError, setPrepareError] = useState<string | null>(null);
@@ -259,6 +279,7 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
         email,
         acceptsMarketing: marketing,
         address,
+        note: note.trim() || null,
         countryCode: address.countryCode,
         shippingRateId: q.shippingRateId,
         discountCode: appliedCode,
@@ -293,7 +314,21 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
 
   /* ---------- rendering helpers ---------- */
 
-  const ctx: ContentContext = { labels: L, lowestInventory, preview: !live };
+  const freeShippingThresholdCents = useMemo(() => {
+    const thresholds = rates.filter((r) => r.active && r.freeOverCents != null).map((r) => r.freeOverCents as number);
+    return thresholds.length ? Math.min(...thresholds) : null;
+  }, [rates]);
+  const ctx: ContentContext = {
+    labels: L,
+    lang: theme.language,
+    lowestInventory,
+    preview: !live,
+    subtotalCents: totals.subtotalCents - totals.discountCents,
+    freeShippingThresholdCents,
+    money,
+    note,
+    setNote,
+  };
   const visible = layout.blocks.filter((b) => !b.hidden);
   const formBlocks = visible.filter((b) => b.placement === "form" || isSection(b));
   const summaryBlocks = visible.filter((b) => b.placement === "summary" && !isSection(b));
@@ -492,8 +527,12 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
     }
   }
 
+  const summaryLeft = theme.summarySide === "left";
+  const widths = { narrow: { form: 480, summary: 400 }, normal: { form: 560, summary: 440 }, wide: { form: 640, summary: 500 } }[theme.contentWidth];
+
   const summary = (
     <OrderSummary
+      showImages={theme.summaryImages}
       L={L}
       lines={lines}
       totals={totals}
@@ -517,29 +556,38 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
   );
 
   return (
-    <div className="@container min-h-full" style={themeVars(theme)}>
+    <div className="@container min-h-full" style={themeVars(theme)} data-inputs={theme.inputStyle}>
       <StoreHeader theme={theme} />
 
       {/* Mobile summary toggle */}
-      <div className="border-b border-neutral-200 @3xl:hidden" style={{ background: theme.summaryBackground || undefined }}>
-        <button type="button" onClick={() => setSummaryOpen(!summaryOpen)} className="flex w-full items-center justify-between px-5 py-4 text-sm">
-          <span className="font-medium text-[var(--accent)]">
-            {summaryOpen ? L.hideSummary : L.showSummary} {summaryOpen ? "▴" : "▾"}
+      <div className="border-b border-[var(--border)] @3xl:hidden" style={{ background: theme.summaryBackground || undefined }}>
+        <button type="button" onClick={() => setSummaryOpen(!summaryOpen)} className="flex w-full items-center justify-between px-5 py-4 text-sm" aria-expanded={summaryOpen}>
+          <span className="flex items-center gap-1.5 font-medium text-[var(--accent)]">
+            {summaryOpen ? L.hideSummary : L.showSummary}
+            <ChevronDown className={`h-4 w-4 transition-transform ${summaryOpen ? "rotate-180" : ""}`} />
           </span>
           <span className="text-base font-semibold">{money(totals.totalCents)}</span>
         </button>
         {summaryOpen && <div className="px-5 pb-5">{summary}</div>}
       </div>
 
-      <div className="grid @3xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-        <main className="px-5 py-6 @3xl:flex @3xl:justify-end @3xl:border-r @3xl:border-neutral-200 @3xl:px-10 @3xl:py-10" style={{ background: theme.formBackground || undefined }}>
-          <div className="w-full @3xl:max-w-[560px]">
+      <div className={`grid @3xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] ${summaryLeft ? "@3xl:[direction:rtl]" : ""}`}>
+        <main
+          className={`px-5 py-6 [direction:ltr] @3xl:flex @3xl:px-10 @3xl:py-10 ${summaryLeft ? "@3xl:justify-start @3xl:border-l" : "@3xl:justify-end @3xl:border-r"} @3xl:border-[var(--border)]`}
+          style={{ background: theme.formBackground || undefined }}
+        >
+          <div className="w-full space-y-1" style={{ maxWidth: widths.form }}>
             {formBlocks.map((b) => wrap(b, renderSection(b)))}
             <Footer theme={theme} />
           </div>
         </main>
-        <aside className="hidden px-5 py-6 @3xl:block @3xl:px-10 @3xl:py-10" style={{ background: theme.summaryBackground || undefined }}>
-          <div className="sticky top-6 w-full @3xl:max-w-[440px]">{summary}</div>
+        <aside
+          className={`hidden px-5 py-6 [direction:ltr] @3xl:flex @3xl:px-10 @3xl:py-10 ${summaryLeft ? "@3xl:justify-end" : "@3xl:justify-start"}`}
+          style={{ background: theme.summaryBackground || undefined }}
+        >
+          <div className="sticky top-6 h-fit w-full" style={{ maxWidth: widths.summary }}>
+            {summary}
+          </div>
         </aside>
       </div>
     </div>
@@ -552,13 +600,13 @@ function isSection(b: Block) {
   return b.type === "contact" || b.type === "delivery" || b.type === "shipping_method" || b.type === "payment" || b.type === "order_addons";
 }
 
-const inputCls =
-  "w-full rounded-[var(--radius)] border border-neutral-300 bg-white px-3.5 py-3 text-[15px] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--accent)_20%,transparent)] disabled:bg-neutral-50 disabled:text-neutral-500";
+// Look depends on theme.inputStyle via [data-inputs] rules in globals.css
+const inputCls = "wc-input";
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section>
-      <h2 className="mb-3 text-lg font-semibold">{title}</h2>
+      <h2 className="mb-3 font-[family-name:var(--heading-font)] text-lg font-semibold tracking-tight">{title}</h2>
       {children}
     </section>
   );
@@ -587,6 +635,7 @@ function Field({
 }
 
 function OrderSummary(props: {
+  showImages: boolean;
   L: Labels;
   lines: CartLine[];
   totals: Totals;
@@ -609,7 +658,7 @@ function OrderSummary(props: {
       <ul className="space-y-4">
         {lines.map((l) => (
           <li key={l.variantId} className="flex items-center gap-3">
-            <div className="relative shrink-0">
+            <div className={`relative shrink-0 ${props.showImages ? "" : "hidden"}`}>
               {l.imageUrl ? (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img src={l.imageUrl} alt="" className="h-16 w-16 rounded-[calc(var(--radius)*0.8)] border border-neutral-200 bg-white object-cover" />
@@ -639,7 +688,8 @@ function OrderSummary(props: {
           {props.appliedCode ? (
             <div className="flex items-center justify-between rounded-[var(--radius)] bg-white px-3 py-2 text-sm">
               <span>
-                🏷️ <strong>{props.appliedCode}</strong>
+                <Tag className="mr-1 inline h-3.5 w-3.5 text-[var(--accent)]" />
+                <strong>{props.appliedCode}</strong>
               </span>
               {!props.locked && (
                 <button type="button" onClick={props.onRemove} className="text-neutral-500 underline">

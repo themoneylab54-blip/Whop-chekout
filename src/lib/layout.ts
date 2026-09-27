@@ -29,8 +29,22 @@ const url = z
 export const themeSchema = z.object({
   language: z.enum(["fr", "en"]).default("fr"),
   font: z.enum(FONTS).default("Inter"),
+  headingFont: z.enum([...FONTS, "same"]).default("same"),
+  fontScale: z.enum(["sm", "md", "lg"]).default("md"),
   radius: z.number().int().min(0).max(24).default(10),
   accentColor: color.default("#111827"),
+  // second color: turns buttons into a gradient
+  accentColor2: optionalColor,
+  textColor: color.default("#111827"),
+  borderColor: color.default("#d4d4d8"),
+  buttonShape: z.enum(["default", "pill", "square"]).default("default"),
+  buttonShadow: z.boolean().default(true),
+  inputStyle: z.enum(["outlined", "filled", "underline"]).default("outlined"),
+  headerBackground: color.default("#ffffff"),
+  headerBorder: z.boolean().default(true),
+  summarySide: z.enum(["right", "left"]).default("right"),
+  summaryImages: z.boolean().default(true),
+  contentWidth: z.enum(["narrow", "normal", "wide"]).default("normal"),
   pageBackground: optionalColor,
   formBackground: optionalColor,
   summaryBackground: color.or(z.literal("")).default("#f7f7f8"),
@@ -51,6 +65,32 @@ export function fontHref(font: Theme["font"]) {
   if (font === "System") return null;
   return `https://fonts.googleapis.com/css2?family=${encodeURIComponent(font)}:wght@400;500;600;700&display=swap`;
 }
+
+/** Icon keys available in blocks (rendered with Lucide in src/components/icons.tsx). */
+export const ICON_KEYS = [
+  "shield",
+  "truck",
+  "lock",
+  "heart",
+  "check",
+  "refresh",
+  "star",
+  "gift",
+  "clock",
+  "package",
+  "sparkles",
+  "leaf",
+  "support",
+  "card",
+  "zap",
+  "award",
+  "thumbs",
+  "users",
+  "globe",
+  "return",
+] as const;
+export type IconKey = (typeof ICON_KEYS)[number];
+const iconKey = z.enum(ICON_KEYS);
 
 /* ------------------------------------------------------------------ */
 /* Block style (shared by every block)                                 */
@@ -145,7 +185,8 @@ export const blockSchema = z.discriminatedUnion("type", [
   z.object({
     ...base,
     type: z.literal("value_props"),
-    props: z.object({ items: z.array(z.object({ icon: z.string().max(8), label: z.string().max(80) })).max(8) }),
+    // icon: an IconKey (legacy layouts may still hold an emoji, rendered as text)
+    props: z.object({ items: z.array(z.object({ icon: z.string().max(16), label: z.string().max(80) })).max(8) }),
   }),
   z.object({
     ...base,
@@ -180,12 +221,122 @@ export const blockSchema = z.discriminatedUnion("type", [
       rows: z
         .array(
           z.object({
-            icon: z.enum(["shield", "star", "truck", "lock", "heart", "check", "refresh"]),
+            icon: iconKey,
             title: z.string().max(80),
             text: z.string().max(300),
           }),
         )
         .max(8),
+    }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("free_shipping_bar"),
+    // threshold in major units; 0 = use the lowest "free over" of the shipping rates
+    props: z.object({ message: z.string().max(200), success: z.string().max(200), threshold: z.number().min(0).max(100000) }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("delivery_estimate"),
+    props: z.object({
+      label: z.string().max(120),
+      minDays: z.number().int().min(0).max(60),
+      maxDays: z.number().int().min(0).max(90),
+      businessDays: z.boolean(),
+      showTimeline: z.boolean(),
+    }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("reviews"),
+    props: z.object({
+      title: z.string().max(120),
+      layout: z.enum(["carousel", "stack"]),
+      items: z
+        .array(z.object({ name: z.string().max(80), text: z.string().max(800), stars: z.number().int().min(1).max(5), verified: z.boolean() }))
+        .max(20),
+    }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("comparison"),
+    props: z.object({
+      title: z.string().max(120),
+      usLabel: z.string().max(40),
+      themLabel: z.string().max(40),
+      rows: z.array(z.object({ label: z.string().max(80), us: z.boolean(), them: z.boolean() })).max(12),
+    }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("video"),
+    props: z.object({ url, caption: z.string().max(200) }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("logos"),
+    props: z.object({ title: z.string().max(120), logos: z.array(z.object({ imageUrl: url, alt: z.string().max(80) })).max(10) }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("stats"),
+    props: z.object({ items: z.array(z.object({ value: z.string().max(20), label: z.string().max(60) })).max(4) }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("benefits"),
+    props: z.object({
+      title: z.string().max(120),
+      columns: z.union([z.literal(2), z.literal(3)]),
+      items: z.array(z.object({ icon: iconKey, title: z.string().max(80), text: z.string().max(200) })).max(9),
+    }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("secure_badge"),
+    props: z.object({ text: z.string().max(120), subtext: z.string().max(160) }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("order_note"),
+    // Buyer's free text, copied into the Shopify order note
+    props: z.object({ title: z.string().max(120), placeholder: z.string().max(160) }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("support"),
+    props: z.object({
+      title: z.string().max(120),
+      text: z.string().max(300),
+      email: z.string().max(120),
+      phone: z.string().max(40),
+      whatsapp: z.string().max(40),
+    }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("spacer"),
+    props: z.object({ size: z.number().int().min(4).max(120), line: z.boolean() }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("button_link"),
+    props: z.object({ label: z.string().max(60), url, variant: z.enum(["solid", "outline"]) }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("coupon"),
+    props: z.object({ title: z.string().max(120), text: z.string().max(300), code: z.string().max(40) }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("social"),
+    props: z.object({
+      title: z.string().max(120),
+      instagram: url,
+      tiktok: url,
+      facebook: url,
+      youtube: url,
     }),
   }),
 ]);
@@ -202,6 +353,18 @@ export function isFixed(type: BlockType): boolean {
 /** Blocks that can be added from the palette, per page. */
 export const CHECKOUT_PALETTE: BlockType[] = [
   "order_addons",
+  "free_shipping_bar",
+  "delivery_estimate",
+  "order_note",
+  "secure_badge",
+  "reviews",
+  "benefits",
+  "comparison",
+  "stats",
+  "logos",
+  "video",
+  "support",
+  "spacer",
   "announcement",
   "text",
   "image",
@@ -217,6 +380,16 @@ export const CHECKOUT_PALETTE: BlockType[] = [
   "why_us",
 ];
 export const THANK_YOU_PALETTE: BlockType[] = [
+  "coupon",
+  "button_link",
+  "social",
+  "delivery_estimate",
+  "reviews",
+  "benefits",
+  "stats",
+  "video",
+  "support",
+  "spacer",
   "text",
   "image",
   "testimonial",
@@ -236,7 +409,7 @@ export const checkoutLayoutSchema = layoutSchema.refine(
   (l) => FIXED_CHECKOUT_BLOCKS.every((t) => l.blocks.filter((b) => b.type === t).length === 1),
   { message: "Contact, Livraison, Méthode de livraison et Paiement sont obligatoires" },
 );
-export const thankYouLayoutSchema = layoutSchema.refine((l) => l.blocks.every((b) => !isFixed(b.type)), {
+export const thankYouLayoutSchema = layoutSchema.refine((l) => l.blocks.every((b) => !isFixed(b.type) && b.type !== "order_note"), {
   message: "Les sections du checkout ne peuvent pas être sur la page de remerciement",
 });
 
@@ -282,9 +455,9 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
   },
   value_props: {
     items: [
-      { icon: "🚚", label: "Livraison offerte" },
-      { icon: "↩️", label: "Retours faciles" },
-      { icon: "🔒", label: "Paiement sécurisé" },
+      { icon: "truck", label: "Livraison offerte" },
+      { icon: "return", label: "Retours faciles" },
+      { icon: "lock", label: "Paiement sécurisé" },
     ],
   },
   payment_icons: { label: "Moyens de paiement acceptés", methods: ["visa", "mastercard", "amex", "applepay", "gpay"] },
@@ -299,6 +472,55 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
       { icon: "lock", title: "Paiement sécurisé", text: "Transactions chiffrées de bout en bout." },
     ],
   },
+  free_shipping_bar: {
+    message: "Plus que {amount} pour profiter de la livraison offerte",
+    success: "Bravo, la livraison est offerte !",
+    threshold: 0,
+  },
+  delivery_estimate: { label: "Livraison estimée", minDays: 3, maxDays: 5, businessDays: true, showTimeline: true },
+  reviews: {
+    title: "Ce que disent nos clients",
+    layout: "carousel",
+    items: [
+      { name: "Camille R.", text: "Commande reçue en 3 jours, qualité au top. Je recommande !", stars: 5, verified: true },
+      { name: "Yanis B.", text: "Service client réactif et produit conforme aux photos.", stars: 5, verified: true },
+    ],
+  },
+  comparison: {
+    title: "Pourquoi nous choisir",
+    usLabel: "Nous",
+    themLabel: "Les autres",
+    rows: [
+      { label: "Livraison offerte", us: true, them: false },
+      { label: "Satisfait ou remboursé 30 jours", us: true, them: false },
+      { label: "Service client 7j/7", us: true, them: true },
+    ],
+  },
+  video: { url: "", caption: "" },
+  logos: { title: "Ils parlent de nous", logos: [] },
+  stats: {
+    items: [
+      { value: "+10 000", label: "clients satisfaits" },
+      { value: "4,8/5", label: "note moyenne" },
+      { value: "48 h", label: "expédition" },
+    ],
+  },
+  benefits: {
+    title: "",
+    columns: 3,
+    items: [
+      { icon: "truck", title: "Livraison rapide", text: "Expédiée sous 48 h" },
+      { icon: "shield", title: "Garantie 30 jours", text: "Satisfait ou remboursé" },
+      { icon: "support", title: "Support 7j/7", text: "Une vraie équipe à l'écoute" },
+    ],
+  },
+  secure_badge: { text: "Paiement 100 % sécurisé", subtext: "Vos données sont chiffrées et ne sont jamais stockées." },
+  order_note: { title: "Une précision sur votre commande ?", placeholder: "Instructions de livraison, message cadeau…" },
+  support: { title: "Besoin d'aide ?", text: "Notre équipe vous répond en moins de 24 h.", email: "", phone: "", whatsapp: "" },
+  spacer: { size: 24, line: false },
+  button_link: { label: "Continuer mes achats", url: "", variant: "solid" },
+  coupon: { title: "Merci ! Voici un cadeau", text: "Profitez de -10 % sur votre prochaine commande.", code: "MERCI10" },
+  social: { title: "Suivez-nous", instagram: "", tiktok: "", facebook: "", youtube: "" },
 };
 
 export function createBlock<T extends BlockType>(type: T, overrides: Partial<Block> = {}): BlockOf<T> {
@@ -335,21 +557,68 @@ export function defaultTheme(storeName = ""): Theme {
 /* Safe loaders (DB JSON -> typed, never throws)                       */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Parses an object, dropping only the fields that fail instead of rejecting everything,
+ * so one outdated value never wipes a whole saved design.
+ */
+function lenientObject<T extends z.ZodTypeAny>(schema: T, raw: unknown): z.infer<T> | null {
+  let value: Record<string, unknown> = raw && typeof raw === "object" && !Array.isArray(raw) ? { ...(raw as Record<string, unknown>) } : {};
+  for (let i = 0; i < 20; i++) {
+    const parsed = schema.safeParse(value);
+    if (parsed.success) return parsed.data;
+    const bad = new Set(parsed.error.issues.map((issue) => issue.path[0]).filter((k): k is string => typeof k === "string"));
+    if (bad.size === 0) return null;
+    value = Object.fromEntries(Object.entries(value).filter(([k]) => !bad.has(k)));
+  }
+  return null;
+}
+
 export function loadTheme(raw: unknown, storeName = ""): Theme {
-  const parsed = themeSchema.safeParse(raw ?? {});
-  const theme = parsed.success ? parsed.data : defaultTheme(storeName);
+  const theme = lenientObject(themeSchema, raw) ?? defaultTheme(storeName);
   // Until a name is set in the builder, show the store's own name.
   return theme.storeName ? theme : { ...theme, storeName };
 }
 
+/** Keeps every valid block (repairing props/style when possible) and drops only broken ones. */
+function loadBlocks(raw: unknown): Block[] {
+  const list = raw && typeof raw === "object" && Array.isArray((raw as { blocks?: unknown }).blocks) ? (raw as { blocks: unknown[] }).blocks : [];
+  const blocks: Block[] = [];
+  for (const item of list.slice(0, 40)) {
+    const direct = blockSchema.safeParse(item);
+    if (direct.success) {
+      blocks.push(direct.data);
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const b = item as Record<string, unknown>;
+    const type = b.type as BlockType;
+    if (!(type in DEFAULT_PROPS)) continue;
+    const props = { ...structuredClone(DEFAULT_PROPS[type]), ...(typeof b.props === "object" && b.props ? b.props : {}) };
+    const repaired =
+      blockSchema.safeParse({ ...b, props }).data ??
+      blockSchema.safeParse({ ...b, props, style: undefined }).data ??
+      blockSchema.safeParse({ id: b.id ?? newBlockId(), type, hidden: b.hidden, placement: b.placement, position: b.position, props: DEFAULT_PROPS[type] }).data;
+    if (repaired) blocks.push(repaired);
+  }
+  return blocks;
+}
+
 export function loadCheckoutLayout(raw: unknown): Layout {
-  const parsed = checkoutLayoutSchema.safeParse(raw);
-  return parsed.success ? parsed.data : defaultCheckoutLayout();
+  if (raw == null) return defaultCheckoutLayout();
+  const blocks = loadBlocks(raw).filter((b, i, all) => !isFixed(b.type) || all.findIndex((x) => x.type === b.type) === i);
+  // Every fixed section must exist exactly once: re-add missing ones before "payment".
+  for (const type of FIXED_CHECKOUT_BLOCKS) {
+    if (!blocks.some((b) => b.type === type)) {
+      const pay = blocks.findIndex((b) => b.type === "payment");
+      blocks.splice(type === "payment" || pay < 0 ? blocks.length : pay, 0, createBlock(type));
+    }
+  }
+  return { blocks };
 }
 
 export function loadThankYouLayout(raw: unknown): Layout {
-  const parsed = thankYouLayoutSchema.safeParse(raw);
-  return parsed.success ? parsed.data : defaultThankYouLayout();
+  if (raw == null) return defaultThankYouLayout();
+  return { blocks: loadBlocks(raw).filter((b) => !isFixed(b.type) && b.type !== "order_addons" && b.type !== "order_note") };
 }
 
 /* ------------------------------------------------------------------ */

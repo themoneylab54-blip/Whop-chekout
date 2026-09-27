@@ -1,7 +1,8 @@
+import { Pencil, Plus, Truck } from "lucide-react";
 import { notFound } from "next/navigation";
 import { db } from "@/lib/db";
 import { centsToDecimal, formatMoney } from "@/lib/pricing";
-import { Badge, Card, Flash, Input, Label, PageHeader, SubmitButton } from "@/components/ui";
+import { Badge, Card, EmptyState, Flash, Input, Label, PageHeader, SubmitButton } from "@/components/ui";
 import { deleteRateAction, saveRateAction } from "../../../../actions";
 
 export default async function ShippingPage({
@@ -20,6 +21,8 @@ export default async function ShippingPage({
   return (
     <>
       <PageHeader
+        icon={Truck}
+        iconColor="#0ea5e9"
         title="Livraison"
         description="Les pays livrés et leurs tarifs. Le coût s'ajoute au montant encaissé par Whop et apparaît sur la commande Shopify."
       />
@@ -41,7 +44,9 @@ export default async function ShippingPage({
                 <span className="flex items-center gap-3">
                   {!r.active && <Badge>Inactif</Badge>}
                   <span className="font-semibold">{r.priceCents ? money(r.priceCents) : "Offert"}</span>
-                  <span className="text-sm text-zinc-400">Modifier</span>
+                  <span className="inline-flex items-center gap-1 text-sm text-zinc-400">
+                    <Pencil className="h-3.5 w-3.5" /> Modifier
+                  </span>
                 </span>
               </summary>
               <div className="mt-4 border-t border-zinc-100 pt-4">
@@ -56,11 +61,13 @@ export default async function ShippingPage({
           </Card>
         ))}
         {store.shippingRates.length === 0 && (
-          <p className="rounded-xl border border-dashed border-zinc-300 bg-white p-6 text-center text-sm text-zinc-500">
-            Aucun tarif pour l&apos;instant : ajoutez-en au moins un pour les produits physiques.
-          </p>
+          <div className="rounded-2xl bg-white shadow-[var(--shadow-card)]">
+            <EmptyState icon={Truck} title="Aucun tarif de livraison">
+              Ajoutez-en au moins un : sans tarif, le checkout ne peut pas livrer les produits physiques.
+            </EmptyState>
+          </div>
         )}
-        <Card title="Ajouter un tarif">
+        <Card icon={Plus} title="Ajouter un tarif">
           <RateForm storeId={store.id} />
         </Card>
       </div>

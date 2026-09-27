@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { Check, Copy } from "lucide-react";
 
 export function CopyButton({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
@@ -12,9 +13,10 @@ export function CopyButton({ value }: { value: string }) {
         setCopied(true);
         setTimeout(() => setCopied(false), 1500);
       }}
-      className="shrink-0 rounded-lg border border-zinc-300 bg-white px-3 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+      className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-white px-3 text-xs font-medium text-zinc-700 shadow-[var(--shadow-card)] transition hover:bg-zinc-50"
     >
-      {copied ? "Copié ✓" : "Copier"}
+      {copied ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />}
+      {copied ? "Copié" : "Copier"}
     </button>
   );
 }

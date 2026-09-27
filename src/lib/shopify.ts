@@ -239,6 +239,7 @@ export type PaidOrderInput = {
   currency: string;
   email: string;
   acceptsMarketing: boolean;
+  buyerNote?: string | null;
   shippingAddress: Address | null;
   lines: CartLine[];
   addOns: { title: string; priceCents: number; variantId: string | null }[];
@@ -318,7 +319,7 @@ export function buildOrderCreateInput(o: PaidOrderInput) {
     sourceName: "whop-checkout",
     sourceIdentifier: o.sessionId,
     tags: ["whop-checkout", ...(o.test ? ["test"] : [])],
-    note: `Payé via Whop — paiement ${o.whopPaymentId}`,
+    note: `${o.buyerNote ? `Note du client : ${o.buyerNote}\n\n` : ""}Payé via Whop — paiement ${o.whopPaymentId}`,
     customer: {
       toUpsert: {
         email: o.email,

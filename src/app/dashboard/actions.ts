@@ -150,7 +150,7 @@ export async function setEnabledAction(storeId: string, enabled: boolean) {
   await db.store.update({ where: { id: storeId }, data: { enabled } });
   revalidatePath(storePath(storeId), "layout");
   back(storePath(storeId), {
-    ok: enabled ? "Checkout Whop activé sur la boutique 🎉" : "Checkout Whop désactivé : la boutique utilise le checkout Shopify.",
+    ok: enabled ? "Checkout Whop activé sur la boutique" : "Checkout Whop désactivé : la boutique utilise le checkout Shopify.",
   });
 }
 
@@ -214,7 +214,7 @@ export async function reinstallScriptAction(storeId: string) {
   } catch (err) {
     back(storePath(storeId, "interception"), { error: errorMessage(err) });
   }
-  back(storePath(storeId, "interception"), { ok: "Script vérifié et installé sur la boutique ✓" });
+  back(storePath(storeId, "interception"), { ok: "Script vérifié et installé sur la boutique" });
 }
 
 /* ------------------------------------------------------------------ */
@@ -246,7 +246,7 @@ export async function connectWhopAction(storeId: string, fd: FormData) {
     },
   });
   revalidatePath(storePath(storeId), "layout");
-  back(path, { ok: `Compte Whop « ${result.accountName} » connecté. Produit et webhook créés automatiquement ✓` });
+  back(path, { ok: `Compte Whop « ${result.accountName} » connecté. Produit et webhook créés automatiquement.` });
 }
 
 export async function disconnectWhopAction(storeId: string) {
@@ -288,7 +288,7 @@ export async function setupApplePayAction(storeId: string, fd: FormData) {
   } catch (err) {
     back(path, { error: `Whop n'a pas pu enregistrer le domaine : ${errorMessage(err)}` });
   }
-  if (status === "verified") back(path, { ok: "Apple Pay est activé sur votre checkout ✓" });
+  if (status === "verified") back(path, { ok: "Apple Pay est activé sur votre checkout" });
   back(path, {
     error: "Domaine enregistré mais pas encore vérifié par Apple. Vérifiez le fichier collé, puis réessayez dans quelques minutes.",
   });
@@ -491,7 +491,7 @@ export async function resyncOrderAction(storeId: string, sessionId: string) {
   } catch (err) {
     back(path, { error: `Échec de la synchronisation : ${errorMessage(err)}` });
   }
-  back(path, { ok: "Commande synchronisée dans Shopify ✓" });
+  back(path, { ok: "Commande synchronisée dans Shopify" });
 }
 
 export async function refundOrderAction(storeId: string, sessionId: string, fd: FormData) {

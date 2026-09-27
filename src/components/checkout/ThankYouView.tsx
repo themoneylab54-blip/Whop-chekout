@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, type ReactNode } from "react";
+import { Check } from "lucide-react";
 import type { Layout, Theme } from "@/lib/layout";
 import { formatMoney, type CartLine } from "@/lib/pricing";
 import { ContentBlock, StyledBlock, type ContentContext } from "./blocks";
@@ -51,7 +52,17 @@ export function ThankYouView({ theme, layout, data: initial, sessionId, preview 
     return () => clearInterval(t);
   }, [sessionId, data.orderName]);
 
-  const ctx: ContentContext = { labels: L, lowestInventory: null, preview: !!preview };
+  const ctx: ContentContext = {
+    labels: L,
+    lang: theme.language,
+    lowestInventory: null,
+    preview: !!preview,
+    subtotalCents: data.subtotalCents - data.discountCents,
+    freeShippingThresholdCents: null,
+    money,
+    note: "",
+    setNote: () => {},
+  };
   const blocks = layout.blocks.filter((b) => !b.hidden);
   const render = (pos: "above" | "below") =>
     blocks
@@ -84,7 +95,7 @@ export function ThankYouView({ theme, layout, data: initial, sessionId, preview 
       <main className="mx-auto max-w-[640px] px-5 py-8">
         {render("above")}
         <div className="flex items-center gap-4 py-4">
-          <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full border-2 border-[var(--accent)] text-2xl text-[var(--accent)]">✓</span>
+          <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-[image:var(--accent-bg)] text-[var(--accent-fg)] shadow-[var(--btn-shadow)]"><Check className="h-6 w-6" strokeWidth={3} /></span>
           <div>
             {data.orderName && (
               <p className="text-sm text-neutral-500">

@@ -1,7 +1,9 @@
 "use client";
 
 import type { ReactNode } from "react";
-import type { Block, BlockOf, BlockStyle } from "@/lib/layout";
+import { ICON_KEYS, type Block, type BlockOf, type BlockStyle, type IconKey } from "@/lib/layout";
+import { X } from "lucide-react";
+import { BlockIcon, ICON_LABELS, isIconKey } from "@/components/icons";
 
 /* ------------------------------------------------------------------ */
 /* Small controlled inputs                                             */
@@ -93,6 +95,38 @@ export function ColorInput({ value, onChange, allowEmpty = true }: { value: stri
   );
 }
 
+/** Grid of Lucide icons (replaces the old emoji inputs). */
+export function IconPicker({ value, onChange }: { value: string; onChange: (v: IconKey) => void }) {
+  return (
+    <div className="grid grid-cols-10 gap-1">
+      {ICON_KEYS.map((k) => (
+        <button
+          key={k}
+          type="button"
+          title={ICON_LABELS[k]}
+          aria-label={ICON_LABELS[k]}
+          aria-pressed={value === k}
+          onClick={() => onChange(k)}
+          className={`flex aspect-square items-center justify-center rounded-md border transition ${
+            value === k ? "border-indigo-400 bg-indigo-50 text-indigo-600" : "border-zinc-200 bg-white text-zinc-500 hover:border-zinc-300 hover:text-zinc-800"
+          }`}
+        >
+          <BlockIcon value={k} size={14} />
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <label className="flex items-center gap-2 text-xs font-medium text-zinc-700">
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="h-3.5 w-3.5 accent-zinc-900" />
+      {label}
+    </label>
+  );
+}
+
 function ListEditor<T>({
   items,
   onChange,
@@ -119,7 +153,7 @@ function ListEditor<T>({
             onClick={() => onChange(items.filter((_, j) => j !== i))}
             className="absolute top-2 right-2 text-zinc-400 hover:text-red-600"
           >
-            ✕
+            <X className="h-3.5 w-3.5" />
           </button>
         </div>
       ))}
@@ -273,13 +307,13 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           items={block.props.items}
           max={8}
           addLabel="Ajouter un argument"
-          create={() => ({ icon: "⭐", label: "Argument" })}
+          create={() => ({ icon: "star", label: "Argument" })}
           onChange={(items) => props(block, { items })}
           render={(it, set) => (
-            <div className="flex gap-2">
-              <input className={`${input} w-14 text-center`} value={it.icon} maxLength={8} onChange={(e) => set({ ...it, icon: e.target.value })} />
+            <>
               <Text value={it.label} onChange={(label) => set({ ...it, label })} />
-            </div>
+              <IconPicker value={isIconKey(it.icon) ? it.icon : ""} onChange={(icon) => set({ ...it, icon })} />
+            </>
           )}
         />
       );
@@ -355,24 +389,275 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
             onChange={(rows) => props(block, { rows })}
             render={(r, set) => (
               <>
-                <Pick
-                  value={r.icon}
-                  options={[
-                    ["shield", "🛡️ Bouclier"],
-                    ["star", "⭐ Étoile"],
-                    ["truck", "🚚 Camion"],
-                    ["lock", "🔒 Cadenas"],
-                    ["heart", "❤️ Cœur"],
-                    ["check", "✅ Coche"],
-                    ["refresh", "🔄 Retour"],
-                  ]}
-                  onChange={(icon) => set({ ...r, icon })}
-                />
+                <IconPicker value={r.icon} onChange={(icon) => set({ ...r, icon })} />
                 <Text value={r.title} onChange={(title) => set({ ...r, title })} />
                 <Text value={r.text} onChange={(text) => set({ ...r, text })} />
               </>
             )}
           />
+        </div>
+      );
+    case "free_shipping_bar":
+      return (
+        <div className="space-y-3">
+          <F label="Message" hint="{amount} = montant restant">
+            <Text value={block.props.message} onChange={(message) => props(block, { message })} />
+          </F>
+          <F label="Message une fois atteint">
+            <Text value={block.props.success} onChange={(success) => props(block, { success })} />
+          </F>
+          <F label="Seuil (€)" hint="0 = le seuil « Offert dès » de vos tarifs de livraison">
+            <Num value={block.props.threshold} min={0} max={100000} onChange={(threshold) => props(block, { threshold })} />
+          </F>
+        </div>
+      );
+    case "delivery_estimate":
+      return (
+        <div className="space-y-3">
+          <F label="Libellé">
+            <Text value={block.props.label} onChange={(label) => props(block, { label })} />
+          </F>
+          <div className="grid grid-cols-2 gap-3">
+            <F label="Délai min (jours)">
+              <Num value={block.props.minDays} min={0} max={60} onChange={(minDays) => props(block, { minDays })} />
+            </F>
+            <F label="Délai max (jours)">
+              <Num value={block.props.maxDays} min={0} max={90} onChange={(maxDays) => props(block, { maxDays })} />
+            </F>
+          </div>
+          <Toggle label="Jours ouvrés uniquement (hors week-end)" checked={block.props.businessDays} onChange={(businessDays) => props(block, { businessDays })} />
+          <Toggle label="Afficher la frise Commande → Livraison" checked={block.props.showTimeline} onChange={(showTimeline) => props(block, { showTimeline })} />
+        </div>
+      );
+    case "reviews":
+      return (
+        <div className="space-y-3">
+          <F label="Titre">
+            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+          </F>
+          <F label="Affichage">
+            <Segmented value={block.props.layout} options={[["carousel", "Carrousel"], ["stack", "Liste"]]} onChange={(layout) => props(block, { layout })} />
+          </F>
+          <p className="text-[11px] text-zinc-500">Utilisez de vrais avis clients : les faux avis sont interdits (directive Omnibus).</p>
+          <ListEditor
+            items={block.props.items}
+            max={20}
+            addLabel="Ajouter un avis"
+            create={() => ({ name: "Prénom N.", text: "Votre avis…", stars: 5, verified: true })}
+            onChange={(items) => props(block, { items })}
+            render={(r, set) => (
+              <>
+                <Text value={r.name} onChange={(name) => set({ ...r, name })} />
+                <Area value={r.text} rows={2} onChange={(text) => set({ ...r, text })} />
+                <div className="flex items-center gap-3">
+                  <div className="w-20">
+                    <Num value={r.stars} min={1} max={5} onChange={(stars) => set({ ...r, stars })} />
+                  </div>
+                  <Toggle label="Achat vérifié" checked={r.verified} onChange={(verified) => set({ ...r, verified })} />
+                </div>
+              </>
+            )}
+          />
+        </div>
+      );
+    case "comparison":
+      return (
+        <div className="space-y-3">
+          <F label="Titre">
+            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+          </F>
+          <div className="grid grid-cols-2 gap-3">
+            <F label="Colonne « nous »">
+              <Text value={block.props.usLabel} onChange={(usLabel) => props(block, { usLabel })} />
+            </F>
+            <F label="Colonne « eux »">
+              <Text value={block.props.themLabel} onChange={(themLabel) => props(block, { themLabel })} />
+            </F>
+          </div>
+          <ListEditor
+            items={block.props.rows}
+            max={12}
+            addLabel="Ajouter une ligne"
+            create={() => ({ label: "Critère", us: true, them: false })}
+            onChange={(rows) => props(block, { rows })}
+            render={(r, set) => (
+              <>
+                <Text value={r.label} onChange={(label) => set({ ...r, label })} />
+                <div className="flex gap-4">
+                  <Toggle label={block.props.usLabel || "Nous"} checked={r.us} onChange={(us) => set({ ...r, us })} />
+                  <Toggle label={block.props.themLabel || "Eux"} checked={r.them} onChange={(them) => set({ ...r, them })} />
+                </div>
+              </>
+            )}
+          />
+        </div>
+      );
+    case "video":
+      return (
+        <div className="space-y-3">
+          <F label="Lien de la vidéo" hint="YouTube, Vimeo ou fichier .mp4">
+            <Text value={block.props.url} placeholder="https://youtube.com/watch?v=…" onChange={(url) => props(block, { url })} />
+          </F>
+          <F label="Légende (facultatif)">
+            <Text value={block.props.caption} onChange={(caption) => props(block, { caption })} />
+          </F>
+        </div>
+      );
+    case "logos":
+      return (
+        <div className="space-y-3">
+          <F label="Titre">
+            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+          </F>
+          <ListEditor
+            items={block.props.logos}
+            max={10}
+            addLabel="Ajouter un logo"
+            create={() => ({ imageUrl: "", alt: "" })}
+            onChange={(logos) => props(block, { logos })}
+            render={(l, set) => (
+              <>
+                <Text value={l.imageUrl} placeholder="URL du logo (PNG/SVG)" onChange={(imageUrl) => set({ ...l, imageUrl })} />
+                <Text value={l.alt} placeholder="Nom du média" onChange={(alt) => set({ ...l, alt })} />
+              </>
+            )}
+          />
+        </div>
+      );
+    case "stats":
+      return (
+        <ListEditor
+          items={block.props.items}
+          max={4}
+          addLabel="Ajouter un chiffre"
+          create={() => ({ value: "100 %", label: "Libellé" })}
+          onChange={(items) => props(block, { items })}
+          render={(it, set) => (
+            <div className="grid grid-cols-[90px_1fr] gap-2">
+              <Text value={it.value} onChange={(value) => set({ ...it, value })} />
+              <Text value={it.label} onChange={(label) => set({ ...it, label })} />
+            </div>
+          )}
+        />
+      );
+    case "benefits":
+      return (
+        <div className="space-y-3">
+          <F label="Titre (facultatif)">
+            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+          </F>
+          <F label="Colonnes">
+            <Segmented value={String(block.props.columns) as "2" | "3"} options={[["2", "2"], ["3", "3"]]} onChange={(c) => props(block, { columns: c === "2" ? 2 : 3 })} />
+          </F>
+          <ListEditor
+            items={block.props.items}
+            max={9}
+            addLabel="Ajouter un avantage"
+            create={() => ({ icon: "sparkles" as const, title: "Avantage", text: "" })}
+            onChange={(items) => props(block, { items })}
+            render={(it, set) => (
+              <>
+                <Text value={it.title} onChange={(title) => set({ ...it, title })} />
+                <Text value={it.text} placeholder="Sous-texte (facultatif)" onChange={(text) => set({ ...it, text })} />
+                <IconPicker value={it.icon} onChange={(icon) => set({ ...it, icon })} />
+              </>
+            )}
+          />
+        </div>
+      );
+    case "secure_badge":
+      return (
+        <div className="space-y-3">
+          <F label="Texte">
+            <Text value={block.props.text} onChange={(text) => props(block, { text })} />
+          </F>
+          <F label="Sous-texte">
+            <Text value={block.props.subtext} onChange={(subtext) => props(block, { subtext })} />
+          </F>
+        </div>
+      );
+    case "order_note":
+      return (
+        <div className="space-y-3">
+          <F label="Titre">
+            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+          </F>
+          <F label="Texte d'exemple">
+            <Text value={block.props.placeholder} onChange={(placeholder) => props(block, { placeholder })} />
+          </F>
+          <p className="text-[11px] text-zinc-500">La note du client est ajoutée à la commande Shopify.</p>
+        </div>
+      );
+    case "support":
+      return (
+        <div className="space-y-3">
+          <F label="Titre">
+            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+          </F>
+          <F label="Texte">
+            <Text value={block.props.text} onChange={(text) => props(block, { text })} />
+          </F>
+          <F label="E-mail">
+            <Text value={block.props.email} placeholder="support@maboutique.fr" onChange={(email) => props(block, { email })} />
+          </F>
+          <div className="grid grid-cols-2 gap-3">
+            <F label="Téléphone">
+              <Text value={block.props.phone} placeholder="01 23 45 67 89" onChange={(phone) => props(block, { phone })} />
+            </F>
+            <F label="WhatsApp">
+              <Text value={block.props.whatsapp} placeholder="+33 6 12 34 56 78" onChange={(whatsapp) => props(block, { whatsapp })} />
+            </F>
+          </div>
+        </div>
+      );
+    case "spacer":
+      return (
+        <div className="space-y-3">
+          <F label={`Hauteur : ${block.props.size}px`}>
+            <input type="range" min={4} max={120} value={block.props.size} onChange={(e) => props(block, { size: Number(e.target.value) })} className="w-full accent-zinc-900" />
+          </F>
+          <Toggle label="Afficher une ligne" checked={block.props.line} onChange={(line) => props(block, { line })} />
+        </div>
+      );
+    case "button_link":
+      return (
+        <div className="space-y-3">
+          <F label="Texte du bouton">
+            <Text value={block.props.label} onChange={(label) => props(block, { label })} />
+          </F>
+          <F label="Lien">
+            <Text value={block.props.url} placeholder="https://…" onChange={(url) => props(block, { url })} />
+          </F>
+          <F label="Style">
+            <Segmented value={block.props.variant} options={[["solid", "Plein"], ["outline", "Contour"]]} onChange={(variant) => props(block, { variant })} />
+          </F>
+        </div>
+      );
+    case "coupon":
+      return (
+        <div className="space-y-3">
+          <F label="Titre">
+            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+          </F>
+          <F label="Texte">
+            <Area value={block.props.text} rows={2} onChange={(text) => props(block, { text })} />
+          </F>
+          <F label="Code" hint="Créez-le aussi dans Promos & options pour qu'il fonctionne.">
+            <Text value={block.props.code} onChange={(code) => props(block, { code: code.toUpperCase() })} />
+          </F>
+        </div>
+      );
+    case "social":
+      return (
+        <div className="space-y-3">
+          <F label="Titre">
+            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+          </F>
+          {(["instagram", "tiktok", "facebook", "youtube"] as const).map((k) => (
+            <F key={k} label={k[0].toUpperCase() + k.slice(1)}>
+              <Text value={block.props[k]} placeholder="https://…" onChange={(v) => props(block, { [k]: v })} />
+            </F>
+          ))}
         </div>
       );
   }

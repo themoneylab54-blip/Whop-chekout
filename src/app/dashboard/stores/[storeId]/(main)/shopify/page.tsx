@@ -1,8 +1,9 @@
+import { AlertTriangle, ArrowRight, Blocks, CheckCircle2, PlugZap, ShoppingBag } from "lucide-react";
 import { notFound } from "next/navigation";
 import { db } from "@/lib/db";
 import { env } from "@/lib/env";
 import { SHOPIFY_SCOPES, oauthCallbackUrl } from "@/lib/shopify";
-import { Badge, Card, CopyField, Flash, Input, Label, PageHeader, SubmitButton } from "@/components/ui";
+import { Badge, Card, CopyField, Flash, Input, Label, PageHeader, SubmitButton, buttonClass } from "@/components/ui";
 import { disconnectShopifyAction, startShopifyInstallAction } from "../../../../actions";
 
 export default async function ShopifyPage({
@@ -21,8 +22,8 @@ export default async function ShopifyPage({
 
   return (
     <>
-      <PageHeader title="Shopify" description="Votre boutique, où les commandes payées sont créées automatiquement." />
-      <Flash ok={sp.connected ? "Boutique connectée et script installé automatiquement ✓" : sp.ok} error={sp.error} />
+      <PageHeader icon={ShoppingBag} iconColor="#16a34a" title="Shopify" description="Votre boutique, où les commandes payées sont créées automatiquement." />
+      <Flash ok={sp.connected ? "Boutique connectée et script installé automatiquement." : sp.ok} error={sp.error} />
 
       {connected && (
         <Card
@@ -31,13 +32,25 @@ export default async function ShopifyPage({
           actions={<Badge color="green">Connectée</Badge>}
           className="mb-6"
         >
-          <ul className="mb-5 space-y-1.5 text-sm">
-            <li>✓ Autorisations : <span className="font-mono text-xs text-zinc-600">{store.shopifyScopes}</span></li>
-            <li>{store.scriptTagId ? "✓ Script d'interception installé sur la boutique" : "⚠️ Script non installé — voir l'onglet Interception"}</li>
-            {store.storefrontHost && <li>✓ Domaine de la vitrine : {store.storefrontHost}</li>}
+          <ul className="mb-5 space-y-2 text-sm">
+            <li className="flex items-start gap-2">
+              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />
+              <span>
+                Autorisations : <span className="font-mono text-xs text-zinc-600">{store.shopifyScopes}</span>
+              </span>
+            </li>
+            <li className="flex items-start gap-2">
+              {store.scriptTagId ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" /> : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />}
+              {store.scriptTagId ? "Script d'interception installé sur la boutique" : "Script non installé — voir l'onglet Interception"}
+            </li>
+            {store.storefrontHost && (
+              <li className="flex items-start gap-2">
+                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" /> Domaine de la vitrine : {store.storefrontHost}
+              </li>
+            )}
           </ul>
           <div className="flex flex-wrap gap-2">
-            <a href="?edit=1" className="inline-flex items-center rounded-lg border border-zinc-300 bg-white px-4 py-2 text-sm font-medium hover:bg-zinc-50">
+            <a href="?edit=1" className={buttonClass("secondary")}>
               Mettre à jour la connexion / changer de domaine
             </a>
             <form action={disconnectShopifyAction.bind(null, store.id)}>
@@ -51,7 +64,7 @@ export default async function ShopifyPage({
 
       {showForm && (
         <div className="grid gap-6 lg:grid-cols-2">
-          <Card title="1. Créez l'app dans Shopify" description="Une seule fois par boutique, environ 3 minutes.">
+          <Card icon={Blocks} title="1. Créez l'app dans Shopify" description="Une seule fois par boutique, environ 3 minutes.">
             <ol className="mb-5 list-decimal space-y-2 pl-5 text-sm text-zinc-700">
               <li>
                 Ouvrez le{" "}
@@ -77,7 +90,7 @@ export default async function ShopifyPage({
             </div>
           </Card>
 
-          <Card title="2. Connectez la boutique" description="On redirige vers Shopify pour approuver l'installation, puis tout est automatique.">
+          <Card icon={PlugZap} title="2. Connectez la boutique" description="On redirige vers Shopify pour approuver l'installation, puis tout est automatique.">
             <form action={startShopifyInstallAction.bind(null, store.id)} className="space-y-4">
               <div>
                 <Label htmlFor="shopDomain" hint="L'adresse en .myshopify.com (Paramètres → Domaines)">
@@ -102,7 +115,9 @@ export default async function ShopifyPage({
                   placeholder={store.shopifyClientSecret ? "••••••••••••" : ""}
                 />
               </div>
-              <SubmitButton className="w-full">Enregistrer et installer sur Shopify →</SubmitButton>
+              <SubmitButton className="w-full">
+                Enregistrer et installer sur Shopify <ArrowRight className="h-4 w-4" />
+              </SubmitButton>
               <p className="text-xs text-zinc-500">
                 Le secret est chiffré (AES-256) avant d&apos;être enregistré. Après approbation, le script d&apos;interception est installé
                 automatiquement : aucune modification du thème n&apos;est nécessaire.

@@ -43,6 +43,7 @@ export const paySchema = quoteSchema.extend({
   email: z.string().trim().email().max(200),
   acceptsMarketing: z.boolean().default(false),
   address: addressSchema,
+  note: z.string().trim().max(1000).nullable().optional(),
 });
 export type PayInput = z.infer<typeof paySchema>;
 
@@ -184,6 +185,7 @@ export async function confirmSession(session: SessionWithStore, input: PayInput)
       email: input.email,
       acceptsMarketing: input.acceptsMarketing,
       shippingAddress: input.address as Prisma.InputJsonValue,
+      note: input.note || null,
     },
   });
   return { ready: true as const, checkoutConfigurationId: session.whopCheckoutId, totals: quote.totals };
@@ -293,6 +295,7 @@ export async function syncOrder(sessionId: string) {
       currency: session.currency,
       email: session.email ?? "",
       acceptsMarketing: session.acceptsMarketing,
+      buyerNote: session.note,
       shippingAddress: session.shippingAddress as Address | null,
       lines: session.lines as unknown as CartLine[],
       addOns: addOns.map((a) => ({ title: a.title, priceCents: a.priceCents, variantId: a.variantId })),

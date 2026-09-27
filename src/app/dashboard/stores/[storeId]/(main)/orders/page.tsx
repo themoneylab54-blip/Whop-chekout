@@ -1,10 +1,11 @@
+import { ExternalLink, Receipt } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import type { SessionStatus } from "@prisma/client";
 import { db } from "@/lib/db";
 import { centsToDecimal, formatMoney } from "@/lib/pricing";
 import { orderAdminUrl } from "@/lib/shopify";
-import { Badge, Card, Flash, Input, PageHeader, SubmitButton } from "@/components/ui";
+import { Badge, Card, EmptyState, Flash, Input, PageHeader, SubmitButton } from "@/components/ui";
 import { refundOrderAction, resyncOrderAction } from "../../../../actions";
 
 const FILTERS: { key: string; label: string; status?: SessionStatus[] }[] = [
@@ -34,14 +35,14 @@ export default async function OrdersPage({
 
   return (
     <>
-      <PageHeader title="Commandes" description="Chaque checkout passé par votre page Whop, et son statut de synchronisation dans Shopify." />
+      <PageHeader icon={Receipt} title="Commandes" description="Chaque checkout passé par votre page Whop, et son statut de synchronisation dans Shopify." />
       <Flash ok={sp.ok} error={sp.error} />
       <div className="mb-4 flex gap-1">
         {FILTERS.map((f) => (
           <Link
             key={f.key}
             href={`?filter=${f.key}`}
-            className={`rounded-lg px-3 py-1.5 text-sm ${f.key === filter.key ? "bg-zinc-900 text-white" : "text-zinc-600 hover:bg-zinc-100"}`}
+            className={`rounded-lg px-3 py-1.5 text-sm transition ${f.key === filter.key ? "bg-zinc-900 font-medium text-white shadow-sm" : "text-zinc-600 hover:bg-white hover:shadow-[var(--shadow-card)]"}`}
           >
             {f.label}
           </Link>
@@ -50,10 +51,12 @@ export default async function OrdersPage({
 
       <Card className="overflow-x-auto p-0">
         {sessions.length === 0 ? (
-          <p className="p-8 text-center text-sm text-zinc-500">Aucune commande pour l&apos;instant. Elles apparaissent ici dès qu&apos;un client passe par votre checkout.</p>
+          <EmptyState icon={Receipt} title="Aucune commande pour l'instant">
+            Elles apparaissent ici dès qu&apos;un client passe par votre checkout.
+          </EmptyState>
         ) : (
           <table className="w-full text-left text-sm">
-            <thead className="border-b border-zinc-200 bg-zinc-50 text-xs text-zinc-500">
+            <thead className="border-b border-zinc-100 bg-zinc-50/70 text-[11px] tracking-wide text-zinc-500 uppercase">
               <tr>
                 <th className="px-4 py-2.5 font-medium">Date</th>
                 <th className="px-4 py-2.5 font-medium">Client</th>
@@ -65,7 +68,7 @@ export default async function OrdersPage({
             </thead>
             <tbody className="divide-y divide-zinc-100">
               {sessions.map((s) => (
-                <tr key={s.id} className="align-top">
+                <tr key={s.id} className="align-top transition hover:bg-zinc-50/60">
                   <td className="px-4 py-3 whitespace-nowrap text-zinc-600">
                     {(s.paidAt ?? s.createdAt).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })}
                   </td>
@@ -80,7 +83,7 @@ export default async function OrdersPage({
                   <td className="px-4 py-3">
                     {s.shopifyOrderId && store.shopDomain ? (
                       <a href={orderAdminUrl(store.shopDomain, s.shopifyOrderId)} target="_blank" rel="noreferrer" className="font-medium underline">
-                        {s.shopifyOrderName} ↗
+                        {s.shopifyOrderName} <ExternalLink className="inline h-3 w-3" />
                       </a>
                     ) : s.status === "PAID" ? (
                       <div className="max-w-xs space-y-1.5">

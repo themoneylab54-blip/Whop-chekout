@@ -148,6 +148,8 @@ model CheckoutSession {
   // Customer
   email           String?
   acceptsMarketing Boolean @default(false)
+  // Buyer's note from the "order_note" block, copied to the Shopify order
+  note             String?
   shippingAddress Json?
 
   // Attribution

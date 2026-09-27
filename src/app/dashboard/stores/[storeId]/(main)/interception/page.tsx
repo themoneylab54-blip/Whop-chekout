@@ -1,8 +1,9 @@
+import { Code2, Crosshair, ExternalLink, LifeBuoy, MousePointerClick, ScanEye } from "lucide-react";
 import { notFound } from "next/navigation";
 import { db } from "@/lib/db";
 import { loadInterception } from "@/lib/layout";
 import { loaderUrl } from "@/lib/shopify";
-import { Badge, Card, CopyField, Flash, Label, PageHeader, SubmitButton, Textarea, Toggle } from "@/components/ui";
+import { Badge, Card, CopyField, Flash, Label, PageHeader, SubmitButton, Textarea, Toggle, buttonClass } from "@/components/ui";
 import { reinstallScriptAction, saveInterceptionAction } from "../../../../actions";
 
 export default async function InterceptionPage({
@@ -22,13 +23,14 @@ export default async function InterceptionPage({
   return (
     <>
       <PageHeader
+        icon={Crosshair}
         title="Interception"
         description="Choisissez quels boutons de la boutique ouvrent votre checkout Whop. Tout est automatique : aucune modification du thème."
       />
       <Flash ok={sp.ok} error={sp.error} />
 
       <div className="grid gap-6 lg:grid-cols-[1.3fr_1fr]">
-        <Card title="Boutons interceptés" description="Les changements sont actifs sur la boutique en quelques secondes.">
+        <Card icon={MousePointerClick} title="Boutons interceptés" description="Les changements sont actifs sur la boutique en quelques secondes.">
           <form action={saveInterceptionAction.bind(null, store.id)}>
             <div className="divide-y divide-zinc-100">
               <Toggle name="cartCheckout" defaultChecked={i.cartCheckout} label="Bouton « Paiement » de la page panier" hint="Le bouton Checkout de /cart." />
@@ -60,7 +62,7 @@ export default async function InterceptionPage({
         </Card>
 
         <div className="space-y-6">
-          <Card title="Script sur la boutique" actions={<Badge color={store.scriptTagId ? "green" : "amber"}>{store.scriptTagId ? "Installé" : "Non installé"}</Badge>}>
+          <Card icon={Code2} iconColor="#0ea5e9" title="Script sur la boutique" actions={<Badge color={store.scriptTagId ? "green" : "amber"}>{store.scriptTagId ? "Installé" : "Non installé"}</Badge>}>
             <p className="mb-4 text-sm text-zinc-600">
               Le script est injecté automatiquement via l&apos;API Shopify à la connexion. S&apos;il a été supprimé, réinstallez-le en un clic.
             </p>
@@ -71,7 +73,7 @@ export default async function InterceptionPage({
             </form>
           </Card>
 
-          <Card title="Tester l'interception">
+          <Card icon={ScanEye} iconColor="#10b981" title="Tester l'interception">
             <p className="mb-4 text-sm text-zinc-600">
               Ouvre la boutique en mode test : les boutons détectés sont entourés en vert et un badge confirme que l&apos;interception est active.
             </p>
@@ -80,16 +82,16 @@ export default async function InterceptionPage({
                 href={`${shopUrl}/?whopco_debug=1`}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex items-center rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-800"
+                className={buttonClass("primary")}
               >
-                Ouvrir la boutique en mode test ↗
+                Ouvrir la boutique en mode test <ExternalLink className="h-4 w-4" />
               </a>
             ) : (
               <p className="text-sm text-zinc-500">Connectez d&apos;abord Shopify.</p>
             )}
           </Card>
 
-          <Card title="Plan B : installation manuelle" description="Seulement si votre thème bloque le script automatique.">
+          <Card icon={LifeBuoy} iconColor="#71717a" title="Plan B : installation manuelle" description="Seulement si votre thème bloque le script automatique.">
             <p className="mb-3 text-sm text-zinc-600">
               Shopify → Boutique en ligne → Thèmes → Modifier le code → <code>theme.liquid</code>, collez cette ligne juste avant{" "}
               <code>&lt;/head&gt;</code> :

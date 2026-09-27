@@ -1,3 +1,4 @@
+import { Settings, Store, Trash2 } from "lucide-react";
 import { notFound } from "next/navigation";
 import { db } from "@/lib/db";
 import { Card, Flash, Input, Label, PageHeader, SubmitButton, Toggle } from "@/components/ui";
@@ -17,10 +18,10 @@ export default async function SettingsPage({
 
   return (
     <>
-      <PageHeader title="Réglages" />
+      <PageHeader icon={Settings} iconColor="#71717a" title="Réglages" />
       <Flash ok={sp.ok} error={sp.error} />
       <div className="max-w-2xl space-y-6">
-        <Card title="Boutique">
+        <Card icon={Store} title="Boutique">
           <form action={saveSettingsAction.bind(null, store.id)} className="space-y-4">
             <div>
               <Label htmlFor="name">Nom interne</Label>
@@ -38,7 +39,7 @@ export default async function SettingsPage({
           </form>
         </Card>
 
-        <Card title="Supprimer la boutique" description="Retire le script de la boutique Shopify, supprime le webhook Whop et efface toutes les données (commandes comprises) de cet outil.">
+        <Card icon={Trash2} iconColor="#dc2626" title="Supprimer la boutique" description="Retire le script de la boutique Shopify, supprime le webhook Whop et efface toutes les données (commandes comprises) de cet outil.">
           <form action={deleteStoreAction.bind(null, store.id)}>
             <SubmitButton variant="danger" confirm={`Supprimer définitivement « ${store.name} » et toutes ses données ?`}>
               Supprimer définitivement {store.name}

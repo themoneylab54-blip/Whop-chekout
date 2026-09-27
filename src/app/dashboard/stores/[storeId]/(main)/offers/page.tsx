@@ -1,3 +1,4 @@
+import { PackagePlus, Percent, Plus, Ticket, Trash2 } from "lucide-react";
 import { notFound } from "next/navigation";
 import { db } from "@/lib/db";
 import { formatMoney } from "@/lib/pricing";
@@ -29,12 +30,12 @@ export default async function OffersPage({
 
   return (
     <>
-      <PageHeader title="Promos & options" description="Codes promo et options à ajouter en un clic au checkout pour augmenter le panier moyen." />
+      <PageHeader icon={Percent} iconColor="#ec4899" title="Promos & options" description="Codes promo et options à ajouter en un clic au checkout pour augmenter le panier moyen." />
       <Flash ok={sp.ok} error={sp.error} />
 
       <div className="grid gap-6 lg:grid-cols-2">
         <div className="space-y-6">
-          <Card title="Codes promo">
+          <Card icon={Ticket} iconColor="#ec4899" title="Codes promo">
             {store.discounts.length === 0 ? (
               <p className="text-sm text-zinc-500">Aucun code. Le champ « Code promo » n&apos;apparaît au checkout que s&apos;il existe au moins un code actif.</p>
             ) : (
@@ -58,8 +59,8 @@ export default async function OffersPage({
                         </SubmitButton>
                       </form>
                       <form action={deleteDiscountAction.bind(null, store.id, d.id)}>
-                        <SubmitButton variant="danger" size="sm">
-                          ✕
+                        <SubmitButton variant="danger" size="sm" aria-label="Supprimer">
+                          <Trash2 className="h-3.5 w-3.5" />
                         </SubmitButton>
                       </form>
                     </span>
@@ -68,7 +69,7 @@ export default async function OffersPage({
               </ul>
             )}
           </Card>
-          <Card title="Nouveau code promo">
+          <Card icon={Plus} title="Nouveau code promo">
             <form action={createDiscountAction.bind(null, store.id)} className="grid gap-4 sm:grid-cols-2">
               <div>
                 <Label>Code</Label>
@@ -106,7 +107,7 @@ export default async function OffersPage({
         </div>
 
         <div className="space-y-6">
-          <Card title="Options au checkout (order bumps)" description="Affichées par le bloc « Options » du builder, une case à cocher chacune.">
+          <Card icon={PackagePlus} iconColor="#8b5cf6" title="Options au checkout (order bumps)" description="Affichées par le bloc « Options » du builder, une case à cocher chacune.">
             {store.addOns.length === 0 ? (
               <p className="text-sm text-zinc-500">Aucune option. Exemples : emballage cadeau, livraison prioritaire, garantie étendue, 2ᵉ produit à prix réduit.</p>
             ) : (
@@ -128,8 +129,8 @@ export default async function OffersPage({
                         </SubmitButton>
                       </form>
                       <form action={deleteAddOnAction.bind(null, store.id, a.id)}>
-                        <SubmitButton variant="danger" size="sm">
-                          ✕
+                        <SubmitButton variant="danger" size="sm" aria-label="Supprimer">
+                          <Trash2 className="h-3.5 w-3.5" />
                         </SubmitButton>
                       </form>
                     </span>
@@ -138,7 +139,7 @@ export default async function OffersPage({
               </ul>
             )}
           </Card>
-          <Card title="Nouvelle option">
+          <Card icon={Plus} title="Nouvelle option">
             <form action={createAddOnAction.bind(null, store.id)} className="grid gap-4 sm:grid-cols-2">
               <div className="sm:col-span-2">
                 <Label>Titre</Label>
