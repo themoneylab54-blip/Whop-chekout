@@ -1,11 +1,12 @@
 import type { ReactNode } from "react";
-import { CreditCard, Paintbrush, ShieldCheck, ShoppingBag, Zap } from "lucide-react";
+import { Paintbrush, ShoppingBag, Zap } from "lucide-react";
+import { ShopifyLogo, WhopLogo } from "@/components/brands";
 
 const POINTS = [
   { icon: Zap, title: "Checkout en une page", text: "Apple Pay, Google Pay, PayPal et carte, sans friction." },
-  { icon: CreditCard, title: "Encaissé sur ton Whop", text: "Tes fonds, ton compte, payouts rapides." },
+  { icon: WhopLogo, title: "Encaissé sur ton Whop", text: "Tes fonds, ton compte, payouts rapides." },
   { icon: Paintbrush, title: "Design sans code", text: "30+ blocs de conversion, aperçu en direct." },
-  { icon: ShieldCheck, title: "Commandes dans Shopify", text: "Créées automatiquement, stock à jour." },
+  { icon: ShopifyLogo, title: "Commandes dans Shopify", text: "Créées automatiquement, stock à jour." },
 ];
 
 /** Split-screen shell for login / setup / onboarding screens. */

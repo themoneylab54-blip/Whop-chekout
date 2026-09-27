@@ -3,14 +3,15 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import { CreditCard, Crosshair, LayoutDashboard, Paintbrush, PartyPopper, Percent, Receipt, Settings, ShoppingBag, Truck } from "lucide-react";
+import { Crosshair, LayoutDashboard, Paintbrush, PartyPopper, Percent, Receipt, Settings, Truck } from "lucide-react";
+import { ShopifyLogo, WhopLogo } from "@/components/brands";
 
 // Server components can't pass component functions to this client component: they pass a name.
 const NAV_ICONS = {
   overview: LayoutDashboard,
   orders: Receipt,
-  shopify: ShoppingBag,
-  whop: CreditCard,
+  shopify: ShopifyLogo,
+  whop: WhopLogo,
   interception: Crosshair,
   design: Paintbrush,
   thankyou: PartyPopper,
@@ -33,7 +34,12 @@ export function NavLink({ href, exact, icon, children, badge }: { href: string; 
       }`}
     >
       {active && <span className="absolute top-1/2 -left-3 h-4 w-1 -translate-y-1/2 rounded-r-full bg-indigo-500" />}
-      <Icon className={`h-4 w-4 shrink-0 ${active ? "text-indigo-600" : "text-zinc-400 group-hover:text-zinc-600"}`} strokeWidth={2} />
+      {icon === "shopify" || icon === "whop" ? (
+        // Real brand marks, in color: they read instantly in the sidebar.
+        <Icon className={`h-4 w-4 shrink-0 transition ${active ? "" : "opacity-80 grayscale-[35%] group-hover:opacity-100 group-hover:grayscale-0"}`} />
+      ) : (
+        <Icon className={`h-4 w-4 shrink-0 ${active ? "text-indigo-600" : "text-zinc-400 group-hover:text-zinc-600"}`} strokeWidth={2} />
+      )}
       <span className="flex-1 truncate">{children}</span>
       {badge}
     </Link>

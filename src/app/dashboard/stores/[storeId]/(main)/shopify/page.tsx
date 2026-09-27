@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowRight, Blocks, CheckCircle2, PlugZap, ShoppingBag } from "lucide-react";
+import { AlertTriangle, ArrowRight, Blocks, CheckCircle2 } from "lucide-react";
 import { notFound } from "next/navigation";
 import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
@@ -24,7 +24,7 @@ export default async function ShopifyPage({
 
   return (
     <>
-      <PageHeader icon={ShoppingBag} iconColor="#16a34a" title="Shopify" description="Votre boutique, où les commandes payées sont créées automatiquement." />
+      <PageHeader brand="shopify" title="Shopify" description="Votre boutique, où les commandes payées sont créées automatiquement." />
       <Flash ok={sp.connected ? "Boutique connectée et script installé automatiquement." : sp.ok} error={sp.error} />
 
       {connected && (
@@ -92,7 +92,7 @@ export default async function ShopifyPage({
             </div>
           </Card>
 
-          <Card icon={PlugZap} title="2. Connectez la boutique" description="On redirige vers Shopify pour approuver l'installation, puis tout est automatique.">
+          <Card brand="shopify" title="2. Connectez la boutique" description="On redirige vers Shopify pour approuver l'installation, puis tout est automatique.">
             <form action={startShopifyInstallAction.bind(null, store.id)} className="space-y-4">
               <div>
                 <Label htmlFor="shopDomain" hint="L'adresse en .myshopify.com (Paramètres → Domaines)">

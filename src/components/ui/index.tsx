@@ -1,6 +1,7 @@
 import type { ComponentProps, ReactNode } from "react";
 import { AlertCircle, CheckCircle2, type LucideIcon } from "lucide-react";
 import { IconTile } from "@/components/icons";
+import { BrandTile, type Brand } from "@/components/brands";
 import { CopyButton } from "./CopyButton";
 import { SubmitButton } from "./SubmitButton";
 
@@ -11,6 +12,7 @@ export function Card({
   description,
   icon,
   iconColor,
+  brand,
   children,
   actions,
   className = "",
@@ -19,6 +21,7 @@ export function Card({
   description?: ReactNode;
   icon?: LucideIcon;
   iconColor?: string;
+  brand?: Brand;
   children?: ReactNode;
   actions?: ReactNode;
   className?: string;
@@ -28,7 +31,7 @@ export function Card({
       {(title || actions) && (
         <div className="mb-4 flex items-start justify-between gap-4">
           <div className="flex items-start gap-3">
-            {icon && <IconTile icon={icon} size={36} color={iconColor ?? "#6366f1"} />}
+            {brand ? <BrandTile brand={brand} size={36} /> : icon && <IconTile icon={icon} size={36} color={iconColor ?? "#6366f1"} />}
             <div>
               {title && <h2 className="text-[15px] font-semibold tracking-tight text-zinc-900">{title}</h2>}
               {description && <p className="mt-0.5 text-sm leading-relaxed text-zinc-500">{description}</p>}
@@ -48,17 +51,19 @@ export function PageHeader({
   actions,
   icon,
   iconColor,
+  brand,
 }: {
   title: string;
   description?: ReactNode;
   actions?: ReactNode;
   icon?: LucideIcon;
   iconColor?: string;
+  brand?: Brand;
 }) {
   return (
     <div className="mb-7 flex flex-wrap items-end justify-between gap-4">
       <div className="flex items-center gap-3.5">
-        {icon && <IconTile icon={icon} size={44} color={iconColor ?? "#6366f1"} />}
+        {brand ? <BrandTile brand={brand} size={44} /> : icon && <IconTile icon={icon} size={44} color={iconColor ?? "#6366f1"} />}
         <div>
           <h1 className="text-[26px] leading-tight font-semibold tracking-[-0.02em] text-zinc-900">{title}</h1>
           {description && <p className="mt-1 max-w-2xl text-sm text-zinc-500">{description}</p>}

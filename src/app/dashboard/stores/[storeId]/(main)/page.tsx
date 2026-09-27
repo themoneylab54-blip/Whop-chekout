@@ -20,6 +20,7 @@ import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { formatMoney } from "@/lib/pricing";
 import { IconTile } from "@/components/icons";
+import { BrandTile, type Brand } from "@/components/brands";
 import { Badge, Flash, SubmitButton } from "@/components/ui";
 import { RevenueChart, type DailyPoint } from "@/components/dashboard/RevenueChart";
 import { setEnabledAction } from "../../../actions";
@@ -92,9 +93,9 @@ export default async function OverviewPage({
   }
 
   const base = `/dashboard/stores/${store.id}`;
-  const steps: { done: boolean; title: string; text: string; href: string | null; icon: LucideIcon }[] = [
-    { done: !!store.shopifyConnectedAt, title: "Connecter Shopify", text: "Installe le script sur ta boutique", href: `${base}/shopify`, icon: ShoppingBag },
-    { done: !!store.whopConnectedAt, title: "Connecter Whop", text: "Encaisse les paiements sur ton compte", href: `${base}/whop`, icon: CreditCard },
+  const steps: { done: boolean; title: string; text: string; href: string | null; icon: LucideIcon; brand?: Brand }[] = [
+    { done: !!store.shopifyConnectedAt, title: "Connecter Shopify", text: "Installe le script sur ta boutique", href: `${base}/shopify`, icon: ShoppingBag, brand: "shopify" },
+    { done: !!store.whopConnectedAt, title: "Connecter Whop", text: "Encaisse les paiements sur ton compte", href: `${base}/whop`, icon: CreditCard, brand: "whop" },
     { done: store._count.shippingRates > 0, title: "Ajouter la livraison", text: "Au moins un tarif par pays livré", href: `${base}/shipping`, icon: Truck },
     { done: !!store.checkoutLayout, title: "Designer le checkout", text: "Couleurs, logo, blocs de conversion", href: `${base}/builder/checkout`, icon: Paintbrush },
     { done: store.enabled, title: "Mettre en ligne", text: "Remplace le checkout Shopify", href: null, icon: Rocket },
@@ -172,6 +173,8 @@ export default async function OverviewPage({
                     <span className="flex h-9 w-9 items-center justify-center rounded-[28%] bg-emerald-500 text-white shadow-[inset_0_1px_0_rgba(255,255,255,.3),0_4px_10px_-4px_rgba(16,185,129,.8)]">
                       <Check className="h-4 w-4" strokeWidth={3} />
                     </span>
+                  ) : s.brand ? (
+                    <BrandTile brand={s.brand} size={36} />
                   ) : (
                     <IconTile icon={s.icon} size={36} color="#6366f1" />
                   )}

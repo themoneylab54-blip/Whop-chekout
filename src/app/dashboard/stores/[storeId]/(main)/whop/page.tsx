@@ -1,4 +1,4 @@
-import { CreditCard, KeyRound, PlugZap, Smartphone, Wallet } from "lucide-react";
+import { KeyRound, Smartphone, Wallet } from "lucide-react";
 import { notFound } from "next/navigation";
 import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
@@ -28,7 +28,7 @@ export default async function WhopPage({
 
   return (
     <>
-      <PageHeader icon={CreditCard} iconColor="#f97316" title="Whop" description="Le compte qui encaisse chaque paiement. Votre compte, vos fonds." />
+      <PageHeader brand="whop" title="Whop" description="Le compte qui encaisse chaque paiement. Votre compte, vos fonds." />
       <Flash ok={sp.ok} error={sp.error} />
 
       {connected && (
@@ -122,7 +122,7 @@ export default async function WhopPage({
               {store.testMode ? "sandbox" : "de production"}. Le mode se change dans Réglages.
             </p>
           </Card>
-          <Card icon={PlugZap} iconColor="#f97316" title="Connecter Whop">
+          <Card brand="whop" title="Connecter Whop">
             <form action={connectWhopAction.bind(null, store.id)} className="space-y-4">
               <div>
                 <Label htmlFor="apiKey">Clé API Whop ({env})</Label>
