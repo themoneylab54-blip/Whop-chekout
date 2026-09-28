@@ -6,6 +6,9 @@ import { WhopCheckoutEmbed, WhopExpressCheckoutButton, useCheckoutEmbedControls 
 import type { Theme } from "@/lib/layout";
 import type { Labels } from "./i18n";
 
+type ExpressMethod = "apple-pay" | "google-pay" | "whop-pay";
+const EXPRESS_METHODS: ExpressMethod[] = ["apple-pay", "google-pay", "whop-pay"];
+
 export type Prepared = { configId: string; environment: "sandbox" | "production" };
 
 export type BuyerForPayment = {
@@ -54,27 +57,41 @@ export function ExpressCheckout({
   title?: string;
   dividerLabel?: string;
 }) {
-  const [rendered, setRendered] = useState<string | null>(null);
-  if (!prepared || rendered === "none") return null;
+  // One Whop button per wallet: a single button only ever shows the one wallet Whop ranks first for
+  // the device, so Apple Pay, Google Pay and Whop Pay each get their own (each hides itself when the
+  // device can't use it). PayPal is not an express method at Whop: it stays in the payment form below.
+  const [rendered, setRendered] = useState<Partial<Record<ExpressMethod, boolean>>>({});
+  if (!prepared) return null;
+  const resolved = EXPRESS_METHODS.every((m) => m in rendered);
+  const shown = EXPRESS_METHODS.filter((m) => rendered[m] !== false);
+  if (resolved && shown.length === 0) return null;
+  const cols = resolved ? shown.length : 1;
   return (
     <section aria-label={title || labels.expressCheckout}>
       <p data-inline-field="title" className="mb-3 text-center text-xs font-medium tracking-wide text-neutral-600 uppercase">
         {title || labels.expressCheckout}
       </p>
-      <WhopExpressCheckoutButton
-        key={prepared.configId}
-        checkoutConfigurationId={prepared.configId}
-        environment={prepared.environment}
-        returnUrl={returnUrl}
-        theme="light"
-        locale={theme.language}
-        collectShipping
-        setupFutureUsage={saveCard ? "off_session" : undefined}
-        prefill={email ? { email } : undefined}
-        onExpressMethodResolved={({ rendered: r }) => setRendered(r)}
-        onComplete={onPaid}
-        fallback={<div className="h-12 animate-pulse rounded-[var(--radius)] bg-neutral-100" />}
-      />
+      <div className={`grid gap-2 ${cols >= 3 ? "sm:grid-cols-3" : cols === 2 ? "sm:grid-cols-2" : ""}`}>
+        {EXPRESS_METHODS.map((method, i) => (
+          <div key={method} className={rendered[method] === false ? "hidden" : !resolved && i > 0 ? "sr-only" : undefined}>
+            <WhopExpressCheckoutButton
+              key={`${prepared.configId}-${method}`}
+              checkoutConfigurationId={prepared.configId}
+              environment={prepared.environment}
+              methods={[method]}
+              returnUrl={returnUrl}
+              theme="light"
+              locale={theme.language}
+              collectShipping
+              setupFutureUsage={saveCard ? "off_session" : undefined}
+              prefill={email ? { email } : undefined}
+              onExpressMethodResolved={({ rendered: r }) => setRendered((prev) => ({ ...prev, [method]: r !== "none" }))}
+              onComplete={onPaid}
+              fallback={i === 0 ? <div className="h-12 animate-pulse rounded-[var(--radius)] bg-neutral-100" /> : null}
+            />
+          </div>
+        ))}
+      </div>
       {termsNotice}
       <Divider label={dividerLabel || labels.or} />
     </section>
