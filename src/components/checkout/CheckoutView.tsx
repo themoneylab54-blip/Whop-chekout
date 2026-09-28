@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { ChevronDown, Tag } from "lucide-react";
 import type { Block, Layout, Theme } from "@/lib/layout";
@@ -13,7 +13,7 @@ export type AddOnView = { id: string; title: string; description: string | null;
 
 export type CheckoutMode =
   | { kind: "preview"; selectedBlockId?: string | null; onSelectBlock?: (id: string) => void }
-  | { kind: "live"; sessionId: string; testMode: boolean };
+  | { kind: "live"; sessionId: string; testMode: boolean; saveCard?: boolean };
 
 type Props = {
   theme: Theme;
@@ -145,6 +145,7 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
 
   const [email, setEmail] = useState(initialEmail ?? "");
   const [marketing, setMarketing] = useState(false); // never pre-checked (GDPR)
+  const [termsAccepted, setTermsAccepted] = useState(false); // never pre-checked (consumer law)
   const [address, setAddress] = useState<Address>(() => ({
     ...EMPTY_ADDRESS,
     countryCode: countries.find((c) => c.code === (theme.language === "fr" ? "FR" : "US"))?.code ?? countries[0]?.code ?? "FR",
@@ -272,6 +273,7 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
     for (const k of ["firstName", "lastName", "address1", "city", "zip", "countryCode"] as const) {
       if (!address[k].trim()) e[k] = L.required;
     }
+    if (theme.requireTerms && !termsAccepted) e.terms = L.termsRequired;
     setErrors(e);
     if (Object.keys(e).length) {
       document.querySelector(`[data-field="${Object.keys(e)[0]}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -288,6 +290,7 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
       body: JSON.stringify({
         email,
         acceptsMarketing: marketing,
+        acceptsTerms: termsAccepted,
         address,
         note: note.trim() || null,
         checkoutConfigurationId: prepared?.configId ?? null,
@@ -371,6 +374,49 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
     );
   }
 
+  // Save the e-mail as soon as it's typed: an abandoned checkout can then be recovered.
+  const savedContact = useRef("");
+  function saveContact(acceptsMarketing: boolean | React.FocusEvent = marketing) {
+    const optIn = typeof acceptsMarketing === "boolean" ? acceptsMarketing : marketing;
+    const value = email.trim();
+    if (!liveSessionId || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) return;
+    const key = `${value}|${optIn}`;
+    if (savedContact.current === key) return;
+    savedContact.current = key;
+    void fetch(`/api/public/sessions/${liveSessionId}/contact`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: value, acceptsMarketing: optIn }),
+      keepalive: true,
+    }).catch(() => undefined);
+  }
+
+  const termsBox = theme.requireTerms ? (
+    <div data-field="terms">
+      <label className="flex items-start gap-2.5 text-sm leading-snug">
+        <input
+          type="checkbox"
+          checked={termsAccepted}
+          disabled={locked}
+          onChange={(e) => {
+            setTermsAccepted(e.target.checked);
+            if (e.target.checked) setErrors((x) => ({ ...x, terms: "" }));
+          }}
+          aria-invalid={!!errors.terms}
+          className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--accent)]"
+        />
+        <span>
+          <TermsText L={L} theme={theme} />
+        </span>
+      </label>
+      {errors.terms && (
+        <p role="alert" className="mt-1.5 text-xs text-red-600">
+          {errors.terms}
+        </p>
+      )}
+    </div>
+  ) : null;
+
   function renderSection(block: Block): ReactNode {
     switch (block.type) {
       case "contact":
@@ -385,16 +431,36 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
                   returnUrl={`${origin}${thankYouUrl}`}
                   email={email}
                   onPaid={onPaid}
+                  saveCard={!!mode.saveCard}
+                  termsNotice={theme.requireTerms ? <TermsText L={L} theme={theme} express /> : null}
                 />
               ) : (
                 <ExpressPreview labels={L} />
               ))}
           <Section title={block.props.title || L.contact}>
             <Field label={L.email} error={errors.email} field="email">
-              <input type="email" autoComplete="email" value={email} disabled={locked} onChange={(e) => setEmail(e.target.value)} className={inputCls} />
+              <input
+                type="email"
+                autoComplete="email"
+                inputMode="email"
+                value={email}
+                disabled={locked}
+                onChange={(e) => setEmail(e.target.value)}
+                onBlur={saveContact}
+                className={inputCls}
+              />
             </Field>
             <label className="mt-3 flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={marketing} disabled={locked} onChange={(e) => setMarketing(e.target.checked)} className="h-4 w-4 accent-[var(--accent)]" />
+              <input
+                type="checkbox"
+                checked={marketing}
+                disabled={locked}
+                onChange={(e) => {
+                  setMarketing(e.target.checked);
+                  saveContact(e.target.checked);
+                }}
+                className="h-4 w-4 accent-[var(--accent)]"
+              />
               {L.marketing}
             </label>
           </Section>
@@ -527,9 +593,11 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
                 testMode={mode.testMode}
                 confirm={confirm}
                 onPaid={onPaid}
+                saveCard={!!mode.saveCard}
+                beforeButton={termsBox}
               />
             ) : (
-              <PaymentPreview labels={L} payLabel={payLabel} />
+              <PaymentPreview labels={L} payLabel={payLabel} beforeButton={termsBox} />
             )}
           </Section>
         );
@@ -565,6 +633,7 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
       locked={locked}
       needsShippingAddress={!address.address1}
       currency={currency}
+      vatNote={theme.vatNote}
     >
       {summaryBlocks.map((b) => wrap(b, <ContentBlock block={b} ctx={ctx} />))}
     </OrderSummary>
@@ -665,6 +734,7 @@ function OrderSummary(props: {
   locked: boolean;
   needsShippingAddress: boolean;
   currency: string;
+  vatNote?: string;
   children: ReactNode;
 }) {
   const { L, lines, totals, money } = props;
@@ -750,15 +820,36 @@ function OrderSummary(props: {
         />
         <div className="flex items-baseline justify-between border-t border-neutral-200 pt-3">
           <dt className="text-base font-semibold">{L.total}</dt>
-          <dd className="text-xl font-semibold">
+          <dd className="text-right text-xl font-semibold">
             <span className="mr-1.5 text-xs font-normal text-neutral-500">{props.currency}</span>
             {money(totals.totalCents)}
+            {props.vatNote && <span className="block text-xs font-normal text-neutral-500">{props.vatNote}</span>}
           </dd>
         </div>
       </dl>
 
       {props.children}
     </div>
+  );
+}
+
+/** "J'accepte les CGV" text, linking to the terms page when the merchant set one. */
+function TermsText({ L, theme, express }: { L: Labels; theme: Theme; express?: boolean }) {
+  const href = theme.termsUrl || theme.policyLinks.find((p) => /cgv|condition|terms/i.test(p.label))?.url || "";
+  if (express) {
+    return <p className="mt-2 text-center text-[11px] text-neutral-500">{L.expressTerms}</p>;
+  }
+  return (
+    <>
+      {L.acceptTerms}{" "}
+      {href ? (
+        <a href={href} target="_blank" rel="noreferrer" className="underline underline-offset-2">
+          {L.termsLink}
+        </a>
+      ) : (
+        L.termsLink
+      )}
+    </>
   );
 }
 

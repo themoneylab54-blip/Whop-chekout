@@ -1,11 +1,11 @@
-import { KeyRound, Smartphone, Wallet } from "lucide-react";
+import { Globe2, KeyRound, Smartphone, Wallet } from "lucide-react";
 import { notFound } from "next/navigation";
 import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { whopWebhookUrl, WHOP_WEBHOOK_EVENTS } from "@/lib/whop";
+import { OPTIONAL_PAYMENT_METHODS, whopWebhookUrl, WHOP_WEBHOOK_EVENTS } from "@/lib/whop";
 import { Badge, Card, CopyField, Flash, Input, Label, PageHeader, SubmitButton, Textarea, buttonClass } from "@/components/ui";
 import { env as appEnv } from "@/lib/env";
-import { connectWhopAction, disconnectWhopAction, setupApplePayAction } from "../../../../actions";
+import { connectWhopAction, disconnectWhopAction, refreshWhopWebhookAction, savePaymentMethodsAction, setupApplePayAction } from "../../../../actions";
 
 export default async function WhopPage({
   params,
@@ -49,6 +49,11 @@ export default async function WhopPage({
             <a href="?edit=1" className={buttonClass("secondary")}>
               Changer de clé API
             </a>
+            <form action={refreshWhopWebhookAction.bind(null, store.id)}>
+              <SubmitButton variant="secondary" title="À faire après une mise à jour de l'app : ajoute les nouveaux événements (alertes de fraude…)">
+                Mettre à jour le webhook
+              </SubmitButton>
+            </form>
             <form action={disconnectWhopAction.bind(null, store.id)}>
               <SubmitButton variant="danger" confirm="Déconnecter Whop ? Le checkout Whop sera désactivé.">
                 Déconnecter
@@ -99,6 +104,34 @@ export default async function WhopPage({
             </ul>
           </Card>
         </div>
+      )}
+
+      {connected && (
+        <Card
+          icon={Globe2}
+          iconColor="#8b5cf6"
+          title="Paiements locaux & en plusieurs fois"
+          description="Ajoutez les moyens préférés de chaque pays. Whop ne montre chacun qu'aux clients des pays concernés, et seulement s'il est activé sur votre compte (sinon il est ignoré sans bloquer le paiement)."
+          className="mb-6"
+        >
+          <form action={savePaymentMethodsAction.bind(null, store.id)}>
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+              {OPTIONAL_PAYMENT_METHODS.map((m) => (
+                <label
+                  key={m.id}
+                  className="flex cursor-pointer items-start gap-2.5 rounded-xl p-3 ring-1 ring-zinc-900/[.07] transition hover:ring-zinc-900/20 has-[:checked]:bg-indigo-50/60 has-[:checked]:ring-indigo-500/40"
+                >
+                  <input type="checkbox" name="methods" value={m.id} defaultChecked={store.paymentMethods.includes(m.id)} className="mt-0.5 h-4 w-4 accent-indigo-600" />
+                  <span>
+                    <span className="block text-sm font-medium">{m.label}</span>
+                    <span className="block text-xs text-zinc-500">{m.hint}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+            <SubmitButton className="mt-4">Enregistrer</SubmitButton>
+          </form>
+        </Card>
       )}
 
       {(!connected || sp.edit === "1") && (

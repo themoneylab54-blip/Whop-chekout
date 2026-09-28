@@ -6,6 +6,10 @@ import { env } from "@/lib/env";
 import { json, preflight, readJson } from "@/lib/http";
 import { priceCart } from "@/lib/shopify";
 import { loadInterception } from "@/lib/layout";
+import { after } from "next/server";
+import { sendCheckoutConversions } from "@/lib/conversions";
+import { assignVariant } from "@/lib/experiments";
+import { maybeTick } from "@/lib/tick";
 
 export const OPTIONS = preflight;
 
@@ -20,16 +24,25 @@ const bodySchema = z.object({
     .record(z.string().max(40), z.string().max(300))
     .refine((u) => Object.keys(u).length <= 10)
     .optional(),
+  tracking: z
+    .object({
+      fbp: z.string().max(200).optional(),
+      fbc: z.string().max(300).optional(),
+      ttp: z.string().max(200).optional(),
+      ttclid: z.string().max(300).optional(),
+      marketing: z.boolean().nullable().optional(),
+    })
+    .optional(),
 });
 
 /** Called by the storefront loader with the contents of /cart.js. */
 export async function POST(req: Request) {
-  if (!rateLimit(`session:ip:${clientIp(req)}`, 20)) {
+  if (!(await rateLimit(`session:ip:${clientIp(req)}`, 20))) {
     return json({ error: "Trop de requêtes", fallback: true }, { status: 429, cors: true });
   }
   const parsed = bodySchema.safeParse(await readJson(req));
   if (!parsed.success) return json({ error: "Panier invalide" }, { status: 400, cors: true });
-  const { store: publicId, items, returnUrl, utm } = parsed.data;
+  const { store: publicId, items, returnUrl, utm, tracking } = parsed.data;
 
   const store = await db.store.findUnique({ where: { publicId } });
   if (!store?.enabled || !store.shopifyConnectedAt || !store.whopConnectedAt) {
@@ -62,7 +75,16 @@ export async function POST(req: Request) {
       subtotalCents: lines.reduce((s, l) => s + l.unitPriceCents * l.quantity, 0),
       returnUrl: safeReturnUrl,
       utm: utm ? (utm as Prisma.InputJsonValue) : undefined,
+      tracking: tracking ? (tracking as Prisma.InputJsonValue) : undefined,
+      clientIp: clientIp(req),
+      userAgent: req.headers.get("user-agent")?.slice(0, 400) ?? null,
+      ...(await assignVariant(store.id)),
     },
+  });
+  // After the response: ad "InitiateCheckout" event + background maintenance.
+  after(async () => {
+    await sendCheckoutConversions(session.id).catch(() => undefined);
+    await maybeTick().catch(() => undefined);
   });
   return json({ id: session.id, url: `${env.appUrl}/c/${session.id}` }, { cors: true });
 }

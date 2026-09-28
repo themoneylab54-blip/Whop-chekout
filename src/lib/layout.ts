@@ -58,6 +58,14 @@ export const themeSchema = z.object({
   expressCheckout: z.boolean().default(true),
   payButtonText: z.string().max(40).default(""),
   policyLinks: z.array(z.object({ label: z.string().max(60), url })).max(8).default([]),
+  // --- EU consumer law ---
+  // "J'accepte les CGV" checkbox before paying (proof kept for disputes)
+  requireTerms: z.boolean().default(true),
+  termsUrl: url.default(""),
+  // "TVA incluse" under the total
+  vatNote: z.string().max(60).default("TVA incluse"),
+  // 14-day withdrawal right reminder on the thank-you page
+  withdrawalNotice: z.boolean().default(true),
 });
 export type Theme = z.infer<typeof themeSchema>;
 
@@ -337,6 +345,22 @@ export const blockSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     ...base,
+    type: z.literal("upsell"),
+    // One-click post-purchase offer, charged on the card saved during checkout
+    props: z.object({
+      badge: z.string().max(60),
+      title: z.string().max(120),
+      text: z.string().max(400),
+      variantId: z.string().max(120),
+      imageUrl: url,
+      price: z.number().min(0).max(100000),
+      compareAt: z.number().min(0).max(100000),
+      buttonText: z.string().max(60),
+      declineText: z.string().max(60),
+    }),
+  }),
+  z.object({
+    ...base,
     type: z.literal("social"),
     props: z.object({
       title: z.string().max(120),
@@ -387,6 +411,7 @@ export const CHECKOUT_PALETTE: BlockType[] = [
   "why_us",
 ];
 export const THANK_YOU_PALETTE: BlockType[] = [
+  "upsell",
   "coupon",
   "button_link",
   "social",
@@ -528,6 +553,17 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
   button_link: { label: "Continuer mes achats", url: "", variant: "solid" },
   coupon: { title: "Merci ! Voici un cadeau", text: "Profitez de -10 % sur votre prochaine commande.", code: "MERCI10" },
   social: { title: "Suivez-nous", instagram: "", tiktok: "", facebook: "", youtube: "" },
+  upsell: {
+    badge: "Offre réservée à votre commande",
+    title: "Ajoutez-le à votre colis",
+    text: "Expédié avec votre commande, sans frais de livraison supplémentaires. Un clic, sans ressaisir votre carte.",
+    variantId: "",
+    imageUrl: "",
+    price: 19.9,
+    compareAt: 29.9,
+    buttonText: "Oui, ajouter à ma commande",
+    declineText: "Non merci",
+  },
 };
 
 export function createBlock<T extends BlockType>(type: T, overrides: Partial<Block> = {}): BlockOf<T> {

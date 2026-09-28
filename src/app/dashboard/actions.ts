@@ -8,7 +8,7 @@ import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { login, logout, requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { encrypt, randomToken } from "@/lib/crypto";
+import { decrypt, encrypt, randomToken } from "@/lib/crypto";
 import {
   checkoutLayoutSchema,
   interceptionSchema,
@@ -18,7 +18,11 @@ import {
   type Theme,
 } from "@/lib/layout";
 import { ensureScriptTag, installUrl, normalizeShopDomain, removeScriptTag } from "@/lib/shopify";
-import { refundPayment, registerApplePayDomain, setupWhop, teardownWhop } from "@/lib/whop";
+import { OPTIONAL_PAYMENT_METHOD_IDS, refundPayment, registerApplePayDomain, setupWhop, statementDescriptor, teardownWhop } from "@/lib/whop";
+import { testConversions } from "@/lib/conversions";
+import { draftDesign } from "@/lib/design";
+import { recordEvent } from "@/lib/log";
+import { sendAlert } from "@/lib/notify";
 import { env } from "@/lib/env";
 import { syncOrder } from "@/lib/checkout";
 
@@ -82,7 +86,7 @@ function errorMessage(err: unknown) {
 export async function loginAction(fd: FormData) {
   const h = await headers();
   const ip = h.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
-  if (!rateLimit(`login:${ip}`, 10)) back("/login", { error: "Trop de tentatives. Réessayez dans une minute." });
+  if (!(await rateLimit(`login:${ip}`, 10))) back("/login", { error: "Trop de tentatives. Réessayez dans une minute." });
   const ok = await login(str(fd, "email"), String(fd.get("password") ?? ""));
   if (!ok) back("/login", { error: "E-mail ou mot de passe incorrect" });
   redirect("/dashboard");
@@ -106,6 +110,13 @@ export async function createStoreAction(fd: FormData) {
 
 export async function deleteStoreAction(storeId: string) {
   const store = await getStore(storeId);
+  // Paid orders are accounting records: never erase them by accident.
+  const paid = await db.checkoutSession.count({ where: { storeId, status: "PAID" } });
+  if (paid > 0) {
+    back(storePath(storeId, "settings"), {
+      error: `Cette boutique a ${paid} commande(s) payée(s) : désactivez le checkout au lieu de la supprimer.`,
+    });
+  }
   if (store.scriptTagId && store.shopifyAccessToken) {
     await removeScriptTag(store, store.scriptTagId).catch(() => undefined);
   }
@@ -238,7 +249,13 @@ export async function connectWhopAction(storeId: string, fd: FormData) {
   let result;
   try {
     // Set up with the new key first: a wrong key must not break a working connection.
-    result = await setupWhop({ apiKey, testMode: store.testMode, storeId, storeName: store.name });
+    result = await setupWhop({
+      apiKey,
+      testMode: store.testMode,
+      storeId,
+      storeName: store.name,
+      statementDescriptor: store.statementDescriptor,
+    });
   } catch (err) {
     back(path, { error: `Whop a refusé la connexion : ${errorMessage(err)}` });
   }
@@ -342,14 +359,125 @@ export async function saveBuilderAction(
   if (!t.success) return { ok: false, error: `Thème invalide : ${t.error.issues[0]?.path.join(".")} ${t.error.issues[0]?.message}` };
   const l = (page === "checkout" ? checkoutLayoutSchema : thankYouLayoutSchema).safeParse(layout);
   if (!l.success) return { ok: false, error: l.error.issues[0]?.message ?? "Mise en page invalide" };
+  // Autosave goes to the draft: buyers keep seeing the published design until "Publier".
   await db.store.update({
     where: { id: storeId },
     data: {
-      theme: t.data as Prisma.InputJsonValue,
-      ...(page === "checkout" ? { checkoutLayout: l.data as Prisma.InputJsonValue } : { thankYouLayout: l.data as Prisma.InputJsonValue }),
+      draftTheme: t.data as Prisma.InputJsonValue,
+      ...(page === "checkout"
+        ? { draftCheckoutLayout: l.data as Prisma.InputJsonValue }
+        : { draftThankYouLayout: l.data as Prisma.InputJsonValue }),
+      draftUpdatedAt: new Date(),
     },
   });
   return { ok: true };
+}
+
+/** Publishes the drafts (theme + both layouts) and keeps a version in the history. */
+export async function publishDesignAction(storeId: string, label: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const store = await getStore(storeId);
+  const design = draftDesign(store);
+  const t = themeSchema.safeParse(design.theme);
+  const c = checkoutLayoutSchema.safeParse(design.checkoutLayout);
+  const y = thankYouLayoutSchema.safeParse(design.thankYouLayout);
+  if (!t.success || !c.success || !y.success) return { ok: false, error: "Le brouillon contient une erreur : corrigez-la avant de publier." };
+  await db.$transaction([
+    db.store.update({
+      where: { id: storeId },
+      data: {
+        theme: t.data as Prisma.InputJsonValue,
+        checkoutLayout: c.data as Prisma.InputJsonValue,
+        thankYouLayout: y.data as Prisma.InputJsonValue,
+        draftTheme: Prisma.DbNull,
+        draftCheckoutLayout: Prisma.DbNull,
+        draftThankYouLayout: Prisma.DbNull,
+        draftUpdatedAt: null,
+        publishedAt: new Date(),
+      },
+    }),
+    db.layoutVersion.create({
+      data: {
+        storeId,
+        label: label.trim().slice(0, 80) || `Publication du ${new Date().toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: "Europe/Paris" })}`,
+        theme: t.data as Prisma.InputJsonValue,
+        checkoutLayout: c.data as Prisma.InputJsonValue,
+        thankYouLayout: y.data as Prisma.InputJsonValue,
+      },
+    }),
+  ]);
+  await recordEvent({ storeId, kind: "design.published", message: "Nouveau design publié sur le checkout" });
+  revalidatePath(storePath(storeId), "layout");
+  return { ok: true };
+}
+
+/** Loads a version from the history into the draft (publish to make it live). */
+export async function restoreVersionAction(storeId: string, versionId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  await getStore(storeId);
+  const v = await db.layoutVersion.findFirst({ where: { id: versionId, storeId } });
+  if (!v) return { ok: false, error: "Version introuvable" };
+  await db.store.update({
+    where: { id: storeId },
+    data: {
+      draftTheme: v.theme as Prisma.InputJsonValue,
+      draftCheckoutLayout: v.checkoutLayout as Prisma.InputJsonValue,
+      draftThankYouLayout: v.thankYouLayout as Prisma.InputJsonValue,
+      draftUpdatedAt: new Date(),
+    },
+  });
+  return { ok: true };
+}
+
+/** Throws the draft away and goes back to the published design. */
+export async function discardDraftAction(storeId: string): Promise<{ ok: true }> {
+  await getStore(storeId);
+  await db.store.update({
+    where: { id: storeId },
+    data: { draftTheme: Prisma.DbNull, draftCheckoutLayout: Prisma.DbNull, draftThankYouLayout: Prisma.DbNull, draftUpdatedAt: null },
+  });
+  return { ok: true };
+}
+
+/* ------------------------------------------------------------------ */
+/* A/B tests                                                           */
+/* ------------------------------------------------------------------ */
+
+export async function startExperimentAction(storeId: string, fd: FormData) {
+  await getStore(storeId);
+  const path = storePath(storeId, "analytics");
+  const versionId = str(fd, "versionId");
+  const split = Math.min(90, Math.max(10, parseInt(str(fd, "split"), 10) || 50));
+  const version = await db.layoutVersion.findFirst({ where: { id: versionId, storeId } });
+  if (!version) back(path, { error: "Choisissez la version à tester (variante B)." });
+  await db.experiment.updateMany({ where: { storeId, status: "RUNNING" }, data: { status: "STOPPED", endedAt: new Date() } });
+  await db.experiment.create({
+    data: { storeId, versionId, splitB: split, name: str(fd, "name").slice(0, 80) || `Test « ${version.label} »` },
+  });
+  await recordEvent({ storeId, kind: "experiment.started", message: `Test A/B lancé : ${version.label} sur ${split} % du trafic` });
+  back(path, { ok: `Test A/B lancé : ${split} % des nouveaux checkouts voient « ${version.label} ».` });
+}
+
+export async function stopExperimentAction(storeId: string, experimentId: string, promote: boolean) {
+  await getStore(storeId);
+  const path = storePath(storeId, "analytics");
+  const exp = await db.experiment.findFirst({ where: { id: experimentId, storeId } });
+  if (!exp) back(path, { error: "Test introuvable" });
+  await db.experiment.update({ where: { id: exp.id }, data: { status: "STOPPED", endedAt: new Date() } });
+  if (promote) {
+    const v = await db.layoutVersion.findUnique({ where: { id: exp.versionId } });
+    if (v) {
+      await db.store.update({
+        where: { id: storeId },
+        data: {
+          theme: v.theme as Prisma.InputJsonValue,
+          checkoutLayout: v.checkoutLayout as Prisma.InputJsonValue,
+          thankYouLayout: v.thankYouLayout as Prisma.InputJsonValue,
+          publishedAt: new Date(),
+        },
+      });
+    }
+  }
+  await recordEvent({ storeId, kind: "experiment.stopped", message: promote ? "Test A/B terminé : variante B publiée" : "Test A/B arrêté" });
+  back(path, { ok: promote ? "Variante B publiée pour tous les clients." : "Test arrêté : tout le monde voit le design publié." });
 }
 
 /* ------------------------------------------------------------------ */
@@ -523,7 +651,7 @@ export async function deleteAddOnAction(storeId: string, id: string) {
 
 export async function resyncOrderAction(storeId: string, sessionId: string) {
   await getStore(storeId);
-  const path = storePath(storeId, "orders");
+  const path = storePath(storeId, `orders/${sessionId}`);
   // Manual sync is the merchant's decision on an order held for review.
   await db.checkoutSession.updateMany({ where: { id: sessionId, storeId }, data: { reviewNote: null } });
   try {
@@ -536,7 +664,7 @@ export async function resyncOrderAction(storeId: string, sessionId: string) {
 
 export async function refundOrderAction(storeId: string, sessionId: string, fd: FormData) {
   const store = await getStore(storeId);
-  const path = storePath(storeId, "orders");
+  const path = storePath(storeId, `orders/${sessionId}`);
   const session = await db.checkoutSession.findUnique({ where: { id: sessionId, storeId } });
   if (!session?.whopPaymentId) back(path, { error: "Paiement introuvable" });
   const remaining = session.totalCents - session.refundedCents;
@@ -564,4 +692,168 @@ function endOfDayParis(day: string): Date | null {
     ),
   );
   return new Date(utc.getTime() - (parisHour - 12) * 3600_000);
+}
+
+/* ------------------------------------------------------------------ */
+/* Growth: ads tracking, recovery, alerts, dispute shield, methods     */
+/* ------------------------------------------------------------------ */
+
+/** Keeps a stored secret when the field is left blank ("•••• enregistré"). */
+function secretField(fd: FormData, key: string, current: string | null, path: string): string | null {
+  if (fd.get(`${key}Clear`) === "on") return null;
+  const v = str(fd, key);
+  return v ? encryptOrBack(v, path) : current;
+}
+
+export async function saveTrackingAction(storeId: string, fd: FormData) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "growth");
+  const metaPixelId = str(fd, "metaPixelId").replace(/\D/g, "").slice(0, 30) || null;
+  const tiktokPixelId = str(fd, "tiktokPixelId").replace(/[^A-Za-z0-9]/g, "").slice(0, 40) || null;
+  await db.store.update({
+    where: { id: storeId },
+    data: {
+      metaPixelId,
+      metaAccessToken: secretField(fd, "metaAccessToken", store.metaAccessToken, path),
+      metaTestEventCode: str(fd, "metaTestEventCode").slice(0, 40) || null,
+      tiktokPixelId,
+      tiktokAccessToken: secretField(fd, "tiktokAccessToken", store.tiktokAccessToken, path),
+    },
+  });
+  back(path, { ok: "Pixels enregistrés" });
+}
+
+export async function testTrackingAction(storeId: string) {
+  await getStore(storeId);
+  const path = storePath(storeId, "growth");
+  try {
+    const n = await testConversions(storeId);
+    if (n === 0) back(path, { error: "Aucun pixel complet (ID + jeton) n'est configuré." });
+  } catch (err) {
+    if (isRedirect(err)) throw err;
+    back(path, { error: `Test refusé : ${errorMessage(err)}` });
+  }
+  back(path, { ok: "Événement de test envoyé. Vérifiez « Événements de test » dans Meta / TikTok." });
+}
+
+export async function saveRecoveryAction(storeId: string, fd: FormData) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "growth");
+  const emailFrom = str(fd, "emailFrom").slice(0, 200) || null;
+  if (emailFrom && !/^([^<>]+<)?[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+>?$/.test(emailFrom)) {
+    back(path, { error: "Expéditeur invalide : ex. « Ma Boutique <contact@maboutique.fr> »" });
+  }
+  const code = str(fd, "recoveryCode").toUpperCase().slice(0, 40) || null;
+  if (code && !(await db.discountCode.findFirst({ where: { storeId, code } }))) {
+    back(path, { error: `Le code ${code} n'existe pas : créez-le d'abord dans Promos & options.` });
+  }
+  const resendApiKey = secretField(fd, "resendApiKey", store.resendApiKey, path);
+  const enabled = fd.get("recoveryEnabled") === "on";
+  if (enabled && (!resendApiKey || !emailFrom)) back(path, { error: "Renseignez la clé Resend et l'expéditeur pour activer les relances." });
+  await db.store.update({
+    where: { id: storeId },
+    data: {
+      recoveryEnabled: enabled,
+      recoveryConsentOnly: fd.get("recoveryConsentOnly") === "on",
+      recoveryCode: code,
+      resendApiKey,
+      emailFrom,
+    },
+  });
+  back(path, { ok: enabled ? "Relances de paniers abandonnés activées" : "Réglages des relances enregistrés" });
+}
+
+export async function saveAlertsAction(storeId: string, fd: FormData) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "settings");
+  const alertEmail = str(fd, "alertEmail").slice(0, 200) || null;
+  if (alertEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(alertEmail)) back(path, { error: "E-mail d'alerte invalide" });
+  await db.store.update({
+    where: { id: storeId },
+    data: {
+      alertEmail,
+      telegramBotToken: secretField(fd, "telegramBotToken", store.telegramBotToken, path),
+      telegramChatId: str(fd, "telegramChatId").replace(/[^\d-]/g, "").slice(0, 30) || null,
+    },
+  });
+  back(path, { ok: "Alertes enregistrées" });
+}
+
+export async function testAlertAction(storeId: string) {
+  await getStore(storeId);
+  const path = storePath(storeId, "settings");
+  try {
+    await sendAlert(storeId, "Test d'alerte : tout fonctionne ✅", null);
+  } catch (err) {
+    back(path, { error: `Échec de l'alerte : ${errorMessage(err)}` });
+  }
+  back(path, { ok: "Alerte de test envoyée (Telegram et/ou e-mail)." });
+}
+
+export async function saveShieldAction(storeId: string, fd: FormData) {
+  await getStore(storeId);
+  const path = storePath(storeId, "settings");
+  const raw = str(fd, "statementDescriptor");
+  const descriptor = raw ? statementDescriptor(raw) : null;
+  if (raw && !descriptor) back(path, { error: "Libellé bancaire : 5 à 22 lettres ou chiffres." });
+  await db.store.update({
+    where: { id: storeId },
+    data: {
+      pushTracking: fd.get("pushTracking") === "on",
+      autoDisputeEvidence: fd.get("autoDisputeEvidence") === "on",
+      autoRefundFraudAlerts: fd.get("autoRefundFraudAlerts") === "on",
+      statementDescriptor: descriptor,
+    },
+  });
+  back(path, { ok: "Bouclier anti-litiges enregistré" });
+}
+
+export async function savePaymentMethodsAction(storeId: string, fd: FormData) {
+  await getStore(storeId);
+  const methods = fd.getAll("methods").map(String).filter((m) => OPTIONAL_PAYMENT_METHOD_IDS.includes(m));
+  await db.store.update({ where: { id: storeId }, data: { paymentMethods: methods } });
+  back(storePath(storeId, "whop"), {
+    ok: methods.length ? `${methods.length} moyen(s) de paiement ajouté(s) au checkout` : "Moyens de paiement locaux désactivés",
+  });
+}
+
+/** Re-creates the Whop webhook with the current event list (e.g. after an app update). */
+export async function refreshWhopWebhookAction(storeId: string) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "whop");
+  if (!store.whopApiKey) back(path, { error: "Connectez Whop d'abord" });
+  let result;
+  try {
+    result = await setupWhop({
+      apiKey: decrypt(store.whopApiKey),
+      testMode: store.testMode,
+      storeId,
+      storeName: store.name,
+      statementDescriptor: store.statementDescriptor,
+    });
+  } catch (err) {
+    back(path, { error: `Whop a refusé la mise à jour : ${errorMessage(err)}` });
+  }
+  await db.store.update({
+    where: { id: storeId },
+    data: {
+      whopProductId: result.productId,
+      whopWebhookId: result.webhookId,
+      whopWebhookSecret: encryptOrBack(result.webhookSecret, path),
+    },
+  });
+  back(path, { ok: "Webhook Whop mis à jour (alertes de fraude incluses)." });
+}
+
+function isRedirect(err: unknown) {
+  return err instanceof Error && "digest" in err && String((err as { digest?: string }).digest).startsWith("NEXT_REDIRECT");
+}
+
+export async function runTickAction(storeId: string) {
+  await getStore(storeId);
+  const { runTick } = await import("@/lib/tick");
+  const report = await runTick();
+  back(storePath(storeId, "journal"), {
+    ok: `Maintenance terminée : ${Number(report.reconciled) || 0} paiement(s) récupéré(s), ${Number(report.syncRetried) || 0} synchro(s) relancée(s).`,
+  });
 }

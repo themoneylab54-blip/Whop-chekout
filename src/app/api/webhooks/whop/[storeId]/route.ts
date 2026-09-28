@@ -2,8 +2,11 @@ import { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
 import { decrypt } from "@/lib/crypto";
 import { json } from "@/lib/http";
-import { markPaid, recordDispute, recordRefund, type PaymentBuyer } from "@/lib/checkout";
-import { eventType, moneyToCents, verifyWhopWebhook, type WhopEvent } from "@/lib/whop";
+import { markPaid, recordDispute, recordRefund } from "@/lib/checkout";
+import { handleDisputeAlert } from "@/lib/disputes";
+import { log } from "@/lib/log";
+import { markUpsellPaid } from "@/lib/upsell";
+import { eventType, paymentInfoFromWhop, moneyToCents, verifyWhopWebhook, type WhopEvent } from "@/lib/whop";
 
 export const dynamic = "force-dynamic";
 
@@ -31,16 +34,18 @@ export async function POST(req: Request, ctx: { params: Promise<{ storeId: strin
   }
 
   const data = (evt.data ?? {}) as Record<string, unknown>;
+  await db.store.update({ where: { id: store.id }, data: { lastWebhookAt: new Date() } }).catch(() => undefined);
   try {
     await handle(type, data, store.id);
   } catch (err) {
-    console.error(`whop webhook ${type} failed`, err);
+    log.error("webhook.failed", `Whop webhook ${type} failed`, { storeId, webhookId, err });
     return json({ error: "processing failed" }, { status: 500 });
   }
+  log.info("webhook.handled", `Whop webhook ${type}`, { storeId, webhookId, dataId: data.id });
 
   if (webhookId) {
     try {
-      await db.webhookEvent.create({ data: { id: webhookId, storeId, type } });
+      await db.webhookEvent.create({ data: { id: webhookId, storeId, type, payload: safePayload(raw) } });
     } catch (err) {
       if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002")) throw err;
     }
@@ -51,22 +56,15 @@ export async function POST(req: Request, ctx: { params: Promise<{ storeId: strin
 async function handle(type: string, data: Record<string, unknown>, storeId: string) {
   switch (type) {
     case "payment.succeeded": {
+      // One-click post-purchase offers are separate payments on the same session.
+      const metadata = (data.metadata ?? {}) as Record<string, unknown>;
+      if (typeof metadata.upsell_id === "string") {
+        await markUpsellPaid(metadata.upsell_id, String(data.id), storeId);
+        return;
+      }
       const sessionId = await sessionIdFor(data, storeId);
       if (!sessionId) return; // not one of our checkouts (e.g. another product on this Whop account)
-      const total = (data.total ?? data.final_amount) as { currency?: string } | number | undefined;
-      const user = (data.user ?? null) as { email?: string } | null;
-      await markPaid(sessionId, {
-        id: String(data.id),
-        totalCents: moneyToCents(total),
-        currency: typeof total === "object" && total?.currency ? total.currency : typeof data.currency === "string" ? data.currency : null,
-        checkoutConfigurationId: typeof data.checkout_configuration_id === "string" ? data.checkout_configuration_id : null,
-        buyer: {
-          email: (typeof data.customer_email === "string" ? data.customer_email : null) ?? user?.email ?? null,
-          shippingAddress: (data.shipping_address ?? null) as PaymentBuyer["address"],
-          address: (data.shipping_address ?? data.billing_address ?? null) as PaymentBuyer["address"],
-          phone: typeof data.customer_phone === "string" ? data.customer_phone : null,
-        },
-      });
+      await markPaid(sessionId, paymentInfoFromWhop(data));
       return;
     }
     case "payment.failed": {
@@ -106,7 +104,11 @@ async function handle(type: string, data: Record<string, unknown>, storeId: stri
       const payment = data.payment as { id?: string } | undefined;
       const paymentId = (typeof data.payment_id === "string" ? data.payment_id : payment?.id) ?? null;
       const session = paymentId ? await db.checkoutSession.findUnique({ where: { whopPaymentId: paymentId } }) : null;
-      if (session && session.storeId === storeId) await recordDispute(session.id);
+      if (session && session.storeId === storeId) await recordDispute(session.id, typeof data.id === "string" ? data.id : null);
+      return;
+    }
+    case "dispute_alert.created": {
+      await handleDisputeAlert(storeId, data as Parameters<typeof handleDisputeAlert>[1]);
       return;
     }
     default:
@@ -131,3 +133,14 @@ async function sessionIdFor(data: Record<string, unknown>, storeId: string): Pro
   });
   return fromMeta || configId ? (session?.id ?? null) : null;
 }
+
+/** Keeps the raw event for audit (bounded size). */
+function safePayload(raw: string) {
+  if (raw.length > 50_000) return { truncated: true, length: raw.length };
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { raw: raw.slice(0, 2000) };
+  }
+}
+

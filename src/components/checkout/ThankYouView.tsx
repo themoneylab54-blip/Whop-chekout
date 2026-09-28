@@ -30,9 +30,10 @@ type Props = {
   data: ThankYouData;
   sessionId?: string; // live mode: poll until the Shopify order exists
   preview?: { selectedBlockId?: string | null; onSelectBlock?: (id: string) => void };
+  upsell?: { eligible: boolean; states: Record<string, string> };
 };
 
-export function ThankYouView({ theme, layout, data: initial, sessionId, preview }: Props) {
+export function ThankYouView({ theme, layout, data: initial, sessionId, preview, upsell }: Props) {
   const L = labelsFor(theme.language);
   const [data, setData] = useState(initial);
   const [mountedAt] = useState(() => Date.now());
@@ -68,6 +69,7 @@ export function ThankYouView({ theme, layout, data: initial, sessionId, preview 
     money,
     note: "",
     setNote: () => {},
+    upsell: sessionId && upsell ? { sessionId, ...upsell } : undefined,
   };
   const blocks = layout.blocks.filter((b) => !b.hidden);
   const render = (pos: "above" | "below") =>
@@ -159,6 +161,9 @@ export function ThankYouView({ theme, layout, data: initial, sessionId, preview 
         )}
 
         {render("below")}
+
+        {theme.withdrawalNotice && <p className="mt-6 text-xs leading-relaxed text-neutral-500">{L.withdrawal}</p>}
+        {!preview && <p className="mt-2 text-xs leading-relaxed text-neutral-500">{L.statementNote}</p>}
 
         {data.continueUrl && (
           <a

@@ -20,7 +20,8 @@ export const LABELS = {
     addons: "Ajouter à votre commande",
     payment: "Paiement",
     paymentSecure: "Toutes les transactions sont sécurisées et chiffrées.",
-    payNow: "Payer maintenant",
+    // Unambiguous "order with obligation to pay" wording (Code de la consommation L221-14)
+    payNow: "Commander et payer",
     expressCheckout: "Paiement express",
     or: "OU",
     totalUpdated: "Le total a été mis à jour. Vérifiez le montant puis cliquez à nouveau sur Payer.",
@@ -49,6 +50,16 @@ export const LABELS = {
     continueShopping: "Continuer mes achats",
     required: "Champ obligatoire",
     invalidEmail: "E-mail invalide",
+    acceptTerms: "J'ai lu et j'accepte les",
+    termsLink: "conditions générales de vente",
+    termsRequired: "Veuillez accepter les conditions générales de vente pour commander.",
+    expressTerms: "En payant, vous acceptez nos conditions générales de vente.",
+    withdrawal:
+      "Droit de rétractation : vous disposez de 14 jours à compter de la réception de votre commande pour nous la retourner, sans avoir à vous justifier. Contactez-nous pour exercer ce droit.",
+    upsellAdded: (name: string) => `Ajouté ! Commande ${name} confirmée.`,
+    upsellAddedPending: "Ajout en cours de confirmation…",
+    upsellNoCard: "Aucun nouveau paiement à saisir : votre moyen de paiement enregistré sera utilisé.",
+    statementNote: "Le paiement apparaîtra sur votre relevé bancaire sous le nom de notre prestataire de paiement Whop.",
   },
   en: {
     contact: "Contact",
@@ -100,6 +111,16 @@ export const LABELS = {
     continueShopping: "Continue shopping",
     required: "Required",
     invalidEmail: "Invalid email",
+    acceptTerms: "I have read and accept the",
+    termsLink: "terms and conditions",
+    termsRequired: "Please accept the terms and conditions to place your order.",
+    expressTerms: "By paying, you accept our terms and conditions.",
+    withdrawal:
+      "Right of withdrawal: you have 14 days from receiving your order to return it, without giving any reason. Contact us to exercise this right.",
+    upsellAdded: (name: string) => `Added! Order ${name} confirmed.`,
+    upsellAddedPending: "Confirming your addition…",
+    upsellNoCard: "Nothing to type: your saved payment method will be used.",
+    statementNote: "The charge will appear on your bank statement under our payment provider's name, Whop.",
   },
 };
 

@@ -78,25 +78,53 @@ export class ShopifyError extends Error {}
 
 type ConnectedStore = Pick<Store, "shopDomain" | "shopifyAccessToken">;
 
+const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+
+/**
+ * Admin GraphQL call with a 20s timeout, and up to 3 attempts with backoff when
+ * Shopify is throttling (429 / THROTTLED) or briefly unavailable (5xx, network).
+ */
 export async function shopifyGraphql<T>(
   store: ConnectedStore,
   query: string,
   variables: Record<string, unknown> = {},
+  // Non-idempotent mutations (orderCreate, refundCreate) must not be re-sent blindly:
+  // a timeout may hide a success. Their callers dedupe at a higher level instead.
+  opts: { retry?: boolean } = {},
 ): Promise<T> {
   if (!store.shopDomain || !store.shopifyAccessToken) throw new ShopifyError("Boutique Shopify non connectée");
-  const res = await fetch(`https://${store.shopDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": decrypt(store.shopifyAccessToken),
-    },
-    body: JSON.stringify({ query, variables }),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new ShopifyError(`Shopify API ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  const json = (await res.json()) as { data?: T; errors?: { message: string }[] };
-  if (json.errors?.length) throw new ShopifyError(json.errors.map((e) => e.message).join("; "));
-  return json.data as T;
+  const token = decrypt(store.shopifyAccessToken);
+  const attempts = opts.retry === false ? 1 : 3;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 400 * 2 ** attempt + Math.random() * 300));
+    let res: Response;
+    try {
+      res = await fetch(`https://${store.shopDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
+        body: JSON.stringify({ query, variables }),
+        cache: "no-store",
+        signal: AbortSignal.timeout(20_000),
+      });
+    } catch (err) {
+      lastError = new ShopifyError(`Shopify injoignable : ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    if (RETRYABLE.has(res.status)) {
+      lastError = new ShopifyError(`Shopify API ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      continue;
+    }
+    if (!res.ok) throw new ShopifyError(`Shopify API ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const json = (await res.json()) as { data?: T; errors?: { message: string; extensions?: { code?: string } }[] };
+    if (json.errors?.some((e) => e.extensions?.code === "THROTTLED")) {
+      lastError = new ShopifyError("Shopify API throttled");
+      continue;
+    }
+    if (json.errors?.length) throw new ShopifyError(json.errors.map((e) => e.message).join("; "));
+    return json.data as T;
+  }
+  throw lastError;
 }
 
 function assertNoUserErrors(errors: { field?: string[] | null; message: string }[] | undefined, what: string) {
@@ -319,7 +347,8 @@ export function buildOrderCreateInput(o: PaidOrderInput) {
     ],
     sourceName: "whop-checkout",
     sourceIdentifier: o.sessionId,
-    tags: ["whop-checkout", ...(o.test ? ["test"] : [])],
+    // The session tag lets a retry find an order that was created but not recorded.
+    tags: ["whop-checkout", sessionTag(o.sessionId), ...(o.test ? ["test"] : [])],
     note: `${o.buyerNote ? `Note du client : ${o.buyerNote}\n\n` : ""}Payé via Whop — paiement ${o.whopPaymentId}`,
     customer: {
       toUpsert: {
@@ -337,6 +366,33 @@ export function buildOrderCreateInput(o: PaidOrderInput) {
     order.note = `${order.note} — code promo ${o.discount.code} (−${centsToDecimal(o.discount.amountCents)} ${o.currency}, déjà déduit des lignes)`;
   }
   return order;
+}
+
+export function sessionTag(sessionId: string) {
+  return `wc-${sessionId}`;
+}
+
+/** The Shopify order already created for this checkout session, if any (idempotency). */
+export async function findOrderForSession(store: ConnectedStore, sessionId: string) {
+  const data = await shopifyGraphql<{ orders: { nodes: { id: string; name: string; tags: string[] }[] } }>(
+    store,
+    `query($q: String!) { orders(first: 3, query: $q) { nodes { id name tags } } }`,
+    { q: `tag:'${sessionTag(sessionId)}'` },
+  );
+  return data.orders.nodes.find((o) => o.tags.includes(sessionTag(sessionId))) ?? null;
+}
+
+/** Tracking numbers of an order's fulfillments (for the dispute shield). */
+export async function orderTracking(store: ConnectedStore, orderId: string) {
+  const data = await shopifyGraphql<{
+    order: { fulfillments: { status: string; trackingInfo: { number: string | null; company: string | null; url: string | null }[] }[] } | null;
+  }>(store, `query($id: ID!) { order(id: $id) { fulfillments(first: 10) { status trackingInfo(first: 5) { number company url } } } }`, {
+    id: orderId,
+  });
+  return (data.order?.fulfillments ?? [])
+    .filter((f) => f.status !== "CANCELLED")
+    .flatMap((f) => f.trackingInfo)
+    .filter((t): t is { number: string; company: string | null; url: string | null } => !!t.number);
 }
 
 export async function createPaidOrder(store: ConnectedStore, input: PaidOrderInput) {
@@ -357,6 +413,7 @@ export async function createPaidOrder(store: ConnectedStore, input: PaidOrderInp
       order: buildOrderCreateInput(input),
       options: { inventoryBehaviour: "DECREMENT_OBEYING_POLICY", sendReceipt: true, sendFulfillmentReceipt: true },
     },
+    { retry: false },
   );
   assertNoUserErrors(data.orderCreate.userErrors, "Création de la commande");
   return data.orderCreate.order!;
@@ -382,6 +439,7 @@ export async function createRefund(store: ConnectedStore, orderId: string, amoun
         ],
       },
     },
+    { retry: false },
   );
   assertNoUserErrors(data.refundCreate.userErrors, "Remboursement Shopify");
 }

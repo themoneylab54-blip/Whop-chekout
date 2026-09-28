@@ -48,15 +48,58 @@ model Store {
   testMode Boolean @default(true) // Whop sandbox + Shopify test orders
 
   // --- Settings (validated by zod in src/lib/layout) ---
+  // Published design (what buyers see)
   theme          Json?
   checkoutLayout Json?
   thankYouLayout Json?
   interception   Json?
+  // Builder drafts: autosaved here, copied to the fields above on "Publier"
+  draftTheme          Json?
+  draftCheckoutLayout Json?
+  draftThankYouLayout Json?
+  draftUpdatedAt      DateTime?
+  publishedAt         DateTime?
+
+  // --- Payments ---
+  // Extra Whop payment methods offered on top of card/wallets/PayPal (e.g. alma, bancontact)
+  paymentMethods      String[] @default([])
+  // Shown on the buyer's bank statement (new Whop products / upsell charges)
+  statementDescriptor String?
+
+  // --- Ads tracking (server-side conversions) ---
+  metaPixelId       String?
+  metaAccessToken   String? // encrypted
+  metaTestEventCode String?
+  tiktokPixelId     String?
+  tiktokAccessToken String? // encrypted
+
+  // --- Abandoned checkout recovery (e-mails via Resend) ---
+  recoveryEnabled     Boolean @default(false)
+  recoveryConsentOnly Boolean @default(true)
+  recoveryCode        String?
+  resendApiKey        String? // encrypted
+  emailFrom           String?
+
+  // --- Alerts ---
+  alertEmail       String?
+  telegramBotToken String? // encrypted
+  telegramChatId   String?
+
+  // --- Dispute shield ---
+  pushTracking          Boolean @default(true)
+  autoDisputeEvidence   Boolean @default(true)
+  autoRefundFraudAlerts Boolean @default(false)
+
+  // --- Health ---
+  lastWebhookAt DateTime?
 
   shippingRates ShippingRate[]
   discounts     DiscountCode[]
   addOns        AddOn[]
   sessions      CheckoutSession[]
+  versions      LayoutVersion[]
+  experiments   Experiment[]
+  events        EventLog[]
 }
 
 model ShippingRate {
@@ -172,12 +215,47 @@ model CheckoutSession {
   // Set when a payment needs a human look (amount/country/code mismatch, extra payment):
   // the Shopify order is then only created by a manual "sync" from the dashboard.
   reviewNote       String?
+  // Automatic retries of the Shopify sync (exponential backoff)
+  syncAttempts     Int       @default(0)
+  nextSyncAt       DateTime?
+
+  // Funnel
+  contactAt     DateTime? // e-mail captured
+  preparedAt    DateTime? // payment form ready
+  payClickedAt  DateTime? // buyer clicked "Pay"
+  termsAcceptedAt DateTime?
+
+  // Attribution & ads (fbp, fbc, ttp, ttclid, marketing consent…)
+  tracking   Json?
+  clientIp   String?
+  userAgent  String?
+  pixelSentAt DateTime?
+
+  // A/B test
+  experimentId String?
+  variant      String?
+
+  // Upsell: the saved payment method from the first payment
+  whopMemberId        String?
+  whopPaymentMethodId String?
+  upsells             UpsellCharge[]
+
+  // Abandoned checkout recovery
+  recoveryStage  Int       @default(0)
+  recoverySentAt DateTime?
+
+  // Dispute shield
+  trackingNumber    String?
+  trackingPushedAt  DateTime?
+  trackingCheckedAt DateTime?
+  disputeEvidenceAt DateTime?
   // Snapshot of the exact quote the buyer paid (see CheckoutQuote)
   paidQuoteId      String?
   quotes           CheckoutQuote[]
 
   @@index([storeId, createdAt])
   @@index([storeId, status])
+  @@index([status, createdAt])
 }
 
 model WebhookEvent {
@@ -185,6 +263,79 @@ model WebhookEvent {
   storeId    String
   type       String
   receivedAt DateTime @default(now())
+  // Raw event body, kept for audit and replay
+  payload    Json?
+}
+
+/// Audit trail and alert source: every notable thing that happens to a store.
+model EventLog {
+  id        String   @id @default(cuid())
+  storeId   String?
+  store     Store?   @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  sessionId String?
+  level     String   // info | warn | error
+  kind      String   // e.g. order.synced, sync.failed, review.hold, dispute.created
+  message   String
+  data      Json?
+  createdAt DateTime @default(now())
+
+  @@index([storeId, createdAt])
+  @@index([sessionId])
+}
+
+/// Published designs, for history/restore and A/B tests.
+model LayoutVersion {
+  id             String   @id @default(cuid())
+  storeId        String
+  store          Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  label          String
+  theme          Json
+  checkoutLayout Json
+  thankYouLayout Json
+  createdAt      DateTime @default(now())
+
+  @@index([storeId, createdAt])
+}
+
+/// A/B test: variant B renders a saved LayoutVersion to `splitB`% of new checkouts.
+model Experiment {
+  id        String    @id @default(cuid())
+  storeId   String
+  store     Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  name      String
+  versionId String
+  splitB    Int       @default(50)
+  status    String    @default("RUNNING") // RUNNING | STOPPED
+  startedAt DateTime  @default(now())
+  endedAt   DateTime?
+
+  @@index([storeId, status])
+}
+
+/// One-click post-purchase offer charged on the saved payment method.
+model UpsellCharge {
+  id               String          @id @default(cuid())
+  sessionId        String
+  session          CheckoutSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  blockId          String
+  title            String
+  variantId        String
+  amountCents      Int
+  status           String          @default("PENDING") // PENDING | PAID | FAILED | DECLINED
+  whopPaymentId    String?         @unique
+  shopifyOrderId   String?
+  shopifyOrderName String?
+  error            String?
+  createdAt        DateTime        @default(now())
+
+  @@unique([sessionId, blockId])
+}
+
+/// Shared fixed-window counters (works across serverless instances).
+model RateLimit {
+  key     String   @id
+  count   Int
+  resetAt DateTime
 }
 
 /// App-wide settings (e.g. the Apple Pay domain-association file served on this domain).

@@ -376,6 +376,8 @@ export type ContentContext = {
   money: (cents: number) => string;
   note: string;
   setNote: (v: string) => void;
+  /** Thank-you page, live: one-click post-purchase offers. */
+  upsell?: { sessionId: string; eligible: boolean; states: Record<string, string> };
 };
 
 /** Renders every non-section block. Returns null for fixed sections / add-ons. */
@@ -401,6 +403,10 @@ export function isEmptyInLive(block: Block, ctx: ContentContext, now: number): b
       return ctx.lowestInventory == null || ctx.lowestInventory <= 0 || ctx.lowestInventory > block.props.threshold;
     case "free_shipping_bar":
       return !(block.props.threshold > 0 || ctx.freeShippingThresholdCents);
+    case "upsell": {
+      const state = ctx.upsell?.states[block.id];
+      return !block.props.variantId || !(ctx.upsell?.eligible || state === "PAID") || state === "DECLINED";
+    }
     default:
       return false;
   }
@@ -681,6 +687,8 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
       );
     case "coupon":
       return <Coupon {...block.props} />;
+    case "upsell":
+      return <UpsellOffer block={block} ctx={ctx} />;
     case "social": {
       const links = [
         { url: block.props.instagram, icon: InstagramIcon, label: "Instagram" },
@@ -751,5 +759,96 @@ function TikTokIcon({ className }: { className?: string }) {
 export function Placeholder({ children }: { children: ReactNode }) {
   return (
     <div className="rounded-[var(--radius)] border-2 border-dashed border-neutral-300 px-4 py-6 text-center text-sm text-neutral-400">{children}</div>
+  );
+}
+
+/** One-click post-purchase offer (thank-you page). */
+function UpsellOffer({ block, ctx }: { block: BlockOf<"upsell">; ctx: ContentContext }) {
+  const p = block.props;
+  const [state, setState] = useState<string | null>(ctx.upsell?.states[block.id] ?? null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const L = ctx.labels;
+  const price = ctx.money(Math.round(p.price * 100));
+  const compare = p.compareAt > p.price ? ctx.money(Math.round(p.compareAt * 100)) : null;
+  const live = !!ctx.upsell && !ctx.preview;
+
+  async function answer(accept: boolean) {
+    if (!live || !ctx.upsell) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/public/sessions/${ctx.upsell.sessionId}/upsell`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ blockId: block.id, accept }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error ?? "Erreur");
+      if (body.status === "action" && body.url) {
+        window.location.href = body.url; // 3-D Secure confirmation, back to this page after
+        return;
+      }
+      setState(body.status === "paid" ? "PAID" : body.status === "declined" ? "DECLINED" : "PENDING");
+      if (body.status === "paid") setMessage(L.upsellAdded(body.orderName ?? ""));
+      if (body.status === "pending") setMessage(L.upsellAddedPending);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Erreur");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (state === "DECLINED") return null;
+  if (state === "PAID" || state === "PENDING") {
+    return (
+      <div className="flex items-center gap-3 rounded-[var(--radius)] border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800">
+        <Check className="h-5 w-5 shrink-0" strokeWidth={2.5} />
+        {message ?? (state === "PAID" ? L.upsellAdded("") : L.upsellAddedPending)}
+      </div>
+    );
+  }
+  return (
+    <div className="overflow-hidden rounded-[var(--radius)] border-2 border-[var(--accent)] bg-white shadow-[0_12px_32px_-16px_rgba(0,0,0,.25)]">
+      {p.badge && <p className="bg-[image:var(--accent-bg)] px-4 py-2 text-center text-xs font-semibold tracking-wide text-[var(--accent-fg)] uppercase">{p.badge}</p>}
+      <div className="flex gap-4 p-4">
+        {p.imageUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={p.imageUrl} alt="" className="h-24 w-24 shrink-0 rounded-[calc(var(--radius)*0.8)] object-cover" />
+        ) : ctx.preview ? (
+          <div className="h-24 w-24 shrink-0 rounded-[calc(var(--radius)*0.8)] bg-neutral-100" />
+        ) : null}
+        <div className="min-w-0 flex-1">
+          <h3 className="font-[family-name:var(--heading-font)] text-base font-semibold">{p.title}</h3>
+          <p className="mt-1 text-sm text-[var(--muted)]">{p.text}</p>
+          <p className="mt-2 flex items-baseline gap-2">
+            <span className="text-lg font-semibold">{price}</span>
+            {compare && <span className="text-sm text-neutral-400 line-through">{compare}</span>}
+          </p>
+        </div>
+      </div>
+      <div className="space-y-2 px-4 pb-4">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => answer(true)}
+          className="flex w-full items-center justify-center gap-2 rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-5 py-3.5 font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)] transition hover:brightness-110 disabled:opacity-60"
+        >
+          {busy && <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-r-transparent" />}
+          {p.buttonText} · {price}
+        </button>
+        <button type="button" disabled={busy} onClick={() => answer(false)} className="w-full py-1.5 text-sm text-[var(--muted)] underline underline-offset-2">
+          {p.declineText}
+        </button>
+        <p className="text-center text-[11px] text-neutral-400">{L.upsellNoCard}</p>
+        {error && (
+          <p role="alert" className="text-center text-xs text-red-600">
+            {error}
+          </p>
+        )}
+        {ctx.preview && !p.variantId && <Placeholder>Offre post-achat : renseignez l&apos;ID de variante Shopify</Placeholder>}
+      </div>
+    </div>
   );
 }

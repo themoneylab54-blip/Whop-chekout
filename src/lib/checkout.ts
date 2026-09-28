@@ -12,8 +12,13 @@ import {
   type RateInput,
   type Totals,
 } from "./pricing";
-import { createPaidOrder, createRefund, tagOrder, type Address } from "./shopify";
+import { createPaidOrder, createRefund, findOrderForSession, tagOrder, type Address } from "./shopify";
+import { log, recordEvent } from "./log";
+import { sendPurchaseConversions } from "./conversions";
+import { submitDisputeEvidence } from "./disputes";
 import { createCheckoutConfiguration } from "./whop";
+import { designFor } from "./experiments";
+import { loadTheme } from "./layout";
 
 /* ------------------------------------------------------------------ */
 /* Input validation                                                    */
@@ -42,6 +47,7 @@ export type QuoteInput = z.infer<typeof quoteSchema>;
 export const paySchema = quoteSchema.extend({
   email: z.string().trim().email().max(200),
   acceptsMarketing: z.boolean().default(false),
+  acceptsTerms: z.boolean().default(false),
   address: addressSchema,
   note: z.string().trim().max(1000).nullable().optional(),
   /** The Whop checkout the page is about to submit. */
@@ -115,8 +121,8 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
 
 export class CheckoutError extends Error {}
 
-/** A checkout session can be paid for this long after the cart left the store. */
-export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+/** A checkout session can be paid for this long after the cart left the store (covers recovery e-mails). */
+export const SESSION_TTL_MS = 72 * 60 * 60 * 1000;
 /** Upper bound on Whop configurations per session (each price change creates one). */
 const MAX_QUOTES_PER_SESSION = 60;
 
@@ -209,6 +215,7 @@ export async function prepareSession(session: SessionWithStore, input: QuoteInpu
       ...quoteFields(quote),
       preparedTotalCents: quote.totals.totalCents,
       whopCheckoutId: snapshot.whopCheckoutId,
+      preparedAt: session.preparedAt ?? new Date(),
     },
   });
   return { checkoutConfigurationId: snapshot.whopCheckoutId, totals: quote.totals, quote };
@@ -236,6 +243,10 @@ export async function confirmSession(session: SessionWithStore, input: PayInput)
   const quoteInput = { ...input, countryCode: input.address.countryCode };
   const quote = await quoteSession(session, quoteInput);
   assertPayable(session, quote, quoteInput);
+  const theme = loadTheme((await designFor(session.store, session)).theme, session.store.name);
+  if (theme.requireTerms && !input.acceptsTerms) {
+    throw new CheckoutError(theme.language === "en" ? "Please accept the terms and conditions." : "Veuillez accepter les conditions générales de vente.");
+  }
 
   const configId = input.checkoutConfigurationId ?? session.whopCheckoutId;
   const snapshot = configId
@@ -253,7 +264,10 @@ export async function confirmSession(session: SessionWithStore, input: PayInput)
       whopCheckoutId: snapshot.whopCheckoutId,
       preparedTotalCents: snapshot.totalCents,
       status: "PAYING",
+      payClickedAt: new Date(),
+      termsAcceptedAt: input.acceptsTerms ? new Date() : null,
       email: input.email,
+      contactAt: session.contactAt ?? new Date(),
       acceptsMarketing: input.acceptsMarketing,
       shippingAddress: input.address as Prisma.InputJsonValue,
       note: input.note || null,
@@ -305,23 +319,38 @@ export function addressFromPayment(buyer: Pick<PaymentBuyer, "address" | "phone"
 
 export type PaymentInfo = {
   id: string;
+  /** Settlement amount (`total`). */
   totalCents: number | null;
   currency: string | null;
+  /** What the buyer was charged in their currency (`presentment_total`), when Whop sends it. */
+  presentmentCents?: number | null;
+  presentmentCurrency?: string | null;
   checkoutConfigurationId?: string | null;
+  /** Saved payment method, used for one-click post-purchase offers. */
+  memberId?: string | null;
+  paymentMethodId?: string | null;
   buyer?: PaymentBuyer;
 };
 
 /** Reasons a paid order must be looked at by a human before it goes to Shopify. */
 export function reviewReasons(
   snapshot: { totalCents: number; currency: string; shippingCountries: string[]; shippingRateId: string | null },
-  payment: Pick<PaymentInfo, "totalCents" | "currency">,
+  payment: Pick<PaymentInfo, "totalCents" | "currency" | "presentmentCents" | "presentmentCurrency">,
   address: Address | null,
 ): string[] {
   const reasons: string[] = [];
-  if (payment.totalCents == null || !payment.currency) {
+  const cur = snapshot.currency.toUpperCase();
+  // Compare in the checkout's currency: presentment first (what the buyer paid), then settlement.
+  const amount =
+    payment.presentmentCents != null && payment.presentmentCurrency?.toUpperCase() === cur
+      ? payment.presentmentCents
+      : payment.totalCents != null && payment.currency?.toUpperCase() === cur
+        ? payment.totalCents
+        : null;
+  if (payment.totalCents == null && payment.presentmentCents == null) {
     reasons.push("montant ou devise du paiement illisible");
-  } else if (payment.currency.toUpperCase() === snapshot.currency.toUpperCase() && payment.totalCents < snapshot.totalCents) {
-    reasons.push(`montant payé (${payment.totalCents}) inférieur au total (${snapshot.totalCents})`);
+  } else if (amount != null && amount < snapshot.totalCents) {
+    reasons.push(`montant payé (${amount}) inférieur au total (${snapshot.totalCents})`);
   }
   if (
     snapshot.shippingRateId &&
@@ -334,7 +363,11 @@ export function reviewReasons(
   return reasons;
 }
 
-/** Marks the session paid and creates the Shopify order. Safe to call repeatedly. */
+/**
+ * Marks the session paid and creates the Shopify order. Safe to call repeatedly
+ * (webhook retries, reconciliation). Never throws for a Shopify failure: the payment
+ * is recorded and the sync is retried in the background with backoff.
+ */
 export async function markPaid(sessionId: string, payment: PaymentInfo) {
   const session = await db.checkoutSession.findUnique({ where: { id: sessionId } });
   if (!session) throw new Error(`Session ${sessionId} introuvable`);
@@ -348,10 +381,11 @@ export async function markPaid(sessionId: string, payment: PaymentInfo) {
           where: { id: sessionId },
           data: { reviewNote: session.reviewNote ? `${session.reviewNote}\n${note}` : note },
         });
+        await recordEvent({ storeId: session.storeId, sessionId, level: "warn", kind: "payment.duplicate", message: note, alert: true });
       }
       return;
     }
-    if (!session.reviewNote) await syncOrder(sessionId);
+    if (!session.reviewNote) await syncOrderSafely(sessionId);
     return;
   }
 
@@ -386,6 +420,8 @@ export async function markPaid(sessionId: string, payment: PaymentInfo) {
       status: "PAID",
       paidAt: new Date(),
       whopPaymentId: payment.id,
+      whopMemberId: payment.memberId ?? null,
+      whopPaymentMethodId: payment.paymentMethodId ?? null,
       syncError: null,
       email: session.email ?? payment.buyer?.email ?? null,
       ...(address ? { shippingAddress: address as Prisma.InputJsonValue } : {}),
@@ -416,14 +452,35 @@ export async function markPaid(sessionId: string, payment: PaymentInfo) {
     if (used === 0) reasons.push(`code promo ${paid.discountCode} déjà épuisé au moment du paiement`);
   }
 
+  await recordEvent({
+    storeId: session.storeId,
+    sessionId,
+    kind: "payment.succeeded",
+    message: `Paiement ${payment.id} reçu (${(paid?.totalCents ?? session.totalCents) / 100} ${session.currency})`,
+  });
+  await sendPurchaseConversions(sessionId).catch((err) =>
+    log.error("conversions.failed", "Server-side purchase event failed", { sessionId, err }),
+  );
+
   if (reasons.length) {
-    await db.checkoutSession.update({
-      where: { id: sessionId },
-      data: { reviewNote: `À vérifier : ${reasons.join(" ; ")}. Remboursez dans Whop ou synchronisez la commande manuellement.` },
-    });
+    const reviewNote = `À vérifier : ${reasons.join(" ; ")}. Remboursez dans Whop ou synchronisez la commande manuellement.`;
+    await db.checkoutSession.update({ where: { id: sessionId }, data: { reviewNote } });
+    await recordEvent({ storeId: session.storeId, sessionId, level: "warn", kind: "review.hold", message: reviewNote, alert: true });
     return;
   }
-  await syncOrder(sessionId);
+  await syncOrderSafely(sessionId);
+}
+
+/** Minutes to wait before each automatic retry of a failed Shopify sync. */
+export const SYNC_BACKOFF_MINUTES = [1, 5, 15, 60, 180, 360, 720, 1440];
+
+/** Runs syncOrder; failures are already recorded and scheduled for retry, so they don't propagate. */
+export async function syncOrderSafely(sessionId: string) {
+  try {
+    await syncOrder(sessionId);
+  } catch {
+    /* recorded in syncOrder */
+  }
 }
 
 /** Creates the Shopify order for a paid session if it doesn't exist yet. */
@@ -442,65 +499,101 @@ export async function syncOrder(sessionId: string) {
   if (claim.count === 0) return;
 
   const session = await db.checkoutSession.findUniqueOrThrow({ where: { id: sessionId }, include: { store: true } });
+  let order: { id: string; name: string } | null = null;
   try {
-    const snapshot = session.paidQuoteId ? await db.checkoutQuote.findUnique({ where: { id: session.paidQuoteId } }) : null;
-    let addOns: { title: string; priceCents: number; variantId: string | null }[];
-    let shipping: { title: string; priceCents: number } | null;
-    let freeShipping: boolean;
-    if (snapshot) {
-      addOns = snapshot.addOns as unknown as typeof addOns;
-      shipping = snapshot.shippingRateId ? { title: snapshot.shippingRateName ?? "Livraison", priceCents: snapshot.shippingCents } : null;
-      freeShipping = snapshot.discountFreeShipping;
-    } else {
-      // Sessions paid before quote snapshots existed.
-      const [rate, liveAddOns, discount] = await Promise.all([
-        session.shippingRateId ? db.shippingRate.findUnique({ where: { id: session.shippingRateId } }) : null,
-        db.addOn.findMany({ where: { id: { in: session.addOnIds } } }),
-        session.discountCode
-          ? db.discountCode.findFirst({ where: { storeId: session.storeId, code: session.discountCode } })
-          : null,
-      ]);
-      addOns = liveAddOns.map((a) => ({ title: a.title, priceCents: a.priceCents, variantId: a.variantId }));
-      shipping = session.shippingRateId ? { title: rate?.name ?? "Livraison", priceCents: session.shippingCents } : null;
-      freeShipping = discount?.type === "FREE_SHIPPING";
-    }
-    const order = await createPaidOrder(session.store, {
-      sessionId: session.id,
-      currency: session.currency,
-      email: session.email ?? "",
-      acceptsMarketing: session.acceptsMarketing,
-      buyerNote: session.note,
-      shippingAddress: session.shippingAddress as Address | null,
-      lines: session.lines as unknown as CartLine[],
-      addOns,
-      discount: session.discountCode
-        ? { code: session.discountCode, amountCents: session.discountCents, freeShipping }
-        : null,
-      shipping,
-      totalCents: session.totalCents,
-      whopPaymentId: session.whopPaymentId ?? "",
-      test: session.store.testMode,
-    });
-    await db.checkoutSession.update({
-      where: { id: sessionId },
-      data: { shopifyOrderId: order.id, shopifyOrderName: order.name, syncError: null, syncStartedAt: null },
-    });
-    // Refunds or disputes that arrived before the order existed.
-    try {
-      if (session.refundedCents > 0) {
-        await createRefund(session.store, order.id, session.refundedCents, "Remboursé via Whop");
-      }
-      if (session.disputed) await tagOrder(session.store, order.id, ["litige-whop"]);
-    } catch (err) {
-      console.error("replaying refund/dispute on new order failed", err);
-    }
+    // Idempotency: an earlier attempt may have created the order and then failed to record it.
+    order = await findOrderForSession(session.store, session.id).catch(() => null);
+    if (!order) order = await createPaidOrder(session.store, await buildOrderInput(session));
   } catch (err) {
+    const attempts = session.syncAttempts + 1;
+    const delay = SYNC_BACKOFF_MINUTES[attempts - 1];
+    const message = err instanceof Error ? err.message.slice(0, 1000) : String(err);
     await db.checkoutSession.update({
       where: { id: sessionId },
-      data: { syncError: err instanceof Error ? err.message.slice(0, 1000) : String(err), syncStartedAt: null },
+      data: {
+        syncError: message,
+        syncStartedAt: null,
+        syncAttempts: attempts,
+        nextSyncAt: delay != null ? new Date(Date.now() + delay * 60_000) : null,
+      },
+    });
+    await recordEvent({
+      storeId: session.storeId,
+      sessionId,
+      level: "error",
+      kind: "sync.failed",
+      message:
+        delay != null
+          ? `Commande payée non créée dans Shopify (essai ${attempts}) : ${message}. Nouvel essai automatique dans ${delay} min.`
+          : `Commande payée toujours absente de Shopify après ${attempts} essais : ${message}. Action manuelle requise.`,
+      // Alert on the first failure and when retries are exhausted, not on every retry.
+      alert: attempts === 1 || delay == null,
     });
     throw err;
   }
+
+  // The order exists in Shopify now: never release the lease without recording it,
+  // or a retry could create it twice (the tag lookup covers the lease-expiry case).
+  for (let i = 0; ; i++) {
+    try {
+      await db.checkoutSession.update({
+        where: { id: sessionId },
+        data: { shopifyOrderId: order.id, shopifyOrderName: order.name, syncError: null, syncStartedAt: null, nextSyncAt: null },
+      });
+      break;
+    } catch (err) {
+      if (i >= 2) throw err;
+      await new Promise((r) => setTimeout(r, 300 * (i + 1)));
+    }
+  }
+  await recordEvent({ storeId: session.storeId, sessionId, kind: "order.synced", message: `Commande ${order.name} créée dans Shopify` });
+
+  // Refunds or disputes that arrived before the order existed.
+  try {
+    if (session.refundedCents > 0) {
+      await createRefund(session.store, order.id, session.refundedCents, "Remboursé via Whop");
+    }
+    if (session.disputed) await tagOrder(session.store, order.id, ["litige-whop"]);
+  } catch (err) {
+    log.error("sync.replay_failed", "Replaying refund/dispute on the new order failed", { sessionId, err });
+  }
+}
+
+async function buildOrderInput(session: SessionWithStore) {
+  const snapshot = session.paidQuoteId ? await db.checkoutQuote.findUnique({ where: { id: session.paidQuoteId } }) : null;
+  let addOns: { title: string; priceCents: number; variantId: string | null }[];
+  let shipping: { title: string; priceCents: number } | null;
+  let freeShipping: boolean;
+  if (snapshot) {
+    addOns = snapshot.addOns as unknown as typeof addOns;
+    shipping = snapshot.shippingRateId ? { title: snapshot.shippingRateName ?? "Livraison", priceCents: snapshot.shippingCents } : null;
+    freeShipping = snapshot.discountFreeShipping;
+  } else {
+    // Sessions paid before quote snapshots existed.
+    const [rate, liveAddOns, discount] = await Promise.all([
+      session.shippingRateId ? db.shippingRate.findUnique({ where: { id: session.shippingRateId } }) : null,
+      db.addOn.findMany({ where: { id: { in: session.addOnIds } } }),
+      session.discountCode ? db.discountCode.findFirst({ where: { storeId: session.storeId, code: session.discountCode } }) : null,
+    ]);
+    addOns = liveAddOns.map((a) => ({ title: a.title, priceCents: a.priceCents, variantId: a.variantId }));
+    shipping = session.shippingRateId ? { title: rate?.name ?? "Livraison", priceCents: session.shippingCents } : null;
+    freeShipping = discount?.type === "FREE_SHIPPING";
+  }
+  return {
+    sessionId: session.id,
+    currency: session.currency,
+    email: session.email ?? "",
+    acceptsMarketing: session.acceptsMarketing,
+    buyerNote: session.note,
+    shippingAddress: session.shippingAddress as Address | null,
+    lines: session.lines as unknown as CartLine[],
+    addOns,
+    discount: session.discountCode ? { code: session.discountCode, amountCents: session.discountCents, freeShipping } : null,
+    shipping,
+    totalCents: session.totalCents,
+    whopPaymentId: session.whopPaymentId ?? "",
+    test: session.store.testMode,
+  };
 }
 
 /**
@@ -516,11 +609,30 @@ export async function recordRefund(sessionId: string, amountCents: number) {
     await createRefund(session.store, session.shopifyOrderId, amountCents, "Remboursé via Whop");
   }
   await db.checkoutSession.update({ where: { id: sessionId }, data: { refundedCents: { increment: amountCents } } });
+  await recordEvent({
+    storeId: session.storeId,
+    sessionId,
+    kind: "refund.recorded",
+    message: `Remboursement de ${amountCents / 100} ${session.currency}${session.shopifyOrderName ? ` reporté sur ${session.shopifyOrderName}` : ""}`,
+  });
 }
 
-export async function recordDispute(sessionId: string) {
+export async function recordDispute(sessionId: string, disputeId: string | null) {
   const session = await db.checkoutSession.findUnique({ where: { id: sessionId }, include: { store: true } });
-  if (!session || session.disputed) return;
-  await db.checkoutSession.update({ where: { id: sessionId }, data: { disputed: true } });
-  if (session.shopifyOrderId) await tagOrder(session.store, session.shopifyOrderId, ["litige-whop"]);
+  if (!session) return;
+  if (!session.disputed) {
+    await db.checkoutSession.update({ where: { id: sessionId }, data: { disputed: true } });
+    if (session.shopifyOrderId) await tagOrder(session.store, session.shopifyOrderId, ["litige-whop"]);
+    await recordEvent({
+      storeId: session.storeId,
+      sessionId,
+      level: "warn",
+      kind: "dispute.created",
+      message: `Litige ouvert sur ${session.shopifyOrderName ?? "une commande"} (${session.totalCents / 100} ${session.currency})`,
+      alert: true,
+    });
+  }
+  if (disputeId && session.store.autoDisputeEvidence && !session.disputeEvidenceAt) {
+    await submitDisputeEvidence(session, disputeId);
+  }
 }

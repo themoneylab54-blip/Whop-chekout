@@ -13,6 +13,7 @@ export const WHOP_WEBHOOK_EVENTS = [
   "refund.created",
   "refund.updated",
   "dispute.created",
+  "dispute_alert.created",
 ] as const;
 
 export function whopClient(apiKey: string, testMode: boolean) {
@@ -22,7 +23,7 @@ export function whopClient(apiKey: string, testMode: boolean) {
   });
 }
 
-function storeClient(store: Pick<Store, "whopApiKey" | "testMode">) {
+export function storeClient(store: Pick<Store, "whopApiKey" | "testMode">) {
   if (!store.whopApiKey) throw new Error("Compte Whop non connecté");
   return whopClient(decrypt(store.whopApiKey), store.testMode);
 }
@@ -35,7 +36,13 @@ export function whopWebhookUrl(storeId: string) {
  * One-click Whop setup: validates the key, then creates the hidden product that
  * carries every checkout and the webhook pointing at this app.
  */
-export async function setupWhop(opts: { apiKey: string; testMode: boolean; storeId: string; storeName: string }) {
+export async function setupWhop(opts: {
+  apiKey: string;
+  testMode: boolean;
+  storeId: string;
+  storeName: string;
+  statementDescriptor?: string | null;
+}) {
   const client = whopClient(opts.apiKey, opts.testMode);
   const account = await client.accounts.me();
 
@@ -50,6 +57,8 @@ export async function setupWhop(opts: { apiKey: string; testMode: boolean; store
       visibility: "hidden",
       collect_shipping_address: false,
       send_welcome_message: false,
+      // What buyers see on their bank statement: a recognisable name prevents "unknown charge" disputes.
+      custom_statement_descriptor: statementDescriptor(opts.statementDescriptor || opts.storeName) ?? undefined,
       metadata: { source: "whop-checkout", store_id: opts.storeId },
     }));
 
@@ -110,9 +119,34 @@ export async function teardownWhop(store: Pick<Store, "whopApiKey" | "testMode" 
 /** Wallets and methods offered on every checkout, on top of the account's defaults. */
 export const CHECKOUT_PAYMENT_METHODS = ["card", "apple_pay", "google_pay", "paypal"] as const;
 
+/**
+ * Local and pay-later methods the merchant can switch on (Whop shows each one only
+ * to buyers in the countries it supports). Grouped for the dashboard.
+ */
+export const OPTIONAL_PAYMENT_METHODS = [
+  { id: "klarna", label: "Klarna", hint: "Paiement en 3x / 30 jours — Europe" },
+  { id: "alma", label: "Alma", hint: "3x / 4x sans frais — France, Belgique, Italie" },
+  { id: "oney_3x", label: "Oney 3x", hint: "Paiement en 3 fois — France" },
+  { id: "oney_4x", label: "Oney 4x", hint: "Paiement en 4 fois — France" },
+  { id: "scalapay", label: "Scalapay", hint: "3x / 4x — France, Italie, Espagne" },
+  { id: "bancontact", label: "Bancontact", hint: "Belgique" },
+  { id: "ideal", label: "iDEAL", hint: "Pays-Bas" },
+  { id: "twint", label: "TWINT", hint: "Suisse" },
+  { id: "sepa_debit", label: "Prélèvement SEPA", hint: "Zone euro" },
+  { id: "eps", label: "EPS", hint: "Autriche" },
+  { id: "p24", label: "Przelewy24", hint: "Pologne" },
+  { id: "blik", label: "BLIK", hint: "Pologne" },
+  { id: "multibanco", label: "Multibanco", hint: "Portugal" },
+  { id: "mb_way", label: "MB WAY", hint: "Portugal" },
+  { id: "satispay", label: "Satispay", hint: "Italie" },
+  { id: "revolut_pay", label: "Revolut Pay", hint: "Europe" },
+] as const;
+export type OptionalPaymentMethod = (typeof OPTIONAL_PAYMENT_METHODS)[number]["id"];
+export const OPTIONAL_PAYMENT_METHOD_IDS: readonly string[] = OPTIONAL_PAYMENT_METHODS.map((m) => m.id);
+
 /** Creates the one-off checkout for a session; the embed is rendered with its id. */
 export async function createCheckoutConfiguration(
-  store: Pick<Store, "whopApiKey" | "testMode" | "whopAccountId" | "whopProductId">,
+  store: Pick<Store, "whopApiKey" | "testMode" | "whopAccountId" | "whopProductId"> & { paymentMethods?: string[] },
   opts: { sessionId: string; storeId: string; totalCents: number; currency: string; title: string; redirectUrl: string },
 ) {
   if (!store.whopAccountId || !store.whopProductId) throw new Error("Compte Whop non configuré");
@@ -138,7 +172,13 @@ export async function createCheckoutConfiguration(
   try {
     config = await client.checkoutConfigurations.create({
       ...base,
-      payment_method_configuration: { enabled: [...CHECKOUT_PAYMENT_METHODS], include_platform_defaults: true },
+      payment_method_configuration: {
+        enabled: [
+          ...CHECKOUT_PAYMENT_METHODS,
+          ...(store.paymentMethods ?? []).filter((m) => OPTIONAL_PAYMENT_METHOD_IDS.includes(m)),
+        ] as (typeof CHECKOUT_PAYMENT_METHODS)[number][],
+        include_platform_defaults: true,
+      },
     });
   } catch (err) {
     // A method the account isn't eligible for (e.g. PayPal) must never block the sale:
@@ -206,4 +246,51 @@ export function moneyToCents(value: unknown): number | null {
   if (typeof value === "string") return Math.round(Number(value) * 100);
   if (typeof value === "object" && "amount" in value) return moneyToCents((value as { amount: unknown }).amount);
   return null;
+}
+
+/** Normalizes a Whop payment (webhook data or API object) for markPaid. */
+export function paymentInfoFromWhop(data: Record<string, unknown>) {
+  const total = (data.total ?? data.final_amount) as { currency?: string } | number | undefined;
+  const presentment = data.presentment_total as { currency?: string } | null | undefined;
+  const user = (data.user ?? null) as { email?: string } | null;
+  const str = (v: unknown) => (typeof v === "string" && v ? v : null);
+  type Addr = {
+    name: string | null;
+    line1: string | null;
+    line2: string | null;
+    city: string | null;
+    state: string | null;
+    postal_code: string | null;
+    country: string | null;
+  };
+  return {
+    id: String(data.id),
+    totalCents: moneyToCents(total),
+    currency: typeof total === "object" && total?.currency ? total.currency : str(data.currency),
+    presentmentCents: moneyToCents(presentment),
+    presentmentCurrency: presentment?.currency ?? null,
+    checkoutConfigurationId: str(data.checkout_configuration_id),
+    memberId: str(data.member_id),
+    paymentMethodId: str(data.payment_method_id),
+    buyer: {
+      email: str(data.customer_email) ?? user?.email ?? null,
+      shippingAddress: (data.shipping_address ?? null) as Addr | null,
+      address: (data.shipping_address ?? data.billing_address ?? null) as Addr | null,
+      phone: str(data.customer_phone),
+    },
+  };
+}
+
+/** Bank statement descriptors: 5–22 characters, letters/digits/spaces only. */
+export function statementDescriptor(name: string | null | undefined): string | null {
+  const clean = (name ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^A-Za-z0-9 ]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toUpperCase()
+    .slice(0, 22)
+    .trim();
+  return clean.length >= 5 ? clean : null;
 }

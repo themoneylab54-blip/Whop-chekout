@@ -68,7 +68,8 @@ body {
 /* ---------- Checkout inputs (theme.inputStyle) ---------- */
 .wc-input {
   width: 100%;
-  font-size: 15px;
+  /* 16px minimum: below that iOS Safari zooms into the field on focus */
+  font-size: 16px;
   padding: 0.75rem 0.875rem;
   color: inherit;
   background: #fff;

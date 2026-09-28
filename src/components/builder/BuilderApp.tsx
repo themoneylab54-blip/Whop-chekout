@@ -64,6 +64,10 @@ import {
   Type as TypeIcon,
   X,
   type LucideIcon,
+  Rocket,
+  History,
+  Undo2,
+  Redo2,
 } from "lucide-react";
 import { IconTile } from "@/components/icons";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
@@ -120,6 +124,7 @@ export const BLOCK_META: Record<BlockType, { label: string; icon: LucideIcon; de
   video: { label: "Vidéo", icon: PlayCircle, description: "YouTube, Vimeo ou .mp4", group: "content" },
   support: { label: "Support client", icon: Headphones, description: "E-mail, téléphone, WhatsApp", group: "content" },
   spacer: { label: "Espace / séparateur", icon: SeparatorHorizontal, description: "Respiration entre les blocs", group: "content" },
+  upsell: { label: "Offre post-achat 1 clic", icon: Rocket, description: "Ajout au colis sans ressaisir la carte", group: "conversion" },
   coupon: { label: "Code promo cadeau", icon: Ticket, description: "Code à copier pour la prochaine commande", group: "after" },
   button_link: { label: "Bouton lien", icon: MousePointerClick, description: "Suivi de commande, communauté…", group: "after" },
   social: { label: "Réseaux sociaux", icon: Share2, description: "Instagram, TikTok, Facebook, YouTube", group: "after" },
@@ -143,8 +148,18 @@ export function BuilderApp(props: {
   addOns: AddOnView[];
   hasDiscounts: boolean;
   save: SaveFn;
+  /** The builder edits a draft; buyers see the last published design. */
+  hasDraft: boolean;
+  versions: { id: string; label: string; createdAt: string }[];
+  publish: (label: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  restore: (versionId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  discard: () => Promise<{ ok: true }>;
 }) {
   const { page } = props;
+  const [unpublished, setUnpublished] = useState(props.hasDraft);
+  const [publishing, setPublishing] = useState(false);
+  const [publishMsg, setPublishMsg] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [theme, setTheme] = useState(props.theme);
   const [layout, setLayout] = useState(props.layout);
   const [selected, setSelected] = useState<string | null>(null);
@@ -178,6 +193,7 @@ export function BuilderApp(props: {
           saved.current = snap;
           setState(latest.current === snap ? "saved" : "dirty");
           setError(null);
+          setUnpublished(true);
           return true;
         }
         setState("error");
@@ -228,6 +244,93 @@ export function BuilderApp(props: {
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
   }, [state]);
+
+  /* ---------- undo / redo ---------- */
+
+  type Snap = { theme: Theme; layout: Layout };
+  const past = useRef<Snap[]>([]);
+  const future = useRef<Snap[]>([]);
+  const prevSnap = useRef<Snap>(initial);
+  const lastPush = useRef(0);
+  const applying = useRef(false);
+  const [historyDepth, setHistoryDepth] = useState({ undo: 0, redo: 0 });
+  useEffect(() => {
+    const current = { theme, layout };
+    if (applying.current) {
+      applying.current = false;
+    } else if (current.theme !== prevSnap.current.theme || current.layout !== prevSnap.current.layout) {
+      // Typing in one field is a single undo step (changes closer than 600 ms are merged).
+      if (Date.now() - lastPush.current > 600) {
+        past.current.push(prevSnap.current);
+        if (past.current.length > 100) past.current.shift();
+      }
+      lastPush.current = Date.now();
+      future.current = [];
+    }
+    prevSnap.current = current;
+    setHistoryDepth({ undo: past.current.length, redo: future.current.length });
+  }, [theme, layout]);
+
+  const travel = useCallback((dir: "undo" | "redo") => {
+    const from = dir === "undo" ? past.current : future.current;
+    const to = dir === "undo" ? future.current : past.current;
+    const target = from.pop();
+    if (!target) return;
+    to.push(prevSnap.current);
+    applying.current = true;
+    lastPush.current = 0;
+    setTheme(target.theme);
+    setLayout(target.layout);
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const el = e.target as HTMLElement | null;
+      // Inside a text field, keep the browser's own undo.
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) return;
+      const key = e.key.toLowerCase();
+      if (key === "z" && !e.shiftKey) {
+        e.preventDefault();
+        travel("undo");
+      } else if ((key === "z" && e.shiftKey) || key === "y") {
+        e.preventDefault();
+        travel("redo");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [travel]);
+
+  /* ---------- publish / history ---------- */
+
+  async function publish() {
+    setPublishing(true);
+    setPublishMsg(null);
+    try {
+      if (!(await doSave())) throw new Error("Enregistrement impossible");
+      const res = await props.publish("");
+      if (!res.ok) throw new Error(res.error);
+      setUnpublished(false);
+      setPublishMsg("Publié ✓");
+      setTimeout(() => setPublishMsg(null), 2500);
+    } catch (err) {
+      setPublishMsg(err instanceof Error ? err.message : "Erreur");
+    } finally {
+      setPublishing(false);
+    }
+  }
+  async function restoreVersion(id: string) {
+    if (!window.confirm("Charger cette version dans le brouillon ? (Rien n'est publié tant que vous ne cliquez pas sur Publier.)")) return;
+    const res = await props.restore(id);
+    if (res.ok) window.location.reload();
+    else window.alert(res.error);
+  }
+  async function discardDraft() {
+    if (!window.confirm("Abandonner le brouillon et revenir au design publié ?")) return;
+    await props.discard();
+    window.location.reload();
+  }
 
   /* ---------- block operations ---------- */
 
@@ -375,7 +478,29 @@ export function BuilderApp(props: {
               </button>
             ))}
           </div>
-          <SaveStatus state={state} error={error} />
+          <div className="flex rounded-xl bg-zinc-100/80 p-1 ring-1 ring-zinc-200/60 ring-inset" role="group" aria-label="Historique des modifications">
+            <button
+              type="button"
+              onClick={() => travel("undo")}
+              disabled={historyDepth.undo === 0}
+              title="Annuler (Ctrl/⌘ + Z)"
+              aria-label="Annuler"
+              className="rounded-lg p-1.5 text-zinc-600 transition hover:bg-white hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent"
+            >
+              <Undo2 className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => travel("redo")}
+              disabled={historyDepth.redo === 0}
+              title="Rétablir (Ctrl/⌘ + Maj + Z)"
+              aria-label="Rétablir"
+              className="rounded-lg p-1.5 text-zinc-600 transition hover:bg-white hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent"
+            >
+              <Redo2 className="h-4 w-4" />
+            </button>
+          </div>
+          <SaveStatus state={state} error={error} unpublished={unpublished} />
           {state === "error" && (
             <button type="button" onClick={() => window.location.reload()} className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm shadow-sm hover:bg-zinc-50">
               <RotateCw className="h-3.5 w-3.5" /> Recharger
@@ -390,13 +515,50 @@ export function BuilderApp(props: {
           >
             <ExternalLink className="h-3.5 w-3.5" /> Aperçu
           </a>
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setHistoryOpen((o) => !o)}
+              aria-expanded={historyOpen}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-sm shadow-sm transition hover:bg-zinc-50"
+            >
+              <History className="h-3.5 w-3.5" /> Versions
+            </button>
+            {historyOpen && (
+              <div className="absolute right-0 z-30 mt-2 w-80 overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-[var(--shadow-float)]">
+                <p className="border-b border-zinc-100 px-4 py-2.5 text-xs font-semibold tracking-wide text-zinc-500 uppercase">Versions publiées</p>
+                <ul className="max-h-72 overflow-y-auto py-1">
+                  {props.versions.length === 0 && <li className="px-4 py-3 text-sm text-zinc-500">Aucune publication pour l&apos;instant.</li>}
+                  {props.versions.map((v) => (
+                    <li key={v.id} className="flex items-center justify-between gap-2 px-4 py-2 text-sm hover:bg-zinc-50">
+                      <span className="min-w-0">
+                        <span className="block truncate font-medium">{v.label}</span>
+                        <span className="text-xs text-zinc-500">{new Date(v.createdAt).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })}</span>
+                      </span>
+                      <button type="button" onClick={() => restoreVersion(v.id)} className="shrink-0 text-xs font-medium text-indigo-600 hover:underline">
+                        Restaurer
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                {unpublished && (
+                  <button type="button" onClick={discardDraft} className="w-full border-t border-zinc-100 px-4 py-2.5 text-left text-sm text-red-600 hover:bg-red-50">
+                    Abandonner le brouillon
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          {publishMsg && <span className="text-xs text-zinc-600">{publishMsg}</span>}
           <button
             type="button"
-            onClick={() => void doSave()}
-            disabled={state === "saving" || state === "saved"}
-            className="rounded-lg bg-zinc-900 px-4 py-1.5 text-sm font-medium text-white shadow-[0_1px_0_rgba(255,255,255,.15)_inset,0_2px_6px_-2px_rgba(0,0,0,.4)] transition hover:bg-zinc-800 disabled:opacity-40"
+            onClick={publish}
+            disabled={publishing || (!unpublished && state === "saved")}
+            title="Rendre ce design visible par vos clients"
+            className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-900 px-4 py-1.5 text-sm font-medium text-white shadow-[0_1px_0_rgba(255,255,255,.15)_inset,0_2px_6px_-2px_rgba(0,0,0,.4)] transition hover:bg-zinc-800 disabled:opacity-40"
           >
-            Enregistrer
+            {publishing ? <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-r-transparent" /> : <Rocket className="h-3.5 w-3.5" />}
+            Publier
           </button>
         </div>
       </header>
@@ -570,9 +732,9 @@ export function BuilderApp(props: {
   );
 }
 
-function SaveStatus({ state, error }: { state: SaveState; error: string | null }) {
+function SaveStatus({ state, error, unpublished }: { state: SaveState; error: string | null; unpublished: boolean }) {
   const map = {
-    saved: ["bg-emerald-500", "Enregistré", "text-zinc-500"],
+    saved: unpublished ? ["bg-amber-400", "Brouillon non publié", "text-zinc-500"] : ["bg-emerald-500", "Publié", "text-zinc-500"],
     dirty: ["bg-amber-400", "Non enregistré", "text-zinc-500"],
     saving: ["bg-sky-500 animate-pulse", "Enregistrement…", "text-zinc-500"],
     error: ["bg-red-500", `Erreur : ${error ?? ""}`, "text-red-600"],
@@ -725,7 +887,7 @@ function StylePanel({
             {theme.policyLinks.map((l, i) => (
               <div key={i} className="flex gap-1.5">
                 <Text value={l.label} placeholder="CGV" onChange={(label) => setT("policyLinks", theme.policyLinks.map((x, j) => (j === i ? { ...x, label } : x)))} />
-                <Text value={l.url} placeholder="https://…" onChange={(url) => setT("policyLinks", theme.policyLinks.map((x, j) => (j === i ? { ...x, url } : x)))} />
+                <UrlText value={l.url} placeholder="https://…" onChange={(url) => setT("policyLinks", theme.policyLinks.map((x, j) => (j === i ? { ...x, url } : x)))} />
                 <button type="button" aria-label="Retirer" className="px-1 text-zinc-400 hover:text-red-600" onClick={() => setT("policyLinks", theme.policyLinks.filter((_, j) => j !== i))}>
                   <X className="h-4 w-4" />
                 </button>
@@ -738,6 +900,20 @@ function StylePanel({
             )}
           </div>
         </F>
+      </PanelSection>
+
+      <PanelSection title="Conformité UE" icon={Scale}>
+        <Check label="Case « J'accepte les CGV » avant de payer" checked={theme.requireTerms} onChange={(v) => setT("requireTerms", v)} />
+        <F label="Lien des CGV" hint="Sinon, le lien légal nommé « CGV » ou « Conditions » est utilisé.">
+          <UrlText value={theme.termsUrl} placeholder="https://…/pages/cgv" onChange={(v) => setT("termsUrl", v)} />
+        </F>
+        <F label="Mention sous le total" hint="Ex. « TVA incluse ». Laisser vide pour masquer.">
+          <Text value={theme.vatNote} onChange={(v) => setT("vatNote", v)} />
+        </F>
+        <Check label="Rappel du droit de rétractation (remerciement)" checked={theme.withdrawalNotice} onChange={(v) => setT("withdrawalNotice", v)} />
+        <p className="text-[11px] leading-relaxed text-zinc-500">
+          Le bouton affiche par défaut « Commander et payer » (mention d&apos;obligation de paiement exigée par le Code de la consommation).
+        </p>
       </PanelSection>
     </div>
   );

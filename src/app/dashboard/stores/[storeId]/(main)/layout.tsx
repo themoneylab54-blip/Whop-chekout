@@ -1,7 +1,9 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ChevronsUpDown, FlaskConical, LogOut, Plus, ShoppingBag } from "lucide-react";
+import { after } from "next/server";
 import { requireAdmin } from "@/lib/auth";
+import { maybeTick } from "@/lib/tick";
 import { db } from "@/lib/db";
 import { MobileNav, NavLink } from "@/components/dashboard/NavLink";
 import { logoutAction } from "../../../actions";
@@ -49,6 +51,8 @@ export default async function StoreLayout({ children, params }: { children: Reac
     db.adminUser.findUnique({ where: { id: adminId }, select: { email: true } }),
     db.checkoutSession.count({ where: { storeId, status: "PAID", shopifyOrderId: null } }),
   ]);
+  // Dashboard visits also keep background maintenance going (reconciliation, retries…).
+  after(() => maybeTick().catch(() => undefined));
   if (!store) notFound();
   const base = `/dashboard/stores/${store.id}`;
   const live = store.enabled && !!store.shopifyConnectedAt && !!store.whopConnectedAt;
@@ -102,6 +106,9 @@ export default async function StoreLayout({ children, params }: { children: Reac
           >
             Commandes
           </NavLink>
+          <NavLink href={`${base}/analytics`} icon="analytics">
+            Analytics
+          </NavLink>
           <p className="mt-5 mb-1.5 px-2.5 text-[10px] font-semibold tracking-[.1em] text-zinc-400 uppercase">Connexions</p>
           <NavLink href={`${base}/shopify`} icon="shopify" badge={<Dot ok={!!store.shopifyConnectedAt} />}>
             Shopify
@@ -125,7 +132,13 @@ export default async function StoreLayout({ children, params }: { children: Reac
           <NavLink href={`${base}/offers`} icon="offers">
             Promos &amp; options
           </NavLink>
+          <NavLink href={`${base}/growth`} icon="growth">
+            Pixels &amp; relances
+          </NavLink>
           <p className="mt-5 mb-1.5 px-2.5 text-[10px] font-semibold tracking-[.1em] text-zinc-400 uppercase">Compte</p>
+          <NavLink href={`${base}/journal`} icon="journal">
+            Journal &amp; santé
+          </NavLink>
           <NavLink href={`${base}/settings`} icon="settings">
             Réglages
           </NavLink>
@@ -147,20 +160,44 @@ export default async function StoreLayout({ children, params }: { children: Reac
       <div className="min-w-0 flex-1">
         <div className="sticky top-0 z-20 border-b border-zinc-200/70 bg-white/80 backdrop-blur-xl md:hidden">
           <div className="flex items-center gap-2.5 px-4 pt-3 pb-2">
-            <StoreAvatar id={store.id} name={store.name} size={26} />
-            <span className="flex-1 truncate font-semibold">{store.name}</span>
-            <span className={`h-2 w-2 rounded-full ${live ? "bg-emerald-500" : "bg-zinc-300"}`} />
+            <details className="group relative min-w-0 flex-1">
+              <summary className="flex cursor-pointer list-none items-center gap-2.5">
+                <StoreAvatar id={store.id} name={store.name} size={26} />
+                <span className="truncate font-semibold">{store.name}</span>
+                <span className={`h-2 w-2 shrink-0 rounded-full ${live ? "bg-emerald-500" : "bg-zinc-300"}`} />
+                <ChevronsUpDown className="h-4 w-4 shrink-0 text-zinc-400" />
+              </summary>
+              <div className="absolute inset-x-0 top-full z-30 mt-2 w-64 rounded-xl bg-white p-1.5 shadow-[var(--shadow-float)]">
+                {stores.map((s) => (
+                  <Link key={s.id} href={`/dashboard/stores/${s.id}`} className="flex items-center gap-2 rounded-lg px-2 py-2 text-sm hover:bg-zinc-100">
+                    <StoreAvatar id={s.id} name={s.name} size={22} />
+                    <span className="flex-1 truncate">{s.name}</span>
+                  </Link>
+                ))}
+                <Link href="/dashboard/stores/new" className="flex items-center gap-2 rounded-lg px-2 py-2 text-sm font-medium text-indigo-600 hover:bg-indigo-50">
+                  <Plus className="h-4 w-4" /> Ajouter une boutique
+                </Link>
+              </div>
+            </details>
+            <form action={logoutAction}>
+              <button title="Se déconnecter" aria-label="Se déconnecter" className="rounded-md p-2 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-900">
+                <LogOut className="h-4 w-4" />
+              </button>
+            </form>
           </div>
           <MobileNav
             items={[
               { href: base, label: "Vue d'ensemble", exact: true },
-              { href: `${base}/orders`, label: "Commandes" },
+              { href: `${base}/orders`, label: unsynced > 0 ? `Commandes (${unsynced})` : "Commandes" },
+              { href: `${base}/analytics`, label: "Analytics" },
               { href: `${base}/shopify`, label: "Shopify" },
               { href: `${base}/whop`, label: "Whop" },
               { href: `${base}/interception`, label: "Interception" },
               { href: `${base}/builder/checkout`, label: "Design" },
               { href: `${base}/shipping`, label: "Livraison" },
               { href: `${base}/offers`, label: "Promos" },
+              { href: `${base}/growth`, label: "Pixels & relances" },
+              { href: `${base}/journal`, label: "Journal" },
               { href: `${base}/settings`, label: "Réglages" },
             ]}
           />

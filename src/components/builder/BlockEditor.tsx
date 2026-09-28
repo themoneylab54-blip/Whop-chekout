@@ -701,6 +701,51 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           </F>
         </div>
       );
+    case "upsell":
+      return (
+        <div className="space-y-3">
+          <p className="rounded-lg bg-indigo-50 px-3 py-2 text-[11px] leading-relaxed text-indigo-900">
+            Affichée juste après l&apos;achat. Le client accepte en un clic : Whop débite la carte enregistrée pendant le checkout et une commande Shopify
+            liée est créée. Valable 1 h après le paiement. Quand une offre est active, le checkout enregistre la carte (certains moyens comme PayPal peuvent
+            alors être masqués).
+          </p>
+          <F label="ID de variante Shopify" hint="Le numéro de la variante (ou l'URL admin …/variants/123).">
+            <Text
+              value={block.props.variantId}
+              placeholder="44871234567890"
+              onChange={(v) => props(block, { variantId: v.startsWith("gid://") ? v : (v.match(/(\d+)\D*$/)?.[1] ?? v.trim()) })}
+            />
+          </F>
+          <div className="grid grid-cols-2 gap-2">
+            <F label="Prix de l'offre">
+              <Num value={block.props.price} min={0} step={0.1} onChange={(price) => props(block, { price })} />
+            </F>
+            <F label="Prix barré">
+              <Num value={block.props.compareAt} min={0} step={0.1} onChange={(compareAt) => props(block, { compareAt })} />
+            </F>
+          </div>
+          <F label="Bandeau">
+            <Text value={block.props.badge} onChange={(badge) => props(block, { badge })} />
+          </F>
+          <F label="Titre">
+            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+          </F>
+          <F label="Texte">
+            <Area value={block.props.text} rows={3} onChange={(text) => props(block, { text })} />
+          </F>
+          <F label="Image">
+            <UrlText value={block.props.imageUrl} onChange={(imageUrl) => props(block, { imageUrl })} />
+          </F>
+          <div className="grid grid-cols-2 gap-2">
+            <F label="Bouton">
+              <Text value={block.props.buttonText} onChange={(buttonText) => props(block, { buttonText })} />
+            </F>
+            <F label="Refus">
+              <Text value={block.props.declineText} onChange={(declineText) => props(block, { declineText })} />
+            </F>
+          </div>
+        </div>
+      );
     case "coupon":
       return (
         <div className="space-y-3">

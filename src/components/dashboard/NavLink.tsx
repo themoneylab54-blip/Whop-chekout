@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import { Crosshair, LayoutDashboard, Paintbrush, PartyPopper, Percent, Receipt, Settings, Truck } from "lucide-react";
+import { Activity, BarChart3, Crosshair, LayoutDashboard, Megaphone, Paintbrush, PartyPopper, Percent, Receipt, Settings, Truck } from "lucide-react";
 import { ShopifyLogo, WhopLogo } from "@/components/brands";
 
 // Server components can't pass component functions to this client component: they pass a name.
@@ -18,6 +18,9 @@ const NAV_ICONS = {
   shipping: Truck,
   offers: Percent,
   settings: Settings,
+  analytics: BarChart3,
+  growth: Megaphone,
+  journal: Activity,
 } as const;
 export type NavIcon = keyof typeof NAV_ICONS;
 

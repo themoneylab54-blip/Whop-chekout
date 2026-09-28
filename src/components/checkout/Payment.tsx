@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { WhopCheckoutEmbed, WhopExpressCheckoutButton, useCheckoutEmbedControls } from "@whop/checkout/react";
 import type { Theme } from "@/lib/layout";
 import type { Labels } from "./i18n";
@@ -35,6 +35,8 @@ export function ExpressCheckout({
   returnUrl,
   email,
   onPaid,
+  saveCard,
+  termsNotice,
 }: {
   prepared: Prepared | null;
   theme: Theme;
@@ -42,6 +44,9 @@ export function ExpressCheckout({
   returnUrl: string;
   email: string;
   onPaid: () => void;
+  /** Save the payment method for the one-click post-purchase offer. */
+  saveCard?: boolean;
+  termsNotice?: ReactNode;
 }) {
   const [rendered, setRendered] = useState<string | null>(null);
   if (!prepared || rendered === "none") return null;
@@ -56,11 +61,13 @@ export function ExpressCheckout({
         theme="light"
         locale={theme.language}
         collectShipping
+        setupFutureUsage={saveCard ? "off_session" : undefined}
         prefill={email ? { email } : undefined}
         onExpressMethodResolved={({ rendered: r }) => setRendered(r)}
         onComplete={onPaid}
         fallback={<div className="h-12 animate-pulse rounded-[var(--radius)] bg-neutral-100" />}
       />
+      {termsNotice}
       <div className="my-6 flex items-center gap-3 text-xs text-neutral-400">
         <span className="h-px flex-1 bg-neutral-200" />
         {labels.or}
@@ -85,6 +92,8 @@ export function PaymentPanel({
   testMode,
   confirm,
   onPaid,
+  saveCard,
+  beforeButton,
 }: {
   prepared: Prepared | null;
   preparing: boolean;
@@ -96,6 +105,8 @@ export function PaymentPanel({
   testMode: boolean;
   confirm: () => Promise<ConfirmResult>;
   onPaid: () => void;
+  saveCard?: boolean;
+  beforeButton?: ReactNode;
 }) {
   const controls = useCheckoutEmbedControls();
   const [ready, setReady] = useState(false);
@@ -144,6 +155,7 @@ export function PaymentPanel({
             hideEmail
             hideAddressForm={!showBillingForm}
             hideTermsAndConditions={false}
+            setupFutureUsage={saveCard ? "off_session" : undefined}
             skipRedirect
             returnUrl={returnUrl}
             onStateChange={(s) => setReady(s === "ready")}
@@ -174,6 +186,8 @@ export function PaymentPanel({
           {error ?? prepareError}
         </p>
       )}
+
+      {beforeButton}
 
       <button
         type="button"
@@ -216,7 +230,7 @@ function LockIcon() {
 }
 
 /** Static stand-in for the builder preview (no live Whop form there). */
-export function PaymentPreview({ labels, payLabel }: { labels: Labels; payLabel: string }) {
+export function PaymentPreview({ labels, payLabel, beforeButton }: { labels: Labels; payLabel: string; beforeButton?: ReactNode }) {
   return (
     <div className="space-y-3">
       <div className="space-y-3 rounded-[var(--radius)] border border-neutral-200 bg-white p-4">
@@ -233,6 +247,7 @@ export function PaymentPreview({ labels, payLabel }: { labels: Labels; payLabel:
           <div className="h-11 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3 text-sm text-neutral-400">CVC</div>
         </div>
       </div>
+      {beforeButton}
       <div className="flex w-full items-center justify-center rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-5 py-4 text-base font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)]">
         {payLabel}
       </div>

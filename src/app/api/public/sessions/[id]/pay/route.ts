@@ -6,7 +6,7 @@ import { CheckoutError, confirmSession, paySchema } from "@/lib/checkout";
 /** Saves the buyer's details just before the embedded Whop form is submitted. */
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  if (!rateLimit(`pay:ip:${clientIp(req)}`, 20) || !rateLimit(`pay:s:${id}`, 15)) return json({ error: "Trop de requêtes, réessayez dans une minute." }, { status: 429 });
+  if (!(await rateLimit(`pay:ip:${clientIp(req)}`, 20)) || !(await rateLimit(`pay:s:${id}`, 15))) return json({ error: "Trop de requêtes, réessayez dans une minute." }, { status: 429 });
   const parsed = paySchema.safeParse(await readJson(req));
   if (!parsed.success) {
     return json({ error: "Merci de vérifier vos informations", issues: parsed.error.issues.map((i) => i.path.join(".")) }, { status: 400 });

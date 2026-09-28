@@ -2,7 +2,8 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { themeFontHrefs, loadCheckoutLayout, loadTheme, loadThankYouLayout } from "@/lib/layout";
+import { themeFontHrefs } from "@/lib/layout";
+import { draftDesign, hasDraft } from "@/lib/design";
 import { SAMPLE_LINES, sampleThankYou } from "@/lib/sample";
 import { CheckoutView } from "@/components/checkout/CheckoutView";
 import { ThankYouView } from "@/components/checkout/ThankYouView";
@@ -24,7 +25,9 @@ export default async function PreviewPage({ params }: { params: Promise<{ storeI
     },
   });
   if (!store) notFound();
-  const theme = loadTheme(store.theme, store.name);
+  // The merchant previews what they are editing (the draft), before publishing it.
+  const design = draftDesign(store);
+  const theme = design.theme;
   const fonts = themeFontHrefs(theme);
 
   return (
@@ -33,12 +36,12 @@ export default async function PreviewPage({ params }: { params: Promise<{ storeI
         <link key={href} rel="stylesheet" href={href} />
       ))}
       <div className="sticky top-0 z-50 bg-zinc-900 px-4 py-2 text-center text-xs text-white">
-        Aperçu du design enregistré · données d&apos;exemple · rien n&apos;est facturé
+        {hasDraft(store) ? "Aperçu du brouillon (non publié)" : "Aperçu du design publié"} · données d&apos;exemple · rien n&apos;est facturé
       </div>
       {page === "checkout" ? (
         <CheckoutView
           theme={theme}
-          layout={loadCheckoutLayout(store.checkoutLayout)}
+          layout={design.checkoutLayout}
           currency={store.shopCurrency}
           lines={SAMPLE_LINES}
           rates={store.shippingRates}
@@ -47,7 +50,7 @@ export default async function PreviewPage({ params }: { params: Promise<{ storeI
           mode={{ kind: "preview" }}
         />
       ) : (
-        <ThankYouView theme={theme} layout={loadThankYouLayout(store.thankYouLayout)} data={sampleThankYou(store.shopCurrency)} />
+        <ThankYouView theme={theme} layout={design.thankYouLayout} data={sampleThankYou(store.shopCurrency)} />
       )}
     </>
   );

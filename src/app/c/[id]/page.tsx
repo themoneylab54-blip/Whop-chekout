@@ -4,6 +4,8 @@ import { db } from "@/lib/db";
 import { themeFontHrefs, loadCheckoutLayout, loadTheme } from "@/lib/layout";
 import type { CartLine } from "@/lib/pricing";
 import { CheckoutView } from "@/components/checkout/CheckoutView";
+import { designFor } from "@/lib/experiments";
+import { activeUpsells } from "@/lib/upsell";
 
 export const dynamic = "force-dynamic";
 
@@ -21,8 +23,12 @@ export default async function CheckoutPage({ params }: { params: Promise<{ id: s
     db.addOn.findMany({ where: { storeId: store.id, active: true }, orderBy: { position: "asc" } }),
     db.discountCode.count({ where: { storeId: store.id, active: true } }),
   ]);
-  const theme = loadTheme(store.theme, store.name);
+  // A/B test: variant B sessions render the tested design.
+  const design = await designFor(store, session);
+  const theme = loadTheme(design.theme, store.name);
   const fonts = themeFontHrefs(theme);
+  // Save the card for the one-click post-purchase offer only when one is live.
+  const saveCard = activeUpsells({ thankYouLayout: design.thankYouLayout }).length > 0;
 
   return (
     <>
@@ -31,13 +37,13 @@ export default async function CheckoutPage({ params }: { params: Promise<{ id: s
       ))}
       <CheckoutView
         theme={theme}
-        layout={loadCheckoutLayout(store.checkoutLayout)}
+        layout={loadCheckoutLayout(design.checkoutLayout)}
         currency={session.currency}
         lines={session.lines as unknown as CartLine[]}
         rates={rates}
         addOns={addOns.map((a) => ({ id: a.id, title: a.title, description: a.description, priceCents: a.priceCents, imageUrl: a.imageUrl }))}
         hasDiscounts={discountCount > 0}
-        mode={{ kind: "live", sessionId: session.id, testMode: store.testMode }}
+        mode={{ kind: "live", sessionId: session.id, testMode: store.testMode, saveCard }}
         initialEmail={session.email}
       />
     </>

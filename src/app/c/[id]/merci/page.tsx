@@ -5,6 +5,8 @@ import { themeFontHrefs, loadTheme, loadThankYouLayout } from "@/lib/layout";
 import type { CartLine } from "@/lib/pricing";
 import type { Address } from "@/lib/shopify";
 import { ThankYouView } from "@/components/checkout/ThankYouView";
+import { designFor } from "@/lib/experiments";
+import { upsellEligible } from "@/lib/upsell";
 
 export const dynamic = "force-dynamic";
 
@@ -17,7 +19,9 @@ export default async function ThankYouPage({ params }: { params: Promise<{ id: s
   // show "processing" for any session that reached a Whop checkout.
   if (!session || (session.status === "OPEN" && !session.whopCheckoutId)) notFound();
 
-  const theme = loadTheme(session.store.theme, session.store.name);
+  const design = await designFor(session.store, session);
+  const theme = loadTheme(design.theme, session.store.name);
+  const charges = await db.upsellCharge.findMany({ where: { sessionId: session.id }, select: { blockId: true, status: true } });
   const fonts = themeFontHrefs(theme);
   const a = session.shippingAddress as Address | null;
   const continueUrl = session.returnUrl
@@ -33,7 +37,11 @@ export default async function ThankYouPage({ params }: { params: Promise<{ id: s
       ))}
       <ThankYouView
         theme={theme}
-        layout={loadThankYouLayout(session.store.thankYouLayout)}
+        layout={loadThankYouLayout(design.thankYouLayout)}
+        upsell={{
+          eligible: upsellEligible(session),
+          states: Object.fromEntries(charges.map((c) => [c.blockId, c.status])),
+        }}
         sessionId={session.id}
         data={{
           status: session.status === "OPEN" ? "PAYING" : session.status,

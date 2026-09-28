@@ -122,6 +122,30 @@
     });
     return out;
   }
+  // Ad identifiers for server-side conversions (Meta CAPI, TikTok Events API).
+  function cookie(name) {
+    var m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+  function tracking() {
+    var out = {};
+    var fbp = cookie("_fbp");
+    var fbc = cookie("_fbc");
+    var fbclid = params.get("fbclid") || sessionStorageGet("whopco_fbclid");
+    if (!fbc && fbclid) fbc = "fb.1." + Date.now() + "." + fbclid;
+    var ttp = cookie("_ttp");
+    var ttclid = params.get("ttclid") || sessionStorageGet("whopco_ttclid");
+    if (fbp) out.fbp = fbp.slice(0, 200);
+    if (fbc) out.fbc = fbc.slice(0, 300);
+    if (ttp) out.ttp = ttp.slice(0, 200);
+    if (ttclid) out.ttclid = ttclid.slice(0, 300);
+    // Shopify's cookie banner: respect a refusal of marketing tracking.
+    try {
+      var cp = window.Shopify && window.Shopify.customerPrivacy;
+      if (cp && typeof cp.marketingAllowed === "function") out.marketing = !!cp.marketingAllowed();
+    } catch (e) {}
+    return out;
+  }
   function sessionStorageGet(k) {
     try {
       return sessionStorage.getItem(k);
@@ -206,6 +230,7 @@
             }),
             returnUrl: location.origin + "/",
             utm: utm(),
+            tracking: tracking(),
           }),
         });
       })
