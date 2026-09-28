@@ -254,7 +254,8 @@ export function PaymentPanel({
             hideSubmitButton
             hideEmail
             hideAddressForm={!showBillingForm}
-            hideTermsAndConditions={false}
+            // The store's own terms checkbox already covers acceptance: no second "you accept X's terms" line.
+            hideTermsAndConditions={theme.requireTerms}
             setupFutureUsage={saveCard ? "off_session" : undefined}
             skipRedirect
             returnUrl={returnUrl}
