@@ -76,6 +76,8 @@ model Store {
   pixelRequireConsent Boolean @default(false)
   // Meta content_ids format: "variant" (variant id) or "shopify" (shopify_FR_<product>_<variant>, Shopify catalog)
   metaContentIdFormat String @default("variant")
+  // Country of the Meta catalog for "shopify" content ids (shopify_<country>_…)
+  metaCatalogCountry  String @default("FR")
 
   // --- Alerts (Telegram and/or e-mail through Resend) ---
   resendApiKey     String? // encrypted
@@ -233,6 +235,10 @@ model CheckoutSession {
   visitorId  String?
   // Whop payment method used (card, apple_pay, paypal, klarna…)
   paymentMethodType String?
+  // Whop's fees on this payment (total − amount after fees), for net-margin analytics
+  whopFeeCents      Int?
+  // Open dispute awaiting evidence submission (sent once tracking exists, or near the deadline)
+  disputeId         String?
   paymentFailedAt   DateTime?
   upsellShownAt     DateTime?
 
@@ -319,6 +325,8 @@ model Experiment {
   versionIdA String?
   versionId String
   splitB    Int       @default(50)
+  // Stop automatically and publish the winner once the result is significant
+  autoPromote Boolean   @default(false)
   status    String    @default("RUNNING") // RUNNING | STOPPED
   startedAt DateTime  @default(now())
   endedAt   DateTime?
@@ -334,7 +342,13 @@ model UpsellCharge {
   blockId          String
   title            String
   variantId        String
+  productId        String?
   amountCents      Int
+  // Idempotency: Whop request key = "<id>:<chargeAttempts>", so SDK retries never charge twice
+  chargeAttempts   Int             @default(0)
+  disputed         Boolean         @default(false)
+  pixelSentAt      DateTime?
+  pixelAttempts    Int             @default(0)
   status           String          @default("PENDING") // PENDING | PAID | FAILED | DECLINED
   whopPaymentId    String?         @unique
   shopifyOrderId   String?

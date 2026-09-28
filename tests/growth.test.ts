@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { analyze, bucketOf, summarize } from "@/lib/experiments";
 import { statementDescriptor } from "@/lib/whop";
 import { buildEvidence } from "@/lib/disputes";
-import { e164, metaPayload, sessionEvent, tiktokPayload } from "@/lib/conversions";
+import { consentAllows, e164, metaPayload, sessionEvent, tiktokPayload } from "@/lib/conversions";
 import { reviewReasons } from "@/lib/checkout";
 
 const sha = (v: string) => createHash("sha256").update(v).digest("hex");
@@ -68,6 +68,16 @@ describe("server-side conversions", () => {
     expect(e164("0470 12 34 56", "BE")).toBe("32470123456");
     expect(e164("0551 23 45 67", "DZ")).toBe("213551234567");
     expect(e164("", "FR")).toBeUndefined();
+    expect(e164("+33 (0)6 12 34 56 78", "FR")).toBe("33612345678");
+  });
+  it("never sends test orders, respects refusals and strict consent", () => {
+    const base = { tracking: {}, test: false, store: { pixelRequireConsent: false, metaTestEventCode: null } };
+    expect(consentAllows(base as never)).toBe(true);
+    expect(consentAllows({ ...base, test: true } as never)).toBe(false);
+    expect(consentAllows({ ...base, test: true, store: { ...base.store, metaTestEventCode: "TEST1" } } as never)).toBe(true);
+    expect(consentAllows({ ...base, tracking: { marketing: false } } as never)).toBe(false);
+    expect(consentAllows({ ...base, store: { ...base.store, pixelRequireConsent: true } } as never)).toBe(false);
+    expect(consentAllows({ ...base, tracking: { marketing: true }, store: { ...base.store, pixelRequireConsent: true } } as never)).toBe(true);
   });
 });
 

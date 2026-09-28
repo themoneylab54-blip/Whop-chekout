@@ -22,7 +22,7 @@ export default async function WhopPage({
     db.store.findUnique({ where: { id: storeId } }),
     db.appSetting.findUnique({ where: { key: "apple_pay_domain_association" } }),
     // Recent rejection of the optional methods (last 7 days).
-    db.eventLog.findFirst({ where: { storeId, kind: "payment_methods.rejected", createdAt: { gt: daysAgo(7) } }, orderBy: { createdAt: "desc" }, select: { createdAt: true } }),
+    db.eventLog.findFirst({ where: { storeId, kind: "payment_methods.rejected", createdAt: { gt: daysAgo(7) } }, orderBy: { createdAt: "desc" }, select: { createdAt: true, data: true } }),
   ]);
   if (!store) notFound();
   const connected = !!store.whopConnectedAt;
@@ -119,9 +119,9 @@ export default async function WhopPage({
         >
           {methodsRejected && (
             <p className="mb-4 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900 ring-1 ring-amber-600/20">
-              Le {methodsRejected.createdAt.toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: "Europe/Paris" })}, Whop a refusé un
-              moyen de la liste : les moyens par défaut du compte ont été utilisés. Activez les moyens cochés dans Whop → Paramètres → Moyens de paiement, ou
-              décochez ceux qui ne sont pas disponibles.
+              Le {methodsRejected.createdAt.toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: "Europe/Paris" })}, Whop n&apos;a pas
+              activé : <strong>{((methodsRejected.data as { dropped?: string[] } | null)?.dropped ?? []).join(", ") || "un moyen de la liste"}</strong>. Activez-les
+              dans Whop → Paramètres → Moyens de paiement, ou décochez-les. Les autres moyens restent proposés.
             </p>
           )}
           <form action={savePaymentMethodsAction.bind(null, store.id)}>

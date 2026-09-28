@@ -1,11 +1,15 @@
 import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { centsToDecimal, type CartLine } from "@/lib/pricing";
+import type { CartLine } from "@/lib/pricing";
 import type { Address } from "@/lib/shopify";
 
 export const dynamic = "force-dynamic";
 
+/** Amounts as French numbers (64,90), unquoted, so Excel can sum them. */
+const num = (cents: number) => ({ num: (cents / 100).toFixed(2).replace(".", ",") });
+
 const cell = (v: unknown) => {
+  if (v && typeof v === "object" && "num" in v) return String((v as { num: string }).num);
   const s = v == null ? "" : String(v);
   // Quote everything; neutralise spreadsheet formulas (CSV injection).
   return `"${(/^[=+\-@]/.test(s) ? `'${s}` : s).replace(/"/g, '""')}"`;
@@ -25,7 +29,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ storeId: string
   });
   const header = [
     "Date (Paris)", "Commande Shopify", "E-mail", "Pays", "Articles", "Sous-total", "Réduction", "Code", "Livraison", "Options",
-    "Total", "Offres post-achat", "Remboursé", "Devise", "Moyen de paiement", "Paiement Whop", "Source", "Campagne", "Variante A/B", "Litige", "Test",
+    "Total", "Offres post-achat", "Offres remboursées", "Frais Whop", "Remboursé", "Devise", "Moyen de paiement", "Paiement Whop", "Source", "Campagne", "Variante A/B", "Litige", "Test",
   ];
   const lines = rows.map((s) => {
     const a = s.shippingAddress as Address | null;
@@ -37,14 +41,16 @@ export async function GET(req: Request, ctx: { params: Promise<{ storeId: string
       s.email,
       a?.countryCode,
       items,
-      centsToDecimal(s.subtotalCents),
-      centsToDecimal(s.discountCents),
+      num(s.subtotalCents),
+      num(s.discountCents),
       s.discountCode,
-      centsToDecimal(s.shippingCents),
-      centsToDecimal(s.addOnsCents),
-      centsToDecimal(s.totalCents),
-      centsToDecimal(s.upsells.reduce((x, u) => x + u.amountCents, 0)),
-      centsToDecimal(s.refundedCents),
+      num(s.shippingCents),
+      num(s.addOnsCents),
+      num(s.totalCents),
+      num(s.upsells.reduce((x, u) => x + u.amountCents, 0)),
+      num(s.upsells.reduce((x, u) => x + u.refundedCents, 0)),
+      s.whopFeeCents != null ? num(s.whopFeeCents) : "",
+      num(s.refundedCents),
       s.currency,
       s.paymentMethodType,
       s.whopPaymentId,

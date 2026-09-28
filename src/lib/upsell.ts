@@ -3,9 +3,10 @@ import { Prisma, type CheckoutSession, type Store } from "@prisma/client";
 import { db } from "./db";
 import { loadThankYouLayout, type BlockOf } from "./layout";
 import { sendUpsellConversions } from "./conversions";
+import { submitDisputeEvidence } from "./disputes";
 import { designFor } from "./experiments";
 import { SYNC_BACKOFF_MINUTES } from "./checkout";
-import { recordEvent } from "./log";
+import { log, recordEvent } from "./log";
 import { createPaidOrder, createRefund, findOrderForSession, priceCart, tagOrder, type Address } from "./shopify";
 import { centsToDecimal } from "./pricing";
 import { statementDescriptor, storeClient } from "./whop";
@@ -85,7 +86,7 @@ export async function acceptUpsell(session: SessionWithStore, blockId: string): 
   let charge;
   try {
     charge = await db.upsellCharge.create({
-      data: { sessionId: session.id, blockId, title: line.title, variantId: line.variantId, amountCents },
+      data: { sessionId: session.id, blockId, title: line.title, variantId: line.variantId, productId: line.productId, amountCents },
     });
   } catch (err) {
     if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002")) throw err;
@@ -93,55 +94,136 @@ export async function acceptUpsell(session: SessionWithStore, blockId: string): 
     if (existing.status === "PAID") return { status: "paid", orderName: existing.shopifyOrderName };
     if (existing.status === "DECLINED") throw new UpsellError("Offre déjà refusée");
     if (existing.status === "PENDING") return { status: "pending" };
-    // FAILED: try again with the same row.
-    charge = await db.upsellCharge.update({ where: { id: existing.id }, data: { status: "PENDING", error: null } });
+    // FAILED: a new attempt, with a new idempotency key.
+    const retried = await db.upsellCharge.updateMany({
+      where: { id: existing.id, status: "FAILED" },
+      data: { status: "PENDING", error: null, whopPaymentId: null, chargeAttempts: { increment: 1 } },
+    });
+    if (retried.count === 0) return { status: "pending" };
+    charge = await db.upsellCharge.findUniqueOrThrow({ where: { id: existing.id } });
   }
+  return chargeWhop(session, charge);
+}
 
+type Charge = Awaited<ReturnType<typeof db.upsellCharge.findUniqueOrThrow>>;
+
+/** Whop answered with a client error: nothing was charged. Anything else (timeout, 5xx) is uncertain. */
+function definitelyRejected(err: unknown) {
+  const status = (err as { statusCode?: number }).statusCode;
+  return typeof status === "number" && status >= 400 && status < 500 && status !== 409 && status !== 429;
+}
+
+/**
+ * Charges the saved payment method. The Idempotency-Key is fixed per attempt, so the
+ * SDK's automatic retries and the background sweep's replay can never charge twice.
+ */
+async function chargeWhop(session: SessionWithStore, charge: Charge): Promise<UpsellResult> {
+  const store = session.store;
   const a = session.shippingAddress as Address | null;
   let payment;
   try {
-    payment = await storeClient(store).payments.create({
-      account_id: store.whopAccountId,
-      member_id: session.whopMemberId,
-      payment_method_id: session.whopPaymentMethodId,
-      plan: {
-        product_id: store.whopProductId,
-        plan_type: "one_time",
-        currency: session.currency.toLowerCase() as "eur",
-        initial_price: Number(centsToDecimal(amountCents)),
-        force_create_new_plan: true,
-        visibility: "hidden",
-        title: `Offre : ${line.title}`.slice(0, 80),
+    payment = await storeClient(store).payments.create(
+      {
+        account_id: store.whopAccountId!,
+        member_id: session.whopMemberId,
+        payment_method_id: session.whopPaymentMethodId,
+        plan: {
+          product_id: store.whopProductId!,
+          plan_type: "one_time",
+          currency: session.currency.toLowerCase() as "eur",
+          initial_price: Number(centsToDecimal(charge.amountCents)),
+          force_create_new_plan: true,
+          visibility: "hidden",
+          title: `Offre : ${charge.title}`.slice(0, 80),
+        },
+        metadata: { checkout_session_id: session.id, upsell_id: charge.id },
+        statement_descriptor: statementDescriptor(store.statementDescriptor || store.name) ?? undefined,
+        shipping_address: a
+          ? {
+              name: `${a.firstName} ${a.lastName}`.trim(),
+              line1: a.address1,
+              line2: a.address2 ?? null,
+              city: a.city,
+              state: a.province ?? null,
+              postal_code: a.zip,
+              country: a.countryCode,
+            }
+          : undefined,
       },
-      metadata: { checkout_session_id: session.id, upsell_id: charge.id },
-      statement_descriptor: statementDescriptor(store.statementDescriptor || store.name) ?? undefined,
-      shipping_address: a
-        ? {
-            name: `${a.firstName} ${a.lastName}`.trim(),
-            line1: a.address1,
-            line2: a.address2 ?? null,
-            city: a.city,
-            state: a.province ?? null,
-            postal_code: a.zip,
-            country: a.countryCode,
-          }
-        : undefined,
-    });
+      { idempotencyKey: `upsell_${charge.id}_${charge.chargeAttempts}` },
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await db.upsellCharge.update({ where: { id: charge.id }, data: { status: "FAILED", error: message.slice(0, 500) } });
-    await recordEvent({ storeId: store.id, sessionId: session.id, level: "warn", kind: "upsell.failed", message: `Offre post-achat refusée par Whop : ${message}` });
-    throw new UpsellError("Le paiement n'a pas pu être effectué. Aucun montant n'a été débité.");
+    if (definitelyRejected(err)) {
+      await db.upsellCharge.update({ where: { id: charge.id }, data: { status: "FAILED", error: message.slice(0, 500) } });
+      await recordEvent({ storeId: store.id, sessionId: session.id, level: "warn", kind: "upsell.failed", message: `Offre post-achat refusée par Whop : ${message}` });
+      throw new UpsellError("Le paiement n'a pas pu être effectué. Aucun montant n'a été débité.");
+    }
+    // Unknown outcome: stay PENDING; the sweep replays the same key to learn the result.
+    await db.upsellCharge.update({ where: { id: charge.id }, data: { error: message.slice(0, 500) } });
+    await recordEvent({ storeId: store.id, sessionId: session.id, level: "warn", kind: "upsell.uncertain", message: `Réponse de Whop incertaine pour une offre post-achat (${message}) : vérification automatique en cours.` });
+    return { status: "pending" };
   }
+  return applyPayment(charge.id, store.id, payment);
+}
 
-  await db.upsellCharge.update({ where: { id: charge.id }, data: { whopPaymentId: payment.id } });
+async function applyPayment(chargeId: string, storeId: string, payment: { id: string; status: string; recovery_url?: string | null }): Promise<UpsellResult> {
+  await db.upsellCharge.update({ where: { id: chargeId }, data: { whopPaymentId: payment.id } });
   if (payment.status === "paid") {
-    const done = await markUpsellPaid(charge.id, payment.id, store.id);
+    const done = await markUpsellPaid(chargeId, payment.id, storeId);
     return { status: "paid", orderName: done?.shopifyOrderName ?? null };
   }
-  // 3-D Secure or similar: the buyer confirms on Whop, the webhook finishes the job.
+  if (["void", "uncollectible"].includes(payment.status)) {
+    await markUpsellFailed(chargeId, storeId, `Paiement ${payment.status}`, payment.id);
+    throw new UpsellError("Le paiement a été refusé. Aucun montant n'a été débité.");
+  }
+  // 3-D Secure or similar: the buyer confirms on Whop, the webhook (or the sweep) finishes the job.
   if (payment.recovery_url) return { status: "action", url: payment.recovery_url };
   return { status: "pending" };
+}
+
+/**
+ * Resolves offers stuck in PENDING (lost webhook, crash, timeout): asks Whop for the
+ * payment, or replays the same idempotent request when we never learned its id.
+ */
+export async function sweepPendingUpsells(deadline: number): Promise<number> {
+  const stuck = await db.upsellCharge.findMany({
+    where: { status: "PENDING", createdAt: { lt: new Date(Date.now() - 5 * 60_000) } },
+    include: { session: { include: { store: true } } },
+    take: 20,
+    orderBy: { createdAt: "asc" },
+  });
+  let resolved = 0;
+  for (const c of stuck) {
+    if (Date.now() > deadline) break;
+    const storeId = c.session.storeId;
+    try {
+      if (c.whopPaymentId) {
+        const p = await storeClient(c.session.store).payments.retrieve({ id: c.whopPaymentId });
+        if (p.status === "paid") await markUpsellPaid(c.id, p.id, storeId);
+        else if (["void", "uncollectible"].includes(p.status)) await markUpsellFailed(c.id, storeId, `Paiement ${p.status}`, p.id);
+        else if (Date.now() - c.createdAt.getTime() > 24 * 3600_000) await markUpsellFailed(c.id, storeId, "Jamais confirmé par le client", p.id);
+        else continue;
+      } else if (Date.now() - c.createdAt.getTime() < 23 * 3600_000) {
+        // Same key as the original request: Whop returns the original result, no new charge.
+        await chargeWhop(c.session, c).catch(() => undefined);
+      } else {
+        await db.upsellCharge.update({ where: { id: c.id }, data: { status: "FAILED", error: "Issue inconnue" } });
+        await recordEvent({
+          storeId,
+          sessionId: c.sessionId,
+          level: "error",
+          kind: "upsell.gave_up",
+          message: `Offre post-achat « ${c.title} » : impossible de savoir si le client a été débité. Vérifiez dans Whop.`,
+          alert: true,
+        });
+      }
+      resolved++;
+    } catch (err) {
+      log.warn("upsell.sweep_failed", "Could not resolve a pending upsell", { chargeId: c.id, err });
+    }
+  }
+  return resolved;
 }
 
 /** Marks an offer paid and creates its Shopify order. Idempotent (webhook + direct call). */
@@ -300,9 +382,11 @@ export async function recordUpsellRefund(paymentId: string, storeId: string, ref
   await recordEvent({ storeId, sessionId: charge.sessionId, kind: "refund.recorded", message: `Offre post-achat remboursée (${amountCents / 100} ${charge.session.currency})` });
 }
 
-export async function recordUpsellDispute(paymentId: string, storeId: string) {
+export async function recordUpsellDispute(paymentId: string, storeId: string, disputeId: string | null) {
   const charge = await db.upsellCharge.findUnique({ where: { whopPaymentId: paymentId }, include: { session: { include: { store: true } } } });
   if (!charge || charge.session.storeId !== storeId) return;
+  const first = await db.upsellCharge.updateMany({ where: { id: charge.id, disputed: false }, data: { disputed: true } });
+  if (first.count === 0) return;
   if (charge.shopifyOrderId) await tagOrder(charge.session.store, charge.shopifyOrderId, ["litige-whop"]).catch(() => undefined);
   await recordEvent({
     storeId,
@@ -312,6 +396,15 @@ export async function recordUpsellDispute(paymentId: string, storeId: string) {
     message: `Litige ouvert sur une offre post-achat (${charge.title}, ${charge.amountCents / 100} ${charge.session.currency})`,
     alert: true,
   });
+  if (disputeId && charge.session.store.autoDisputeEvidence) {
+    await submitDisputeEvidence(charge.session, disputeId, {
+      id: charge.id,
+      title: charge.title,
+      amountCents: charge.amountCents,
+      paidAt: charge.createdAt,
+      shopifyOrderId: charge.shopifyOrderId,
+    });
+  }
 }
 
 /** Counts the offer as shown (acceptance rate = accepted / shown). */

@@ -461,7 +461,7 @@ export async function startExperimentAction(storeId: string, fd: FormData) {
   });
   await db.experiment.updateMany({ where: { storeId, status: "RUNNING" }, data: { status: "STOPPED", endedAt: new Date() } });
   await db.experiment.create({
-    data: { storeId, versionId, versionIdA: control.id, splitB: split, name: str(fd, "name").slice(0, 80) || `Test « ${version.label} »` },
+    data: { storeId, versionId, versionIdA: control.id, splitB: split, autoPromote: fd.get("autoPromote") === "on", name: str(fd, "name").slice(0, 80) || `Test « ${version.label} »` },
   });
   await recordEvent({ storeId, kind: "experiment.started", message: `Test A/B lancé : ${version.label} sur ${split} % du trafic` });
   back(path, { ok: `Test A/B lancé : ${split} % des nouveaux checkouts voient « ${version.label} ».` });
@@ -731,6 +731,7 @@ export async function saveTrackingAction(storeId: string, fd: FormData) {
       tiktokAccessToken: secretField(fd, "tiktokAccessToken", store.tiktokAccessToken, path),
       pixelRequireConsent: fd.get("pixelRequireConsent") === "on",
       metaContentIdFormat: str(fd, "metaContentIdFormat") === "shopify" ? "shopify" : "variant",
+      metaCatalogCountry: /^[A-Za-z]{2}$/.test(str(fd, "metaCatalogCountry")) ? str(fd, "metaCatalogCountry").toUpperCase() : "FR",
     },
   });
   back(path, { ok: "Pixels enregistrés" });

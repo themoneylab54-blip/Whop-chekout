@@ -26,6 +26,17 @@ const METHOD_LABELS: Record<string, string> = {
   bancontact: "Bancontact",
   ideal: "iDEAL",
   sepa_debit: "SEPA",
+  scalapay: "Scalapay",
+  twint: "TWINT",
+  eps: "EPS",
+  p24: "Przelewy24",
+  blik: "BLIK",
+  multibanco: "Multibanco",
+  mb_way: "MB WAY",
+  satispay: "Satispay",
+  revolut_pay: "Revolut Pay",
+  klarna_pay_now: "Klarna",
+  card_installments_three: "Carte 3x",
   inconnu: "Non précisé",
 };
 
@@ -97,10 +108,22 @@ export default async function AnalyticsPage({
       <Flash ok={sp.ok} error={sp.error} />
 
       <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <Stat label="Chiffre d'affaires net" value={money(a.revenueCents)} now={a.revenueCents} before={a.previous.revenueCents} hint={`dont ${money(a.upsellRevenueCents)} d'offres post-achat`} />
+        <Stat
+          label="Chiffre d'affaires net"
+          value={money(a.revenueCents)}
+          now={a.revenueCents}
+          before={a.previous.revenueCents}
+          hint={`dont ${money(a.upsellRevenueCents)} d'offres · frais Whop ${a.feesKnown ? "" : "≥ "}${money(a.feesCents)}`}
+        />
         <Stat label="Commandes" value={String(a.orders)} now={a.orders} before={a.previous.orders} hint={`${a.visitors} visiteurs uniques`} />
         <Stat label="Conversion" value={pct(a.cvr)} now={a.cvr} before={a.previous.cvr} hint={`${a.sessions} checkouts ouverts`} />
-        <Stat label="Panier moyen" value={a.orders ? money(a.aovCents) : "—"} now={a.aovCents} before={a.previous.aovCents} hint="net, offres comprises" />
+        <Stat
+          label="Panier moyen"
+          value={a.orders ? money(a.aovCents) : "—"}
+          now={a.aovCents}
+          before={a.previous.aovCents}
+          hint={a.feesCents ? `après frais Whop : ${money(Math.round((a.revenueCents - a.feesCents) / Math.max(1, a.orders)))}` : "net, offres comprises"}
+        />
       </div>
 
       <Card icon={BarChart3} iconColor="#6366f1" title="Chiffre d'affaires par jour" className="mb-6">
@@ -266,6 +289,10 @@ export default async function AnalyticsPage({
               <SubmitButton>
                 <Percent className="h-4 w-4" /> Lancer le test
               </SubmitButton>
+              <label className="flex items-center gap-2 text-sm text-zinc-600 sm:col-span-3">
+                <input type="checkbox" name="autoPromote" className="h-4 w-4 accent-indigo-600" />
+                Décider automatiquement : après 7 jours minimum et un résultat fiable (p &lt; 0,01), publier le gagnant et arrêter le test.
+              </label>
             </form>
           ))}
       </Card>

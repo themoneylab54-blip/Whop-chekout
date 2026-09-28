@@ -42,12 +42,19 @@ export async function pushTracking(session: SessionWithStore): Promise<boolean> 
 }
 
 /** Text evidence built from what the checkout knows: order, delivery, consent, policies. */
-export function buildEvidence(session: CheckoutSession, tracking: { number: string; company: string | null; url: string | null }[], policyUrls: string[]) {
+export function buildEvidence(
+  session: CheckoutSession,
+  tracking: { number: string; company: string | null; url: string | null }[],
+  policyUrls: string[],
+  opts: { withdrawalShown?: boolean; offer?: { title: string; amountCents: number; paidAt: Date } } = {},
+) {
   const a = session.shippingAddress as Address | null;
   const lines = session.lines as unknown as CartLine[];
   const money = (c: number) => `${(c / 100).toFixed(2)} ${session.currency}`;
   const notes = [
-    `Commande ${session.shopifyOrderName ?? session.id} payée le ${session.paidAt?.toISOString().slice(0, 10) ?? "?"} pour ${money(session.totalCents)}.`,
+    opts.offer
+      ? `Achat contesté : offre post-achat « ${opts.offer.title} » (${money(opts.offer.amountCents)}) acceptée en un clic par le client le ${opts.offer.paidAt.toISOString().slice(0, 10)}, juste après sa commande ${session.shopifyOrderName ?? session.id} (${money(session.totalCents)}), et expédiée avec elle.`
+      : `Commande ${session.shopifyOrderName ?? session.id} payée le ${session.paidAt?.toISOString().slice(0, 10) ?? "?"} pour ${money(session.totalCents)}.`,
     tracking.length
       ? `Expédiée : ${tracking.map((t) => `${t.company ?? "transporteur"} ${t.number}${t.url ? ` (${t.url})` : ""}`).join(", ")}.`
       : "Numéro de suivi non encore disponible.",
@@ -63,8 +70,10 @@ export function buildEvidence(session: CheckoutSession, tracking: { number: stri
     billing_address: a ? [a.address1, a.address2, a.zip, a.city, a.countryCode].filter(Boolean).join(", ") : null,
     product_description: lines.map((l) => `${l.quantity} × ${l.title}${l.variantTitle ? ` (${l.variantTitle})` : ""}`).join("; ").slice(0, 1000),
     service_date: (session.paidAt ?? session.createdAt).toISOString().slice(0, 10),
-    cancellation_policy_disclosure:
-      "Droit de rétractation de 14 jours à compter de la réception (rappelé au client sur la page de confirmation), retour du produit à la charge du client sauf défaut.",
+    // Only claim what the buyer was actually shown.
+    cancellation_policy_disclosure: opts.withdrawalShown
+      ? "Droit de rétractation de 14 jours à compter de la réception, rappelé au client sur la page de confirmation de commande."
+      : "Droit de rétractation de 14 jours à compter de la réception, conformément aux conditions générales de vente.",
     refund_policy_disclosure: policyUrls.length
       ? `Politiques affichées au moment du paiement : ${policyUrls.join(" · ")}`
       : "Politique de retour de 14 jours affichée sur la boutique.",
@@ -73,15 +82,23 @@ export function buildEvidence(session: CheckoutSession, tracking: { number: stri
 }
 
 /** Fills and submits the dispute's evidence in Whop. Never throws. */
-export async function submitDisputeEvidence(session: SessionWithStore, disputeId: string) {
+export async function submitDisputeEvidence(
+  session: SessionWithStore,
+  disputeId: string,
+  offer?: { id: string; title: string; amountCents: number; paidAt: Date; shopifyOrderId: string | null },
+) {
   try {
-    const tracking = session.shopifyOrderId ? await orderTracking(session.store, session.shopifyOrderId).catch(() => []) : [];
+    const orderId = offer?.shopifyOrderId ?? session.shopifyOrderId;
+    const tracking = orderId ? await orderTracking(session.store, orderId).catch(() => []) : [];
     const theme = loadTheme(session.store.theme, session.store.name);
-    const evidence = buildEvidence(session, tracking, theme.policyLinks.map((p) => p.url));
+    const evidence = buildEvidence(session, tracking, theme.policyLinks.map((p) => p.url), {
+      withdrawalShown: theme.withdrawalNotice,
+      offer,
+    });
     const client = storeClient(session.store);
     await client.disputes.update({ id: disputeId, evidence });
     await client.disputes.submit({ id: disputeId });
-    await db.checkoutSession.update({ where: { id: session.id }, data: { disputeEvidenceAt: new Date() } });
+    if (!offer) await db.checkoutSession.update({ where: { id: session.id }, data: { disputeEvidenceAt: new Date() } });
     await recordEvent({
       storeId: session.storeId,
       sessionId: session.id,
@@ -98,6 +115,29 @@ export async function submitDisputeEvidence(session: SessionWithStore, disputeId
       alert: true,
     });
   }
+}
+
+/**
+ * Evidence is stronger with a tracking number: disputes wait until the order has one,
+ * or 3 days at most (well inside Whop's response window), then evidence is sent.
+ */
+export async function submitDueDisputeEvidence(deadline: number): Promise<number> {
+  const pending = await db.checkoutSession.findMany({
+    where: { disputeId: { not: null }, disputeEvidenceAt: null, store: { autoDisputeEvidence: true } },
+    include: { store: true },
+    take: 10,
+  });
+  let n = 0;
+  for (const s of pending) {
+    if (Date.now() > deadline) break;
+    const opened = await db.eventLog.findFirst({ where: { sessionId: s.id, kind: "dispute.created" }, orderBy: { createdAt: "asc" }, select: { createdAt: true } });
+    const age = opened ? Date.now() - opened.createdAt.getTime() : Infinity;
+    const tracking = s.trackingNumber ?? (s.shopifyOrderId ? (await orderTracking(s.store, s.shopifyOrderId).catch(() => []))[0]?.number : null);
+    if (!tracking && age < 3 * 24 * 3600_000) continue;
+    await submitDisputeEvidence(s, s.disputeId!);
+    n++;
+  }
+  return n;
 }
 
 /**

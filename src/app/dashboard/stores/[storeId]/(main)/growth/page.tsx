@@ -79,6 +79,12 @@ export default async function GrowthPage({
                   <option value="shopify">Catalogue Shopify (shopify_FR_produit_variante)</option>
                 </Select>
               </div>
+              <div>
+                <Label htmlFor="metaCatalogCountry" hint="Le pays de votre catalogue Meta (celui de la boutique), pour les identifiants « Catalogue Shopify ».">
+                  Pays du catalogue
+                </Label>
+                <Input id="metaCatalogCountry" name="metaCatalogCountry" defaultValue={store.metaCatalogCountry} maxLength={2} className="w-24 uppercase" />
+              </div>
             </div>
             <div className="border-y border-zinc-100">
               <Toggle

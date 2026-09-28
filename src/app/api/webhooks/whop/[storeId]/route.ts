@@ -164,7 +164,7 @@ async function handle(type: string, data: Record<string, unknown>, storeId: stri
       const paymentId = (typeof data.payment_id === "string" ? data.payment_id : payment?.id) ?? null;
       const session = paymentId ? await db.checkoutSession.findUnique({ where: { whopPaymentId: paymentId } }) : null;
       if (session && session.storeId === storeId) await recordDispute(session.id, typeof data.id === "string" ? data.id : null);
-      else if (paymentId) await recordUpsellDispute(paymentId, storeId);
+      else if (paymentId) await recordUpsellDispute(paymentId, storeId, typeof data.id === "string" ? data.id : null);
       return null;
     }
     case "dispute_alert.created": {

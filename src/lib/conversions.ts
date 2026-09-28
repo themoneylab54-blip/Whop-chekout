@@ -53,7 +53,7 @@ const CALLING_CODES: Record<string, string> = {
 /** "06 12 34 56 78" + FR → "33612345678" (E.164 without "+", as Meta and TikTok expect before hashing). */
 export function e164(phone: string | null | undefined, country: string | null | undefined): string | undefined {
   if (!phone) return undefined;
-  const trimmed = phone.trim();
+  const trimmed = phone.trim().replace(/\(0\)/g, "");
   let digits = trimmed.replace(/\D/g, "");
   if (!digits) return undefined;
   if (trimmed.startsWith("+")) return digits;
@@ -86,7 +86,7 @@ export function sessionEvent(session: Session, kind: "purchase" | "checkout"): C
 export function metaPayload(session: Session, e: ConversionEvent) {
   const t = (session.tracking ?? {}) as Tracking;
   const a = session.shippingAddress as Address | null;
-  const country = a?.countryCode ?? "FR";
+  const country = session.store.metaCatalogCountry || "FR";
   return {
     data: [
       {
@@ -195,7 +195,9 @@ async function sendTo(platform: Platform, session: Session, e: ConversionEvent) 
 }
 
 /** Consent: a refusal on the storefront banner always wins; strict mode also needs an explicit yes. */
-export function consentAllows(session: CheckoutSession & { store: Pick<Store, "pixelRequireConsent"> }) {
+export function consentAllows(session: CheckoutSession & { store: Pick<Store, "pixelRequireConsent" | "metaTestEventCode"> }) {
+  // Test-mode orders never reach the ad platforms (except in Meta's test-events mode).
+  if (session.test && !session.store.metaTestEventCode) return false;
   const marketing = ((session.tracking ?? {}) as Tracking).marketing;
   return session.store.pixelRequireConsent ? marketing === true : marketing !== false;
 }
@@ -256,21 +258,36 @@ export async function retryConversions(deadline: number): Promise<number> {
     await sendPurchaseConversions(s.id).catch((err) => log.warn("conversion.retry_failed", "Conversion retry failed", { sessionId: s.id, err }));
     n++;
   }
+  const upsells = await db.upsellCharge.findMany({
+    where: { status: "PAID", pixelSentAt: null, pixelAttempts: { gt: 0, lt: 5 }, createdAt: { gt: new Date(Date.now() - 6.5 * 24 * 3600_000) } },
+    select: { id: true },
+    take: 25,
+  });
+  for (const u of upsells) {
+    if (Date.now() > deadline) break;
+    await sendUpsellConversions(u.id).catch(() => undefined);
+    n++;
+  }
   return n;
 }
 
-/** Post-purchase offer accepted: its own Purchase event (own dedupe id). Best effort. */
+/** Post-purchase offer accepted: its own Purchase event (own dedupe id), retried by the tick. */
 export async function sendUpsellConversions(chargeId: string) {
   const charge = await db.upsellCharge.findUnique({ where: { id: chargeId }, include: { session: { include: { store: true } } } });
-  if (!charge || charge.status !== "PAID" || !consentAllows(charge.session)) return;
+  if (!charge || charge.status !== "PAID" || charge.pixelSentAt || !consentAllows(charge.session)) return;
+  const list = platforms(charge.session.store);
+  if (!list.length) return;
   const event: ConversionEvent = {
     kind: "purchase",
     eventId: `upsell-${charge.id}`,
     time: charge.createdAt,
     valueCents: charge.amountCents,
-    lines: [{ variantId: charge.variantId, productId: "", title: charge.title, quantity: 1, unitPriceCents: charge.amountCents }],
+    lines: [{ variantId: charge.variantId, productId: charge.productId ?? "", title: charge.title, quantity: 1, unitPriceCents: charge.amountCents }],
   };
-  const results = await Promise.allSettled(platforms(charge.session.store).map((p) => sendTo(p, charge.session, event)));
+  // Meta/TikTok dedupe by event id, so resending to every platform on retry is harmless.
+  const results = await Promise.allSettled(list.map((p) => sendTo(p, charge.session, event)));
+  const ok = results.every((r) => r.status === "fulfilled");
+  await db.upsellCharge.update({ where: { id: chargeId }, data: { pixelAttempts: { increment: 1 }, ...(ok ? { pixelSentAt: new Date() } : {}) } });
   for (const r of results) if (r.status === "rejected") log.warn("conversion.upsell_failed", "Upsell conversion failed", { chargeId, err: r.reason });
 }
 
@@ -300,7 +317,7 @@ export function browserPixel(session: Session, kind: "purchase" | "checkout") {
   const s = session.store;
   if (!(s.metaPixelId || s.tiktokPixelId) || !consentAllows(session)) return null;
   const e = sessionEvent(session, kind);
-  const country = (session.shippingAddress as Address | null)?.countryCode ?? "FR";
+  const country = s.metaCatalogCountry || "FR";
   return {
     metaPixelId: s.metaPixelId,
     tiktokPixelId: s.tiktokPixelId,

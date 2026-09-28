@@ -1,6 +1,7 @@
 -- AlterTable
 ALTER TABLE "CheckoutSession" ADD COLUMN     "clientIp" TEXT,
 ADD COLUMN     "disputeEvidenceAt" TIMESTAMP(3),
+ADD COLUMN     "disputeId" TEXT,
 ADD COLUMN     "experimentId" TEXT,
 ADD COLUMN     "extraPaymentIds" TEXT[] DEFAULT ARRAY[]::TEXT[],
 ADD COLUMN     "nextSyncAt" TIMESTAMP(3),
@@ -23,6 +24,7 @@ ADD COLUMN     "upsellShownAt" TIMESTAMP(3),
 ADD COLUMN     "userAgent" TEXT,
 ADD COLUMN     "variant" TEXT,
 ADD COLUMN     "visitorId" TEXT,
+ADD COLUMN     "whopFeeCents" INTEGER,
 ADD COLUMN     "whopMemberId" TEXT,
 ADD COLUMN     "whopPaymentMethodId" TEXT;
 
@@ -37,6 +39,7 @@ ADD COLUMN     "draftUpdatedAt" TIMESTAMP(3),
 ADD COLUMN     "emailFrom" TEXT,
 ADD COLUMN     "lastWebhookAt" TIMESTAMP(3),
 ADD COLUMN     "metaAccessToken" TEXT,
+ADD COLUMN     "metaCatalogCountry" TEXT NOT NULL DEFAULT 'FR',
 ADD COLUMN     "metaContentIdFormat" TEXT NOT NULL DEFAULT 'variant',
 ADD COLUMN     "metaPixelId" TEXT,
 ADD COLUMN     "metaTestEventCode" TEXT,
@@ -90,6 +93,7 @@ CREATE TABLE "Experiment" (
     "versionIdA" TEXT,
     "versionId" TEXT NOT NULL,
     "splitB" INTEGER NOT NULL DEFAULT 50,
+    "autoPromote" BOOLEAN NOT NULL DEFAULT false,
     "status" TEXT NOT NULL DEFAULT 'RUNNING',
     "startedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "endedAt" TIMESTAMP(3),
@@ -104,7 +108,12 @@ CREATE TABLE "UpsellCharge" (
     "blockId" TEXT NOT NULL,
     "title" TEXT NOT NULL,
     "variantId" TEXT NOT NULL,
+    "productId" TEXT,
     "amountCents" INTEGER NOT NULL,
+    "chargeAttempts" INTEGER NOT NULL DEFAULT 0,
+    "disputed" BOOLEAN NOT NULL DEFAULT false,
+    "pixelSentAt" TIMESTAMP(3),
+    "pixelAttempts" INTEGER NOT NULL DEFAULT 0,
     "status" TEXT NOT NULL DEFAULT 'PENDING',
     "whopPaymentId" TEXT,
     "shopifyOrderId" TEXT,
@@ -167,3 +176,6 @@ UPDATE "CheckoutSession" SET "refundMirroredCents" = "refundedCents" WHERE "shop
 
 -- Backfill: webhook events stored before this migration were fully handled.
 UPDATE "WebhookEvent" SET "processedAt" = "receivedAt" WHERE "processedAt" IS NULL;
+
+-- Backfill: checkouts of stores currently in test mode are test checkouts.
+UPDATE "CheckoutSession" s SET "test" = true FROM "Store" st WHERE st.id = s."storeId" AND st."testMode" = true;

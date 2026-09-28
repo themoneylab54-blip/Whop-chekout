@@ -330,6 +330,8 @@ export type PaymentInfo = {
   paymentMethodId?: string | null;
   /** card, apple_pay, paypal, klarna… (analytics) */
   paymentMethodType?: string | null;
+  /** Whop's fee on the payment, in cents (net-margin analytics). */
+  feeCents?: number | null;
   buyer?: PaymentBuyer;
 };
 
@@ -411,6 +413,7 @@ export async function markPaid(sessionId: string, payment: PaymentInfo, opts: { 
         whopMemberId: payment.memberId ?? null,
         whopPaymentMethodId: payment.paymentMethodId ?? null,
         paymentMethodType: payment.paymentMethodType ?? null,
+        whopFeeCents: payment.feeCents ?? null,
         syncError: null,
         email: session.email ?? payment.buyer?.email ?? null,
         ...(address ? { shippingAddress: address as Prisma.InputJsonValue } : {}),
@@ -694,7 +697,11 @@ export async function recordDispute(sessionId: string, disputeId: string | null)
       alert: true,
     });
   }
-  if (disputeId && session.store.autoDisputeEvidence && !session.disputeEvidenceAt) {
-    await submitDisputeEvidence(session, disputeId);
+  if (disputeId && !session.disputeId) {
+    await db.checkoutSession.update({ where: { id: sessionId }, data: { disputeId } });
+    // Submit now if the parcel is already tracked; otherwise the tick waits for tracking (max 3 days).
+    if (session.store.autoDisputeEvidence && session.trackingNumber && !session.disputeEvidenceAt) {
+      await submitDisputeEvidence(session, disputeId);
+    }
   }
 }

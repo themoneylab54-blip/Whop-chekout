@@ -220,11 +220,13 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
       shopifyOrderId: "gid://shopify/Order/5",
       shopifyOrderName: "#1005",
     });
-    shopify.orderTracking.mockResolvedValue([{ number: "6A1", company: "Colissimo", url: null }]);
+    // No tracking yet: evidence waits (stronger once the parcel is tracked).
     await recordDispute(s.id, "dsp_1");
+    expect(whop.disputeSubmit).not.toHaveBeenCalled();
+    shopify.orderTracking.mockResolvedValue([{ number: "6A1", company: "Colissimo", url: null }]);
+    await runTick();
     expect(whop.disputeUpdate).toHaveBeenCalledWith(expect.objectContaining({ id: "dsp_1" }));
     expect(whop.disputeSubmit).toHaveBeenCalledWith({ id: "dsp_1" });
-    await runTick();
     expect(whop.shipments).toHaveBeenCalledWith(expect.objectContaining({ payment_id: expect.stringMatching(/^pay_dis_/), tracking_number: "6A1" }));
     const row = await db.checkoutSession.findUniqueOrThrow({ where: { id: s.id } });
     expect(row.disputed).toBe(true);
@@ -378,6 +380,32 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
     });
     await markUpsellFailed(charge.id, store.id, "old attempt", `pay_old_${s.id}`);
     expect((await db.upsellCharge.findUniqueOrThrow({ where: { id: charge.id } })).status).toBe("PENDING");
+  });
+
+  it("charges offers with an idempotency key and resolves uncertain ones by replaying it", async () => {
+    const store = await makeStore({
+      thankYouLayout: {
+        blocks: [{ id: "up3", type: "upsell", props: { badge: "", title: "Bonnet", text: "", variantId: "99", imageUrl: "", price: 7, compareAt: 0, buttonText: "Oui", declineText: "Non" } }],
+      },
+    });
+    const s = await makePaidReadySession(store.id, { status: "PAID", paidAt: new Date(), whopPaymentId: `pay_up3_${Date.now()}`, whopMemberId: "m", whopPaymentMethodId: "pm" });
+    shopify.priceCart.mockResolvedValue([{ ...line, variantId: "gid://shopify/ProductVariant/99", title: "Bonnet" }]);
+    // Timeout: outcome unknown → stays pending, no second charge on retry click.
+    whop.create.mockRejectedValueOnce(Object.assign(new Error("timeout"), { statusCode: undefined }));
+    const full = await db.checkoutSession.findUniqueOrThrow({ where: { id: s.id }, include: { store: true } });
+    expect(await acceptUpsell(full, "up3")).toEqual({ status: "pending" });
+    expect(await acceptUpsell(full, "up3")).toEqual({ status: "pending" });
+    expect(whop.create).toHaveBeenCalledTimes(1);
+    const key = whop.create.mock.calls[0][1].idempotencyKey;
+    expect(key).toMatch(/^upsell_/);
+    // The sweep replays the same key and learns it was paid.
+    const charge = await db.upsellCharge.findFirstOrThrow({ where: { sessionId: s.id } });
+    await db.upsellCharge.update({ where: { id: charge.id }, data: { createdAt: new Date(Date.now() - 10 * 60_000) } });
+    whop.create.mockResolvedValueOnce({ id: `pay_up3b_${s.id}`, status: "paid", recovery_url: null });
+    shopify.createPaidOrder.mockResolvedValue({ id: "gid://shopify/Order/73", name: "#1073" });
+    await runTick();
+    expect(whop.create.mock.calls[1][1].idempotencyKey).toBe(key);
+    expect((await db.upsellCharge.findUniqueOrThrow({ where: { id: charge.id } })).status).toBe("PAID");
   });
 
   it("keeps reconciling other stores when one store's Whop call fails", async () => {

@@ -2,8 +2,9 @@ import "server-only";
 import type { Store } from "@prisma/client";
 import { db } from "./db";
 import { markPaid, mirrorRefunds, syncOrderSafely } from "./checkout";
-import { pushTracking } from "./disputes";
-import { retryUpsellSyncs } from "./upsell";
+import { pushTracking, submitDueDisputeEvidence } from "./disputes";
+import { autoPromoteExperiments } from "./analytics";
+import { markUpsellPaid, retryUpsellSyncs, sweepPendingUpsells } from "./upsell";
 import { retryConversions } from "./conversions";
 import { log, recordEvent, withLogContext } from "./log";
 import { paymentInfoFromWhop, storeClient } from "./whop";
@@ -59,6 +60,9 @@ export async function runTick(budgetMs = TICK_BUDGET_MS): Promise<TickReport> {
     ["upsellRetried", retryUpsellSyncs],
     ["conversionsRetried", retryConversions],
     ["refundsMirrored", retryRefundMirrors],
+    ["upsellsSwept", sweepPendingUpsells],
+    ["disputeEvidence", submitDueDisputeEvidence],
+    ["experiments", autoPromoteExperiments],
     ["reconciled", reconcilePayments],
     ["trackingPushed", pushTrackingNumbers],
     ["cleaned", cleanup],
@@ -225,6 +229,19 @@ function paymentTime(p: WhopPayment): number | null {
 
 /** Resolves a batch of Whop payments to sessions in two queries and heals the unknown ones. */
 async function healBatch(store: Store, payments: WhopPayment[]): Promise<number> {
+  // One-click offers: a paid offer whose webhook never came is completed here too.
+  const offers = payments.filter((p) => typeof (p.metadata as Record<string, unknown> | null)?.upsell_id === "string");
+  if (offers.length) {
+    const charges = await db.upsellCharge.findMany({
+      where: { id: { in: offers.map((p) => String((p.metadata as Record<string, unknown>).upsell_id)) }, status: { not: "PAID" }, session: { storeId: store.id } },
+      select: { id: true },
+    });
+    const open = new Set(charges.map((c) => c.id));
+    for (const p of offers) {
+      const id = String((p.metadata as Record<string, unknown>).upsell_id);
+      if (open.has(id)) await markUpsellPaid(id, p.id, store.id);
+    }
+  }
   const relevant = payments.filter((p) => typeof (p.metadata as Record<string, unknown> | null)?.upsell_id !== "string");
   const configIds = relevant.map((p) => p.checkout_configuration_id).filter((v): v is string => !!v);
   const [quotes, known] = await Promise.all([

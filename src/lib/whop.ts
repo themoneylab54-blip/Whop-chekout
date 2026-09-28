@@ -6,6 +6,7 @@ import { decrypt } from "./crypto";
 import { env } from "./env";
 import { centsToDecimal } from "./pricing";
 import { recordEvent } from "./log";
+import { db } from "./db";
 
 /** Events the app subscribes to when it creates the Whop webhook itself. */
 export const WHOP_WEBHOOK_EVENTS = [
@@ -173,30 +174,33 @@ export async function createCheckoutConfiguration(
       metadata: { checkout_session_id: opts.sessionId },
     },
   };
+  const optional = (store.paymentMethods ?? []).filter((m) => OPTIONAL_PAYMENT_METHOD_IDS.includes(m));
+  const attempts: string[][] = [
+    [...CHECKOUT_PAYMENT_METHODS, ...optional],
+    // An ineligible optional method must not cost the buyer PayPal & wallets.
+    ...(optional.length ? [[...CHECKOUT_PAYMENT_METHODS]] : []),
+  ];
   let config;
-  try {
-    config = await client.checkoutConfigurations.create({
-      ...base,
-      payment_method_configuration: {
-        enabled: [
-          ...CHECKOUT_PAYMENT_METHODS,
-          ...(store.paymentMethods ?? []).filter((m) => OPTIONAL_PAYMENT_METHOD_IDS.includes(m)),
-        ] as (typeof CHECKOUT_PAYMENT_METHODS)[number][],
-        include_platform_defaults: true,
-      },
-    });
-  } catch (err) {
-    // A method the account isn't eligible for (e.g. PayPal) must never block the sale:
-    // fall back to the account's default methods.
-    await recordEvent({
-      storeId: opts.storeId,
-      sessionId: opts.sessionId,
-      level: "warn",
-      kind: "payment_methods.rejected",
-      message: `Whop a refusé la liste des moyens de paiement (${err instanceof Error ? err.message : String(err)}) : moyens par défaut du compte utilisés. Activez-les dans Whop ou retirez-les.`,
-    });
+  let lastError: unknown;
+  for (const enabled of attempts) {
+    try {
+      config = await client.checkoutConfigurations.create({
+        ...base,
+        payment_method_configuration: { enabled: enabled as (typeof CHECKOUT_PAYMENT_METHODS)[number][], include_platform_defaults: true },
+      });
+      break;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  if (!config) {
+    // Last resort: the account's own defaults. A method problem must never block the sale.
     config = await client.checkoutConfigurations.create(base);
   }
+  // What Whop will actually offer: report any requested method it dropped (once a day).
+  const effective = config.effective_payment_method_configuration?.enabled;
+  const dropped = effective ? [...CHECKOUT_PAYMENT_METHODS, ...optional].filter((m) => !effective.includes(m)) : lastError ? optional : [];
+  if (dropped.length) await reportDroppedMethods(opts.storeId, dropped, lastError);
   return { id: config.id, purchaseUrl: config.purchase_url ?? null };
 }
 
@@ -284,6 +288,14 @@ export function paymentInfoFromWhop(data: Record<string, unknown>) {
     memberId: str(data.member_id),
     paymentMethodId: str(data.payment_method_id),
     paymentMethodType: str(data.payment_method_type),
+    // Whop's cut: total − what the account keeps (same currency only).
+    feeCents: (() => {
+      const after = data.amount_after_fees as { amount?: unknown; currency?: string } | undefined;
+      const totalCents = moneyToCents(total);
+      const afterCents = moneyToCents(after);
+      const sameCurrency = typeof total === "object" && total?.currency && after?.currency ? total.currency.toLowerCase() === after.currency.toLowerCase() : true;
+      return totalCents != null && afterCents != null && sameCurrency && totalCents >= afterCents ? totalCents - afterCents : null;
+    })(),
     buyer: {
       email: str(data.customer_email) ?? user?.email ?? null,
       shippingAddress: (data.shipping_address ?? null) as Addr | null,
@@ -309,4 +321,21 @@ export function statementDescriptor(name: string | null | undefined): string | n
     .slice(0, 17)
     .trim();
   return /[A-Z]/.test(clean) ? `WHOP*${clean}` : null;
+}
+
+/** Records which payment methods Whop didn't enable, at most once a day per store. */
+async function reportDroppedMethods(storeId: string, dropped: string[], err: unknown) {
+  const key = `methods-dropped:${storeId}`;
+  const today = new Date().toISOString().slice(0, 10);
+  const value = `${today}:${[...dropped].sort().join(",")}`;
+  const prev = await db.appSetting.findUnique({ where: { key } });
+  if (prev?.value === value) return;
+  await db.appSetting.upsert({ where: { key }, create: { key, value }, update: { value } });
+  await recordEvent({
+    storeId,
+    level: "warn",
+    kind: "payment_methods.rejected",
+    message: `Whop n'a pas activé : ${dropped.join(", ")}${err ? ` (${err instanceof Error ? err.message : String(err)})` : ""}. Activez-les dans Whop → Paramètres → Moyens de paiement, ou retirez-les.`,
+    data: { dropped },
+  });
 }
