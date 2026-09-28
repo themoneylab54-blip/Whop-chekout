@@ -121,8 +121,8 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
 
 export class CheckoutError extends Error {}
 
-/** A checkout session can be paid for this long after the cart left the store (covers recovery e-mails). */
-export const SESSION_TTL_MS = 72 * 60 * 60 * 1000;
+/** A checkout session can be paid for this long after the cart left the store. */
+export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 /** Upper bound on Whop configurations per session (each price change creates one). */
 const MAX_QUOTES_PER_SESSION = 60;
 
@@ -267,7 +267,6 @@ export async function confirmSession(session: SessionWithStore, input: PayInput)
       payClickedAt: new Date(),
       termsAcceptedAt: input.acceptsTerms ? new Date() : null,
       email: input.email,
-      contactAt: session.contactAt ?? new Date(),
       acceptsMarketing: input.acceptsMarketing,
       shippingAddress: input.address as Prisma.InputJsonValue,
       note: input.note || null,

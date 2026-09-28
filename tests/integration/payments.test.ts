@@ -175,20 +175,6 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
     expect(await db.eventLog.count({ where: { sessionId: s.id, kind: "reconcile.healed" } })).toBe(1);
   });
 
-  it("sends each abandoned-checkout e-mail once", async () => {
-    const store = await makeStore({ recoveryEnabled: true, recoveryConsentOnly: false, resendApiKey: encrypt("re_x"), emailFrom: "Shop <a@shop.fr>" });
-    const s = await db.checkoutSession.create({ data: { storeId: store.id, currency: "EUR", lines: [line], subtotalCents: 5000, email: "lost@example.com" } });
-    await db.$executeRaw`UPDATE "CheckoutSession" SET "updatedAt" = now() - interval '2 hours' WHERE id = ${s.id}`;
-    notify.sendEmail.mockResolvedValue(true);
-    await runTick();
-    await runTick();
-    const mine = notify.sendEmail.mock.calls.filter((c) => c[1].to === "lost@example.com");
-    expect(mine).toHaveLength(1);
-    const row = await db.checkoutSession.findUniqueOrThrow({ where: { id: s.id } });
-    expect(row.recoveryStage).toBe(1);
-    expect(row.status).toBe("ABANDONED");
-  });
-
   it("charges a one-click upsell once and creates its own Shopify order", async () => {
     const store = await makeStore({
       thankYouLayout: {

@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { BarChart3, FlaskConical, Filter, Mail, Megaphone, Percent, Smartphone, Sparkles, Ticket } from "lucide-react";
+import { BarChart3, FlaskConical, Filter, Megaphone, Percent, Smartphone, Sparkles, Ticket } from "lucide-react";
 import { requireAdmin } from "@/lib/auth";
 import { daysAgo } from "@/lib/time";
 import { db } from "@/lib/db";
@@ -62,8 +62,8 @@ export default async function AnalyticsPage({
         <Stat label="Panier moyen" value={a.orders ? money(a.aovCents) : "—"} hint="après remboursements" />
         <Stat
           label="Revenus additionnels"
-          value={money(a.upsell.revenueCents + a.recovery.revenueCents + a.addOns.reduce((s, x) => s + x.revenueCents, 0))}
-          hint="options + offres post-achat + relances"
+          value={money(a.upsell.revenueCents + a.addOns.reduce((s, x) => s + x.revenueCents, 0))}
+          hint="options + offres post-achat"
         />
       </div>
 
@@ -126,10 +126,7 @@ export default async function AnalyticsPage({
         </Card>
 
         <Card icon={Sparkles} iconColor="#a855f7" title="Leviers de panier moyen">
-          <div className="grid grid-cols-2 gap-3">
-            <Mini icon={Sparkles} label="Offre post-achat" value={`${a.upsell.accepted}/${a.upsell.offered} · ${money(a.upsell.revenueCents)}`} />
-            <Mini icon={Mail} label="Paniers récupérés" value={`${a.recovery.recovered}/${a.recovery.emailed} · ${money(a.recovery.revenueCents)}`} />
-          </div>
+          <Mini icon={Sparkles} label="Offre post-achat (acceptées / proposées)" value={`${a.upsell.accepted}/${a.upsell.offered} · ${money(a.upsell.revenueCents)}`} />
           <p className="mt-4 mb-2 text-xs font-semibold tracking-wide text-zinc-500 uppercase">Options (order bumps)</p>
           {a.addOns.length === 0 ? (
             <p className="text-sm text-zinc-500">Aucune option vendue sur la période.</p>

@@ -73,14 +73,9 @@ model Store {
   tiktokPixelId     String?
   tiktokAccessToken String? // encrypted
 
-  // --- Abandoned checkout recovery (e-mails via Resend) ---
-  recoveryEnabled     Boolean @default(false)
-  recoveryConsentOnly Boolean @default(true)
-  recoveryCode        String?
-  resendApiKey        String? // encrypted
-  emailFrom           String?
-
-  // --- Alerts ---
+  // --- Alerts (Telegram and/or e-mail through Resend) ---
+  resendApiKey     String? // encrypted
+  emailFrom        String?
   alertEmail       String?
   telegramBotToken String? // encrypted
   telegramChatId   String?
@@ -220,7 +215,6 @@ model CheckoutSession {
   nextSyncAt       DateTime?
 
   // Funnel
-  contactAt     DateTime? // e-mail captured
   preparedAt    DateTime? // payment form ready
   payClickedAt  DateTime? // buyer clicked "Pay"
   termsAcceptedAt DateTime?
@@ -240,9 +234,6 @@ model CheckoutSession {
   whopPaymentMethodId String?
   upsells             UpsellCharge[]
 
-  // Abandoned checkout recovery
-  recoveryStage  Int       @default(0)
-  recoverySentAt DateTime?
 
   // Dispute shield
   trackingNumber    String?

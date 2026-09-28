@@ -4,7 +4,6 @@ import { significance, summarize } from "@/lib/experiments";
 import { statementDescriptor } from "@/lib/whop";
 import { buildEvidence } from "@/lib/disputes";
 import { metaPayload, tiktokPayload } from "@/lib/conversions";
-import { recoveryEmail } from "@/lib/tick";
 import { reviewReasons } from "@/lib/checkout";
 
 const sha = (v: string) => createHash("sha256").update(v).digest("hex");
@@ -16,7 +15,6 @@ const store = {
   metaTestEventCode: null,
   tiktokPixelId: "TT1",
   theme: null,
-  recoveryCode: "REVIENS10",
 } as never;
 
 const session = {
@@ -99,22 +97,6 @@ describe("dispute evidence", () => {
     expect(e.notes).toContain("CGV");
     expect(e.product_description).toContain("2 × Sweat (M)");
     expect(e.refund_policy_disclosure).toContain("https://shop.fr/cgv");
-  });
-});
-
-describe("recovery e-mails", () => {
-  it("first e-mail has a resume link with UTMs and no code; second carries the code", () => {
-    const first = recoveryEmail(store, session, 0);
-    expect(first.to).toBe(" Alex@Example.com ");
-    expect(first.html).toContain("/c/sess1?utm_source=recovery");
-    expect(first.html).not.toContain("REVIENS10");
-    const second = recoveryEmail(store, session, 1);
-    expect(second.html).toContain("REVIENS10");
-    expect(second.subject).toMatch(/cadeau/);
-  });
-  it("escapes product titles", () => {
-    const evil = { ...(session as object), lines: [{ variantId: "1", title: "<script>x</script>", variantTitle: null, quantity: 1, unitPriceCents: 1, imageUrl: null }] } as never;
-    expect(recoveryEmail(store, evil, 0).html).not.toContain("<script>");
   });
 });
 

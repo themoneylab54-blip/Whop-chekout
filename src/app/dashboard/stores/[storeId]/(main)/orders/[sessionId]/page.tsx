@@ -36,10 +36,8 @@ export default async function OrderDetailPage({
   const timeline: { at: Date; label: string; tone?: "warn" | "error" }[] = [
     { at: s.createdAt, label: "Checkout ouvert depuis la boutique" },
     ...(s.preparedAt ? [{ at: s.preparedAt, label: "Formulaire de paiement prêt" }] : []),
-    ...(s.contactAt ? [{ at: s.contactAt, label: `E-mail saisi${s.acceptsMarketing ? " (accepte le marketing)" : ""}` }] : []),
     ...(s.termsAcceptedAt ? [{ at: s.termsAcceptedAt, label: "CGV acceptées" }] : []),
     ...(s.payClickedAt ? [{ at: s.payClickedAt, label: "Clic sur « Payer »" }] : []),
-    ...(s.recoverySentAt ? [{ at: s.recoverySentAt, label: `Relance panier n°${s.recoveryStage} envoyée` }] : []),
     ...events.map((e) => ({ at: e.createdAt, label: e.message, tone: e.level === "error" ? ("error" as const) : e.level === "warn" ? ("warn" as const) : undefined })),
   ].sort((x, y) => x.at.getTime() - y.at.getTime());
 

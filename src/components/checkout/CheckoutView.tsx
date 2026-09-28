@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { ChevronDown, Tag } from "lucide-react";
 import type { Block, Layout, Theme } from "@/lib/layout";
@@ -374,23 +374,6 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
     );
   }
 
-  // Save the e-mail as soon as it's typed: an abandoned checkout can then be recovered.
-  const savedContact = useRef("");
-  function saveContact(acceptsMarketing: boolean | React.FocusEvent = marketing) {
-    const optIn = typeof acceptsMarketing === "boolean" ? acceptsMarketing : marketing;
-    const value = email.trim();
-    if (!liveSessionId || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) return;
-    const key = `${value}|${optIn}`;
-    if (savedContact.current === key) return;
-    savedContact.current = key;
-    void fetch(`/api/public/sessions/${liveSessionId}/contact`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: value, acceptsMarketing: optIn }),
-      keepalive: true,
-    }).catch(() => undefined);
-  }
-
   const termsBox = theme.requireTerms ? (
     <div data-field="terms">
       <label className="flex items-start gap-2.5 text-sm leading-snug">
@@ -446,7 +429,6 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
                 value={email}
                 disabled={locked}
                 onChange={(e) => setEmail(e.target.value)}
-                onBlur={saveContact}
                 className={inputCls}
               />
             </Field>
@@ -455,10 +437,7 @@ export function CheckoutView({ theme, layout, currency, lines, rates, addOns, ha
                 type="checkbox"
                 checked={marketing}
                 disabled={locked}
-                onChange={(e) => {
-                  setMarketing(e.target.checked);
-                  saveContact(e.target.checked);
-                }}
+                onChange={(e) => setMarketing(e.target.checked)}
                 className="h-4 w-4 accent-[var(--accent)]"
               />
               {L.marketing}

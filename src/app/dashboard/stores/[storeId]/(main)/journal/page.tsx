@@ -44,7 +44,7 @@ export default async function JournalPage({
         icon={HeartPulse}
         iconColor="#10b981"
         title="État du système"
-        description="Vérifié à chaque visite. La maintenance automatique récupère les paiements manqués, relance les synchronisations et envoie les relances."
+        description="Vérifié à chaque visite. La maintenance automatique récupère les paiements manqués, relance les synchronisations Shopify et transmet les suivis à Whop."
         actions={
           <form action={runTickAction.bind(null, storeId)}>
             <SubmitButton size="sm" variant="secondary">
@@ -58,7 +58,7 @@ export default async function JournalPage({
         {tick.report && (
           <p className="mt-3 text-xs text-zinc-500">
             Dernier passage : {Number(tick.report.reconciled) || 0} paiement(s) récupéré(s), {Number(tick.report.syncRetried) || 0} synchro(s) relancée(s),{" "}
-            {Number(tick.report.recoveryEmails) || 0} relance(s) envoyée(s), {Number(tick.report.trackingPushed) || 0} suivi(s) transmis à Whop.
+            {Number(tick.report.trackingPushed) || 0} suivi(s) transmis à Whop.
           </p>
         )}
       </Card>

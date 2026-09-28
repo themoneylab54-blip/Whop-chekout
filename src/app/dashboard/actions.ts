@@ -695,7 +695,7 @@ function endOfDayParis(day: string): Date | null {
 }
 
 /* ------------------------------------------------------------------ */
-/* Growth: ads tracking, recovery, alerts, dispute shield, methods     */
+/* Growth: ads tracking, alerts, dispute shield, payment methods       */
 /* ------------------------------------------------------------------ */
 
 /** Keeps a stored secret when the field is left blank ("•••• enregistré"). */
@@ -736,42 +736,21 @@ export async function testTrackingAction(storeId: string) {
   back(path, { ok: "Événement de test envoyé. Vérifiez « Événements de test » dans Meta / TikTok." });
 }
 
-export async function saveRecoveryAction(storeId: string, fd: FormData) {
-  const store = await getStore(storeId);
-  const path = storePath(storeId, "growth");
-  const emailFrom = str(fd, "emailFrom").slice(0, 200) || null;
-  if (emailFrom && !/^([^<>]+<)?[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+>?$/.test(emailFrom)) {
-    back(path, { error: "Expéditeur invalide : ex. « Ma Boutique <contact@maboutique.fr> »" });
-  }
-  const code = str(fd, "recoveryCode").toUpperCase().slice(0, 40) || null;
-  if (code && !(await db.discountCode.findFirst({ where: { storeId, code } }))) {
-    back(path, { error: `Le code ${code} n'existe pas : créez-le d'abord dans Promos & options.` });
-  }
-  const resendApiKey = secretField(fd, "resendApiKey", store.resendApiKey, path);
-  const enabled = fd.get("recoveryEnabled") === "on";
-  if (enabled && (!resendApiKey || !emailFrom)) back(path, { error: "Renseignez la clé Resend et l'expéditeur pour activer les relances." });
-  await db.store.update({
-    where: { id: storeId },
-    data: {
-      recoveryEnabled: enabled,
-      recoveryConsentOnly: fd.get("recoveryConsentOnly") === "on",
-      recoveryCode: code,
-      resendApiKey,
-      emailFrom,
-    },
-  });
-  back(path, { ok: enabled ? "Relances de paniers abandonnés activées" : "Réglages des relances enregistrés" });
-}
-
 export async function saveAlertsAction(storeId: string, fd: FormData) {
   const store = await getStore(storeId);
   const path = storePath(storeId, "settings");
   const alertEmail = str(fd, "alertEmail").slice(0, 200) || null;
   if (alertEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(alertEmail)) back(path, { error: "E-mail d'alerte invalide" });
+  const emailFrom = str(fd, "emailFrom").slice(0, 200) || null;
+  if (emailFrom && !/^([^<>]+<)?[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+>?$/.test(emailFrom)) {
+    back(path, { error: "Expéditeur invalide : ex. « Alertes <alertes@maboutique.fr> »" });
+  }
   await db.store.update({
     where: { id: storeId },
     data: {
       alertEmail,
+      emailFrom,
+      resendApiKey: secretField(fd, "resendApiKey", store.resendApiKey, path),
       telegramBotToken: secretField(fd, "telegramBotToken", store.telegramBotToken, path),
       telegramChatId: str(fd, "telegramChatId").replace(/[^\d-]/g, "").slice(0, 30) || null,
     },

@@ -21,7 +21,6 @@ export type Analytics = {
   addOns: { id: string; title: string; orders: number; attachRate: number; revenueCents: number }[];
   codes: { code: string; orders: number; discountCents: number; revenueCents: number }[];
   upsell: { offered: number; accepted: number; revenueCents: number };
-  recovery: { emailed: number; recovered: number; revenueCents: number };
   devices: { mobile: number; desktop: number; mobileCvr: number; desktopCvr: number };
 };
 
@@ -41,12 +40,10 @@ export async function storeAnalytics(storeId: string, since: Date): Promise<Anal
         addOnIds: true,
         addOnsCents: true,
         email: true,
-        contactAt: true,
         preparedAt: true,
         payClickedAt: true,
         utm: true,
         userAgent: true,
-        recoveryStage: true,
       },
       take: MAX_ROWS,
       orderBy: { createdAt: "desc" },
@@ -62,13 +59,11 @@ export async function storeAnalytics(storeId: string, since: Date): Promise<Anal
   for (const r of rows) r.totalCents = r.totalCents || r.subtotalCents;
   const paid = rows.filter((r) => r.status === "PAID");
   const revenue = paid.reduce((s, r) => s + r.totalCents - r.refundedCents, 0);
-  const passed = (r: (typeof rows)[number], field: "contactAt" | "preparedAt" | "payClickedAt") =>
-    r.status === "PAID" || r[field] != null || (field === "contactAt" && !!r.email);
+  const passed = (r: (typeof rows)[number], field: "preparedAt" | "payClickedAt") => r.status === "PAID" || r[field] != null;
 
   const funnel: Funnel = [
     { key: "opened", label: "Checkout ouvert", count: rows.length },
     { key: "form", label: "Paiement prêt à l'écran", count: rows.filter((r) => passed(r, "preparedAt")).length },
-    { key: "contact", label: "E-mail saisi", count: rows.filter((r) => passed(r, "contactAt")).length },
     { key: "pay", label: "Clic sur « Payer »", count: rows.filter((r) => passed(r, "payClickedAt")).length },
     { key: "paid", label: "Payé", count: paid.length },
   ];
@@ -109,8 +104,6 @@ export async function storeAnalytics(storeId: string, since: Date): Promise<Anal
   }
 
   const acceptedUpsells = upsells.filter((u) => u.status === "PAID");
-  const emailed = rows.filter((r) => r.recoveryStage > 0);
-  const recovered = emailed.filter((r) => r.status === "PAID");
   const mobile = rows.filter((r) => /Mobi|Android|iPhone/i.test(r.userAgent ?? ""));
   const desktop = rows.filter((r) => r.userAgent && !/Mobi|Android|iPhone/i.test(r.userAgent));
   const cvrOf = (list: typeof rows) => (list.length ? list.filter((r) => r.status === "PAID").length / list.length : 0);
@@ -129,11 +122,6 @@ export async function storeAnalytics(storeId: string, since: Date): Promise<Anal
       offered: upsells.length,
       accepted: acceptedUpsells.length,
       revenueCents: acceptedUpsells.reduce((s, u) => s + u.amountCents, 0),
-    },
-    recovery: {
-      emailed: emailed.length,
-      recovered: recovered.length,
-      revenueCents: recovered.reduce((s, r) => s + r.totalCents - r.refundedCents, 0),
     },
     devices: { mobile: mobile.length, desktop: desktop.length, mobileCvr: cvrOf(mobile), desktopCvr: cvrOf(desktop) },
   };

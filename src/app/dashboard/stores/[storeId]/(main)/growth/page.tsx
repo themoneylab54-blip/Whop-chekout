@@ -1,11 +1,10 @@
 import { notFound } from "next/navigation";
-import { Mail, Megaphone, Radar } from "lucide-react";
+import { Megaphone, Radar } from "lucide-react";
 import { requireAdmin } from "@/lib/auth";
-import { daysAgo } from "@/lib/time";
 import { db } from "@/lib/db";
-import { Card, Flash, Input, Label, PageHeader, SubmitButton, Toggle } from "@/components/ui";
+import { Card, Flash, Input, Label, PageHeader, SubmitButton } from "@/components/ui";
 import { SecretInput } from "@/components/dashboard/SecretInput";
-import { saveRecoveryAction, saveTrackingAction, testTrackingAction } from "../../../../actions";
+import { saveTrackingAction, testTrackingAction } from "../../../../actions";
 
 export default async function GrowthPage({
   params,
@@ -19,19 +18,14 @@ export default async function GrowthPage({
   const sp = await searchParams;
   const store = await db.store.findUnique({ where: { id: storeId } });
   if (!store) notFound();
-  const since = daysAgo(30);
-  const [sent, recovered] = await Promise.all([
-    db.checkoutSession.count({ where: { storeId, recoveryStage: { gt: 0 }, createdAt: { gte: since } } }),
-    db.checkoutSession.count({ where: { storeId, recoveryStage: { gt: 0 }, status: "PAID", createdAt: { gte: since } } }),
-  ]);
 
   return (
     <>
       <PageHeader
         icon={Megaphone}
         iconColor="#f97316"
-        title="Pixels & relances"
-        description="Donnez à vos pubs les achats qu'elles ne voient plus, et récupérez les paniers abandonnés."
+        title="Pixels publicitaires"
+        description="Donnez à vos pubs Meta et TikTok les achats qu'elles ne voient plus depuis que le paiement se fait hors de Shopify."
       />
       <Flash ok={sp.ok} error={sp.error} />
       <div className="grid max-w-3xl gap-6">
@@ -86,45 +80,6 @@ export default async function GrowthPage({
           </form>
         </Card>
 
-        <Card
-          icon={Mail}
-          iconColor="#10b981"
-          title="Relance des paniers abandonnés"
-          description={`L'e-mail est enregistré dès qu'il est saisi. Deux relances : 1 h puis 24 h après l'abandon (la 2ᵉ avec votre code promo si vous en choisissez un). 30 derniers jours : ${sent} relancé(s), ${recovered} récupéré(s).`}
-        >
-          <form action={saveRecoveryAction.bind(null, store.id)} className="space-y-4">
-            <div className="divide-y divide-zinc-100 border-y border-zinc-100">
-              <Toggle name="recoveryEnabled" defaultChecked={store.recoveryEnabled} label="Activer les relances automatiques" />
-              <Toggle
-                name="recoveryConsentOnly"
-                defaultChecked={store.recoveryConsentOnly}
-                label="Seulement aux clients ayant accepté les e-mails marketing"
-                hint="Recommandé dans l'UE (RGPD / CNIL). Désactivez à vos risques si vous considérez la relance comme un e-mail de service."
-              />
-            </div>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div>
-                <Label htmlFor="resendApiKey" hint="resend.com → API Keys (domaine d'envoi vérifié requis)">
-                  Clé API Resend
-                </Label>
-                <SecretInput name="resendApiKey" stored={!!store.resendApiKey} placeholder="re_…" />
-              </div>
-              <div>
-                <Label htmlFor="emailFrom" hint="Doit utiliser votre domaine vérifié dans Resend">
-                  Expéditeur
-                </Label>
-                <Input id="emailFrom" name="emailFrom" defaultValue={store.emailFrom ?? ""} placeholder="Ma Boutique <contact@maboutique.fr>" />
-              </div>
-              <div>
-                <Label htmlFor="recoveryCode" hint="Facultatif · à créer d'abord dans Promos & options">
-                  Code promo de la 2ᵉ relance
-                </Label>
-                <Input id="recoveryCode" name="recoveryCode" defaultValue={store.recoveryCode ?? ""} placeholder="REVIENS10" className="uppercase" />
-              </div>
-            </div>
-            <SubmitButton>Enregistrer</SubmitButton>
-          </form>
-        </Card>
       </div>
     </>
   );

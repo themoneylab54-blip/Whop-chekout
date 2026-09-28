@@ -50,10 +50,22 @@ export default async function SettingsPage({
         >
           <form action={saveAlertsAction.bind(null, store.id)} className="space-y-4">
             <div>
-              <Label htmlFor="alertEmail" hint="Envoyé via votre compte Resend (voir Pixels & relances)">
-                E-mail d&apos;alerte
-              </Label>
+              <Label htmlFor="alertEmail">E-mail d&apos;alerte</Label>
               <Input id="alertEmail" name="alertEmail" type="email" defaultValue={store.alertEmail ?? ""} placeholder="vous@exemple.fr" />
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div>
+                <Label htmlFor="resendApiKey" hint="Pour les alertes par e-mail : resend.com → API Keys">
+                  Clé API Resend
+                </Label>
+                <SecretInput name="resendApiKey" stored={!!store.resendApiKey} placeholder="re_…" />
+              </div>
+              <div>
+                <Label htmlFor="emailFrom" hint="Adresse de votre domaine vérifié dans Resend">
+                  Expéditeur
+                </Label>
+                <Input id="emailFrom" name="emailFrom" defaultValue={store.emailFrom ?? ""} placeholder="Alertes <alertes@maboutique.fr>" />
+              </div>
             </div>
             <div className="grid gap-4 sm:grid-cols-2">
               <div>

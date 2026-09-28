@@ -133,7 +133,7 @@ export default async function StoreLayout({ children, params }: { children: Reac
             Promos &amp; options
           </NavLink>
           <NavLink href={`${base}/growth`} icon="growth">
-            Pixels &amp; relances
+            Pixels publicitaires
           </NavLink>
           <p className="mt-5 mb-1.5 px-2.5 text-[10px] font-semibold tracking-[.1em] text-zinc-400 uppercase">Compte</p>
           <NavLink href={`${base}/journal`} icon="journal">
@@ -196,7 +196,7 @@ export default async function StoreLayout({ children, params }: { children: Reac
               { href: `${base}/builder/checkout`, label: "Design" },
               { href: `${base}/shipping`, label: "Livraison" },
               { href: `${base}/offers`, label: "Promos" },
-              { href: `${base}/growth`, label: "Pixels & relances" },
+              { href: `${base}/growth`, label: "Pixels" },
               { href: `${base}/journal`, label: "Journal" },
               { href: `${base}/settings`, label: "Réglages" },
             ]}
