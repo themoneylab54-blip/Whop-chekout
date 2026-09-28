@@ -23,6 +23,14 @@ export async function GET() {
   });
   // Only judge the tick when a scheduler is expected (CRON_SECRET set).
   const tickOk = !process.env.CRON_SECRET || (tickAgeMin != null && tickAgeMin <= 20);
-  const ok = tickOk && unsyncedOld === 0;
-  return json({ ok, db: true, tickAgeMin, unsyncedOver30min: unsyncedOld, ms: Date.now() - started }, { status: ok ? 200 : 503 });
+  const tickErrors = tick.report
+    ? Object.entries(tick.report)
+        .filter(([, v]) => typeof v === "string" && v.startsWith("error"))
+        .map(([k]) => k)
+    : [];
+  const ok = tickOk && tickErrors.length === 0 && unsyncedOld === 0;
+  return json(
+    { ok, db: true, tickAgeMin, tickErrors, unsyncedOver30min: unsyncedOld, ms: Date.now() - started },
+    { status: ok ? 200 : 503 },
+  );
 }

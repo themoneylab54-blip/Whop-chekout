@@ -4,6 +4,7 @@ import { db } from "./db";
 import { loadThankYouLayout, type BlockOf } from "./layout";
 import { sendUpsellConversions } from "./conversions";
 import { designFor } from "./experiments";
+import { SYNC_BACKOFF_MINUTES } from "./checkout";
 import { recordEvent } from "./log";
 import { createPaidOrder, createRefund, findOrderForSession, priceCart, tagOrder, type Address } from "./shopify";
 import { centsToDecimal } from "./pricing";
@@ -145,15 +146,28 @@ export async function acceptUpsell(session: SessionWithStore, blockId: string): 
 
 /** Marks an offer paid and creates its Shopify order. Idempotent (webhook + direct call). */
 export async function markUpsellPaid(chargeId: string, paymentId: string, storeId: string) {
-  const charge = await db.upsellCharge.findUnique({ where: { id: chargeId }, include: { session: { include: { store: true } } } });
-  if (!charge || charge.session.storeId !== storeId) return null;
+  const found = await db.upsellCharge.findUnique({ where: { id: chargeId }, include: { session: { include: { store: true } } } });
+  if (!found || found.session.storeId !== storeId) return null;
   await db.upsellCharge.updateMany({ where: { id: chargeId, status: { not: "PAID" } }, data: { status: "PAID", whopPaymentId: paymentId } });
-  if (charge.shopifyOrderId) return charge;
+  if (found.shopifyOrderId) return found;
+
+  // Lease: the webhook, the direct accept and the tick can race; only one creates the order.
+  const claim = await db.upsellCharge.updateMany({
+    where: {
+      id: chargeId,
+      shopifyOrderId: null,
+      OR: [{ syncStartedAt: null }, { syncStartedAt: { lt: new Date(Date.now() - 2 * 60_000) } }],
+    },
+    data: { syncStartedAt: new Date() },
+  });
+  if (claim.count === 0) return db.upsellCharge.findUnique({ where: { id: chargeId } });
+  const charge = found;
 
   const session = charge.session;
   const ref = `upsell-${charge.id}`;
   try {
-    const existing = await findOrderForSession(session.store, ref).catch(() => null);
+    // A failed lookup must not lead to creating the order (it may already exist): retry later.
+    const existing = await findOrderForSession(session.store, ref);
     const [line] = await priceCart(session.store, [{ variantId: charge.variantId, quantity: 1 }]);
     const order =
       existing ??
@@ -191,7 +205,7 @@ export async function markUpsellPaid(chargeId: string, paymentId: string, storeI
       }));
     const updated = await db.upsellCharge.update({
       where: { id: charge.id },
-      data: { shopifyOrderId: order.id, shopifyOrderName: order.name, error: null },
+      data: { shopifyOrderId: order.id, shopifyOrderName: order.name, error: null, syncStartedAt: null, nextSyncAt: null },
     });
     await sendUpsellConversions(updated.id).catch(() => undefined);
     await recordEvent({
@@ -203,34 +217,55 @@ export async function markUpsellPaid(chargeId: string, paymentId: string, storeI
     return updated;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    const updated = await db.upsellCharge.update({
+    const attempts = charge.syncAttempts + 1;
+    const delay = SYNC_BACKOFF_MINUTES[attempts - 1];
+    await db.upsellCharge.update({
       where: { id: charge.id },
-      data: { error: message.slice(0, 500), syncAttempts: { increment: 1 } },
+      data: {
+        error: message.slice(0, 500),
+        syncAttempts: attempts,
+        syncStartedAt: null,
+        nextSyncAt: delay != null ? new Date(Date.now() + delay * 60_000) : null,
+      },
     });
     await recordEvent({
       storeId,
       sessionId: session.id,
       level: "error",
-      kind: "upsell.sync_failed",
-      message: `Offre post-achat payée mais commande Shopify non créée (essai ${updated.syncAttempts}) : ${message}. Nouvel essai automatique.`,
-      alert: updated.syncAttempts === 1,
+      kind: delay != null ? "upsell.sync_failed" : "upsell.gave_up",
+      message:
+        delay != null
+          ? `Offre post-achat payée mais commande Shopify non créée (essai ${attempts}) : ${message}. Nouvel essai automatique dans ${delay} min.`
+          : `Offre post-achat payée toujours absente de Shopify après ${attempts} essais : ${message}. Créez-la à la main.`,
+      alert: attempts === 1 || delay == null,
     });
     return null;
   }
 }
 
 /** Declined card, 3-D Secure abandoned…: the buyer may try again. */
-export async function markUpsellFailed(chargeId: string, storeId: string, reason: string | null) {
+export async function markUpsellFailed(chargeId: string, storeId: string, reason: string | null, paymentId: string | null) {
   const charge = await db.upsellCharge.findUnique({ where: { id: chargeId }, include: { session: true } });
   if (!charge || charge.session.storeId !== storeId || charge.status === "PAID") return;
-  await db.upsellCharge.update({ where: { id: chargeId }, data: { status: "FAILED", error: (reason ?? "Paiement refusé").slice(0, 500) } });
+  // Only the attempt that failed: a late failure of an earlier try must not free a
+  // charge whose current payment (e.g. in 3-D Secure) may still succeed.
+  const changed = await db.upsellCharge.updateMany({
+    where: { id: chargeId, status: "PENDING", ...(paymentId ? { whopPaymentId: paymentId } : {}) },
+    data: { status: "FAILED", error: (reason ?? "Paiement refusé").slice(0, 500) },
+  });
+  if (changed.count === 0) return;
   await recordEvent({ storeId, sessionId: charge.sessionId, kind: "upsell.declined_by_bank", message: `Offre post-achat refusée par la banque : ${reason ?? "sans motif"}` });
 }
 
 /** Background retry of paid offers whose Shopify order could not be created. */
 export async function retryUpsellSyncs(deadline: number): Promise<number> {
   const due = await db.upsellCharge.findMany({
-    where: { status: "PAID", shopifyOrderId: null, whopPaymentId: { not: null }, syncAttempts: { lt: 8 } },
+    where: {
+      status: "PAID",
+      shopifyOrderId: null,
+      whopPaymentId: { not: null },
+      OR: [{ nextSyncAt: { lte: new Date() } }, { syncAttempts: 0, createdAt: { lt: new Date(Date.now() - 3 * 60_000) } }],
+    },
     include: { session: { select: { storeId: true } } },
     take: 10,
     orderBy: { createdAt: "asc" },

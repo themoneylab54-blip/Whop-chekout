@@ -46,9 +46,9 @@ const hasDb = !!process.env.DATABASE_URL;
 
 describe.skipIf(!hasDb)("payments (integration)", async () => {
   const { db } = await import("@/lib/db");
-  const { markPaid, recordDispute, SYNC_BACKOFF_MINUTES } = await import("@/lib/checkout");
+  const { markPaid, recordDispute, recordRefund, SYNC_BACKOFF_MINUTES } = await import("@/lib/checkout");
   const { runTick } = await import("@/lib/tick");
-  const { acceptUpsell, markUpsellFailed } = await import("@/lib/upsell");
+  const { acceptUpsell, markUpsellFailed, markUpsellPaid } = await import("@/lib/upsell");
   const { recordEvent } = await import("@/lib/log");
   const { rateLimit } = await import("@/lib/ratelimit");
   const { encrypt } = await import("@/lib/crypto");
@@ -296,7 +296,7 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
     const full = await db.checkoutSession.findUniqueOrThrow({ where: { id: s.id }, include: { store: true } });
     expect(await acceptUpsell(full, "up2")).toEqual({ status: "pending" });
     const charge = await db.upsellCharge.findFirstOrThrow({ where: { sessionId: s.id } });
-    await markUpsellFailed(charge.id, store.id, "insufficient_funds");
+    await markUpsellFailed(charge.id, store.id, "insufficient_funds", `pay_upA_${s.id}`);
     whop.create.mockResolvedValueOnce({ id: `pay_upB_${s.id}`, status: "paid", recovery_url: null });
     shopify.createPaidOrder.mockResolvedValue({ id: "gid://shopify/Order/68", name: "#1068" });
     expect(await acceptUpsell(full, "up2")).toEqual({ status: "paid", orderName: "#1068" });
@@ -331,6 +331,75 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
     expect(row.pixelSentAt).not.toBeNull();
     expect(row.pixelStatus).toEqual({ meta: "sent" });
     fetchSpy.mockRestore();
+  });
+
+  it("mirrors a refund exactly once, even when it arrives during the order sync", async () => {
+    const store = await makeStore();
+    const s = await makePaidReadySession(store.id);
+    // The refund lands while orderCreate is in flight.
+    shopify.createPaidOrder.mockImplementation(async (_st: unknown, input: { sessionId: string }) => {
+      if (input.sessionId !== s.id) throw new Error("not this test");
+      await recordRefund(s.id, 1000);
+      return { id: "gid://shopify/Order/70", name: "#1070" };
+    });
+    shopify.createRefund.mockResolvedValue(undefined);
+    await markPaid(s.id, { id: `pay_rf_${s.id}`, totalCents: 5490, currency: "eur", checkoutConfigurationId: `ch_${s.id}` });
+    await recordRefund(s.id, 500);
+    await runTick();
+    const row = await db.checkoutSession.findUniqueOrThrow({ where: { id: s.id } });
+    expect(row.refundedCents).toBe(1500);
+    expect(row.refundMirroredCents).toBe(1500);
+    const mine = shopify.createRefund.mock.calls.filter((c) => c[1] === "gid://shopify/Order/70");
+    expect(mine.reduce((sum, c) => sum + c[2], 0)).toBe(1500);
+  });
+
+  it("creates an upsell order once under concurrent calls, and never after a failed lookup", async () => {
+    const store = await makeStore();
+    const s = await makePaidReadySession(store.id, { status: "PAID", paidAt: new Date(), whopPaymentId: `pay_ul_${Date.now()}` });
+    const charge = await db.upsellCharge.create({ data: { sessionId: s.id, blockId: "b", title: "X", variantId: "gid://shopify/ProductVariant/1", amountCents: 500 } });
+    shopify.priceCart.mockResolvedValue([line]);
+    shopify.findOrderForSession.mockRejectedValueOnce(new Error("throttled"));
+    await markUpsellPaid(charge.id, `pay_c_${charge.id}`, store.id);
+    expect(shopify.createPaidOrder).not.toHaveBeenCalled();
+    await db.upsellCharge.update({ where: { id: charge.id }, data: { nextSyncAt: null } });
+    shopify.createPaidOrder.mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      return { id: "gid://shopify/Order/71", name: "#1071" };
+    });
+    await Promise.all([markUpsellPaid(charge.id, `pay_c_${charge.id}`, store.id), markUpsellPaid(charge.id, `pay_c_${charge.id}`, store.id)]);
+    expect(shopify.createPaidOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a late failure of an earlier upsell attempt", async () => {
+    const store = await makeStore();
+    const s = await makePaidReadySession(store.id, { status: "PAID", paidAt: new Date(), whopPaymentId: `pay_ug_${Date.now()}` });
+    const charge = await db.upsellCharge.create({
+      data: { sessionId: s.id, blockId: "b", title: "X", variantId: "1", amountCents: 500, whopPaymentId: `pay_new_${s.id}` },
+    });
+    await markUpsellFailed(charge.id, store.id, "old attempt", `pay_old_${s.id}`);
+    expect((await db.upsellCharge.findUniqueOrThrow({ where: { id: charge.id } })).status).toBe("PENDING");
+  });
+
+  it("keeps reconciling other stores when one store's Whop call fails", async () => {
+    const bad = await makeStore();
+    const good = await makeStore();
+    const s = await makePaidReadySession(good.id);
+    shopify.createPaidOrder.mockImplementation(async (_st: unknown, input: { sessionId: string }) => {
+      if (input.sessionId !== s.id) throw new Error("not this test");
+      return { id: "gid://shopify/Order/72", name: "#1072" };
+    });
+    const payment = { id: `pay_iso_${s.id}`, metadata: { checkout_session_id: s.id }, checkout_configuration_id: `ch_${s.id}`, total: { amount: "54.90", currency: "eur" } };
+    let calls = 0;
+    whop.list.mockImplementation(async () => {
+      calls++;
+      if (calls === 1) throw new Error("Whop 401");
+      return [payment];
+    });
+    // Order stores so the failing one goes first.
+    await db.store.update({ where: { id: bad.id }, data: { createdAt: new Date(0) } });
+    await runTick();
+    expect((await db.checkoutSession.findUniqueOrThrow({ where: { id: s.id } })).status).toBe("PAID");
+    expect(await db.eventLog.count({ where: { kind: "reconcile.failed" } })).toBeGreaterThan(0);
   });
 
   it("shares the rate limit through the database", async () => {

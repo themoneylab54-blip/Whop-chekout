@@ -210,6 +210,8 @@ model CheckoutSession {
   // Lease taken while creating the Shopify order (prevents duplicates on webhook retries)
   syncStartedAt    DateTime?
   refundedCents    Int     @default(0)
+  // Part of refundedCents already mirrored on the Shopify order (claimed atomically)
+  refundMirroredCents Int  @default(0)
   disputed         Boolean @default(false)
   // Set when a payment needs a human look (amount/country/code mismatch, extra payment):
   // the Shopify order is then only created by a manual "sync" from the dashboard.
@@ -271,6 +273,8 @@ model WebhookEvent {
   storeId    String
   type       String
   receivedAt DateTime @default(now())
+  // Set once fully handled; a claim left unprocessed (crash) is taken over by a redelivery
+  processedAt DateTime?
   // Raw event body, kept for audit and replay
   payload    Json?
 }
@@ -337,6 +341,9 @@ model UpsellCharge {
   shopifyOrderName String?
   error            String?
   syncAttempts     Int             @default(0)
+  // Lease + backoff for creating the offer's Shopify order (same scheme as sessions)
+  syncStartedAt    DateTime?
+  nextSyncAt       DateTime?
   refundedCents    Int             @default(0)
   createdAt        DateTime        @default(now())
 

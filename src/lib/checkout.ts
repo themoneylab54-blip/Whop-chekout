@@ -546,7 +546,7 @@ export async function syncOrder(sessionId: string) {
       storeId: session.storeId,
       sessionId,
       level: "error",
-      kind: "sync.failed",
+      kind: delay != null ? "sync.failed" : "sync.gave_up",
       message:
         delay != null
           ? `Commande payée non créée dans Shopify (essai ${attempts}) : ${message}. Nouvel essai automatique dans ${delay} min.`
@@ -573,12 +573,12 @@ export async function syncOrder(sessionId: string) {
   }
   await recordEvent({ storeId: session.storeId, sessionId, kind: "order.synced", message: `Commande ${order.name} créée dans Shopify` });
 
-  // Refunds or disputes that arrived before the order existed.
+  // Refunds or disputes that arrived before (or while) the order was being created:
+  // re-read now that shopifyOrderId is recorded, so none can slip between the two.
   try {
-    if (session.refundedCents > 0) {
-      await createRefund(session.store, order.id, session.refundedCents, "Remboursé via Whop");
-    }
-    if (session.disputed) await tagOrder(session.store, order.id, ["litige-whop"]);
+    await mirrorRefunds(sessionId);
+    const fresh = await db.checkoutSession.findUniqueOrThrow({ where: { id: sessionId }, select: { disputed: true } });
+    if (fresh.disputed) await tagOrder(session.store, order.id, ["litige-whop"]);
   } catch (err) {
     log.error("sync.replay_failed", "Replaying refund/dispute on the new order failed", { sessionId, err });
   }
@@ -625,21 +625,58 @@ async function buildOrderInput(session: SessionWithStore) {
  * Applies one Whop refund. Called once per refund id (the webhook holds a marker),
  * so it adds `amountCents` rather than recomputing a delta.
  */
+/**
+ * Applies one Whop refund. Called once per refund id (the webhook holds a marker),
+ * so it adds `amountCents`; mirroring to Shopify is a separate, retryable step.
+ */
 export async function recordRefund(sessionId: string, amountCents: number) {
   if (amountCents <= 0) return;
-  const session = await db.checkoutSession.findUnique({ where: { id: sessionId }, include: { store: true } });
-  if (!session) return;
-  // Mirror to Shopify first: if that fails the webhook is retried and nothing was counted yet.
-  if (session.shopifyOrderId) {
-    await createRefund(session.store, session.shopifyOrderId, amountCents, "Remboursé via Whop");
-  }
-  await db.checkoutSession.update({ where: { id: sessionId }, data: { refundedCents: { increment: amountCents } } });
+  const session = await db.checkoutSession.update({ where: { id: sessionId }, data: { refundedCents: { increment: amountCents } } });
   await recordEvent({
     storeId: session.storeId,
     sessionId,
     kind: "refund.recorded",
-    message: `Remboursement de ${amountCents / 100} ${session.currency}${session.shopifyOrderName ? ` reporté sur ${session.shopifyOrderName}` : ""}`,
+    message: `Remboursement Whop de ${amountCents / 100} ${session.currency} enregistré`,
   });
+  await mirrorRefunds(sessionId);
+}
+
+/**
+ * Reports refunds not yet on the Shopify order. The unmirrored amount is claimed
+ * atomically, so the webhook, the order sync and the background retry can all call
+ * this without ever refunding the same euro twice. Never throws.
+ */
+export async function mirrorRefunds(sessionId: string): Promise<number> {
+  const rows = await db.$queryRaw<{ delta: number }[]>`
+    UPDATE "CheckoutSession" s SET "refundMirroredCents" = s."refundedCents"
+    FROM (SELECT id, "refundedCents" - "refundMirroredCents" AS delta FROM "CheckoutSession" WHERE id = ${sessionId} FOR UPDATE) d
+    WHERE s.id = d.id AND d.delta > 0 AND s."shopifyOrderId" IS NOT NULL
+    RETURNING d.delta AS delta`;
+  const delta = Number(rows[0]?.delta ?? 0);
+  if (delta <= 0) return 0;
+  const session = await db.checkoutSession.findUniqueOrThrow({ where: { id: sessionId }, include: { store: true } });
+  try {
+    await createRefund(session.store, session.shopifyOrderId!, delta, "Remboursé via Whop");
+    await recordEvent({
+      storeId: session.storeId,
+      sessionId,
+      kind: "refund.mirrored",
+      message: `Remboursement de ${delta / 100} ${session.currency} reporté sur ${session.shopifyOrderName ?? "la commande Shopify"}`,
+    });
+    return delta;
+  } catch (err) {
+    // Give the claim back: the background tick retries.
+    await db.checkoutSession.update({ where: { id: sessionId }, data: { refundMirroredCents: { decrement: delta } } });
+    await recordEvent({
+      storeId: session.storeId,
+      sessionId,
+      level: "warn",
+      kind: "refund.mirror_failed",
+      message: `Remboursement non reporté dans Shopify pour l'instant (${err instanceof Error ? err.message : String(err)}) : nouvel essai automatique.`,
+      alert: true,
+    });
+    return 0;
+  }
 }
 
 export async function recordDispute(sessionId: string, disputeId: string | null) {

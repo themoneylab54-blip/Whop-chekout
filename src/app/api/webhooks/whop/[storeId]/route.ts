@@ -5,7 +5,8 @@ import { decrypt } from "@/lib/crypto";
 import { json } from "@/lib/http";
 import { markPaid, recordDispute, recordRefund, syncOrderSafely } from "@/lib/checkout";
 import { handleDisputeAlert } from "@/lib/disputes";
-import { log, recordEvent } from "@/lib/log";
+import { log, recordEvent, withLogContext } from "@/lib/log";
+import { maybeTick } from "@/lib/tick";
 import { markUpsellFailed, markUpsellPaid, recordUpsellDispute, recordUpsellRefund } from "@/lib/upsell";
 import { eventType, paymentInfoFromWhop, moneyToCents, verifyWhopWebhook, type WhopEvent } from "@/lib/whop";
 
@@ -38,19 +39,12 @@ export async function POST(req: Request, ctx: { params: Promise<{ storeId: strin
   const data = (evt.data ?? {}) as Record<string, unknown>;
 
   // Claim before handling: a concurrent redelivery hits the unique key and stops here.
-  if (webhookId) {
-    try {
-      await db.webhookEvent.create({ data: { id: webhookId, storeId, type, payload: safePayload(raw) } });
-    } catch (err) {
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") return json({ ok: true, duplicate: true });
-      throw err;
-    }
-  }
+  if (webhookId && !(await claimEvent(webhookId, storeId, type, raw))) return json({ ok: true, duplicate: true });
   await db.store.update({ where: { id: store.id }, data: { lastWebhookAt: new Date() } }).catch(() => undefined);
 
   let syncSessionId: string | null;
   try {
-    syncSessionId = await handle(type, data, store.id);
+    syncSessionId = await withLogContext({ requestId, webhookId, event: type }, () => handle(type, data, store.id));
   } catch (err) {
     // Release the claim so Whop's retry can run it again, and make the failure visible.
     if (webhookId) await db.webhookEvent.delete({ where: { id: webhookId } }).catch(() => undefined);
@@ -64,14 +58,18 @@ export async function POST(req: Request, ctx: { params: Promise<{ storeId: strin
     });
     return json({ error: "processing failed" }, { status: 500 });
   }
+  if (webhookId) await db.webhookEvent.update({ where: { id: webhookId }, data: { processedAt: new Date() } }).catch(() => undefined);
   log.info("webhook.handled", `Whop webhook ${type}`, { storeId, webhookId, requestId, dataId: data.id });
 
-  // Shopify can be slow or down: create the order after answering Whop.
-  // If this is cut short, the background tick retries it.
-  if (syncSessionId) {
-    const id = syncSessionId;
-    after(() => syncOrderSafely(id));
-  }
+  // After answering Whop: create the Shopify order (it can be slow or down; the tick
+  // retries if this is cut short), then let webhook traffic drive background maintenance.
+  const id = syncSessionId;
+  after(() =>
+    withLogContext({ requestId, webhookId, event: type }, async () => {
+      if (id) await syncOrderSafely(id);
+      await maybeTick().catch(() => undefined);
+    }),
+  );
   return json({ ok: true });
 }
 
@@ -93,7 +91,12 @@ async function handle(type: string, data: Record<string, unknown>, storeId: stri
       const metadata = (data.metadata ?? {}) as Record<string, unknown>;
       if (typeof metadata.upsell_id === "string") {
         // A declined one-click offer: free the slot so the buyer can try again.
-        await markUpsellFailed(metadata.upsell_id, storeId, typeof data.failure_message === "string" ? data.failure_message : null);
+        await markUpsellFailed(
+          metadata.upsell_id,
+          storeId,
+          typeof data.failure_message === "string" ? data.failure_message : null,
+          typeof data.id === "string" ? data.id : null,
+        );
         return null;
       }
       const sessionId = await sessionIdFor(data, storeId);
@@ -130,7 +133,18 @@ async function handle(type: string, data: Record<string, unknown>, storeId: stri
         return null;
       }
       // Each refund id is applied once; the marker doubles as a lock against concurrent deliveries.
-      const marker = `refund:${String(data.id ?? "")}`;
+      if (typeof data.id !== "string" || !data.id) {
+        await recordEvent({
+          storeId,
+          sessionId: session.id,
+          level: "error",
+          kind: "refund.unreadable",
+          message: `Remboursement Whop reçu sans identifiant sur ${session.shopifyOrderName ?? "une commande"} : vérifiez-le et reportez-le dans Shopify.`,
+          alert: true,
+        });
+        return null;
+      }
+      const marker = `refund:${data.id}`;
       try {
         await db.webhookEvent.create({ data: { id: marker, storeId, type: "refund" } });
       } catch (err) {
@@ -190,3 +204,32 @@ function safePayload(raw: string) {
   }
 }
 
+
+/** Stale = claimed but never marked processed (the function died mid-way). */
+const STALE_CLAIM_MS = 5 * 60_000;
+
+/**
+ * Claims a webhook id. Returns false for a duplicate that is done or still being
+ * handled; takes over a claim left unprocessed by a crashed invocation.
+ */
+async function claimEvent(webhookId: string, storeId: string, type: string, raw: string): Promise<boolean> {
+  try {
+    await db.webhookEvent.create({ data: { id: webhookId, storeId, type, payload: safePayload(raw) } });
+    return true;
+  } catch (err) {
+    if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002")) throw err;
+  }
+  const takeover = await db.webhookEvent.updateMany({
+    where: { id: webhookId, processedAt: null, receivedAt: { lt: new Date(Date.now() - STALE_CLAIM_MS) } },
+    data: { receivedAt: new Date() },
+  });
+  if (takeover.count === 0) return false;
+  await recordEvent({
+    storeId,
+    level: "warn",
+    kind: "webhook.stale_claim",
+    message: `Événement Whop ${type} resté inachevé (interruption) : repris lors du renvoi de Whop.`,
+    data: { webhookId },
+  });
+  return true;
+}

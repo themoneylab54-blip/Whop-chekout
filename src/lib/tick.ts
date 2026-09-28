@@ -1,11 +1,11 @@
 import "server-only";
 import type { Store } from "@prisma/client";
 import { db } from "./db";
-import { markPaid, syncOrderSafely } from "./checkout";
+import { markPaid, mirrorRefunds, syncOrderSafely } from "./checkout";
 import { pushTracking } from "./disputes";
 import { retryUpsellSyncs } from "./upsell";
 import { retryConversions } from "./conversions";
-import { log, recordEvent } from "./log";
+import { log, recordEvent, withLogContext } from "./log";
 import { paymentInfoFromWhop, storeClient } from "./whop";
 
 /*
@@ -53,10 +53,12 @@ export async function runTick(budgetMs = TICK_BUDGET_MS): Promise<TickReport> {
   const report: TickReport = {};
   const started = Date.now();
   const deadline = started + budgetMs;
+  const runId = `tick_${started.toString(36)}`;
   const jobs: [string, Job][] = [
     ["syncRetried", retrySyncs],
     ["upsellRetried", retryUpsellSyncs],
     ["conversionsRetried", retryConversions],
+    ["refundsMirrored", retryRefundMirrors],
     ["reconciled", reconcilePayments],
     ["trackingPushed", pushTrackingNumbers],
     ["cleaned", cleanup],
@@ -69,7 +71,7 @@ export async function runTick(budgetMs = TICK_BUDGET_MS): Promise<TickReport> {
         continue;
       }
       try {
-        report[name] = await job(deadline);
+        report[name] = await withLogContext({ tickRun: runId, job: name }, () => job(deadline));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         report[name] = `error: ${message}`;
@@ -89,15 +91,19 @@ export async function runTick(budgetMs = TICK_BUDGET_MS): Promise<TickReport> {
   return report;
 }
 
-/** Platform problems concern every store: alert each one that has a channel (throttled). */
+/**
+ * Platform problems (not tied to one store): one alert through the first store that
+ * has alert channels — this is a single-operator app, so every store reaches the
+ * same person; alerting each store would just repeat it.
+ */
 async function alertEveryStore(message: string) {
-  const stores = await db.store.findMany({
+  const store = await db.store.findFirst({
     where: { OR: [{ alertEmail: { not: null } }, { telegramChatId: { not: null } }] },
+    orderBy: { createdAt: "asc" },
     select: { id: true },
   });
-  for (const s of stores) {
-    await recordEvent({ storeId: s.id, level: "error", kind: "tick.job_failed", message, alert: true });
-  }
+  if (store) await recordEvent({ storeId: store.id, level: "error", kind: "tick.job_failed", message, alert: true });
+  else log.error("tick.job_failed", message);
 }
 
 /* 1. Shopify sync retries ---------------------------------------------------- */
@@ -137,58 +143,84 @@ const OVERLAP_MS = 15 * 60_000;
 async function reconcilePayments(deadline: number): Promise<number> {
   const stores = await db.store.findMany({ where: { whopConnectedAt: { not: null }, whopProductId: { not: null } } });
   let healed = 0;
+  const failed: string[] = [];
   for (const store of stores) {
     if (Date.now() > deadline) break;
     try {
       healed += await reconcileStore(store, deadline);
     } catch (err) {
+      // One store's Whop problem must not stop the others; that store is alerted.
+      const message = err instanceof Error ? err.message : String(err);
+      failed.push(store.name);
       log.warn("reconcile.store_failed", "Whop reconciliation failed for a store", { storeId: store.id, err });
-      throw err;
+      await recordEvent({
+        storeId: store.id,
+        level: "error",
+        kind: "reconcile.failed",
+        message: `Vérification des paiements Whop impossible : ${message}. Clé API ou webhook à vérifier.`,
+        alert: true,
+      });
     }
   }
+  if (failed.length && failed.length === stores.length) throw new Error(`réconciliation impossible pour ${failed.join(", ")}`);
   return healed;
 }
 
-type WhopPayment = Record<string, unknown> & { id: string; created_at?: string; checkout_configuration_id?: string | null };
+type WhopPayment = Record<string, unknown> & { id: string; created_at?: string; paid_at?: string | null; checkout_configuration_id?: string | null };
 
 async function reconcileStore(store: Store, deadline: number): Promise<number> {
+  // Walk payments by *payment* time, newest first, down to the high-water mark: a
+  // payment created long ago but settled just now (Klarna, SEPA, late 3-D Secure) is
+  // still seen. Creation is bounded to 7 days, the longest settlement we care about.
   const markKey = `reconcile:${store.id}`;
   const mark = await db.appSetting.findUnique({ where: { key: markKey } });
-  const floor = Date.now() - MAX_LOOKBACK_MS;
-  const from = Math.max(floor, mark ? new Date(mark.value).getTime() - OVERLAP_MS : Date.now() - FIRST_LOOKBACK_MS);
+  const stopAt = mark ? new Date(mark.value).getTime() - OVERLAP_MS : Date.now() - FIRST_LOOKBACK_MS;
 
   const page = await storeClient(store).payments.list({
     account_id: store.whopAccountId ?? undefined,
     product_id: store.whopProductId ?? undefined,
     status: "paid",
-    created_after: new Date(from).toISOString(),
-    order: "created_at",
-    direction: "asc",
+    created_after: new Date(Date.now() - MAX_LOOKBACK_MS).toISOString(),
+    order: "paid_at",
+    direction: "desc",
     first: 50,
   });
 
   let healed = 0;
-  let newest = mark ? new Date(mark.value).getTime() : from;
+  let newest = mark ? new Date(mark.value).getTime() : 0;
   let batch: WhopPayment[] = [];
   let seen = 0;
-  const flush = async () => {
-    healed += await healBatch(store, batch);
-    for (const p of batch) if (p.created_at) newest = Math.max(newest, new Date(p.created_at).getTime());
-    batch = [];
-  };
+  let complete = true;
   for await (const p of page) {
+    const paidAt = paymentTime(p as unknown as WhopPayment);
+    if (paidAt != null && paidAt < stopAt) break; // reached what previous runs covered
     batch.push(p as unknown as WhopPayment);
-    if (batch.length >= 50) await flush();
-    // Oldest first: stopping early is safe, the mark only advances past what was checked.
-    if (++seen >= 500 || Date.now() > deadline) break;
+    if (paidAt != null) newest = Math.max(newest, paidAt);
+    if (batch.length >= 50) {
+      healed += await healBatch(store, batch);
+      batch = [];
+    }
+    if (++seen >= 500 || Date.now() > deadline) {
+      complete = false;
+      break;
+    }
   }
-  if (batch.length) await flush();
-  await db.appSetting.upsert({
-    where: { key: markKey },
-    create: { key: markKey, value: new Date(newest).toISOString() },
-    update: { value: new Date(newest).toISOString() },
-  });
+  if (batch.length) healed += await healBatch(store, batch);
+  // Newest first: only advance the mark after reaching it, or unchecked payments would be skipped.
+  if (complete && newest > 0) {
+    await db.appSetting.upsert({
+      where: { key: markKey },
+      create: { key: markKey, value: new Date(newest).toISOString() },
+      update: { value: new Date(newest).toISOString() },
+    });
+  }
   return healed;
+}
+
+function paymentTime(p: WhopPayment): number | null {
+  const v = (p.paid_at as string | null | undefined) ?? p.created_at;
+  const t = v ? new Date(v).getTime() : NaN;
+  return Number.isFinite(t) ? t : null;
 }
 
 /** Resolves a batch of Whop payments to sessions in two queries and heals the unknown ones. */
@@ -234,6 +266,20 @@ async function healBatch(store: Store, payments: WhopPayment[]): Promise<number>
     });
   }
   return healed;
+}
+
+/** Refunds recorded in Whop but not yet reported on the Shopify order. */
+async function retryRefundMirrors(deadline: number): Promise<number> {
+  const rows = await db.$queryRaw<{ id: string }[]>`
+    SELECT id FROM "CheckoutSession"
+    WHERE "shopifyOrderId" IS NOT NULL AND "refundedCents" > "refundMirroredCents"
+    ORDER BY "updatedAt" ASC LIMIT 20`;
+  let n = 0;
+  for (const r of rows) {
+    if (Date.now() > deadline) break;
+    if ((await mirrorRefunds(r.id)) > 0) n++;
+  }
+  return n;
 }
 
 /* 3. Tracking → Whop ---------------------------------------------------------- */

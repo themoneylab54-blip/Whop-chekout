@@ -11,6 +11,7 @@ ADD COLUMN     "pixelAttempts" INTEGER NOT NULL DEFAULT 0,
 ADD COLUMN     "pixelSentAt" TIMESTAMP(3),
 ADD COLUMN     "pixelStatus" JSONB,
 ADD COLUMN     "preparedAt" TIMESTAMP(3),
+ADD COLUMN     "refundMirroredCents" INTEGER NOT NULL DEFAULT 0,
 ADD COLUMN     "syncAttempts" INTEGER NOT NULL DEFAULT 0,
 ADD COLUMN     "termsAcceptedAt" TIMESTAMP(3),
 ADD COLUMN     "test" BOOLEAN NOT NULL DEFAULT false,
@@ -51,7 +52,8 @@ ADD COLUMN     "tiktokAccessToken" TEXT,
 ADD COLUMN     "tiktokPixelId" TEXT;
 
 -- AlterTable
-ALTER TABLE "WebhookEvent" ADD COLUMN     "payload" JSONB;
+ALTER TABLE "WebhookEvent" ADD COLUMN     "payload" JSONB,
+ADD COLUMN     "processedAt" TIMESTAMP(3);
 
 -- CreateTable
 CREATE TABLE "EventLog" (
@@ -109,6 +111,8 @@ CREATE TABLE "UpsellCharge" (
     "shopifyOrderName" TEXT,
     "error" TEXT,
     "syncAttempts" INTEGER NOT NULL DEFAULT 0,
+    "syncStartedAt" TIMESTAMP(3),
+    "nextSyncAt" TIMESTAMP(3),
     "refundedCents" INTEGER NOT NULL DEFAULT 0,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
@@ -157,3 +161,9 @@ ALTER TABLE "Experiment" ADD CONSTRAINT "Experiment_storeId_fkey" FOREIGN KEY ("
 -- AddForeignKey
 ALTER TABLE "UpsellCharge" ADD CONSTRAINT "UpsellCharge_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "CheckoutSession"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
+
+-- Backfill: refunds recorded before this migration were already reported on their Shopify orders.
+UPDATE "CheckoutSession" SET "refundMirroredCents" = "refundedCents" WHERE "shopifyOrderId" IS NOT NULL;
+
+-- Backfill: webhook events stored before this migration were fully handled.
+UPDATE "WebhookEvent" SET "processedAt" = "receivedAt" WHERE "processedAt" IS NULL;

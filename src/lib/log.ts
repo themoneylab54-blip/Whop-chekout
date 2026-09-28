@@ -1,4 +1,5 @@
 import "server-only";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { Prisma } from "@prisma/client";
 import { db } from "./db";
 import { sendAlert } from "./notify";
@@ -6,9 +7,24 @@ import { sendAlert } from "./notify";
 type Level = "info" | "warn" | "error";
 type Fields = Record<string, unknown>;
 
+/**
+ * Correlation context (request id, webhook id, session id…) merged into every log
+ * line and journal entry written while it is active, including code run later
+ * through `after()` when wrapped with `withLogContext` again.
+ */
+const context = new AsyncLocalStorage<Fields>();
+
+export function withLogContext<T>(fields: Fields, fn: () => T): T {
+  return context.run({ ...context.getStore(), ...fields }, fn);
+}
+
+export function logContext(): Fields {
+  return context.getStore() ?? {};
+}
+
 /** One JSON line per log: searchable in Vercel's log explorer (filter on kind, sessionId…). */
 function emit(level: Level, kind: string, message: string, fields: Fields = {}) {
-  const line = JSON.stringify({ t: new Date().toISOString(), level, kind, message, ...fields }, (_k, v) =>
+  const line = JSON.stringify({ t: new Date().toISOString(), level, kind, message, ...logContext(), ...fields }, (_k, v) =>
     v instanceof Error ? { name: v.name, message: v.message, stack: v.stack?.split("\n").slice(0, 5).join("\n") } : v,
   );
   if (level === "error") console.error(line);
@@ -46,7 +62,7 @@ export async function recordEvent(e: {
         level,
         kind: e.kind,
         message: e.message.slice(0, 2000),
-        data: e.data ? (JSON.parse(JSON.stringify(e.data)) as Prisma.InputJsonValue) : undefined,
+        data: (JSON.parse(JSON.stringify({ ...logContext(), ...e.data })) as Prisma.InputJsonValue) ?? undefined,
       },
     });
   } catch (err) {
@@ -54,8 +70,15 @@ export async function recordEvent(e: {
   }
   if (e.alert && e.storeId) {
     try {
-      if (await claimAlertSlot(e.storeId, e.kind)) await sendAlert(e.storeId, e.message, e.sessionId ?? null);
-      else emit("info", "alert.throttled", "Alert grouped with a recent one of the same kind", { storeId: e.storeId, kind: e.kind });
+      if (await claimAlertSlot(e.storeId, e.kind)) {
+        try {
+          await sendAlert(e.storeId, e.message, e.sessionId ?? null);
+        } catch (err) {
+          // Not delivered: free the slot so the next occurrence tries again.
+          await releaseAlertSlot(e.storeId, e.kind);
+          throw err;
+        }
+      } else emit("info", "alert.throttled", "Alert grouped with a recent one of the same kind", { storeId: e.storeId, kind: e.kind });
     } catch (err) {
       emit("error", "alert.failed", "Could not send the alert", { err });
     }
@@ -63,7 +86,17 @@ export async function recordEvent(e: {
 }
 
 /** Kinds that must always ping: each one needs its own action from the merchant. */
-const NEVER_THROTTLED = new Set(["review.hold", "payment.duplicate", "dispute.created", "dispute_alert.created", "dispute_alert.refunded"]);
+const NEVER_THROTTLED = new Set([
+  "review.hold",
+  "payment.duplicate",
+  "dispute.created",
+  "dispute_alert.created",
+  "dispute_alert.refunded",
+  "refund.unreadable",
+  "sync.gave_up",
+  "upsell.gave_up",
+  "webhook.stale_claim",
+]);
 const ALERT_WINDOW_MS = 15 * 60_000;
 
 /**
@@ -80,4 +113,9 @@ async function claimAlertSlot(storeId: string, kind: string): Promise<boolean> {
     ON CONFLICT ("key") DO UPDATE SET "value" = EXCLUDED."value", "updatedAt" = now()
     WHERE "AppSetting"."value" < ${cutoff}`;
   return claimed > 0;
+}
+
+async function releaseAlertSlot(storeId: string, kind: string) {
+  if (NEVER_THROTTLED.has(kind)) return;
+  await db.appSetting.deleteMany({ where: { key: `alert:${storeId}:${kind}` } }).catch(() => undefined);
 }
