@@ -19,12 +19,156 @@ export const FONTS = [
 
 const color = z.string().regex(/^#[0-9a-fA-F]{6}$/);
 const optionalColor = color.or(z.literal("")).default("");
-// http(s) only: these URLs end up in <img src> and <a href> on the checkout.
+// http(s) only: these URLs end up in <img src> and <a href> on the checkout. The one relative
+// form allowed is an image uploaded in the builder (lib/media.ts), served on every host.
+export const MEDIA_PATH_RE = /^\/api\/public\/media\/[a-z0-9]{10,40}$/i;
+
+/**
+ * `v` is `url`, or (for a relative `url`) that path written as an absolute http(s) address on any
+ * host, either one optionally followed by a trailing slash and a query / fragment (?v=2, #x): the
+ * forms that still name the same image, in any letter case (lib/media.ts mediaIdOf accepts the same).
+ */
+const sameUrl = (v: string, url: string) => {
+  if (v === url) return true;
+  if (!url.startsWith("/")) return false;
+  // Case-insensitive, as mediaIdOf: /API/public/media/CMAB… names the same (lowercase) upload.
+  const at = v.toLowerCase().indexOf(url.toLowerCase());
+  if (at < 0) return false;
+  return (at === 0 || /^https?:\/\/[^/?#\s]+$/i.test(v.slice(0, at))) && /^\/?(?:[?#].*)?$/.test(v.slice(at + url.length));
+};
+
+/**
+ * A design (theme / layout JSON) with every string equal to `url` replaced by "" (a relative `url`
+ * also matches its absolute form, e.g. https://<host>/api/public/media/<id>): the fields that
+ * showed a deleted image go back to empty. Unchanged parts keep their identity. Pure.
+ */
+export function clearUrl<T>(value: T, url: string): T {
+  if (typeof value === "string") return (sameUrl(value.trim(), url) ? "" : value) as T;
+  if (Array.isArray(value)) {
+    const next = value.map((v) => clearUrl(v, url));
+    return (next.some((v, i) => v !== value[i]) ? next : value) as T;
+  }
+  if (value && typeof value === "object") {
+    let changed = false;
+    const next = Object.fromEntries(
+      Object.entries(value).map(([k, v]) => {
+        const c = clearUrl(v, url);
+        if (c !== v) changed = true;
+        return [k, c];
+      }),
+    );
+    return (changed ? next : value) as T;
+  }
+  return value;
+}
 const url = z
   .string()
   .max(2000)
-  .refine((v) => /^https?:\/\//i.test(v) && URL.canParse(v), "URL http(s) attendue")
+  .refine((v) => (/^https?:\/\//i.test(v) && URL.canParse(v)) || MEDIA_PATH_RE.test(v), "URL http(s) attendue")
   .or(z.literal(""));
+// Image fields (logo, banner, block images): https only, since an http image is mixed content on the
+// https checkout. The builder refuses http on input; an http address saved before this rule
+// is upgraded to https on read instead of failing the whole design.
+const imageUrl = z
+  .string()
+  .max(2000)
+  .transform((v) => (/^http:\/\//i.test(v) ? `https://${v.slice(7)}` : v))
+  .refine((v) => v === "" || (/^https:\/\//i.test(v) && URL.canParse(v)) || MEDIA_PATH_RE.test(v), "URL https attendue");
+
+/* ---------- Express payment buttons (top of the checkout) ---------- */
+
+/** Whop's express wallets, one button each (PayPal is our own button next to them). */
+export const EXPRESS_WALLETS = ["apple-pay", "google-pay", "whop-pay"] as const;
+export type ExpressWallet = (typeof EXPRESS_WALLETS)[number];
+
+/**
+ * Which express buttons the merchant wants at the top of the checkout. Every field falls back to
+ * its default on its own (`catch`), so an outdated or partial value never drops the others.
+ * Google Pay: "auto" = only when nothing ships (Whop's Google Pay express button collects no
+ * shipping address), "always" = even for goods to ship (address-less orders are held for review).
+ */
+export const expressMethodsSchema = z.object({
+  applePay: z.boolean().default(true).catch(true),
+  googlePay: z.enum(["off", "auto", "always"]).default("auto").catch("auto"),
+  whopPay: z.boolean().default(true).catch(true),
+  paypal: z.boolean().default(true).catch(true),
+});
+export type ExpressMethods = z.infer<typeof expressMethodsSchema>;
+export const DEFAULT_EXPRESS_METHODS: ExpressMethods = { applePay: true, googlePay: "auto", whopPay: true, paypal: true };
+
+/**
+ * The express buttons to show, from the merchant's choice and the cart. Pure.
+ * `paypal` is the merchant's permission only: Whop must also offer PayPal on the store.
+ */
+export function expressMethodsShown(
+  settings: Partial<ExpressMethods> | null | undefined,
+  cart: { shippable: boolean },
+): { wallets: ExpressWallet[]; paypal: boolean } {
+  // Parsed, never spread: a key left undefined or holding a stray value gets its default.
+  const s = expressMethodsSchema.parse(settings ?? {});
+  const googlePay = s.googlePay === "always" || (s.googlePay === "auto" && !cart.shippable);
+  const on: Record<ExpressWallet, boolean> = { "apple-pay": s.applePay, "google-pay": googlePay, "whop-pay": s.whopPay };
+  return { wallets: EXPRESS_WALLETS.filter((m) => on[m]), paypal: s.paypal };
+}
+
+/**
+ * Whether the cart has anything to ship, for expressMethodsShown: the buyer's lines and the free
+ * gifts (they ship too), a line at quantity 0 (being removed) counting for nothing. Pure.
+ */
+export function cartShippable(...groups: readonly (readonly { requiresShipping?: boolean; quantity: number }[])[]): boolean {
+  return groups.some((lines) => lines.some((l) => !!l.requiresShipping && l.quantity > 0));
+}
+
+/**
+ * Apple Pay / Google Pay logos next to the Payment title: only wallets the buyer can really use.
+ * Off when the express section is off or a relay point is chosen (the wallets are hidden then);
+ * live (`rendered` = the wallets whose Whop button actually showed on this device), only those;
+ * in the builder preview (`rendered` = null), the merchant's settings. Pure.
+ */
+export function offeredWalletsFor(opts: {
+  walletsOn: boolean;
+  pickupSelected: boolean;
+  configured: readonly ExpressWallet[];
+  rendered: readonly ExpressWallet[] | null;
+}): { applePay: boolean; googlePay: boolean } {
+  const on = (m: ExpressWallet) => opts.walletsOn && !opts.pickupSelected && opts.configured.includes(m) && (opts.rendered === null || opts.rendered.includes(m));
+  return { applePay: on("apple-pay"), googlePay: on("google-pay") };
+}
+
+/**
+ * Whether the merchant allows the PayPal express button (and so the PayPal-only checkout): its
+ * switch on, and the express section itself on the page (theme switch on, the checkout layout's
+ * express block enabled and not hidden) — the button only ever shows there. Pure.
+ */
+export function paypalExpressAllowed(
+  theme: { expressMethods?: Partial<ExpressMethods> | null; expressCheckout?: boolean },
+  layout: { blocks: readonly Pick<Block, "type" | "hidden" | "props">[] },
+): boolean {
+  // Parsed like expressMethodsShown: a stray value falls back to the default (on), as buyers see it.
+  if (!expressMethodsSchema.parse(theme.expressMethods ?? {}).paypal || theme.expressCheckout === false) return false;
+  const express = layout.blocks.find((b) => b.type === "express");
+  return !!express && !express.hidden && (express.props as { enabled?: boolean }).enabled !== false;
+}
+
+/**
+ * Only Google Pay on "auto" left among the express buttons: shown or not depending on the cart
+ * (hidden as soon as something ships). The builder marks the express row « selon le panier »
+ * rather than greying it. Pure.
+ */
+export function expressMethodsCartDependent(m: Partial<ExpressMethods> | null | undefined): boolean {
+  const s = expressMethodsSchema.parse(m ?? {});
+  return !s.applePay && !s.whopPay && !s.paypal && s.googlePay === "auto";
+}
+
+/**
+ * Every express button switched off, whatever the cart (Google Pay "off" too). Only Google Pay on
+ * "auto" left is NOT all off: it shows for carts with nothing to ship (see
+ * expressMethodsCartDependent). The two never both hold. Pure.
+ */
+export function expressMethodsAllOff(m: Partial<ExpressMethods> | null | undefined): boolean {
+  const s = expressMethodsSchema.parse(m ?? {});
+  return !s.applePay && !s.whopPay && !s.paypal && s.googlePay === "off";
+}
 
 /** Checkout languages (labels in components/checkout/i18n.ts). */
 export const LANGUAGES = ["fr", "en", "de", "es", "it", "nl"] as const;
@@ -55,11 +199,28 @@ export const themeSchema = z.object({
   storeName: z.string().max(80).default(""),
   showStoreName: z.boolean().default(true),
   headerAlign: z.enum(["left", "center", "right"]).default("center"),
-  logoUrl: url.default(""),
+  logoUrl: imageUrl.default(""),
   logoHeight: z.number().int().min(16).max(120).default(40),
+  // Header content: store name, logo, or a full-width image banner. Unset on stores saved before
+  // the choice existed: see headerModeOf (logo when a logo URL is set, else the name, as before).
+  headerMode: z.enum(["name", "logo", "banner"]).optional(),
+  // Last template applied per page (builder "Actuel" badge; never shown to buyers).
+  appliedTemplates: z.object({ checkout: z.string().max(40).optional(), thankYou: z.string().max(40).optional() }).optional(),
+  bannerUrl: imageUrl.default(""),
+  // Fixed height (px), or the image's own proportions (bannerRatio = width / height, measured by the builder)
+  bannerHeight: z.number().int().min(60).max(240).default(120),
+  bannerAuto: z.boolean().default(false),
+  bannerRatio: z.number().min(1).max(20).optional(),
+  bannerFit: z.enum(["cover", "contain"]).default("cover"),
+  // Behind a "contain" banner ("" = header background)
+  bannerBackground: optionalColor,
+  // The banner links back to the shop
+  bannerLink: z.boolean().default(false),
   trustLine: z.string().max(200).default(""),
   // Apple Pay / Google Pay buttons at the top of the checkout
   expressCheckout: z.boolean().default(true),
+  // Which express buttons (Apple Pay, Google Pay, Whop Pay, PayPal): missing on older designs = defaults.
+  expressMethods: z.preprocess((v) => (v && typeof v === "object" && !Array.isArray(v) ? v : {}), expressMethodsSchema).default(DEFAULT_EXPRESS_METHODS),
   payButtonText: z.string().max(40).default(""),
   policyLinks: z.array(z.object({ label: z.string().max(60), url })).max(8).default([]),
   // --- EU consumer law ---
@@ -72,6 +233,17 @@ export const themeSchema = z.object({
   withdrawalNotice: z.boolean().default(true),
 });
 export type Theme = z.infer<typeof themeSchema>;
+export type HeaderMode = NonNullable<Theme["headerMode"]>;
+
+/**
+ * The header's content. Themes saved before the choice existed keep their look: a logo URL
+ * means "logo", otherwise the store name. A banner without an image falls back the same way.
+ */
+export function headerModeOf(theme: Pick<Theme, "headerMode" | "logoUrl" | "bannerUrl">): HeaderMode {
+  if (theme.headerMode === "banner") return theme.bannerUrl ? "banner" : theme.logoUrl ? "logo" : "name";
+  if (theme.headerMode) return theme.headerMode;
+  return theme.logoUrl ? "logo" : "name";
+}
 
 /**
  * Self-hosted stylesheet for a theme font (latin + latin-ext, 400–700, font-display: swap).
@@ -154,6 +326,10 @@ const base = {
   id: z.string().min(1).max(40),
   i18n: blockTranslationsSchema.optional(),
   hidden: z.boolean().default(false),
+  // Created (palette, template) with shipped example content since sample content is hidden from
+  // buyers: only such blocks have their sample proof hidden live (lib/sample-content.ts). Blocks
+  // published before carry no flag and render exactly as they did.
+  sample: z.literal(true).optional(),
   placement: z.enum(["form", "summary"]).default("form"),
   // thank-you page only
   position: z.enum(["above", "below"]).default("below"),
@@ -195,7 +371,7 @@ export const offerArmSchema = z.object({
   split: z.number().int().min(1).max(99).default(50),
   variantId: z.string().max(120).default(""),
   productId: z.string().max(120).optional(),
-  imageUrl: url.default(""),
+  imageUrl: imageUrl.default(""),
   badge: z.string().max(60).default(""),
   title: z.string().max(120).default(""),
   text: z.string().max(400).default(""),
@@ -210,6 +386,55 @@ export const offerArmSchema = z.object({
 export type OfferArmProps = z.infer<typeof offerArmSchema>;
 
 /** Post-purchase survey answers ("Comment nous avez-vous connu ?"). */
+/* ---------- "Avis clients" (reviews) block ---------- */
+
+export const MAX_REVIEW_ITEMS = 20;
+/** Where a review comes from: typed in the builder, a review app's CSV export, or the Judge.me API. */
+export const REVIEW_SOURCES = ["manual", "csv", "judgeme"] as const;
+// Optional fields added after the first version: a bad value is dropped on its own
+// (.catch) instead of sending the whole block back to its sample reviews.
+const optionalText = (max: number) => z.string().max(max).optional().catch(undefined);
+export const reviewItemSchema = z.object({
+  name: z.string().max(80),
+  text: z.string().max(800),
+  stars: z.number().int().min(1).max(5),
+  /** "Achat vérifié": only when the review app says the reviewer bought the product. */
+  verified: z.boolean(),
+  title: optionalText(150),
+  /** Day the review was written (YYYY-MM-DD). */
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().catch(undefined),
+  photoUrl: imageUrl.optional().catch(undefined),
+  /** Reviewed product (per-cart ordering: reviews of the products in the cart come first). */
+  productHandle: optionalText(255),
+  /** Numeric Shopify product id. */
+  productId: z.string().regex(/^\d{1,20}$/).optional().catch(undefined),
+  productTitle: optionalText(255),
+  source: z.enum(REVIEW_SOURCES).optional().catch(undefined),
+});
+export type ReviewItem = z.infer<typeof reviewItemSchema>;
+export const reviewSummarySchema = z.object({
+  score: z.number().min(1).max(5),
+  count: z.number().int().min(1).max(100_000_000),
+  source: z.enum(["csv", "judgeme", "shopify"]),
+  /** Day the average was computed (YYYY-MM-DD): shown in the builder only. */
+  asOf: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().catch(undefined),
+  /**
+   * Import cut short: Judge.me (1 000 reviews / time budget / later page error) — the average
+   * covers only the `count` most recent reviews read; Shopify (2 000 products / later page
+   * throttled) — it covers the products read only. Absent (older blocks) = complete.
+   */
+  partial: z.boolean().optional().catch(undefined),
+});
+export type ReviewSummary = z.infer<typeof reviewSummarySchema>;
+
+/**
+ * "Achat vérifié" comes only from a review app (CSV export or Judge.me): a review typed in the
+ * builder (source manual or none) is never shown as verified, whatever was saved.
+ */
+export function honestReviewItem<T extends Pick<ReviewItem, "verified" | "source">>(item: T): T {
+  return item.verified && item.source !== "csv" && item.source !== "judgeme" ? { ...item, verified: false } : item;
+}
+
 export const SURVEY_KEYS = ["facebook", "instagram", "tiktok", "google", "youtube", "friend", "other"] as const;
 export type SurveyKey = (typeof SURVEY_KEYS)[number];
 export const SURVEY_OTHER_MAX = 80;
@@ -274,7 +499,7 @@ export const blockSchema = z.discriminatedUnion("type", [
     ...base,
     type: z.literal("image"),
     props: z.object({
-      url,
+      url: imageUrl,
       alt: z.string().max(200),
       size: z.enum(["sm", "md", "lg", "full"]).default("full"),
     }),
@@ -285,7 +510,7 @@ export const blockSchema = z.discriminatedUnion("type", [
     props: z.object({
       quote: z.string().max(1000),
       author: z.string().max(100),
-      photoUrl: url,
+      photoUrl: imageUrl,
       stars: z.number().int().min(1).max(5),
     }),
   }),
@@ -305,7 +530,7 @@ export const blockSchema = z.discriminatedUnion("type", [
     ...base,
     type: z.literal("trust_badges"),
     props: z.object({
-      badges: z.array(z.object({ label: z.string().max(60), iconUrl: url })).max(8),
+      badges: z.array(z.object({ label: z.string().max(60), iconUrl: imageUrl })).max(8),
     }),
   }),
   z.object({
@@ -387,10 +612,11 @@ export const blockSchema = z.discriminatedUnion("type", [
     type: z.literal("reviews"),
     props: z.object({
       title: z.string().max(120),
-      layout: z.enum(["carousel", "stack"]),
-      items: z
-        .array(z.object({ name: z.string().max(80), text: z.string().max(800), stars: z.number().int().min(1).max(5), verified: z.boolean() }))
-        .max(20),
+      // auto: carousel in a narrow column (mobile), list of the first reviews when wide.
+      layout: z.enum(["carousel", "stack", "auto"]),
+      items: z.array(reviewItemSchema).max(MAX_REVIEW_ITEMS),
+      /** Average of ALL the merchant's published reviews (never of the hand-picked ones): absent until known. */
+      summary: reviewSummarySchema.nullable().optional().catch(undefined),
     }),
   }),
   z.object({
@@ -411,7 +637,7 @@ export const blockSchema = z.discriminatedUnion("type", [
   z.object({
     ...base,
     type: z.literal("logos"),
-    props: z.object({ title: z.string().max(120), logos: z.array(z.object({ imageUrl: url, alt: z.string().max(80) })).max(10) }),
+    props: z.object({ title: z.string().max(120), logos: z.array(z.object({ imageUrl, alt: z.string().max(80) })).max(10) }),
   }),
   z.object({
     ...base,
@@ -462,7 +688,8 @@ export const blockSchema = z.discriminatedUnion("type", [
   z.object({
     ...base,
     type: z.literal("coupon"),
-    props: z.object({ title: z.string().max(120), text: z.string().max(300), code: z.string().max(40) }),
+    // codeConfirmed: the merchant confirmed the example code (MERCI10) exists in their store.
+    props: z.object({ title: z.string().max(120), text: z.string().max(300), code: z.string().max(40), codeConfirmed: z.boolean().optional() }),
   }),
   z.object({
     ...base,
@@ -478,7 +705,7 @@ export const blockSchema = z.discriminatedUnion("type", [
       // "auto": the product most often bought with this order's products (past paid orders),
       // at discountPercent off its live price; "manual" (default): variantId.
       productSource: z.enum(["manual", "auto"]).optional(),
-      imageUrl: url,
+      imageUrl: imageUrl,
       // "fixed": `price`; "percent": `discountPercent` off the live Shopify price (priced at accept time).
       priceMode: offerPriceMode.default("fixed"),
       price: z.number().min(0).max(100000),
@@ -508,7 +735,7 @@ export const blockSchema = z.discriminatedUnion("type", [
     props: z.object({
       title: z.string().max(120).default(""),
       items: z
-        .array(z.object({ variantId: z.string().max(120), title: z.string().max(120).default(""), imageUrl: url.default("") }))
+        .array(z.object({ variantId: z.string().max(120), title: z.string().max(120).default(""), imageUrl: imageUrl.default("") }))
         .max(MAX_RECOMMENDATIONS)
         .default([]),
       hideIfInCart: z.boolean().default(true),
@@ -615,8 +842,9 @@ export const CHECKOUT_PALETTE: BlockType[] = [
   "free_shipping_bar",
   "delivery_estimate",
   "order_note",
-  "secure_badge",
+  // First of the "Confiance" group: the proof merchants look for most.
   "reviews",
+  "secure_badge",
   "benefits",
   "comparison",
   "stats",
@@ -707,16 +935,18 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
   image: { url: "", alt: "", size: "full" },
   testimonial: {
     quote: "Livraison rapide et produit conforme, je recommande.",
-    author: "Client vérifié",
+    // No default author: "Client vérifié" would vouch for a quote the merchant wrote.
+    author: "",
     photoUrl: "",
     stars: 5,
   },
   rating: { score: null, count: 0, label: "note moyenne de nos clients" },
+  // Non-binding reassurance only: the default checkout shows these, so no refund / returns promise.
   trust_badges: {
     badges: [
       { label: "Paiement sécurisé", iconUrl: "" },
-      { label: "Satisfait ou remboursé 30 jours", iconUrl: "" },
-      { label: "Retours faciles", iconUrl: "" },
+      { label: "Données chiffrées", iconUrl: "" },
+      { label: "Suivi de commande", iconUrl: "" },
     ],
   },
   guarantee: {
@@ -754,12 +984,13 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
     threshold: 0,
   },
   delivery_estimate: { label: "Livraison estimée", minDays: 3, maxDays: 5, businessDays: true, showTimeline: true },
+  // Sample reviews: never marked "verified" (the builder asks to replace them before publishing).
   reviews: {
     title: "Ce que disent nos clients",
-    layout: "carousel",
+    layout: "auto",
     items: [
-      { name: "Camille R.", text: "Commande reçue en 3 jours, qualité au top. Je recommande !", stars: 5, verified: true },
-      { name: "Yanis B.", text: "Service client réactif et produit conforme aux photos.", stars: 5, verified: true },
+      { name: "Camille R.", text: "Commande reçue en 3 jours, qualité au top. Je recommande !", stars: 5, verified: false },
+      { name: "Yanis B.", text: "Service client réactif et produit conforme aux photos.", stars: 5, verified: false },
     ],
   },
   comparison: {
@@ -831,12 +1062,16 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
 /** Where a new block goes by default: cross-sell cards sit in the summary, the rest in the form. */
 const DEFAULT_PLACEMENT: Partial<Record<BlockType, Block["placement"]>> = { recommendations: "summary" };
 
+/** Blocks shipped with example proof (reviews, figures, testimonial, coupon, announcement, text). */
+export const SAMPLE_CONTENT_BLOCKS: ReadonlySet<BlockType> = new Set<BlockType>(["reviews", "stats", "testimonial", "coupon", "announcement", "text"]);
+
 export function createBlock<T extends BlockType>(type: T, overrides: Partial<Block> = {}): BlockOf<T> {
   return blockSchema.parse({
     id: newBlockId(),
     type,
     props: structuredClone(DEFAULT_PROPS[type]),
     ...(DEFAULT_PLACEMENT[type] ? { placement: DEFAULT_PLACEMENT[type] } : {}),
+    ...(SAMPLE_CONTENT_BLOCKS.has(type) ? { sample: true } : {}),
     ...overrides,
   }) as BlockOf<T>;
 }
@@ -918,19 +1153,35 @@ export function ratingIsSet(props: BlockOf<"rating">["props"]): props is BlockOf
   return typeof props.score === "number" && Number.isFinite(props.score) && props.score >= 1;
 }
 
-/** "4,8" (fr), "4.8" (en), "4,8" (de): one decimal in the buyer's locale. */
+/**
+ * "4,8" (fr), "4.8" (en), "4,8" (de): one decimal in the buyer's locale, floored (4.96 → "4,9",
+ * never rounded up to "5,0": a score is never shown higher than it is).
+ */
 export function formatRatingScore(score: number, locale: string): string {
-  return new Intl.NumberFormat(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(score);
+  const floored = Number.isFinite(score) ? Math.floor(score * 10 + 1e-9) / 10 : score;
+  return new Intl.NumberFormat(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(floored);
 }
 
 function migrateBlock(b: Block): Block {
-  return b.type === "rating" ? { ...b, props: migrateRatingProps(b.props) } : b;
+  if (b.type === "rating") return { ...b, props: migrateRatingProps(b.props) };
+  if (b.type === "reviews" && b.props.items.some((r) => honestReviewItem(r) !== r)) return { ...b, props: { ...b.props, items: b.props.items.map(honestReviewItem) } };
+  return b;
 }
 
 /** Keeps every valid block (repairing props/style when possible) and drops only broken ones. */
 function loadBlocks(raw: unknown): Block[] {
   return loadRawBlocks(raw).map(migrateBlock);
 }
+
+/** Props holding a sample-content block's example content (see SAMPLE_CONTENT_BLOCKS). */
+const SAMPLE_CONTENT_KEYS: Partial<Record<BlockType, readonly string[]>> = {
+  reviews: ["items"],
+  stats: ["items"],
+  testimonial: ["quote"],
+  coupon: ["code", "text"],
+  announcement: ["text"],
+  text: ["heading", "body"],
+};
 
 function loadRawBlocks(raw: unknown): Block[] {
   const list = raw && typeof raw === "object" && Array.isArray((raw as { blocks?: unknown }).blocks) ? (raw as { blocks: unknown[] }).blocks : [];
@@ -945,11 +1196,29 @@ function loadRawBlocks(raw: unknown): Block[] {
     const b = item as Record<string, unknown>;
     const type = b.type as BlockType;
     if (!(type in DEFAULT_PROPS)) continue;
-    const props = { ...structuredClone(DEFAULT_PROPS[type]), ...(typeof b.props === "object" && b.props ? b.props : {}) };
+    const stored = typeof b.props === "object" && b.props ? (b.props as Record<string, unknown>) : {};
+    const props = { ...structuredClone(DEFAULT_PROPS[type]), ...stored };
+    // A real coupon code must never be paired with the shipped "-10 %" promise.
+    if (type === "coupon" && "code" in stored && !("text" in stored)) (props as Record<string, unknown>).text = "";
+    // A content key filled from the shipped defaults brings example content back (reviews,
+    // figures, MERCI10…): tag the block so buyers never see it. Settings keys (layout, title…)
+    // filled from defaults leave the merchant's own content, and its tag, untouched.
+    const filledContent = (SAMPLE_CONTENT_KEYS[type] ?? []).some((k) => !(k in stored));
+    const sample = b.sample === true || filledContent ? true : undefined;
+    // Last resort: the content is reset to the shipped defaults, i.e. example content again
+    // (tagged so buyers never see it, whatever the stored tag was).
     const repaired =
-      blockSchema.safeParse({ ...b, props }).data ??
-      blockSchema.safeParse({ ...b, props, style: undefined }).data ??
-      blockSchema.safeParse({ id: b.id ?? newBlockId(), type, hidden: b.hidden, placement: b.placement, position: b.position, props: DEFAULT_PROPS[type] }).data;
+      blockSchema.safeParse({ ...b, props, sample }).data ??
+      blockSchema.safeParse({ ...b, props, sample, style: undefined }).data ??
+      blockSchema.safeParse({
+        id: b.id ?? newBlockId(),
+        type,
+        hidden: b.hidden,
+        placement: b.placement,
+        position: b.position,
+        sample: b.sample === true || SAMPLE_CONTENT_BLOCKS.has(type) ? true : undefined,
+        props: DEFAULT_PROPS[type],
+      }).data;
     if (repaired) blocks.push(repaired);
   }
   return blocks;

@@ -1,3 +1,76 @@
+/**
+ * What the average shown above imported reviews covers: true = every published review (full
+ * Judge.me import, store-wide Shopify metafields), "file" = every review of the imported CSV,
+ * { recent } = only the N most recent reviews read (partial Judge.me import; N pre-formatted),
+ * "store" = every published review of the store (Shopify metafields of the active products),
+ * "store-partial" = part of them (Shopify read capped at 2 000 products or cut short).
+ */
+export type ReviewsNoteSummary = boolean | "file" | "store" | "store-partial" | { recent: string };
+
+/** "The average rating covers …" sentence, one per language (under the reviews block). */
+const AVERAGE_SCOPE = {
+  fr: (s: Exclude<ReviewsNoteSummary, false>) =>
+    s === "file"
+      ? "La note moyenne porte sur tous les avis du fichier importé."
+      : s === "store"
+        ? "La note moyenne porte sur tous les avis publiés de la boutique."
+        : s === "store-partial"
+          ? "La note moyenne porte sur une partie des avis publiés de la boutique."
+          : typeof s === "object"
+            ? `La note moyenne porte sur les ${s.recent} avis les plus récents.`
+            : "La note moyenne porte sur tous les avis publiés.",
+  en: (s: Exclude<ReviewsNoteSummary, false>) =>
+    s === "file"
+      ? "The average rating covers all reviews in the imported file."
+      : s === "store"
+        ? "The average rating covers all of the store's published reviews."
+        : s === "store-partial"
+          ? "The average rating covers part of the store's published reviews."
+          : typeof s === "object"
+            ? `The average rating covers the ${s.recent} most recent reviews.`
+            : "The average rating covers all published reviews.",
+  de: (s: Exclude<ReviewsNoteSummary, false>) =>
+    s === "file"
+      ? "Die Durchschnittsbewertung bezieht sich auf alle Bewertungen der importierten Datei."
+      : s === "store"
+        ? "Die Durchschnittsbewertung bezieht sich auf alle veröffentlichten Bewertungen des Shops."
+        : s === "store-partial"
+          ? "Die Durchschnittsbewertung bezieht sich auf einen Teil der veröffentlichten Bewertungen des Shops."
+          : typeof s === "object"
+            ? `Die Durchschnittsbewertung bezieht sich auf die ${s.recent} neuesten Bewertungen.`
+            : "Die Durchschnittsbewertung bezieht sich auf alle veröffentlichten Bewertungen.",
+  es: (s: Exclude<ReviewsNoteSummary, false>) =>
+    s === "file"
+      ? "La valoración media se basa en todas las opiniones del archivo importado."
+      : s === "store"
+        ? "La valoración media se basa en todas las opiniones publicadas de la tienda."
+        : s === "store-partial"
+          ? "La valoración media se basa en una parte de las opiniones publicadas de la tienda."
+          : typeof s === "object"
+            ? `La valoración media se basa en las ${s.recent} opiniones más recientes.`
+            : "La valoración media se basa en todas las opiniones publicadas.",
+  it: (s: Exclude<ReviewsNoteSummary, false>) =>
+    s === "file"
+      ? "La valutazione media si basa su tutte le recensioni del file importato."
+      : s === "store"
+        ? "La valutazione media si basa su tutte le recensioni pubblicate del negozio."
+        : s === "store-partial"
+          ? "La valutazione media si basa su una parte delle recensioni pubblicate del negozio."
+          : typeof s === "object"
+            ? `La valutazione media si basa sulle ${s.recent} recensioni più recenti.`
+            : "La valutazione media si basa su tutte le recensioni pubblicate.",
+  nl: (s: Exclude<ReviewsNoteSummary, false>) =>
+    s === "file"
+      ? "De gemiddelde score is gebaseerd op alle reviews uit het geïmporteerde bestand."
+      : s === "store"
+        ? "De gemiddelde score is gebaseerd op alle gepubliceerde reviews van de winkel."
+        : s === "store-partial"
+          ? "De gemiddelde score is gebaseerd op een deel van de gepubliceerde reviews van de winkel."
+          : typeof s === "object"
+            ? `De gemiddelde score is gebaseerd op de ${s.recent} meest recente reviews.`
+            : "De gemiddelde score is gebaseerd op alle gepubliceerde reviews.",
+};
+
 export const LABELS = {
   fr: {
     contact: "Contact",
@@ -19,10 +92,29 @@ export const LABELS = {
     free: "Offert",
     addons: "Ajouter à votre commande",
     payment: "Paiement",
+    acceptedPaymentMethods: "Moyens de paiement acceptés",
     paymentSecure: "Toutes les transactions sont sécurisées et chiffrées.",
     // Unambiguous "order with obligation to pay" wording (Code de la consommation L221-14)
     payNow: "Commander et payer",
     expressCheckout: "Paiement express",
+    payWithPaypal: "Payer avec PayPal",
+    paypalNeedsDetails: "Renseignez vos coordonnées de livraison pour payer avec PayPal",
+    paypalContinue: "Continuer avec PayPal",
+    paypalSelected: "PayPal sélectionné",
+    paypalPayOther: "Payer autrement",
+    paypalPopupHint: "La fenêtre PayPal ne s'est pas ouverte ? Cliquez sur « Continuer avec PayPal ».",
+    paypalConfirmClosed: "La fenêtre PayPal est-elle fermée ? Si vous avez déjà validé chez PayPal, attendez quelques secondes.",
+    paypalConfirmYes: "Oui, elle est fermée",
+    paypalConfirmWait: "Attendre",
+    paypalPaymentInFlight: "Votre paiement PayPal est peut-être en cours de validation. Patientez un instant avant de payer autrement.",
+    paypalUseWhopButton: "Votre navigateur a bloqué la fenêtre PayPal : cliquez sur le bouton PayPal dans le formulaire de paiement ci-dessus.",
+    paypalExpressLocked: "Un paiement PayPal est ouvert. Choisissez « Payer autrement » pour changer.",
+    paypalEditsLocked: "Paiement PayPal en cours : vos informations sont verrouillées",
+    paymentAlreadyInFlight: "Un paiement est déjà en cours de validation, patientez quelques secondes.",
+    cardDeclinedRetrySoon: "Votre paiement par carte a été refusé ; vous pourrez réessayer dans quelques secondes.",
+    payNowAvailable: "Vous pouvez payer maintenant.",
+    paypalCheckFailed: "Impossible de vérifier votre paiement PayPal pour le moment. Vérifiez votre connexion et réessayez dans un instant.",
+    expressPaymentFailed: "Le paiement express n'a pas abouti. Réessayez ou choisissez un autre moyen de paiement.",
     or: "OU",
     totalUpdated: "Le total a été mis à jour. Vérifiez le montant puis cliquez à nouveau sur Payer.",
     paymentNotReady: "Le formulaire de paiement se charge encore, réessayez dans un instant.",
@@ -94,7 +186,24 @@ export const LABELS = {
     prevReview: "Avis précédent",
     nextReview: "Avis suivant",
     reviewN: (n: number) => `Avis ${n}`,
-    reviewsCount: (n: string) => `${n} avis`,
+    reviewsCarousel: "carrousel d'avis",
+    reviewSlide: "avis",
+    // `n`: the count as written in the buyer's locale; `count`: the number itself, for the
+    // plural rules of the other languages ("avis" is invariable).
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    reviewsCount: (n: string, count?: number) => `${n} avis`,
+    reviewPhoto: "Photo du client",
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    reviewsSummary: (score: string, n: string, count?: number) => `Note moyenne : ${score} sur 5, ${n} avis`,
+    /** Screen-reader name of a star row: `n` as written in the buyer's locale, `count` for the plural. */
+    starsOutOf5: (n: string, count: number) => `${n} ${count >= 2 ? "étoiles" : "étoile"} sur 5`,
+    moreReviews: (n: number) => `Voir ${n} avis de plus`,
+    /** Under a reviews block showing imported reviews (EU Omnibus: where reviews come from). */
+    importedReviewsNote: (app: string | null, o: { mixed?: boolean; summary?: ReviewsNoteSummary } = {}) =>
+      `${o.mixed ? "Sélection d'avis, dont certains importés" : "Sélection d'avis importés"} de ${app ?? "l'application d'avis de la boutique"} ; « Achat vérifié » indique un achat confirmé par l'application.` +
+      (o.summary ? ` ${AVERAGE_SCOPE.fr(o.summary)}` : ""),
+    /** What the shown average covers, alone (reviews block without imported reviews). */
+    averageScope: AVERAGE_SCOPE.fr,
     daysShort: "j",
     estimatedDelivery: "Livraison estimée",
     orderNumberPending: "Numéro de commande en cours d'attribution…",
@@ -131,7 +240,10 @@ export const LABELS = {
     qtyChanged: (name: string, n: number) => `${name} : quantité ${n}`,
     qtyRemoved: (name: string) => `${name} retiré du panier`,
     qtyMax: "Quantité maximale atteinte",
+    lockedLineEdit: "Modifiez ce lot depuis le panier",
+    lockedLineQty: "Quantité fixée par le panier",
     qtyError: "La quantité n'a pas pu être modifiée. Réessayez.",
+    automaticDiscountLost: "Le panier a changé : la remise automatique du panier Shopify ne s'applique plus.",
     recoTitle: "Complétez votre commande",
     recoAdd: "Ajouter",
     recoAddLabel: (name: string, price: string) => `Ajouter ${name} à la commande, ${price}`,
@@ -280,7 +392,9 @@ export const LABELS = {
       discount_minimum: "Le montant minimum pour ce code n'est pas atteint.",
       discount_exhausted: "Ce code promo est épuisé : il a atteint sa limite d'utilisation.",
       discount_unavailable: "Impossible de vérifier ce code pour le moment, réessayez.",
+      cart_code_lost: "Le code promo de votre panier ne peut pas être appliqué ici. Retournez au panier pour finaliser votre commande.",
       discount_not_combinable: "Ce code ne se cumule pas avec les remises déjà appliquées : la remise la plus avantageuse est conservée.",
+      discount_not_combinable_gift: "Ce code ne se cumule pas avec la remise qui rend gratuit le cadeau de votre panier : il n'est pas appliqué.",
       no_shipping: "Nous ne livrons pas encore dans ce pays.",
       minimum_amount: "Montant minimum non atteint.",
       too_many_changes: "Trop de modifications sur cette commande. Retournez au panier pour recommencer.",
@@ -291,6 +405,7 @@ export const LABELS = {
       pickup_unavailable: "Le retrait en point relais est indisponible pour le moment. Choisissez un autre mode de livraison.",
       pickup_failed: "Recherche des points relais impossible pour le moment. Réessayez.",
       pickup_invalid: "Code postal invalide pour la recherche de points relais.",
+      paypal_unavailable: "PayPal n'est pas disponible pour cette commande. Choisissez un autre moyen de paiement.",
     } as Record<string, string>,
   },
   en: {
@@ -313,9 +428,28 @@ export const LABELS = {
     free: "Free",
     addons: "Add to your order",
     payment: "Payment",
+    acceptedPaymentMethods: "Accepted payment methods",
     paymentSecure: "All transactions are secure and encrypted.",
     payNow: "Pay now",
     expressCheckout: "Express checkout",
+    payWithPaypal: "Pay with PayPal",
+    paypalNeedsDetails: "Enter your delivery details to pay with PayPal",
+    paypalContinue: "Continue with PayPal",
+    paypalSelected: "PayPal selected",
+    paypalPayOther: "Pay another way",
+    paypalPopupHint: "PayPal window didn't open? Click “Continue with PayPal”.",
+    paypalConfirmClosed: "Is the PayPal window closed? If you already approved the payment on PayPal, wait a few seconds.",
+    paypalConfirmYes: "Yes, it's closed",
+    paypalConfirmWait: "Wait",
+    paypalPaymentInFlight: "Your PayPal payment may still be going through. Please wait a moment before paying another way.",
+    paypalUseWhopButton: "Your browser blocked the PayPal window: click the PayPal button in the payment form above.",
+    paypalExpressLocked: "A PayPal payment is open. Choose “Pay another way” to change.",
+    paypalEditsLocked: "PayPal payment in progress: your details are locked",
+    paymentAlreadyInFlight: "A payment is already being confirmed, please wait a few seconds.",
+    cardDeclinedRetrySoon: "Your card payment was declined; you can try again in a few seconds.",
+    payNowAvailable: "You can pay now.",
+    paypalCheckFailed: "We couldn't check your PayPal payment right now. Check your connection and try again in a moment.",
+    expressPaymentFailed: "The express payment didn't go through. Try again or choose another payment method.",
     or: "OR",
     totalUpdated: "Your total was updated. Check the amount, then click Pay again.",
     paymentNotReady: "The payment form is still loading, try again in a moment.",
@@ -387,7 +521,17 @@ export const LABELS = {
     prevReview: "Previous review",
     nextReview: "Next review",
     reviewN: (n: number) => `Review ${n}`,
-    reviewsCount: (n: string) => `${n} reviews`,
+    reviewsCarousel: "reviews carousel",
+    reviewSlide: "review",
+    reviewsCount: (n: string, count?: number) => `${n} ${count === 1 ? "review" : "reviews"}`,
+    reviewPhoto: "Customer photo",
+    reviewsSummary: (score: string, n: string, count?: number) => `Average rating: ${score} out of 5, ${n} ${count === 1 ? "review" : "reviews"}`,
+    starsOutOf5: (n: string, count: number) => `${n} ${count === 1 ? "star" : "stars"} out of 5`,
+    moreReviews: (n: number) => (n === 1 ? "Show 1 more review" : `Show ${n} more reviews`),
+    importedReviewsNote: (app: string | null, o: { mixed?: boolean; summary?: ReviewsNoteSummary } = {}) =>
+      `${o.mixed ? "A selection of reviews, some imported" : "A selection of reviews imported"} from ${app ?? "the store's review app"}; “Verified purchase” means the purchase was confirmed by the app.` +
+      (o.summary ? ` ${AVERAGE_SCOPE.en(o.summary)}` : ""),
+    averageScope: AVERAGE_SCOPE.en,
     daysShort: "d",
     estimatedDelivery: "Estimated delivery",
     orderNumberPending: "Your order number is being assigned…",
@@ -424,7 +568,10 @@ export const LABELS = {
     qtyChanged: (name: string, n: number) => `${name}: quantity ${n}`,
     qtyRemoved: (name: string) => `${name} removed from cart`,
     qtyMax: "Maximum quantity reached",
+    lockedLineEdit: "Edit this bundle from your cart",
+    lockedLineQty: "Quantity set by your cart",
     qtyError: "The quantity couldn't be changed. Please try again.",
+    automaticDiscountLost: "Your cart changed: the Shopify cart's automatic discount no longer applies.",
     recoTitle: "Complete your order",
     recoAdd: "Add",
     recoAddLabel: (name: string, price: string) => `Add ${name} to your order, ${price}`,
@@ -573,7 +720,9 @@ export const LABELS = {
       discount_minimum: "The minimum order for this code isn't reached.",
       discount_exhausted: "This discount code has been used up: it reached its usage limit.",
       discount_unavailable: "This code can't be checked right now, please try again.",
+      cart_code_lost: "Your cart's discount code can't be applied here. Go back to your cart to complete your order.",
       discount_not_combinable: "This code can't be combined with the discounts already applied: the better discount is kept.",
+      discount_not_combinable_gift: "This code can't be combined with the discount that makes your cart's gift free: it wasn't applied.",
       no_shipping: "We don't ship to this country yet.",
       minimum_amount: "Minimum amount not reached.",
       too_many_changes: "Too many changes to this order. Go back to your cart to start again.",
@@ -584,6 +733,7 @@ export const LABELS = {
       pickup_unavailable: "Pickup point delivery is unavailable right now. Please choose another shipping method.",
       pickup_failed: "Pickup points can't be loaded right now. Please try again.",
       pickup_invalid: "Invalid postcode for the pickup point search.",
+      paypal_unavailable: "PayPal isn't available for this order. Please choose another payment method.",
     } as Record<string, string>,
   },
   de: {
@@ -606,9 +756,28 @@ export const LABELS = {
     free: "Kostenlos",
     addons: "Zu Ihrer Bestellung hinzufügen",
     payment: "Zahlung",
+    acceptedPaymentMethods: "Akzeptierte Zahlungsarten",
     paymentSecure: "Alle Transaktionen sind sicher und verschlüsselt.",
     payNow: "Zahlungspflichtig bestellen",
     expressCheckout: "Express-Checkout",
+    payWithPaypal: "Mit PayPal bezahlen",
+    paypalNeedsDetails: "Geben Sie Ihre Lieferdaten ein, um mit PayPal zu bezahlen",
+    paypalContinue: "Weiter mit PayPal",
+    paypalSelected: "PayPal ausgewählt",
+    paypalPayOther: "Anders bezahlen",
+    paypalPopupHint: "Das PayPal-Fenster hat sich nicht geöffnet? Klicken Sie auf „Weiter mit PayPal“.",
+    paypalConfirmClosed: "Ist das PayPal-Fenster geschlossen? Wenn Sie die Zahlung bei PayPal bereits bestätigt haben, warten Sie einige Sekunden.",
+    paypalConfirmYes: "Ja, es ist geschlossen",
+    paypalConfirmWait: "Warten",
+    paypalPaymentInFlight: "Ihre PayPal-Zahlung wird möglicherweise noch bestätigt. Bitte warten Sie einen Moment, bevor Sie anders bezahlen.",
+    paypalUseWhopButton: "Ihr Browser hat das PayPal-Fenster blockiert: Klicken Sie auf die PayPal-Schaltfläche im Zahlungsformular oben.",
+    paypalExpressLocked: "Eine PayPal-Zahlung ist geöffnet. Wählen Sie „Anders bezahlen“, um zu wechseln.",
+    paypalEditsLocked: "PayPal-Zahlung läuft: Ihre Angaben sind gesperrt",
+    paymentAlreadyInFlight: "Eine Zahlung wird bereits bestätigt, bitte warten Sie einige Sekunden.",
+    cardDeclinedRetrySoon: "Ihre Kartenzahlung wurde abgelehnt; Sie können es in wenigen Sekunden erneut versuchen.",
+    payNowAvailable: "Sie können jetzt bezahlen.",
+    paypalCheckFailed: "Ihre PayPal-Zahlung lässt sich gerade nicht prüfen. Prüfen Sie Ihre Verbindung und versuchen Sie es gleich noch einmal.",
+    expressPaymentFailed: "Die Express-Zahlung ist fehlgeschlagen. Versuchen Sie es erneut oder wählen Sie eine andere Zahlungsart.",
     or: "ODER",
     totalUpdated: "Ihr Gesamtbetrag wurde aktualisiert. Prüfen Sie den Betrag und klicken Sie erneut auf Bezahlen.",
     paymentNotReady: "Das Zahlungsformular lädt noch, bitte versuchen Sie es gleich erneut.",
@@ -680,7 +849,18 @@ export const LABELS = {
     prevReview: "Vorherige Bewertung",
     nextReview: "Nächste Bewertung",
     reviewN: (n: number) => `Bewertung ${n}`,
-    reviewsCount: (n: string) => `${n} Bewertungen`,
+    reviewsCarousel: "Bewertungskarussell",
+    reviewSlide: "Bewertung",
+    reviewsCount: (n: string, count?: number) => `${n} ${count === 1 ? "Bewertung" : "Bewertungen"}`,
+    reviewPhoto: "Foto des Kunden",
+    reviewsSummary: (score: string, n: string, count?: number) => `Durchschnittliche Bewertung: ${score} von 5, ${n} ${count === 1 ? "Bewertung" : "Bewertungen"}`,
+    // "von 5 Sternen": the noun counts the 5 (always plural), not the rating (1 von 5 Sternen).
+    starsOutOf5: (n: string) => `${n} von 5 Sternen`,
+    moreReviews: (n: number) => (n === 1 ? "1 weitere Bewertung anzeigen" : `${n} weitere Bewertungen anzeigen`),
+    importedReviewsNote: (app: string | null, o: { mixed?: boolean; summary?: ReviewsNoteSummary } = {}) =>
+      `${o.mixed ? "Auswahl von Bewertungen, teils importiert" : "Auswahl von Bewertungen, importiert"} aus ${app ?? "der Bewertungs-App des Shops"}; „Verifizierter Kauf“ bedeutet, dass die App den Kauf bestätigt hat.` +
+      (o.summary ? ` ${AVERAGE_SCOPE.de(o.summary)}` : ""),
+    averageScope: AVERAGE_SCOPE.de,
     daysShort: "T",
     estimatedDelivery: "Voraussichtliche Lieferung",
     orderNumberPending: "Ihre Bestellnummer wird vergeben…",
@@ -717,7 +897,10 @@ export const LABELS = {
     qtyChanged: (name: string, n: number) => `${name}: Menge ${n}`,
     qtyRemoved: (name: string) => `${name} aus dem Warenkorb entfernt`,
     qtyMax: "Höchstmenge erreicht",
+    lockedLineEdit: "Dieses Set im Warenkorb ändern",
+    lockedLineQty: "Menge im Warenkorb festgelegt",
     qtyError: "Die Menge konnte nicht geändert werden. Bitte versuchen Sie es erneut.",
+    automaticDiscountLost: "Ihr Warenkorb hat sich geändert: Der automatische Rabatt des Shopify-Warenkorbs gilt nicht mehr.",
     recoTitle: "Vervollständigen Sie Ihre Bestellung",
     recoAdd: "Hinzufügen",
     recoAddLabel: (name: string, price: string) => `${name} zur Bestellung hinzufügen, ${price}`,
@@ -866,7 +1049,9 @@ export const LABELS = {
       discount_minimum: "Der Mindestbestellwert für diesen Code ist nicht erreicht.",
       discount_exhausted: "Dieser Rabattcode ist aufgebraucht: sein Nutzungslimit ist erreicht.",
       discount_unavailable: "Dieser Code kann gerade nicht geprüft werden, bitte versuchen Sie es erneut.",
+      cart_code_lost: "Der Rabattcode Ihres Warenkorbs kann hier nicht angewendet werden. Kehren Sie zum Warenkorb zurück, um Ihre Bestellung abzuschließen.",
       discount_not_combinable: "Dieser Code ist nicht mit den bereits angewendeten Rabatten kombinierbar: Der günstigere Rabatt bleibt bestehen.",
+      discount_not_combinable_gift: "Dieser Code ist nicht mit dem Rabatt kombinierbar, der das Geschenk in Ihrem Warenkorb kostenlos macht: Er wurde nicht angewendet.",
       no_shipping: "Wir liefern noch nicht in dieses Land.",
       minimum_amount: "Mindestbetrag nicht erreicht.",
       too_many_changes: "Zu viele Änderungen an dieser Bestellung. Kehren Sie zum Warenkorb zurück.",
@@ -877,6 +1062,7 @@ export const LABELS = {
       pickup_unavailable: "Die Lieferung an eine Abholstation ist gerade nicht verfügbar. Wählen Sie eine andere Versandart.",
       pickup_failed: "Abholstationen können gerade nicht geladen werden. Bitte versuchen Sie es erneut.",
       pickup_invalid: "Ungültige Postleitzahl für die Suche nach Abholstationen.",
+      paypal_unavailable: "PayPal ist für diese Bestellung nicht verfügbar. Bitte wählen Sie eine andere Zahlungsart.",
     } as Record<string, string>,
   },
   es: {
@@ -899,9 +1085,28 @@ export const LABELS = {
     free: "Gratis",
     addons: "Añadir a tu pedido",
     payment: "Pago",
+    acceptedPaymentMethods: "Métodos de pago aceptados",
     paymentSecure: "Todas las transacciones son seguras y están cifradas.",
     payNow: "Pedido con obligación de pago",
     expressCheckout: "Pago exprés",
+    payWithPaypal: "Pagar con PayPal",
+    paypalNeedsDetails: "Introduce tus datos de entrega para pagar con PayPal",
+    paypalContinue: "Continuar con PayPal",
+    paypalSelected: "PayPal seleccionado",
+    paypalPayOther: "Pagar de otra forma",
+    paypalPopupHint: "¿No se ha abierto la ventana de PayPal? Haz clic en «Continuar con PayPal».",
+    paypalConfirmClosed: "¿Está cerrada la ventana de PayPal? Si ya has confirmado el pago en PayPal, espera unos segundos.",
+    paypalConfirmYes: "Sí, está cerrada",
+    paypalConfirmWait: "Esperar",
+    paypalPaymentInFlight: "Es posible que tu pago con PayPal aún se esté procesando. Espera un momento antes de pagar de otra forma.",
+    paypalUseWhopButton: "Tu navegador ha bloqueado la ventana de PayPal: haz clic en el botón de PayPal del formulario de pago de arriba.",
+    paypalExpressLocked: "Hay un pago con PayPal abierto. Elige «Pagar de otra forma» para cambiar.",
+    paypalEditsLocked: "Pago con PayPal en curso: tus datos están bloqueados",
+    paymentAlreadyInFlight: "Ya se está validando un pago, espera unos segundos.",
+    cardDeclinedRetrySoon: "Tu pago con tarjeta ha sido rechazado; podrás intentarlo de nuevo en unos segundos.",
+    payNowAvailable: "Ya puedes pagar.",
+    paypalCheckFailed: "No podemos comprobar tu pago con PayPal en este momento. Revisa tu conexión y vuelve a intentarlo en un momento.",
+    expressPaymentFailed: "El pago exprés no se ha completado. Inténtalo de nuevo o elige otro método de pago.",
     or: "O",
     totalUpdated: "Tu total se ha actualizado. Comprueba el importe y vuelve a pulsar Pagar.",
     paymentNotReady: "El formulario de pago aún se está cargando, inténtalo en un momento.",
@@ -973,7 +1178,18 @@ export const LABELS = {
     prevReview: "Opinión anterior",
     nextReview: "Opinión siguiente",
     reviewN: (n: number) => `Opinión ${n}`,
-    reviewsCount: (n: string) => `${n} opiniones`,
+    reviewsCarousel: "carrusel de opiniones",
+    reviewSlide: "opinión",
+    reviewsCount: (n: string, count?: number) => `${n} ${count === 1 ? "opinión" : "opiniones"}`,
+    reviewPhoto: "Foto del cliente",
+    reviewsSummary: (score: string, n: string, count?: number) => `Valoración media: ${score} de 5, ${n} ${count === 1 ? "opinión" : "opiniones"}`,
+    // "de 5 estrellas": the noun counts the 5 (always plural): 1 de 5 estrellas.
+    starsOutOf5: (n: string) => `${n} de 5 estrellas`,
+    moreReviews: (n: number) => (n === 1 ? "Ver 1 opinión más" : `Ver ${n} opiniones más`),
+    importedReviewsNote: (app: string | null, o: { mixed?: boolean; summary?: ReviewsNoteSummary } = {}) =>
+      `${o.mixed ? "Selección de opiniones, algunas importadas" : "Selección de opiniones importadas"} de ${app ?? "la aplicación de opiniones de la tienda"}; «Compra verificada» indica una compra confirmada por la aplicación.` +
+      (o.summary ? ` ${AVERAGE_SCOPE.es(o.summary)}` : ""),
+    averageScope: AVERAGE_SCOPE.es,
     daysShort: "d",
     estimatedDelivery: "Entrega estimada",
     orderNumberPending: "Asignando tu número de pedido…",
@@ -1010,7 +1226,10 @@ export const LABELS = {
     qtyChanged: (name: string, n: number) => `${name}: cantidad ${n}`,
     qtyRemoved: (name: string) => `${name} quitado del carrito`,
     qtyMax: "Cantidad máxima alcanzada",
+    lockedLineEdit: "Modifica este lote desde el carrito",
+    lockedLineQty: "Cantidad fijada por el carrito",
     qtyError: "No se pudo cambiar la cantidad. Inténtalo de nuevo.",
+    automaticDiscountLost: "Tu carrito ha cambiado: el descuento automático del carrito de Shopify ya no se aplica.",
     recoTitle: "Completa tu pedido",
     recoAdd: "Añadir",
     recoAddLabel: (name: string, price: string) => `Añadir ${name} al pedido, ${price}`,
@@ -1159,7 +1378,9 @@ export const LABELS = {
       discount_minimum: "No se alcanza el importe mínimo para este código.",
       discount_exhausted: "Este código de descuento está agotado: ha alcanzado su límite de uso.",
       discount_unavailable: "No podemos verificar este código ahora mismo, inténtalo de nuevo.",
+      cart_code_lost: "El código de descuento de tu carrito no se puede aplicar aquí. Vuelve al carrito para completar tu pedido.",
       discount_not_combinable: "Este código no se puede combinar con los descuentos ya aplicados: se mantiene el descuento más ventajoso.",
+      discount_not_combinable_gift: "Este código no se puede combinar con el descuento que hace gratuito el regalo de tu carrito: no se ha aplicado.",
       no_shipping: "Todavía no enviamos a este país.",
       minimum_amount: "No se alcanza el importe mínimo.",
       too_many_changes: "Demasiados cambios en este pedido. Vuelve a tu carrito para empezar de nuevo.",
@@ -1170,6 +1391,7 @@ export const LABELS = {
       pickup_unavailable: "La entrega en punto de recogida no está disponible ahora. Elige otro método de envío.",
       pickup_failed: "No se pueden cargar los puntos de recogida ahora. Inténtalo de nuevo.",
       pickup_invalid: "Código postal no válido para buscar puntos de recogida.",
+      paypal_unavailable: "PayPal no está disponible para este pedido. Elige otro método de pago.",
     } as Record<string, string>,
   },
   it: {
@@ -1192,9 +1414,28 @@ export const LABELS = {
     free: "Gratis",
     addons: "Aggiungi al tuo ordine",
     payment: "Pagamento",
+    acceptedPaymentMethods: "Metodi di pagamento accettati",
     paymentSecure: "Tutte le transazioni sono sicure e crittografate.",
     payNow: "Ordina e paga",
     expressCheckout: "Pagamento rapido",
+    payWithPaypal: "Paga con PayPal",
+    paypalNeedsDetails: "Inserisci i tuoi dati di consegna per pagare con PayPal",
+    paypalContinue: "Continua con PayPal",
+    paypalSelected: "PayPal selezionato",
+    paypalPayOther: "Paga in un altro modo",
+    paypalPopupHint: "La finestra di PayPal non si è aperta? Clicca su «Continua con PayPal».",
+    paypalConfirmClosed: "La finestra di PayPal è chiusa? Se hai già confermato il pagamento su PayPal, attendi qualche secondo.",
+    paypalConfirmYes: "Sì, è chiusa",
+    paypalConfirmWait: "Attendi",
+    paypalPaymentInFlight: "Il tuo pagamento PayPal potrebbe essere ancora in corso. Attendi un momento prima di pagare in un altro modo.",
+    paypalUseWhopButton: "Il browser ha bloccato la finestra di PayPal: clicca sul pulsante PayPal nel modulo di pagamento qui sopra.",
+    paypalExpressLocked: "È aperto un pagamento PayPal. Scegli «Paga in un altro modo» per cambiare.",
+    paypalEditsLocked: "Pagamento PayPal in corso: i tuoi dati sono bloccati",
+    paymentAlreadyInFlight: "Un pagamento è già in fase di convalida, attendi qualche secondo.",
+    cardDeclinedRetrySoon: "Il tuo pagamento con carta è stato rifiutato; potrai riprovare tra qualche secondo.",
+    payNowAvailable: "Ora puoi pagare.",
+    paypalCheckFailed: "Al momento non riusciamo a verificare il tuo pagamento PayPal. Controlla la connessione e riprova tra un momento.",
+    expressPaymentFailed: "Il pagamento express non è andato a buon fine. Riprova o scegli un altro metodo di pagamento.",
     or: "OPPURE",
     totalUpdated: "Il totale è stato aggiornato. Controlla l'importo e clicca di nuovo su Paga.",
     paymentNotReady: "Il modulo di pagamento si sta ancora caricando, riprova tra un istante.",
@@ -1266,7 +1507,17 @@ export const LABELS = {
     prevReview: "Recensione precedente",
     nextReview: "Recensione successiva",
     reviewN: (n: number) => `Recensione ${n}`,
-    reviewsCount: (n: string) => `${n} recensioni`,
+    reviewsCarousel: "carosello di recensioni",
+    reviewSlide: "recensione",
+    reviewsCount: (n: string, count?: number) => `${n} ${count === 1 ? "recensione" : "recensioni"}`,
+    reviewPhoto: "Foto del cliente",
+    reviewsSummary: (score: string, n: string, count?: number) => `Valutazione media: ${score} su 5, ${n} ${count === 1 ? "recensione" : "recensioni"}`,
+    starsOutOf5: (n: string, count: number) => `${n} ${count === 1 ? "stella" : "stelle"} su 5`,
+    moreReviews: (n: number) => (n === 1 ? "Mostra un'altra recensione" : `Mostra altre ${n} recensioni`),
+    importedReviewsNote: (app: string | null, o: { mixed?: boolean; summary?: ReviewsNoteSummary } = {}) =>
+      `${o.mixed ? "Selezione di recensioni, alcune importate" : "Selezione di recensioni importate"} ${app ? `da ${app}` : "dall'app di recensioni del negozio"}; «Acquisto verificato» indica un acquisto confermato dall'app.` +
+      (o.summary ? ` ${AVERAGE_SCOPE.it(o.summary)}` : ""),
+    averageScope: AVERAGE_SCOPE.it,
     daysShort: "g",
     estimatedDelivery: "Consegna stimata",
     orderNumberPending: "Assegnazione del numero d'ordine in corso…",
@@ -1303,7 +1554,10 @@ export const LABELS = {
     qtyChanged: (name: string, n: number) => `${name}: quantità ${n}`,
     qtyRemoved: (name: string) => `${name} rimosso dal carrello`,
     qtyMax: "Quantità massima raggiunta",
+    lockedLineEdit: "Modifica questo lotto dal carrello",
+    lockedLineQty: "Quantità fissata dal carrello",
     qtyError: "Impossibile modificare la quantità. Riprova.",
+    automaticDiscountLost: "Il carrello è cambiato: lo sconto automatico del carrello Shopify non si applica più.",
     recoTitle: "Completa il tuo ordine",
     recoAdd: "Aggiungi",
     recoAddLabel: (name: string, price: string) => `Aggiungi ${name} all'ordine, ${price}`,
@@ -1452,7 +1706,9 @@ export const LABELS = {
       discount_minimum: "L'importo minimo per questo codice non è raggiunto.",
       discount_exhausted: "Questo codice sconto è esaurito: ha raggiunto il limite di utilizzo.",
       discount_unavailable: "Impossibile verificare questo codice al momento, riprova.",
+      cart_code_lost: "Il codice sconto del tuo carrello non può essere applicato qui. Torna al carrello per completare l'ordine.",
       discount_not_combinable: "Questo codice non è cumulabile con gli sconti già applicati: viene mantenuto lo sconto più vantaggioso.",
+      discount_not_combinable_gift: "Questo codice non è cumulabile con lo sconto che rende gratuito il regalo nel tuo carrello: non è stato applicato.",
       no_shipping: "Non spediamo ancora in questo paese.",
       minimum_amount: "Importo minimo non raggiunto.",
       too_many_changes: "Troppe modifiche a questo ordine. Torna al carrello per ricominciare.",
@@ -1463,6 +1719,7 @@ export const LABELS = {
       pickup_unavailable: "La consegna in un punto di ritiro non è disponibile al momento. Scegli un altro metodo di spedizione.",
       pickup_failed: "Impossibile caricare i punti di ritiro al momento. Riprova.",
       pickup_invalid: "CAP non valido per la ricerca dei punti di ritiro.",
+      paypal_unavailable: "PayPal non è disponibile per questo ordine. Scegli un altro metodo di pagamento.",
     } as Record<string, string>,
   },
   nl: {
@@ -1485,9 +1742,28 @@ export const LABELS = {
     free: "Gratis",
     addons: "Toevoegen aan je bestelling",
     payment: "Betaling",
+    acceptedPaymentMethods: "Geaccepteerde betaalmethoden",
     paymentSecure: "Alle transacties zijn veilig en versleuteld.",
     payNow: "Bestellen met betaalverplichting",
     expressCheckout: "Snel afrekenen",
+    payWithPaypal: "Betalen met PayPal",
+    paypalNeedsDetails: "Vul je bezorggegevens in om met PayPal te betalen",
+    paypalContinue: "Doorgaan met PayPal",
+    paypalSelected: "PayPal geselecteerd",
+    paypalPayOther: "Anders betalen",
+    paypalPopupHint: "Is het PayPal-venster niet geopend? Klik op ‘Doorgaan met PayPal’.",
+    paypalConfirmClosed: "Is het PayPal-venster gesloten? Heb je de betaling al bij PayPal bevestigd, wacht dan een paar seconden.",
+    paypalConfirmYes: "Ja, het is gesloten",
+    paypalConfirmWait: "Wachten",
+    paypalPaymentInFlight: "Je PayPal-betaling wordt mogelijk nog verwerkt. Wacht even voordat je anders betaalt.",
+    paypalUseWhopButton: "Je browser heeft het PayPal-venster geblokkeerd: klik op de PayPal-knop in het betaalformulier hierboven.",
+    paypalExpressLocked: "Er staat een PayPal-betaling open. Kies ‘Anders betalen’ om te wisselen.",
+    paypalEditsLocked: "PayPal-betaling bezig: je gegevens zijn vergrendeld",
+    paymentAlreadyInFlight: "Er wordt al een betaling gevalideerd, wacht een paar seconden.",
+    cardDeclinedRetrySoon: "Je kaartbetaling is geweigerd; je kunt het over een paar seconden opnieuw proberen.",
+    payNowAvailable: "U kunt nu betalen.",
+    paypalCheckFailed: "We kunnen je PayPal-betaling nu niet controleren. Controleer je verbinding en probeer het zo opnieuw.",
+    expressPaymentFailed: "De expressbetaling is niet gelukt. Probeer het opnieuw of kies een andere betaalmethode.",
     or: "OF",
     totalUpdated: "Je totaal is bijgewerkt. Controleer het bedrag en klik opnieuw op Betalen.",
     paymentNotReady: "Het betaalformulier wordt nog geladen, probeer het zo opnieuw.",
@@ -1559,7 +1835,18 @@ export const LABELS = {
     prevReview: "Vorige review",
     nextReview: "Volgende review",
     reviewN: (n: number) => `Review ${n}`,
-    reviewsCount: (n: string) => `${n} reviews`,
+    reviewsCarousel: "reviewcarrousel",
+    reviewSlide: "review",
+    reviewsCount: (n: string, count?: number) => `${n} ${count === 1 ? "review" : "reviews"}`,
+    reviewPhoto: "Foto van de klant",
+    reviewsSummary: (score: string, n: string, count?: number) => `Gemiddelde beoordeling: ${score} van 5, ${n} ${count === 1 ? "review" : "reviews"}`,
+    // "van 5 sterren": the noun counts the 5 (always plural): 1 van 5 sterren.
+    starsOutOf5: (n: string) => `${n} van 5 sterren`,
+    moreReviews: (n: number) => (n === 1 ? "Toon nog 1 review" : `Toon nog ${n} reviews`),
+    importedReviewsNote: (app: string | null, o: { mixed?: boolean; summary?: ReviewsNoteSummary } = {}) =>
+      `${o.mixed ? "Selectie van reviews, deels geïmporteerd" : "Selectie van reviews geïmporteerd"} uit ${app ?? "de review-app van de winkel"}; ‘Geverifieerde aankoop’ betekent dat de app de aankoop heeft bevestigd.` +
+      (o.summary ? ` ${AVERAGE_SCOPE.nl(o.summary)}` : ""),
+    averageScope: AVERAGE_SCOPE.nl,
     daysShort: "d",
     estimatedDelivery: "Verwachte levering",
     orderNumberPending: "Je bestelnummer wordt toegekend…",
@@ -1596,7 +1883,10 @@ export const LABELS = {
     qtyChanged: (name: string, n: number) => `${name}: aantal ${n}`,
     qtyRemoved: (name: string) => `${name} uit winkelwagen verwijderd`,
     qtyMax: "Maximaal aantal bereikt",
+    lockedLineEdit: "Wijzig deze bundel in je winkelwagen",
+    lockedLineQty: "Aantal vastgelegd in je winkelwagen",
     qtyError: "Het aantal kon niet worden gewijzigd. Probeer het opnieuw.",
+    automaticDiscountLost: "Je winkelwagen is gewijzigd: de automatische korting van de Shopify-winkelwagen geldt niet meer.",
     recoTitle: "Maak je bestelling compleet",
     recoAdd: "Toevoegen",
     recoAddLabel: (name: string, price: string) => `${name} toevoegen aan je bestelling, ${price}`,
@@ -1745,7 +2035,9 @@ export const LABELS = {
       discount_minimum: "Het minimumbedrag voor deze code is niet bereikt.",
       discount_exhausted: "Deze kortingscode is op: de gebruikslimiet is bereikt.",
       discount_unavailable: "Deze code kan nu niet worden gecontroleerd, probeer het opnieuw.",
+      cart_code_lost: "De kortingscode van je winkelwagen kan hier niet worden toegepast. Ga terug naar je winkelwagen om je bestelling af te ronden.",
       discount_not_combinable: "Deze code is niet te combineren met de kortingen die al gelden: de voordeligste korting blijft staan.",
+      discount_not_combinable_gift: "Deze code is niet te combineren met de korting die het cadeau in je winkelwagen gratis maakt: hij is niet toegepast.",
       no_shipping: "We verzenden nog niet naar dit land.",
       minimum_amount: "Minimumbedrag niet bereikt.",
       too_many_changes: "Te veel wijzigingen in deze bestelling. Ga terug naar je winkelwagen.",
@@ -1756,6 +2048,7 @@ export const LABELS = {
       pickup_unavailable: "Levering aan een afhaalpunt is nu niet beschikbaar. Kies een andere verzendmethode.",
       pickup_failed: "Afhaalpunten kunnen nu niet worden geladen. Probeer het opnieuw.",
       pickup_invalid: "Ongeldige postcode voor het zoeken naar afhaalpunten.",
+      paypal_unavailable: "PayPal is niet beschikbaar voor deze bestelling. Kies een andere betaalmethode.",
     } as Record<string, string>,
   },
 };

@@ -3,8 +3,9 @@
 import { useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Check, ChevronDown, CreditCard, ExternalLink, Gift, Home, LifeBuoy, Mail, MapPin, Package, ShieldCheck, Truck } from "lucide-react";
 import { FIXED_THANK_YOU_BLOCKS, createBlock, dedupeSingletons, isFixedThankYou, upsellSellable, type Block, type BlockOf, type Layout, type OfferArm, type Theme } from "@/lib/layout";
-import { formatMoney, type CartLine } from "@/lib/pricing";
+import { formatMoney, visibleProperties, type CartLine } from "@/lib/pricing";
 import { ContentBlock, focusAfterDecline, isEmptyInLive, offerAwaitingAnswer, StyledBlock, type ContentContext } from "./blocks";
+import { cartProductsOf } from "@/lib/reviews-import";
 import { Footer, LineThumb, StoreHeader, themeVars } from "./CheckoutView";
 import { countryName, labelsFor, localeOf, paymentMethodName, type Labels } from "./i18n";
 import { localizeDeliveryTime, localizeLayout, localizeTheme } from "./localize";
@@ -203,6 +204,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
     setNote: () => {},
     upsell: undefined,
     lineImages: Object.fromEntries(data.lines.filter((l) => l.imageUrl && !l.gift).map((l) => [l.variantId, l.imageUrl!])),
+    cartProducts: preview ? null : cartProductsOf(data.lines),
     // The survey is answered once the order is paid (live); the builder shows it inert.
     survey: sessionId && data.status === "PAID" ? { sessionId, answered: !!data.surveyAnswered } : null,
     offerCurrency: data.chargeCurrency && data.chargeCurrency.toUpperCase() !== data.currency.toUpperCase() ? { shop: data.currency, paid: data.chargeCurrency } : null,
@@ -435,6 +437,11 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
             <span className="min-w-0 flex-1">
               <span className="text-neutral-600">{l.quantity} ×</span> {l.title}
               {l.variantTitle && <span className="block text-xs text-neutral-600">{l.variantTitle}</span>}
+              {visibleProperties(l).map((p) => (
+                <span key={p.name} className="block text-xs break-words text-neutral-600">
+                  {p.name} : {/^https?:\/\//.test(p.value) ? p.value.split("/").pop() : p.value}
+                </span>
+              ))}
               {l.gift && (
                 <span className="mt-0.5 flex items-center gap-1 text-xs font-medium text-emerald-800">
                   <Gift className="h-3.5 w-3.5" aria-hidden />
@@ -483,8 +490,8 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
   const afterConfirmation = confirmationIndex >= 0 ? blocks.slice(confirmationIndex + 1).find(shown) : undefined;
   const protectionOrder = (afterConfirmation?.type === "upsell" ? blocks.indexOf(afterConfirmation) : Math.max(0, confirmationIndex)) * 2 + 1;
   return (
-    <div lang={theme.language} className="wc-checkout @container min-h-full" style={themeVars(theme)}>
-      <StoreHeader theme={theme} />
+    <div lang={theme.language} className="wc-checkout @container/wc-page min-h-full overflow-x-clip" style={themeVars(theme)}>
+      <StoreHeader theme={theme} homeUrl={data.continueUrl} />
       {ctx.upsell && (
         // Always mounted (the declined card is gone by then); the zero-width space alternates so
         // a second "Offer declined" in a row is announced again.

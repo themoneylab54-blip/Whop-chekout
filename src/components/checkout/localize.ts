@@ -15,6 +15,8 @@ import { LABELS, type Lang } from "./i18n";
 export const DEFAULT_TEXTS = {
   fr: {
     securePayment: "Paiement sécurisé",
+    encryptedData: "Données chiffrées",
+    orderTracking: "Suivi de commande",
     textHeading: "Titre",
     textBody: "Votre texte ici.",
     testimonialQuote: "Livraison rapide et produit conforme, je recommande.",
@@ -77,6 +79,8 @@ export const DEFAULT_TEXTS = {
   },
   en: {
     securePayment: "Secure payment",
+    encryptedData: "Encrypted data",
+    orderTracking: "Order tracking",
     textHeading: "Title",
     textBody: "Your text here.",
     testimonialQuote: "Fast delivery and the product is exactly as described. I recommend it.",
@@ -139,6 +143,8 @@ export const DEFAULT_TEXTS = {
   },
   de: {
     securePayment: "Sichere Zahlung",
+    encryptedData: "Verschlüsselte Daten",
+    orderTracking: "Sendungsverfolgung",
     textHeading: "Titel",
     textBody: "Ihr Text hier.",
     testimonialQuote: "Schnelle Lieferung und Produkt wie beschrieben. Sehr empfehlenswert.",
@@ -201,6 +207,8 @@ export const DEFAULT_TEXTS = {
   },
   es: {
     securePayment: "Pago seguro",
+    encryptedData: "Datos cifrados",
+    orderTracking: "Seguimiento del pedido",
     textHeading: "Título",
     textBody: "Tu texto aquí.",
     testimonialQuote: "Envío rápido y producto tal como se describe. Lo recomiendo.",
@@ -263,6 +271,8 @@ export const DEFAULT_TEXTS = {
   },
   it: {
     securePayment: "Pagamento sicuro",
+    encryptedData: "Dati crittografati",
+    orderTracking: "Tracciamento dell'ordine",
     textHeading: "Titolo",
     textBody: "Il tuo testo qui.",
     testimonialQuote: "Consegna rapida e prodotto conforme alla descrizione. Lo consiglio.",
@@ -325,6 +335,8 @@ export const DEFAULT_TEXTS = {
   },
   nl: {
     securePayment: "Veilig betalen",
+    encryptedData: "Versleutelde gegevens",
+    orderTracking: "Bestelling volgen",
     textHeading: "Titel",
     textBody: "Je tekst hier.",
     testimonialQuote: "Snelle levering en het product klopt precies. Een aanrader.",
@@ -476,6 +488,12 @@ const TEXT_PROPS: ReadonlySet<string> = new Set([
 /** Nested objects whose strings are never copy (targeting rules). */
 const SKIP_OBJECTS: ReadonlySet<string> = new Set(["conditions"]);
 
+/** A review read from a review app (CSV export, Judge.me): the customer's own words. */
+function isImportedItem(item: object): boolean {
+  const source = (item as { source?: unknown }).source;
+  return source === "csv" || source === "judgeme";
+}
+
 export type TextField = {
   /** Dot path inside `props` ("badges.0.label", "variantB.title"). */
   path: string;
@@ -495,7 +513,9 @@ export function textFields(props: unknown): TextField[] {
     }
     if (Array.isArray(node)) {
       node.forEach((item, i) => {
-        if (item && typeof item === "object") walk(item, [...path, String(i)], prop);
+        // An imported review is shown as the customer wrote it, in its own language: never
+        // translated (nor listed as "to translate").
+        if (item && typeof item === "object" && !(prop === "items" && isImportedItem(item))) walk(item, [...path, String(i)], prop);
       });
       return;
     }
@@ -544,6 +564,75 @@ export function localizeBlock<B extends Block>(block: B, lang: Lang): B {
     setPath(props, field.path, text);
   }
   return props ? ({ ...block, props } as B) : block;
+}
+
+/**
+ * Translations are stored by position ("items.2.text"). When a list of the block changes
+ * (item removed, reordered, added, reviews imported / merged), each translation follows its own
+ * item, found by identity (the editors keep untouched items as the same object); an item edited
+ * in place (same list length, same slot) keeps its translations. Anything else — a translation
+ * whose item is gone, or one that would land on an imported review — is dropped, so a
+ * translation never ends up on another customer's card.
+ */
+export function remapListTranslations<B extends Block>(prev: B, next: B): B {
+  const i18n = next.i18n as Translations | undefined;
+  if (!i18n || prev.i18n !== next.i18n) return next;
+  const before = prev.props as Record<string, unknown>;
+  const after = next.props as Record<string, unknown>;
+  const moves = new Map<string, Map<number, number>>();
+  for (const [key, list] of Object.entries(after)) {
+    const old = before[key];
+    if (!Array.isArray(list) || !Array.isArray(old) || old === list) continue;
+    const map = new Map<number, number>();
+    const used = new Set<number>();
+    list.forEach((item, j) => {
+      const i = old.findIndex((o, k) => o === item && !used.has(k));
+      if (i >= 0) {
+        used.add(i);
+        map.set(i, j);
+      }
+    });
+    if (old.length === list.length) {
+      // Edited in place: the slot's previous item is gone and nothing took its translations.
+      list.forEach((item, j) => {
+        if (!used.has(j) && ![...map.values()].includes(j) && !list.includes(old[j])) {
+          used.add(j);
+          map.set(j, j);
+        }
+      });
+    }
+    for (const [i, j] of map) {
+      const item = list[j];
+      if (key === "items" && item && typeof item === "object" && isImportedItem(item)) map.delete(i);
+    }
+    moves.set(key, map);
+  }
+  if (moves.size === 0) return next;
+  const out: Translations = {};
+  let changed = false;
+  for (const [lang, fields] of Object.entries(i18n) as [Lang, Record<string, string>][]) {
+    const kept: Record<string, string> = {};
+    for (const [path, value] of Object.entries(fields ?? {})) {
+      const [key, index, ...rest] = path.split(".");
+      const map = moves.get(key);
+      if (!map || index == null || !/^\d+$/.test(index)) {
+        kept[path] = value;
+        continue;
+      }
+      const to = map.get(Number(index));
+      if (to == null) {
+        changed = true;
+        continue;
+      }
+      if (to !== Number(index)) changed = true;
+      kept[[key, String(to), ...rest].join(".")] = value;
+    }
+    if (Object.keys(kept).length) out[lang] = kept;
+  }
+  if (!changed) return next;
+  const { i18n: _dropped, ...rest } = next;
+  void _dropped;
+  return (Object.keys(out).length ? { ...rest, i18n: out } : rest) as B;
 }
 
 export function localizeLayout(layout: Layout, lang: Lang): Layout {

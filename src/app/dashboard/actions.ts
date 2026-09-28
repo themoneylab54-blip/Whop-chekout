@@ -24,11 +24,12 @@ import { OPTIONAL_PAYMENT_METHOD_IDS, refundPayment, registerApplePayDomain, set
 import { testConversions } from "@/lib/conversions";
 import { draftDesign, hasPublished, publishedDesign, sameDesign } from "@/lib/design";
 import { log, recordEvent } from "@/lib/log";
+import { CLONE_TX, copyMedia, lockStore, missingMediaIds, planMediaCopy, remapMediaIds, withoutMissingMedia } from "@/lib/media";
 import { buyerEmailAvailable, OPERATOR_FROM_SETTING, OPERATOR_KEY_SETTING, sendAlert } from "@/lib/notify";
 import { isStorableTimeZone } from "@/lib/time-db";
 import { addDays, tzOf, zonedDayStart } from "@/lib/time";
 import { env } from "@/lib/env";
-import { syncOrder, syncOrderSafely, syncSkipMessage, type SyncSkipReason } from "@/lib/checkout";
+import { clearPaypalRefusals, syncOrder, syncOrderSafely, syncSkipMessage, type SyncSkipReason } from "@/lib/checkout";
 import { centsToDecimal, MAX_GIFT_TIERS, MAX_PERCENT_TIERS, validateQuantityTiers } from "@/lib/pricing";
 import { pickupConfigured, searchPickupPoints } from "@/lib/pickup";
 import { cleanRecordI18n } from "@/components/checkout/localize";
@@ -36,6 +37,9 @@ import { recordValueModeChange } from "@/lib/value-mode";
 import { closeFallbackPeriod, recordCheckoutEnabled } from "@/lib/fallback";
 import { buyerName, sessionIdsByBuyerName } from "@/lib/order-search";
 import { flashUrl, issueField, type FlashParams } from "@/lib/flash";
+import { checkoutHostOf, formatDomainError, normalizeCheckoutDomain, parseDomainError } from "@/lib/checkout-domain";
+import { APPLE_PAY_ASSOCIATION_KEY, checkStoreDomain, reregisterApplePayDomain, retireCheckoutDomain, retiredDomainOwner, unretireCheckoutDomain } from "@/lib/checkout-domain-check";
+import { addProjectDomain, getProjectDomain, VercelApiError, vercelConfig, type VercelConfig } from "@/lib/vercel-domains";
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -141,6 +145,8 @@ export async function deleteStoreAction(storeId: string) {
     await removeScriptTag(store, store.scriptTagId).catch(() => undefined);
   }
   await teardownWhop(store).catch(() => undefined);
+  // Removed from Vercel after the usual 48 h grace (tick), like a changed or removed domain.
+  if (store.checkoutDomain) await retireCheckoutDomain(storeId, store.checkoutDomain).catch(() => undefined);
   await db.store.delete({ where: { id: storeId } });
   redirect("/dashboard");
 }
@@ -149,8 +155,8 @@ export async function deleteStoreAction(storeId: string) {
 const jsonCopy = (v: Prisma.JsonValue | null) => (v === null ? undefined : (v as Prisma.InputJsonValue));
 
 /**
- * "Cloner la boutique": a new, unconnected store with this store's configuration (design,
- * interception, shipping rates, add-ons, discount codes with fresh counters, quantity breaks,
+ * "Cloner la boutique": a new, unconnected store with this store's configuration (design and its
+ * uploaded images, interception, shipping rates, add-ons, discount codes with fresh counters, quantity breaks,
  * costs & VAT, pixel IDs, alerts, safety net, conversion value). Never copied: Shopify / Whop
  * connections, pixel tokens, Mondial Relay credentials, the bank statement label, orders and
  * stats; the copy starts offline, in test mode, with its own publicId.
@@ -163,101 +169,119 @@ export async function cloneStoreAction(storeId: string) {
     db.discountCode.findMany({ where: { storeId }, orderBy: { createdAt: "asc" } }),
   ]);
   const name = `${src.name.slice(0, 72)} (copie)`;
+  // Uploaded images (logo, banner, block images) are copied too, under new ids the copied design
+  // points to: deleting one in either store never breaks the other. Planned under the source's Store
+  // row lock (as image deletes take), and an image the source no longer has is emptied: the copy
+  // never points to an image that wasn't copied.
+  let mediaCount = 0;
   let copy: { id: string };
   try {
-    copy = await db.store.create({
-      data: {
-        name,
-        testMode: true,
-        enabled: false,
-        shopCurrency: src.shopCurrency,
-        theme: jsonCopy(src.theme),
-        checkoutLayout: jsonCopy(src.checkoutLayout),
-        thankYouLayout: jsonCopy(src.thankYouLayout),
-        interception: jsonCopy(src.interception),
-        publishedAt: src.checkoutLayout ? new Date() : null,
-        paymentMethods: src.paymentMethods,
-        quantityBreaks: jsonCopy(src.quantityBreaks),
-        // Costs & VAT
-        fulfillmentFeeCents: src.fulfillmentFeeCents,
-        disputeFeeCents: src.disputeFeeCents,
-        fixedCostsMonthlyCents: src.fixedCostsMonthlyCents,
-        vatExempt: src.vatExempt,
-        vatDomesticOnly: src.vatDomesticOnly,
-        homeCountry: src.homeCountry,
-        adSpendVatNonReclaimable: src.adSpendVatNonReclaimable,
-        // One-click offers merged into the checkout's order (opt-in) and its window
-        mergeOffersIntoOrder: src.mergeOffersIntoOrder,
-        offerMergeWindowMin: src.offerMergeWindowMin,
-        // Checkout options (the e-mail code needs this store's own Resend key: not copied)
-        shopifyDiscountCodes: src.shopifyDiscountCodes,
-        chargeLocalCurrency: src.chargeLocalCurrency,
-        // Pixels: IDs and options only, never the access tokens
-        metaPixelId: src.metaPixelId,
-        tiktokPixelId: src.tiktokPixelId,
-        ga4MeasurementId: src.ga4MeasurementId,
-        pixelRequireConsent: src.pixelRequireConsent,
-        metaContentIdFormat: src.metaContentIdFormat,
-        metaCatalogCountry: src.metaCatalogCountry,
-        conversionValueMode: src.conversionValueMode,
-        // Alerts (the operator's own channels)
-        alertEmail: src.alertEmail,
-        emailFrom: src.emailFrom,
-        resendApiKey: src.resendApiKey,
-        telegramBotToken: src.telegramBotToken,
-        telegramChatId: src.telegramChatId,
-        // Safety net & dispute shield
-        autoFallback: src.autoFallback,
-        pushTracking: src.pushTracking,
-        autoDisputeEvidence: src.autoDisputeEvidence,
-        autoRefundFraudAlerts: src.autoRefundFraudAlerts,
-        shippingRates: {
-          create: rates.map((r) => ({
-            name: r.name,
-            deliveryTime: r.deliveryTime,
-            countries: r.countries,
-            priceCents: r.priceCents,
-            freeOverCents: r.freeOverCents,
-            position: r.position,
-            active: r.active,
-            costCents: r.costCents,
-            kind: r.kind,
-          })),
+    copy = await db.$transaction(async (tx) => {
+      await lockStore(tx, storeId);
+      const media = await planMediaCopy(storeId, tx);
+      mediaCount = media.size;
+      const design = async <T,>(v: T) => remapMediaIds(await withoutMissingMedia(tx, storeId, v), media);
+      const theme = jsonCopy(await design(src.theme));
+      const checkoutLayout = jsonCopy(await design(src.checkoutLayout));
+      const thankYouLayout = jsonCopy(await design(src.thankYouLayout));
+      const addOnImages: (string | null)[] = [];
+      for (const a of addOns) addOnImages.push(await design(a.imageUrl));
+      const created = await tx.store.create({
+        data: {
+          name,
+          testMode: true,
+          enabled: false,
+          shopCurrency: src.shopCurrency,
+          theme,
+          checkoutLayout,
+          thankYouLayout,
+          interception: jsonCopy(src.interception),
+          publishedAt: src.checkoutLayout ? new Date() : null,
+          paymentMethods: src.paymentMethods,
+          quantityBreaks: jsonCopy(src.quantityBreaks),
+          // Costs & VAT
+          fulfillmentFeeCents: src.fulfillmentFeeCents,
+          disputeFeeCents: src.disputeFeeCents,
+          fixedCostsMonthlyCents: src.fixedCostsMonthlyCents,
+          vatExempt: src.vatExempt,
+          vatDomesticOnly: src.vatDomesticOnly,
+          homeCountry: src.homeCountry,
+          adSpendVatNonReclaimable: src.adSpendVatNonReclaimable,
+          // One-click offers merged into the checkout's order (opt-in) and its window
+          mergeOffersIntoOrder: src.mergeOffersIntoOrder,
+          offerMergeWindowMin: src.offerMergeWindowMin,
+          // Checkout options (the e-mail code needs this store's own Resend key: not copied)
+          shopifyDiscountCodes: src.shopifyDiscountCodes,
+          chargeLocalCurrency: src.chargeLocalCurrency,
+          // Pixels: IDs and options only, never the access tokens
+          metaPixelId: src.metaPixelId,
+          tiktokPixelId: src.tiktokPixelId,
+          ga4MeasurementId: src.ga4MeasurementId,
+          pixelRequireConsent: src.pixelRequireConsent,
+          metaContentIdFormat: src.metaContentIdFormat,
+          metaCatalogCountry: src.metaCatalogCountry,
+          conversionValueMode: src.conversionValueMode,
+          // Alerts (the operator's own channels)
+          alertEmail: src.alertEmail,
+          emailFrom: src.emailFrom,
+          resendApiKey: src.resendApiKey,
+          telegramBotToken: src.telegramBotToken,
+          telegramChatId: src.telegramChatId,
+          // Safety net & dispute shield
+          autoFallback: src.autoFallback,
+          pushTracking: src.pushTracking,
+          autoDisputeEvidence: src.autoDisputeEvidence,
+          autoRefundFraudAlerts: src.autoRefundFraudAlerts,
+          shippingRates: {
+            create: rates.map((r) => ({
+              name: r.name,
+              deliveryTime: r.deliveryTime,
+              countries: r.countries,
+              priceCents: r.priceCents,
+              freeOverCents: r.freeOverCents,
+              position: r.position,
+              active: r.active,
+              costCents: r.costCents,
+              kind: r.kind,
+            })),
+          },
+          addOns: {
+            create: addOns.map((a, i) => ({
+              title: a.title,
+              description: a.description,
+              priceCents: a.priceCents,
+              variantId: a.variantId,
+              imageUrl: addOnImages[i],
+              position: a.position,
+              active: a.active,
+              costCents: a.costCents,
+              showIf: jsonCopy(a.showIf),
+            })),
+          },
+          discounts: {
+            create: discounts.map((d) => ({
+              code: d.code,
+              type: d.type,
+              value: d.value,
+              minSubtotalCents: d.minSubtotalCents,
+              startsAt: d.startsAt,
+              endsAt: d.endsAt,
+              usageLimit: d.usageLimit,
+              usageCount: 0,
+              active: d.active,
+            })),
+          },
         },
-        addOns: {
-          create: addOns.map((a) => ({
-            title: a.title,
-            description: a.description,
-            priceCents: a.priceCents,
-            variantId: a.variantId,
-            imageUrl: a.imageUrl,
-            position: a.position,
-            active: a.active,
-            costCents: a.costCents,
-            showIf: jsonCopy(a.showIf),
-          })),
-        },
-        discounts: {
-          create: discounts.map((d) => ({
-            code: d.code,
-            type: d.type,
-            value: d.value,
-            minSubtotalCents: d.minSubtotalCents,
-            startsAt: d.startsAt,
-            endsAt: d.endsAt,
-            usageLimit: d.usageLimit,
-            usageCount: 0,
-            active: d.active,
-          })),
-        },
-      },
-      select: { id: true },
-    });
+        select: { id: true },
+      });
+      await copyMedia(tx, storeId, created.id, media);
+      return created;
+    }, CLONE_TX); // up to 50 images copied in SQL plus the store's rows: past Prisma's 5 s default
   } catch (err) {
     log.error("store.clone_failed", "Store clone failed", { storeId, err });
     back(storePath(storeId, "settings"), { error: `Duplication impossible : ${errorMessage(err)}` });
   }
-  const counts = { shippingRates: rates.length, addOns: addOns.length, discounts: discounts.length };
+  const counts = { shippingRates: rates.length, addOns: addOns.length, discounts: discounts.length, media: mediaCount };
   await Promise.all([
     recordEvent({
       storeId,
@@ -365,7 +389,8 @@ export async function startShopifyInstallAction(storeId: string, fd: FormData) {
       ...(encryptedSecret ? { shopifyClientSecret: encryptedSecret } : {}),
       shopifyOauthState: state,
       ...(domainChanged
-        ? { shopifyAccessToken: null, scriptTagId: null, shopifyConnectedAt: null, enabled: false, storefrontHost: null }
+        ? // The Judge.me token belongs to the previous shop's .myshopify.com domain: forgotten with it.
+          { shopifyAccessToken: null, scriptTagId: null, shopifyConnectedAt: null, enabled: false, storefrontHost: null, judgemeApiToken: null }
         : {}),
     },
   });
@@ -380,7 +405,8 @@ export async function disconnectShopifyAction(storeId: string) {
   }
   await db.store.update({
     where: { id: storeId },
-    data: { shopifyAccessToken: null, scriptTagId: null, shopifyConnectedAt: null, shopifyScopes: null, enabled: false },
+    // The Judge.me token is tied to this shop's .myshopify.com domain: forgotten with it.
+    data: { shopifyAccessToken: null, scriptTagId: null, shopifyConnectedAt: null, shopifyScopes: null, enabled: false, judgemeApiToken: null },
   });
   await recordCheckoutEnabled(storeId, store.enabled, false, "Shopify déconnecté");
   revalidatePath(storePath(storeId), "layout");
@@ -435,6 +461,8 @@ export async function connectWhopAction(storeId: string, fd: FormData) {
       whopConnectedAt: new Date(),
     },
   });
+  // A new key or account: its Apple Pay domains start empty.
+  await reregisterApplePayDomain(storeId);
   revalidatePath(storePath(storeId), "layout");
   // Several stores on one Whop account work (each has its own product), but its events
   // reach every store: say so, so "événement d'une autre boutique" lines don't surprise.
@@ -473,22 +501,150 @@ export async function setupApplePayAction(storeId: string, fd: FormData) {
   if (file) {
     if (file.length > 20000) back(path, { error: "Fichier Apple Pay trop volumineux : collez uniquement son contenu", field: "association" });
     await db.appSetting.upsert({
-      where: { key: "apple_pay_domain_association" },
+      where: { key: APPLE_PAY_ASSOCIATION_KEY },
       update: { value: file },
-      create: { key: "apple_pay_domain_association", value: file },
+      create: { key: APPLE_PAY_ASSOCIATION_KEY, value: file },
     });
+    // The file serves every host: the other stores' verified checkout domains can now be registered.
+    const others = await db.store.findMany({
+      where: { id: { not: storeId }, checkoutDomain: { not: null }, checkoutDomainVerifiedAt: { not: null }, whopConnectedAt: { not: null } },
+      select: { id: true },
+      take: 20,
+    });
+    await Promise.all(others.map((o) => reregisterApplePayDomain(o.id)));
   }
+  // The store's verified checkout domain (checkout.seyuna.com) is where buyers pay; APP_URL's host
+  // stays registered too (links sent before the domain, fallback while it is down).
+  const hosts = [...new Set([checkoutHostOf(store), new URL(env.appUrl).hostname])];
   let status = "pending";
   try {
-    const domain = await registerApplePayDomain(store, new URL(env.appUrl).hostname);
-    status = domain.status;
+    for (const host of hosts) {
+      const domain = await registerApplePayDomain(store, host);
+      if (host === hosts[0]) status = domain.status;
+    }
   } catch (err) {
     back(path, { error: `Whop n'a pas pu enregistrer le domaine : ${errorMessage(err)}` });
   }
-  if (status === "verified") back(path, { ok: "Apple Pay est activé sur votre checkout" });
+  if (status === "verified") back(path, { ok: `Apple Pay est activé sur votre checkout (${hosts[0]})` });
   back(path, {
     error: "Domaine enregistré mais pas encore vérifié par Apple. Vérifiez le fichier collé, puis réessayez dans quelques minutes.",
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* Checkout domain                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * "Domaine du checkout": saves the hostname (validated, unique), adds it to the Vercel project when
+ * the Vercel API is configured, then checks it right away (already verified when the DNS was ready).
+ */
+export async function saveCheckoutDomainAction(storeId: string, fd: FormData) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "settings");
+  const checked = normalizeCheckoutDomain(str(fd, "checkoutDomain"), {
+    storefrontHosts: [store.storefrontHost, store.shopDomain],
+    // The root of the merchant's domain needs the card's explicit confirmation (its site would move).
+    confirmApex: fd.get("confirmApex") === "on",
+  });
+  if (!checked.ok) back(path, { error: checked.error, field: "checkoutDomain" });
+  const domain = checked.domain;
+  if (domain === store.checkoutDomain) {
+    if (!domain) back(path, { ok: "Aucun domaine du checkout" });
+    // Saved again while not working (the messages ask for it): retry the Vercel step, then check.
+    const cfgAgain = vercelConfig();
+    const lastError = parseDomainError(store.checkoutDomainError);
+    if ((store.checkoutDomainVerifiedAt && !lastError) || (!cfgAgain && lastError?.kind !== "vercel")) back(path, { ok: "Domaine du checkout inchangé" });
+    if (!(await rateLimit(`checkout-domain:verify:${storeId}`, 12))) back(path, { error: "Trop de vérifications d'affilée : réessayez dans une minute." });
+    const again = cfgAgain ? await addDomainToVercel(cfgAgain, domain) : null;
+    if (again) {
+      await db.store.updateMany({ where: { id: storeId, checkoutDomain: domain, checkoutDomainVerifiedAt: null }, data: { checkoutDomainError: formatDomainError("vercel", again), checkoutDomainCheckedAt: new Date() } });
+      revalidatePath(storePath(storeId), "layout");
+      back(path, { error: again, field: "checkoutDomain" });
+    }
+    const recheck = await checkStoreDomain(storeId, { vercel: !!cfgAgain });
+    revalidatePath(storePath(storeId), "layout");
+    if (recheck.verified && !recheck.message) back(path, { ok: `Domaine vérifié : vos clients paient désormais sur ${domain}` });
+    back(path, { error: recheck.message ?? "Le domaine ne répond pas encore." });
+  }
+  const other = domain ? await db.store.findFirst({ where: { checkoutDomain: domain, NOT: { id: storeId } }, select: { name: true } }) : null;
+  if (other) back(path, { error: `${domain} est déjà le domaine du checkout de la boutique « ${other.name} ».`, field: "checkoutDomain" });
+  // Retired by another store less than 48 h ago: its open checkouts and payment return links still
+  // use it (they must keep reaching that store), so it can't be taken over before then.
+  const retiredBy = domain ? await retiredDomainOwner(domain) : null;
+  if (retiredBy && retiredBy !== storeId) {
+    back(path, {
+      error: `${domain} vient d'être retiré par une autre boutique : ses liens de paiement déjà envoyés l'utilisent encore pendant 48 h. Réessayez après ce délai, ou choisissez un autre domaine.`,
+      field: "checkoutDomain",
+    });
+  }
+  const cfg = vercelConfig();
+  const vercelError = domain && cfg ? await addDomainToVercel(cfg, domain) : null;
+  try {
+    await db.store.update({
+      where: { id: storeId },
+      data: {
+        checkoutDomain: domain,
+        checkoutDomainVerifiedAt: null,
+        checkoutDomainCheckedAt: null,
+        checkoutDomainPendingSince: domain ? new Date() : null,
+        checkoutDomainError: vercelError ? formatDomainError("vercel", vercelError) : null,
+      },
+    });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") back(path, { error: `${domain} est déjà utilisé par une autre boutique.`, field: "checkoutDomain" });
+    throw err;
+  }
+  // The old domain stays on the Vercel project for 48 h (open checkouts, Whop's return URLs sent
+  // with it keep working: its /c pages send buyers to the new host), then the tick removes it.
+  if (domain) await unretireCheckoutDomain(domain);
+  if (store.checkoutDomain) await retireCheckoutDomain(storeId, store.checkoutDomain);
+  await recordEvent({
+    storeId,
+    kind: "checkout_domain.saved",
+    message: domain ? `Domaine du checkout enregistré : ${domain}.` : `Domaine du checkout retiré${store.checkoutDomain ? ` (${store.checkoutDomain})` : ""} : le checkout est de nouveau servi sur ${new URL(env.appUrl).hostname}.`,
+  });
+  revalidatePath(storePath(storeId), "layout");
+  if (!domain) back(path, { ok: "Domaine du checkout retiré" });
+  if (vercelError) back(path, { error: vercelError, field: "checkoutDomain" });
+  const result = await checkStoreDomain(storeId, { vercel: !!cfg });
+  if (result.verified) back(path, { ok: `Domaine vérifié : vos clients paient désormais sur ${domain}` });
+  back(path, { ok: `Domaine enregistré. Ajoutez l'enregistrement DNS indiqué, puis cliquez sur « Vérifier ».` });
+}
+
+/** Adds the domain to the Vercel project; the merchant's message when Vercel refuses, else null. */
+async function addDomainToVercel(cfg: VercelConfig, domain: string): Promise<string | null> {
+  try {
+    await addProjectDomain(cfg, domain);
+    return null;
+  } catch (err) {
+    return err instanceof VercelApiError && err.status === 409
+      ? `Vercel refuse ${domain} : il est déjà utilisé par un autre projet ou compte Vercel. Retirez-le de là-bas, puis enregistrez de nouveau.`
+      : `Vercel n'a pas pu ajouter ${domain} au projet (${errorMessage(err)}). Ajoutez-le dans Vercel → Settings → Domains.`;
+  }
+}
+
+/** "Vérifier": pings https://<domain>/.well-known/whop-checkout-ping now (5 s at most). */
+export async function verifyCheckoutDomainAction(storeId: string) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "settings");
+  if (!store.checkoutDomain) back(path, { error: "Enregistrez d'abord un domaine du checkout." });
+  if (!(await rateLimit(`checkout-domain:verify:${storeId}`, 12))) back(path, { error: "Trop de vérifications d'affilée : réessayez dans une minute." });
+  // Missing from the Vercel project (never added, removed by hand): added back before the check.
+  const cfg = vercelConfig();
+  if (cfg && !(store.checkoutDomainVerifiedAt && !store.checkoutDomainError)) {
+    const missing = await getProjectDomain(cfg, store.checkoutDomain).then(
+      () => false,
+      (err) => err instanceof VercelApiError && err.status === 404,
+    );
+    const refused = missing ? await addDomainToVercel(cfg, store.checkoutDomain) : null;
+    if (refused) back(path, { error: refused });
+  }
+  const result = await checkStoreDomain(storeId);
+  revalidatePath(storePath(storeId), "layout");
+  // verified with a message: a first failed check, the domain stays in use until the next one fails.
+  if (result.verified && !result.message) back(path, { ok: `Domaine vérifié : vos clients paient désormais sur ${result.domain}` });
+  back(path, { error: result.message ?? "Le domaine ne répond pas encore." });
 }
 
 /* ------------------------------------------------------------------ */
@@ -522,18 +678,27 @@ export async function saveBuilderAction(
   page: "checkout" | "thank-you",
   theme: Theme,
   layout: Layout,
+  /** The other page's layout, when the builder changed it too (a template applied with its matching page). */
+  otherLayout?: Layout,
 ): Promise<{ ok: true; draft: boolean } | { ok: false; error: string }> {
   const store = await getStore(storeId);
   const t = themeSchema.safeParse(theme);
   if (!t.success) return { ok: false, error: `Thème invalide : ${t.error.issues[0]?.path.join(".")} ${t.error.issues[0]?.message}` };
   const l = (page === "checkout" ? checkoutLayoutSchema : thankYouLayoutSchema).safeParse(layout);
   if (!l.success) return { ok: false, error: l.error.issues[0]?.message ?? "Mise en page invalide" };
+  const o = otherLayout === undefined ? null : (page === "checkout" ? thankYouLayoutSchema : checkoutLayoutSchema).safeParse(otherLayout);
+  if (o && !o.success) return { ok: false, error: o.error.issues[0]?.message ?? "Mise en page invalide" };
+  const [checkoutData, thankYouData] = page === "checkout" ? [l.data, o?.data] : [o?.data, l.data];
+  const layouts = {
+    ...(checkoutData ? { draftCheckoutLayout: checkoutData as Prisma.InputJsonValue } : {}),
+    ...(thankYouData ? { draftThankYouLayout: thankYouData as Prisma.InputJsonValue } : {}),
+  };
   // Edits undone back to the published design (both pages, normalised the same way):
   // there is no draft any more, so "Publier" has nothing to do.
   const next = {
     ...store,
     draftTheme: t.data as Prisma.JsonValue,
-    ...(page === "checkout" ? { draftCheckoutLayout: l.data as Prisma.JsonValue } : { draftThankYouLayout: l.data as Prisma.JsonValue }),
+    ...(layouts as { draftCheckoutLayout?: Prisma.JsonValue; draftThankYouLayout?: Prisma.JsonValue }),
   };
   if (hasPublished(store) && sameDesign(draftDesign(next), publishedDesign(store))) {
     await db.store.update({
@@ -547,9 +712,7 @@ export async function saveBuilderAction(
     where: { id: storeId },
     data: {
       draftTheme: t.data as Prisma.InputJsonValue,
-      ...(page === "checkout"
-        ? { draftCheckoutLayout: l.data as Prisma.InputJsonValue }
-        : { draftThankYouLayout: l.data as Prisma.InputJsonValue }),
+      ...layouts,
       draftUpdatedAt: new Date(),
     },
   });
@@ -557,15 +720,30 @@ export async function saveBuilderAction(
 }
 
 /** Publishes the drafts (theme + both layouts) and keeps a version in the history. */
-export async function publishDesignAction(storeId: string, label: string): Promise<{ ok: true } | { ok: false; error: string }> {
+export async function publishDesignAction(
+  storeId: string,
+  label: string,
+): Promise<{ ok: true; /** Deleted images emptied on the way: the builder reloads the published design. */ stripped: number } | { ok: false; error: string }> {
   const store = await getStore(storeId);
   const design = draftDesign(store);
   const t = themeSchema.safeParse(design.theme);
   const c = checkoutLayoutSchema.safeParse(design.checkoutLayout);
   const y = thankYouLayoutSchema.safeParse(design.thankYouLayout);
   if (!t.success || !c.success || !y.success) return { ok: false, error: "Le brouillon contient une erreur : corrigez-la avant de publier." };
-  await db.$transaction([
-    db.store.update({
+  const published = await db.$transaction(async (tx) => {
+    // Under the Store row lock image deletes take: the draft read again, and any image deleted
+    // meanwhile (brought back by undo, a restored version or a racing delete) emptied, never published.
+    await lockStore(tx, storeId);
+    const draft = draftDesign(await tx.store.findUniqueOrThrow({ where: { id: storeId } }));
+    const missing = await missingMediaIds(tx, storeId, draft);
+    const fresh = await withoutMissingMedia(tx, storeId, draft);
+    const t = themeSchema.safeParse(fresh.theme);
+    const c = checkoutLayoutSchema.safeParse(fresh.checkoutLayout);
+    const y = thankYouLayoutSchema.safeParse(fresh.thankYouLayout);
+    if (!t.success || !c.success || !y.success) return false;
+    // Sample reviews / figures / coupon / testimonial need no gate: the live page never shows them
+    // (isEmptyInLive → isSampleOnly, liveReviewItems), whatever gets published.
+    await tx.store.update({
       where: { id: storeId },
       data: {
         theme: t.data as Prisma.InputJsonValue,
@@ -577,8 +755,8 @@ export async function publishDesignAction(storeId: string, label: string): Promi
         draftUpdatedAt: null,
         publishedAt: new Date(),
       },
-    }),
-    db.layoutVersion.create({
+    });
+    await tx.layoutVersion.create({
       data: {
         storeId,
         label: label.trim().slice(0, 80) || `Publication du ${new Date().toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: tzOf(store) })}`,
@@ -586,11 +764,13 @@ export async function publishDesignAction(storeId: string, label: string): Promi
         checkoutLayout: c.data as Prisma.InputJsonValue,
         thankYouLayout: y.data as Prisma.InputJsonValue,
       },
-    }),
-  ]);
+    });
+    return { stripped: missing.length };
+  });
+  if (!published) return { ok: false, error: "Le brouillon contient une erreur : corrigez-la avant de publier." };
   await recordEvent({ storeId, kind: "design.published", message: "Nouveau design publié sur le checkout" });
   revalidatePath(storePath(storeId), "layout");
-  return { ok: true };
+  return { ok: true, stripped: published.stripped };
 }
 
 /** Loads a version from the history into the draft (publish to make it live). */
@@ -634,21 +814,39 @@ export async function startExperimentAction(storeId: string, fd: FormData) {
   const splitRaw = str(fd, "split") || "50";
   const split = /^\d{1,2}$/.test(splitRaw) ? Number(splitRaw) : NaN;
   if (!(split >= 10 && split <= 90)) back(path, { error: "Part de trafic B : nombre entier entre 10 et 90 %", field: "split" });
-  const store = await db.store.findUniqueOrThrow({ where: { id: storeId } });
-  // Pin the control: publishing during the test must not change variant A.
-  const control = await db.layoutVersion.create({
-    data: {
-      storeId,
-      label: `Contrôle A — ${new Date().toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: tzOf(store) })}`,
-      theme: (store.theme ?? {}) as Prisma.InputJsonValue,
-      checkoutLayout: (store.checkoutLayout ?? { blocks: [] }) as Prisma.InputJsonValue,
-      thankYouLayout: (store.thankYouLayout ?? { blocks: [] }) as Prisma.InputJsonValue,
-    },
+  // Under the Store row lock image deletes take: once the test runs, both its versions count as live
+  // (mediaUsage) and their images can't be deleted; an image deleted before is caught here, so a
+  // test never serves a broken image.
+  const started = await db.$transaction(async (tx) => {
+    await lockStore(tx, storeId);
+    if ((await missingMediaIds(tx, storeId, [version.theme, version.checkoutLayout, version.thankYouLayout])).length > 0) return false;
+    const store = await tx.store.findUniqueOrThrow({ where: { id: storeId } });
+    const published = await withoutMissingMedia(tx, storeId, {
+      theme: store.theme ?? {},
+      checkoutLayout: store.checkoutLayout ?? { blocks: [] },
+      thankYouLayout: store.thankYouLayout ?? { blocks: [] },
+    });
+    // Pin the control: publishing during the test must not change variant A.
+    const control = await tx.layoutVersion.create({
+      data: {
+        storeId,
+        label: `Contrôle A — ${new Date().toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: tzOf(store) })}`,
+        theme: published.theme as Prisma.InputJsonValue,
+        checkoutLayout: published.checkoutLayout as Prisma.InputJsonValue,
+        thankYouLayout: published.thankYouLayout as Prisma.InputJsonValue,
+      },
+    });
+    await tx.experiment.updateMany({ where: { storeId, status: "RUNNING" }, data: { status: "STOPPED", endedAt: new Date() } });
+    await tx.experiment.create({
+      data: { storeId, versionId, versionIdA: control.id, splitB: split, autoPromote: fd.get("autoPromote") === "on", name: str(fd, "name").slice(0, 80) || `Test « ${version.label} »` },
+    });
+    return true;
   });
-  await db.experiment.updateMany({ where: { storeId, status: "RUNNING" }, data: { status: "STOPPED", endedAt: new Date() } });
-  await db.experiment.create({
-    data: { storeId, versionId, versionIdA: control.id, splitB: split, autoPromote: fd.get("autoPromote") === "on", name: str(fd, "name").slice(0, 80) || `Test « ${version.label} »` },
-  });
+  if (!started)
+    back(path, {
+      error: `« ${version.label} » affiche une image supprimée de « Mes images » : restaurez cette version dans l'éditeur, remplacez l'image, publiez, puis testez la nouvelle version.`,
+      field: "versionId",
+    });
   await recordEvent({ storeId, kind: "experiment.started", message: `Test A/B lancé : ${version.label} sur ${split} % du trafic` });
   back(path, { ok: `Test A/B lancé : ${split} % des nouveaux checkouts voient « ${version.label} ».` });
 }
@@ -658,21 +856,25 @@ export async function stopExperimentAction(storeId: string, experimentId: string
   const path = storePath(storeId, "analytics?tab=tests");
   const exp = await db.experiment.findFirst({ where: { id: experimentId, storeId } });
   if (!exp) back(path, { error: "Test introuvable" });
-  await db.experiment.update({ where: { id: exp.id }, data: { status: "STOPPED", endedAt: new Date() } });
-  if (promote) {
-    const v = await db.layoutVersion.findUnique({ where: { id: exp.versionId } });
-    if (v) {
-      await db.store.update({
-        where: { id: storeId },
-        data: {
-          theme: v.theme as Prisma.InputJsonValue,
-          checkoutLayout: v.checkoutLayout as Prisma.InputJsonValue,
-          thankYouLayout: v.thankYouLayout as Prisma.InputJsonValue,
-          publishedAt: new Date(),
-        },
-      });
-    }
-  }
+  // Under the Store row lock image deletes take, and with any image deleted meanwhile emptied: the
+  // promoted variant never shows a broken image.
+  await db.$transaction(async (tx) => {
+    await lockStore(tx, storeId);
+    await tx.experiment.update({ where: { id: exp.id }, data: { status: "STOPPED", endedAt: new Date() } });
+    if (!promote) return;
+    const v = await tx.layoutVersion.findUnique({ where: { id: exp.versionId } });
+    if (!v) return;
+    const d = await withoutMissingMedia(tx, storeId, { theme: v.theme, checkoutLayout: v.checkoutLayout, thankYouLayout: v.thankYouLayout });
+    await tx.store.update({
+      where: { id: storeId },
+      data: {
+        theme: d.theme as Prisma.InputJsonValue,
+        checkoutLayout: d.checkoutLayout as Prisma.InputJsonValue,
+        thankYouLayout: d.thankYouLayout as Prisma.InputJsonValue,
+        publishedAt: new Date(),
+      },
+    });
+  });
   await recordEvent({ storeId, kind: "experiment.stopped", message: promote ? "Test A/B terminé : variante B publiée" : "Test A/B arrêté" });
   back(path, { ok: promote ? "Variante B publiée pour tous les clients." : "Test arrêté : tout le monde voit le design publié." });
 }
@@ -1422,6 +1624,15 @@ export async function savePaymentMethodsAction(storeId: string, fd: FormData) {
   });
 }
 
+/** Brings back the PayPal express button Whop's refusal hid (24 h hold): the next checkout asks Whop again. */
+export async function reactivatePaypalAction(storeId: string) {
+  await getStore(storeId);
+  const cleared = await clearPaypalRefusals(storeId);
+  if (cleared) await recordEvent({ storeId, kind: "paypal.reactivated", message: "PayPal express réactivé depuis le dashboard : Whop sera de nouveau consulté au prochain checkout." });
+  revalidatePath(storePath(storeId), "layout");
+  back(storePath(storeId, "whop"), { ok: cleared ? "PayPal réactivé : Whop sera de nouveau consulté au prochain checkout." : "PayPal n'était pas masqué." });
+}
+
 /** Re-creates the Whop webhook with the current event list (e.g. after an app update). */
 export async function refreshWhopWebhookAction(storeId: string) {
   const store = await getStore(storeId);
@@ -1447,6 +1658,7 @@ export async function refreshWhopWebhookAction(storeId: string) {
       whopWebhookSecret: encryptOrBack(result.webhookSecret, path),
     },
   });
+  await reregisterApplePayDomain(storeId);
   back(path, { ok: "Webhook Whop mis à jour (alertes de fraude incluses)." });
 }
 
@@ -1496,6 +1708,8 @@ async function settingsSectionAction(key: string): Promise<((storeId: string, fd
       return saveShieldAction;
     case "Options du checkout":
       return saveCheckoutOptionsAction;
+    case "Domaine du checkout":
+      return saveCheckoutDomainAction;
     default:
       return null;
   }

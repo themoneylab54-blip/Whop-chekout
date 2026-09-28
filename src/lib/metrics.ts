@@ -23,6 +23,7 @@ export const PROVIDER_LABELS: Record<string, string> = {
   resend: "Resend (e-mails)",
   telegram: "Telegram",
   mondial_relay: "Mondial Relay",
+  judgeme: "Judge.me (avis)",
 };
 
 export const BUCKET_MS = 5 * 60_000;

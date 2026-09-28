@@ -27,8 +27,17 @@ const THEME_LABELS: Partial<Record<keyof Theme, string>> = {
   headerAlign: "alignement de l'en-tête",
   logoUrl: "logo",
   logoHeight: "taille du logo",
+  headerMode: "contenu de l'en-tête",
+  bannerUrl: "bannière",
+  bannerHeight: "hauteur de la bannière",
+  bannerAuto: "proportions de la bannière",
+  bannerFit: "cadrage de la bannière",
+  bannerBackground: "fond de la bannière",
+  bannerLink: "lien de la bannière",
+  bannerRatio: "format de la bannière",
   trustLine: "ligne de confiance",
   expressCheckout: "paiement express",
+  expressMethods: "boutons de paiement express",
   payButtonText: "texte du bouton Payer",
   policyLinks: "liens légaux",
   requireTerms: "case CGV",
@@ -39,7 +48,8 @@ const THEME_LABELS: Partial<Record<keyof Theme, string>> = {
 
 /** Fixed sections are matched by type: their ids may differ between two loads of old data. */
 const keyOf = (b: Block) => (isFixedSection(b.type) ? `type:${b.type}` : b.id);
-const content = (b: Block) => JSON.stringify([b.props, b.style, b.hidden, b.placement, b.position]);
+// `sample` and `i18n` change what buyers see (examples hidden, translations), so they count too.
+const content = (b: Block) => JSON.stringify([b.props, b.style, b.hidden, b.placement, b.position, b.sample ?? null, b.i18n ?? null]);
 
 export type LayoutDiff = { added: number; removed: number; modified: number; reordered: boolean };
 
@@ -61,7 +71,8 @@ export function diffLayout(draft: Layout, published: Layout): LayoutDiff {
 
 export function diffTheme(draft: Theme, published: Theme): string[] {
   return (Object.keys(draft) as (keyof Theme)[])
-    .filter((k) => JSON.stringify(draft[k]) !== JSON.stringify(published[k]))
+    // The last applied template is builder bookkeeping ("Actuel" badge), not a change buyers see.
+    .filter((k) => k !== "appliedTemplates" && JSON.stringify(draft[k]) !== JSON.stringify(published[k]))
     .map((k) => THEME_LABELS[k] ?? String(k));
 }
 

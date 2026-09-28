@@ -1,5 +1,6 @@
 import { clientIp, rateLimit } from "@/lib/ratelimit";
 import { db } from "@/lib/db";
+import { isForeignCheckoutHost } from "@/lib/checkout-domain-check";
 import { json, readJson } from "@/lib/http";
 import { quoteSchema, quoteSession } from "@/lib/checkout";
 import { route } from "@/lib/route";
@@ -20,7 +21,8 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const parsed = quoteSchema.safeParse(await readJson(req));
   if (!parsed.success) return json({ error: "Requête invalide" }, { status: 400 });
   const session = await db.checkoutSession.findUnique({ where: { id }, include: { store: true } });
-  if (!session) return json({ error: "Session introuvable" }, { status: 404 });
+  // Another store's checkout domain never serves this session (see isForeignCheckoutHost).
+  if (!session || (await isForeignCheckoutHost(req, session.store))) return json({ error: "Session introuvable" }, { status: 404 });
   // Funnel: a delivery method is set for a real address (a preselected rate on load doesn't count).
   if (parsed.data.shippingRateId && session.addressEnteredAt && !session.shippingChosenAt) {
     await db.checkoutSession.updateMany({ where: { id, shippingChosenAt: null }, data: { shippingChosenAt: new Date() } });

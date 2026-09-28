@@ -245,11 +245,41 @@ export function eligibleMethods(methods: string[], ctx: { country: string | null
   });
 }
 
-/** Creates the one-off checkout for a session; the embed is rendered with its id. */
+/**
+ * Raised when a checkout restricted to some methods (PayPal only) can't offer them. `remember`:
+ * Whop said the method itself is unavailable (dropped from the effective config, or a refusal
+ * naming it), so the store may remember it; false = a refusal that doesn't say why (this session only).
+ */
+export class MethodUnavailableError extends Error {
+  constructor(
+    readonly methods: readonly string[],
+    readonly remember = true,
+  ) {
+    super(`Whop n'a pas activé : ${methods.join(", ")}`);
+    this.name = "MethodUnavailableError";
+  }
+}
+
+/**
+ * Creates the one-off checkout for a session; the embed is rendered with its id.
+ * `methods` restricts it to those methods only (e.g. ["paypal"] for the express PayPal
+ * button): same plan, price and metadata, so webhooks, markPaid and reconciliation treat it
+ * exactly like the regular one. It never falls back to other methods: a restricted checkout
+ * Whop can't honour throws MethodUnavailableError. `paypal` says whether Whop will offer PayPal.
+ */
 export async function createCheckoutConfiguration(
   store: Pick<Store, "whopApiKey" | "testMode" | "whopAccountId" | "whopProductId"> & { paymentMethods?: string[] },
-  opts: { sessionId: string; storeId: string; totalCents: number; currency: string; title: string; redirectUrl: string; country?: string | null },
-) {
+  opts: {
+    sessionId: string;
+    storeId: string;
+    totalCents: number;
+    currency: string;
+    title: string;
+    redirectUrl: string;
+    country?: string | null;
+    methods?: readonly string[];
+  },
+): Promise<{ id: string; purchaseUrl: string | null; paypal: boolean | null }> {
   if (!store.whopAccountId || !store.whopProductId) throw new Error("Compte Whop non configuré");
   const client = storeClient(store);
   const base = {
@@ -269,6 +299,29 @@ export async function createCheckoutConfiguration(
       metadata: { checkout_session_id: opts.sessionId },
     },
   };
+  if (opts.methods?.length) {
+    const only = [...opts.methods];
+    let restricted;
+    try {
+      restricted = await client.checkoutConfigurations.create({
+        ...base,
+        payment_method_configuration: { enabled: only as (typeof CHECKOUT_PAYMENT_METHODS)[number][], disabled: [], include_platform_defaults: false },
+      });
+    } catch (err) {
+      log.warn("whop.restricted_config_failed", `Whop refused a ${only.join("+")} checkout`, { storeId: opts.storeId, err });
+      // Only a clear refusal of the request (400/422) means "method not available". A 5xx, a 429,
+      // a timeout or a network error says nothing about PayPal: rethrown as is (nothing remembered).
+      // Only a refusal naming PayPal / the payment method is remembered for the store; any other
+      // 400/422 (bad amount, plan…) makes PayPal unavailable for this session only.
+      if (isMethodRefusal(err)) throw new MethodUnavailableError(only, refusalNamesMethod(err, only));
+      throw err;
+    }
+    const enabled = restricted.effective_payment_method_configuration?.enabled;
+    const missing = enabled ? only.filter((m) => !enabled.includes(m)) : [];
+    if (missing.length) throw new MethodUnavailableError(missing);
+    // Whop confirmed PayPal (effective config) → on; silent → unknown (never remembered as "on").
+    return { id: restricted.id, purchaseUrl: restricted.purchase_url ?? null, paypal: enabled && only.includes("paypal") ? true : null };
+  }
   const optional = eligibleMethods(
     (store.paymentMethods ?? []).filter((m) => OPTIONAL_PAYMENT_METHOD_IDS.includes(m)),
     { country: opts.country ?? null, currency: opts.currency, totalCents: opts.totalCents },
@@ -291,15 +344,47 @@ export async function createCheckoutConfiguration(
       lastError = err;
     }
   }
+  let usedFallback = false;
   if (!config) {
     // Last resort: the account's own defaults. A method problem must never block the sale.
     config = await client.checkoutConfigurations.create(base);
+    usedFallback = true;
   }
   // What Whop will actually offer: report any requested method it dropped (once a day).
   const effective = config.effective_payment_method_configuration?.enabled;
   const dropped = effective ? [...CHECKOUT_PAYMENT_METHODS, ...optional].filter((m) => !effective.includes(m)) : lastError ? optional : [];
   if (dropped.length) await reportDroppedMethods(opts.storeId, dropped, lastError);
-  return { id: config.id, purchaseUrl: config.purchase_url ?? null };
+  // Whop silent about what it enabled: PayPal unknown (null) — neither remembered "on" nor "off".
+  // The account-defaults fallback (reached after errors, possibly transient ones) never asked for
+  // PayPal: its absence there proves nothing, so only a confirmed "on" is reported.
+  const paypal = effective ? effective.includes("paypal") : null;
+  return { id: config.id, purchaseUrl: config.purchase_url ?? null, paypal: usedFallback && paypal === false ? null : paypal };
+}
+
+/** A Whop answer refusing the request itself (400/422): the method is not available for it. */
+export function isMethodRefusal(err: unknown): boolean {
+  const status = (err as { statusCode?: unknown; status?: unknown } | null)?.statusCode ?? (err as { status?: unknown } | null)?.status;
+  return status === 400 || status === 422;
+}
+
+/** Whether a Whop refusal's message / code / body names the payment method (or one of `methods`). */
+export function refusalNamesMethod(err: unknown, methods: readonly string[] = []): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { message?: unknown; code?: unknown; error?: unknown; body?: unknown; param?: unknown };
+  const parts: string[] = [];
+  for (const v of [e.message, e.code, e.param, e.error, e.body]) {
+    if (typeof v === "string") parts.push(v);
+    else if (v && typeof v === "object") {
+      try {
+        parts.push(JSON.stringify(v));
+      } catch {
+        // Circular body: its message/code above still count.
+      }
+    }
+  }
+  const text = parts.join(" ").toLowerCase();
+  if (/payment[_\s-]?method/.test(text)) return true;
+  return ["paypal", ...methods].some((m) => m && text.includes(m.toLowerCase()));
 }
 
 /**
@@ -321,6 +406,46 @@ export async function registerApplePayDomain(
   if (existing?.status === "verified") return existing;
   if (existing) return client.paymentMethodDomains.verify({ id: existing.id });
   return client.paymentMethodDomains.create({ account_id: store.whopAccountId ?? undefined, hostname });
+}
+
+/**
+ * Removes a checkout hostname the store no longer uses from its Whop Apple Pay domains (absent is
+ * fine). Returns true when one was removed.
+ */
+export async function unregisterApplePayDomain(store: Pick<Store, "whopApiKey" | "testMode" | "whopAccountId">, hostname: string): Promise<boolean> {
+  const client = storeClient(store);
+  for await (const d of await client.paymentMethodDomains.list({ account_id: store.whopAccountId ?? undefined, hostname }, whopCallOptions("Whop Apple Pay domains"))) {
+    if (d.hostname === hostname) {
+      await client.paymentMethodDomains.delete({ id: d.id }, whopCallOptions("Whop Apple Pay domains"));
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Apple Pay status Whop reports for each checkout hostname ("verified", "pending"…; "absent" when not
+ * registered), or null when Whop is slow or failing (the page never waits more than `timeoutMs`).
+ */
+export async function applePayDomainStatuses(
+  store: Pick<Store, "whopApiKey" | "testMode" | "whopAccountId">,
+  hostnames: string[],
+  timeoutMs = 2_500,
+): Promise<Record<string, string> | null> {
+  const load = (async () => {
+    const client = storeClient(store);
+    const out: Record<string, string> = Object.fromEntries(hostnames.map((h) => [h, "absent"]));
+    for (const hostname of hostnames) {
+      for await (const d of await client.paymentMethodDomains.list({ account_id: store.whopAccountId ?? undefined, hostname })) {
+        if (d.hostname === hostname) {
+          out[hostname] = d.status;
+          break;
+        }
+      }
+    }
+    return out;
+  })().catch(() => null);
+  return Promise.race([load, new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs))]);
 }
 
 /**

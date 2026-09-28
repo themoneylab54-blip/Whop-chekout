@@ -6,7 +6,8 @@ import { decrypt, safeEqual } from "./crypto";
 import { env } from "./env";
 import { log } from "./log";
 import { assertBreakerClosed, boundedTimeout, breakerOpen, isTimeoutError, timeLeft, tripBreaker } from "./deadline";
-import { allocateDiscount, centsToDecimal, type CartLine } from "./pricing";
+import { allocateDiscount, centsToDecimal, productKey, type CartLine } from "./pricing";
+import { splitOverComponents, type CartContext } from "./cart-fidelity";
 
 export const SHOPIFY_API_VERSION = "2026-07";
 
@@ -242,6 +243,8 @@ type VariantNode = {
   compareAtPrice: string | null;
   availableForSale: boolean;
   inventoryQuantity: number | null;
+  /** Bundle parent sold through its components only (absent from old API versions: guarded). */
+  requiresComponents?: boolean | null;
   inventoryItem: { tracked: boolean; requiresShipping: boolean; unitCost: { amount: string } | null } | null;
   image: { url: string } | null;
   product: { id: string; title: string; handle: string; status: string; hasOnlyDefaultVariant: boolean; featuredImage: { url: string } | null; isGiftCard?: boolean };
@@ -270,7 +273,7 @@ export async function priceCart(
       nodes(ids: $ids) {
         __typename
         ... on ProductVariant {
-          id title sku price compareAtPrice availableForSale inventoryQuantity
+          id title sku price compareAtPrice availableForSale inventoryQuantity requiresComponents
           inventoryItem { tracked requiresShipping unitCost { amount } }
           image { url }
           product { id title handle status hasOnlyDefaultVariant isGiftCard featuredImage { url } }
@@ -297,6 +300,7 @@ export async function priceCart(
       requiresShipping: n.inventoryItem?.requiresShipping ?? true,
       unitCostCents: n.inventoryItem?.unitCost ? Math.round(Number(n.inventoryItem.unitCost.amount) * 100) : null,
       ...(n.product.isGiftCard ? { giftCard: true } : {}),
+      ...(n.requiresComponents === true ? { requiresComponents: true } : {}),
     }))
     .filter((l) => l.quantity > 0);
 }
@@ -323,6 +327,10 @@ export type PaidOrderInput = {
   email: string;
   acceptsMarketing: boolean;
   buyerNote?: string | null;
+  /** The Shopify cart's note and attributes (the order's note and "additional details"). */
+  cart?: CartContext | null;
+  /** Titles of Shopify's automatic discounts in the paid amount (e.g. a Kaching deal), for the note. */
+  automaticTitles?: string[];
   shippingAddress: Address | null;
   /** Relay point: becomes the shipping address, the buyer's own address stays the billing one. */
   pickupPoint?: { provider: string; id: string; name: string; address1: string; zip: string; city: string; countryCode: string } | null;
@@ -333,6 +341,11 @@ export type PaidOrderInput = {
    * discount code (Shopify deducts it) instead of being folded into the line prices.
    */
   discount: { code: string; amountCents: number; freeShipping: boolean; nativeCodeCents?: number } | null;
+  /**
+   * Shopify's automatic discount in amountCents (`cents`) and its part per line when the cart said
+   * (variant id → cents): those parts go to their own lines first, only the rest is spread by value.
+   */
+  automaticDiscount?: { cents: number; lineCents?: Record<string, number> } | null;
   shipping: { title: string; priceCents: number } | null;
   totalCents: number;
   whopPaymentId: string;
@@ -344,24 +357,67 @@ function money(cents: number, currency: string) {
 }
 
 /**
+ * The folded merchandise discount per line: Shopify's automatic discount first on the lines it
+ * applied to (its per-line amounts, capped at each line and at the folded total), then the rest
+ * spread by what each line has left (largest remainders). Adds up exactly to `foldedCents`
+ * (never more than a line's value). Pure.
+ */
+export function allocateOrderDiscount(lines: CartLine[], foldedCents: number, automatic: { cents: number; lineCents?: Record<string, number> } | null): number[] {
+  const value = lines.map((l) => l.unitPriceCents * l.quantity);
+  const parts = lines.map(() => 0);
+  let budget = Math.max(0, Math.min(foldedCents, Math.round(automatic?.cents ?? 0)));
+  for (const [variantId, cents] of Object.entries(automatic?.lineCents ?? {})) {
+    let want = Math.min(budget, Math.max(0, Math.round(Number(cents) || 0)));
+    budget -= want;
+    // A variant on several lines (Kaching's paid + free lines of one variant) takes it line by line,
+    // an app's gift first (the discount that makes it free is on it in Shopify's cart).
+    const order = lines.map((_, i) => i).sort((a, b) => Number(!!lines[b].appGift) - Number(!!lines[a].appGift));
+    order.forEach((i) => {
+      const l = lines[i];
+      if (want <= 0 || l.gift || productKey(l.variantId) !== productKey(variantId)) return;
+      const take = Math.min(want, value[i] - parts[i]);
+      parts[i] += take;
+      want -= take;
+    });
+    budget += want; // what a line couldn't take goes back to the proportional rest
+  }
+  const allocated = parts.reduce((a, b) => a + b, 0);
+  const rest = allocateDiscount(
+    lines.map((l, i) => ({ ...l, unitPriceCents: value[i] - parts[i], quantity: 1 })),
+    foldedCents - allocated,
+  );
+  return parts.map((p, i) => p + rest[i]);
+}
+
+/**
  * Builds the `orderCreate` input. The merchandise discount is folded into line prices
  * (allocated proportionally) so the Shopify order total always equals what Whop charged,
  * and the code is still recorded on the order.
  */
 export function buildOrderCreateInput(o: PaidOrderInput) {
   const nativeCents = o.discount && !o.discount.freeShipping ? Math.min(o.discount.amountCents, Math.max(0, o.discount.nativeCodeCents ?? 0)) : 0;
-  const allocation = allocateDiscount(o.lines, (o.discount?.amountCents ?? 0) - nativeCents);
-  const lineItems: Record<string, unknown>[] = o.lines.flatMap((l, i) => {
-    const lineTotal = l.unitPriceCents * l.quantity - allocation[i];
-    // Keep exact totals: split into two lines when the discount doesn't divide evenly per unit.
-    const unit = Math.floor(lineTotal / l.quantity);
-    const extra = lineTotal - unit * l.quantity;
-    const base = { variantId: l.variantId, sku: l.sku ?? undefined, requiresShipping: l.requiresShipping };
-    if (extra === 0) return [{ ...base, quantity: l.quantity, priceSet: money(unit, o.currency) }];
+  const allocation = allocateOrderDiscount(o.lines, (o.discount?.amountCents ?? 0) - nativeCents, o.automaticDiscount ?? null);
+  // Keep exact totals: split into two lines when the amount doesn't divide evenly per unit.
+  const priced = (base: Record<string, unknown>, quantity: number, total: number): Record<string, unknown>[] => {
+    const unit = Math.floor(total / quantity);
+    const extra = total - unit * quantity;
+    if (extra === 0) return [{ ...base, quantity, priceSet: money(unit, o.currency) }];
     return [
       { ...base, quantity: extra, priceSet: money(unit + 1, o.currency) },
-      ...(l.quantity - extra > 0 ? [{ ...base, quantity: l.quantity - extra, priceSet: money(unit, o.currency) }] : []),
+      ...(quantity - extra > 0 ? [{ ...base, quantity: quantity - extra, priceSet: money(unit, o.currency) }] : []),
     ];
+  };
+  const lineItems: Record<string, unknown>[] = o.lines.flatMap((l, i) => {
+    const lineTotal = l.unitPriceCents * l.quantity - allocation[i];
+    // Line item properties (hidden "_…" keys included: bundle / personalization apps read them).
+    const properties = l.properties?.length ? l.properties.map((p) => ({ name: p.name, value: p.value })) : undefined;
+    if (l.components?.length) {
+      // Bundle expanded by Shopify: its components are ordered (their stock), sharing the line's amount.
+      const parts = splitOverComponents(lineTotal, l.components);
+      const bundle = [{ name: "Lot", value: `${l.title}${l.variantTitle ? ` — ${l.variantTitle}` : ""}`.slice(0, 255) }, ...(properties ?? [])].slice(0, 25);
+      return l.components.flatMap((c, k) => priced({ variantId: c.variantId, requiresShipping: l.requiresShipping, properties: bundle }, c.quantity, parts[k]));
+    }
+    return priced({ variantId: l.variantId, sku: l.sku ?? undefined, requiresShipping: l.requiresShipping, ...(properties ? { properties } : {}) }, l.quantity, lineTotal);
   });
   for (const a of o.addOns) {
     lineItems.push(
@@ -421,7 +477,7 @@ export function buildOrderCreateInput(o: PaidOrderInput) {
     sourceIdentifier: o.sessionId,
     // The session tag lets a retry find an order that was created but not recorded.
     tags: ["whop-checkout", sessionTag(o.sessionId), ...(o.whopPaymentId ? [paymentTag(o.whopPaymentId)] : []), ...(o.test ? ["test"] : []), ...(o.pickupPoint ? ["point-relais"] : [])],
-    note: `${o.buyerNote ? `Note du client : ${o.buyerNote}\n\n` : ""}Payé via Whop — paiement ${o.whopPaymentId}${
+    note: `${o.buyerNote ? `Note du client : ${o.buyerNote}\n\n` : ""}${o.cart?.note && o.cart.note !== o.buyerNote ? `Note du panier : ${o.cart.note}\n\n` : ""}Payé via Whop — paiement ${o.whopPaymentId}${
       o.pickupPoint ? `\nLivraison en point relais Mondial Relay n°${o.pickupPoint.id} : ${o.pickupPoint.name}, ${o.pickupPoint.address1}, ${o.pickupPoint.zip} ${o.pickupPoint.city}` : ""
     }`,
     customer: {
@@ -433,6 +489,13 @@ export function buildOrderCreateInput(o: PaidOrderInput) {
     },
     test: o.test,
   };
+  // The cart's attributes, as Shopify's own checkout keeps them ("additional details"). Tags and
+  // sourceIdentifier (duplicate lookups) are untouched.
+  if (o.cart?.attributes?.length) order.customAttributes = o.cart.attributes.slice(0, 25).map((a) => ({ key: a.key, value: a.value }));
+  // Prices an app set on the cart (bundles): already in the line prices, stated for the merchant.
+  const appCents = o.lines.reduce((s, l) => s + (l.appPrice ? Math.max(0, l.appPrice.originalUnitCents - l.unitPriceCents) * l.quantity : 0), 0);
+  if (o.automaticTitles?.length) order.note = `${order.note} — remises automatiques Shopify : ${o.automaticTitles.join(" + ").slice(0, 300)}`;
+  if (appCents > 0) order.note = `${order.note} — prix de lot fixés par une app du panier Shopify (−${centsToDecimal(appCents)} ${o.currency} sur les prix catalogue, déjà dans les prix des lignes)`;
   if (o.discount?.freeShipping) {
     // Shopify zeroes every shipping line of a free-shipping code: only when shipping was free as paid,
     // or the order total would drop below what Whop charged.

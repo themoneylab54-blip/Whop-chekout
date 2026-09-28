@@ -1,5 +1,6 @@
 import { clientIp, rateLimit } from "@/lib/ratelimit";
 import { db } from "@/lib/db";
+import { isForeignCheckoutHost } from "@/lib/checkout-domain-check";
 import { json, readJson } from "@/lib/http";
 import { CheckoutError, journalCheckoutFailure, confirmSession, paySchema } from "@/lib/checkout";
 import { after } from "next/server";
@@ -15,9 +16,10 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
     return json({ error: "Merci de vérifier vos informations", issues: parsed.error.issues.map((i) => i.path.join(".")) }, { status: 400 });
   }
   const session = await db.checkoutSession.findUnique({ where: { id }, include: { store: true } });
-  if (!session) return json({ error: "Session introuvable" }, { status: 404 });
+  // Another store's checkout domain never serves this session (see isForeignCheckoutHost).
+  if (!session || (await isForeignCheckoutHost(req, session.store))) return json({ error: "Session introuvable" }, { status: 404 });
   try {
-    const result = await confirmSession(session, parsed.data);
+    const result = await confirmSession(session, parsed.data, { host: req.headers.get("host") });
     after(() => sendPaymentInfoConversions(session.id).catch(() => undefined));
     return json({ ...result, environment: session.store.testMode ? "sandbox" : "production" });
   } catch (err) {

@@ -61,6 +61,7 @@ const ACCESS_HINTS: Record<string, (code: string) => string> = {
   tiktok: (c) => `TikTok a refusé l'accès (${c}) : générez un nouveau jeton d'accès dans Pub & pixels.`,
   ga4: (c) => `Google Analytics 4 a refusé l'envoi (${c}) : vérifiez l'ID de mesure et le secret d'API dans Pub & pixels.`,
   google_ads: (c) => `Google Ads a refusé l'accès (${c}) : reconnectez Google Ads dans Pub & pixels.`,
+  judgeme: (c) => `Judge.me a refusé l'accès (${c}) : collez à nouveau votre jeton privé Judge.me (Personnaliser › bloc Avis clients › Importer depuis Judge.me).`,
 };
 
 /** Providers that need no credential: an access error is never about a key. */

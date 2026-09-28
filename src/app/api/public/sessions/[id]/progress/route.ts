@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { json, readJson } from "@/lib/http";
+import { isForeignSessionHost } from "@/lib/checkout-domain-check";
 import { clientIp, rateLimit } from "@/lib/ratelimit";
 import { route } from "@/lib/route";
 
@@ -15,6 +16,7 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
   if (!(await rateLimit(`progress:ip:${clientIp(req)}`, 60))) return json({ error: "Trop de requêtes" }, { status: 429 });
   const parsed = schema.safeParse(await readJson(req));
   if (!parsed.success) return json({ error: "Requête invalide" }, { status: 400 });
+  if (await isForeignSessionHost(req, id)) return json({ error: "Session introuvable" }, { status: 404 });
   if (parsed.data.step === "email") {
     await db.checkoutSession.updateMany({ where: { id, emailEnteredAt: null, status: { not: "PAID" } }, data: { emailEnteredAt: new Date() } });
   } else {

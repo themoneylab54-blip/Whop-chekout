@@ -64,6 +64,7 @@ export function PickupPicker({
   lang,
   error,
   inputId,
+  lockedBy = null,
 }: {
   sessionId: string;
   country: string;
@@ -77,7 +78,14 @@ export function PickupPicker({
   error?: string;
   /** Focus target of the "missing fields" mechanism. */
   inputId: string;
+  /**
+   * A PayPal payment is pending (the checkout's lock): the id of the note saying so. The point
+   * can't be changed then (search read-only, list and "Change" disabled), and the focusable
+   * controls point at that note (aria-describedby).
+   */
+  lockedBy?: string | null;
 }) {
+  const locked = !!lockedBy;
   const uid = useId();
   // The postcode follows the address form until the buyer types their own here.
   const [ownZip, setOwnZip] = useState<string | null>(null);
@@ -133,6 +141,7 @@ export function PickupPicker({
             : "";
 
   function choose(p: PickupPointView) {
+    if (locked) return;
     onChange(p);
     setEditing(false);
   }
@@ -155,7 +164,10 @@ export function PickupPicker({
           <button
             type="button"
             id={inputId}
+            aria-disabled={locked || undefined}
+            aria-describedby={lockedBy ?? undefined}
             onClick={() => {
+              if (locked) return;
               setEditing(true);
               requestAnimationFrame(() => listRef.current?.querySelector<HTMLInputElement>("input:checked, input[type=radio]")?.focus());
             }}
@@ -173,7 +185,7 @@ export function PickupPicker({
             aria-label={L.pickupTitle}
             onSubmit={(e) => {
               e.preventDefault();
-              setSearchKey((k) => k + 1);
+              if (!locked) setSearchKey((k) => k + 1);
             }}
           >
             <label htmlFor={inputId} className="sr-only">
@@ -187,12 +199,13 @@ export function PickupPicker({
               autoComplete="postal-code"
               inputMode={country === "FR" || country === "DE" || country === "ES" || country === "IT" ? "numeric" : undefined}
               aria-invalid={error ? true : undefined}
-              aria-describedby={`${uid}-status${error ? ` ${inputId}-error` : ""}`}
+              aria-describedby={`${uid}-status${error ? ` ${inputId}-error` : ""}${lockedBy ? ` ${lockedBy}` : ""}`}
+              readOnly={locked}
               onChange={(e) => setOwnZip(e.target.value.slice(0, 12))}
             />
             <button
               type="submit"
-              disabled={!supported || zip.length < 2}
+              disabled={locked || !supported || zip.length < 2}
               className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-[var(--radius)] border border-neutral-300 bg-white px-4 text-sm font-medium text-neutral-900 disabled:text-neutral-500"
             >
               <Search className="h-4 w-4" aria-hidden />
@@ -227,6 +240,7 @@ export function PickupPicker({
                         type="radio"
                         name={`${uid}-point`}
                         checked={checked}
+                        disabled={locked}
                         onChange={() => choose(p)}
                         className="mt-0.5 h-5 w-5 shrink-0 accent-[var(--accent)]"
                       />

@@ -137,9 +137,10 @@ export default async function OrderDetailPage({
   const sp = await searchParams;
   const s = await db.checkoutSession.findFirst({ where: { id: sessionId, storeId }, include: { store: true, upsells: true, protectionClaims: { orderBy: { createdAt: "asc" }, include: { photos: { select: { id: true, mime: true, size: true } } } } } });
   if (!s) notFound();
-  const [events, quote] = await Promise.all([
+  const [events, quote, cartSnapshot] = await Promise.all([
     db.eventLog.findMany({ where: { sessionId }, orderBy: { createdAt: "asc" } }),
     s.paidQuoteId ? db.checkoutQuote.findUnique({ where: { id: s.paidQuoteId } }) : null,
+    db.cartSnapshot.findUnique({ where: { sessionId } }),
   ]);
   const money = (c: number) => formatCents(c, s.currency);
   const lines = s.lines as unknown as CartLine[];
@@ -344,7 +345,15 @@ export default async function OrderDetailPage({
                     <span className="text-xs text-zinc-500">
                       {l.variantTitle ? `${l.variantTitle} · ` : ""}
                       {l.quantity} × {money(l.unitPriceCents)}
+                      {l.appPrice ? ` (prix de lot d'app, catalogue ${money(l.appPrice.originalUnitCents)})` : ""}
                     </span>
+                    {/* Line item properties as sent to Shopify (hidden "_…" app keys dimmed). */}
+                    {(l.properties ?? []).map((p) => (
+                      <span key={p.name} className={`block truncate text-xs ${p.name.startsWith("_") ? "text-zinc-400" : "text-zinc-600"}`} title={p.value}>
+                        {p.name} : {p.value}
+                      </span>
+                    ))}
+                    {l.components?.length ? <span className="block text-xs text-zinc-500">Lot commandé en {l.components.length} composant(s)</span> : null}
                   </span>
                   <span className="text-sm font-medium tabular-nums">{money(l.unitPriceCents * l.quantity)}</span>
                 </li>
@@ -367,6 +376,16 @@ export default async function OrderDetailPage({
               </div>
               {s.refundedCents > 0 && <Row k="Remboursé" v={`−${money(s.refundedCents)}`} />}
             </dl>
+            {cartSnapshot && (
+              // Redacted /cart.js (apps' lines, amounts, hidden keys), kept 7 days: to send to support.
+              <details className="mt-3 border-t border-zinc-100 pt-3 text-xs text-zinc-600">
+                <summary className="cursor-pointer">
+                  Panier Shopify (diagnostic, 7 jours){cartSnapshot.apps.length ? ` · apps : ${cartSnapshot.apps.join(", ")}` : ""}
+                  {cartSnapshot.unknownKeys.length ? ` · clés inconnues : ${cartSnapshot.unknownKeys.join(", ")}` : ""}
+                </summary>
+                <pre className="mt-2 max-h-80 overflow-auto rounded bg-zinc-50 p-2 font-mono text-[11px] whitespace-pre-wrap">{JSON.stringify(cartSnapshot.data, null, 2)}</pre>
+              </details>
+            )}
           </Card>
 
           {s.upsells.length > 0 && (

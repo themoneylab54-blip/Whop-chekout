@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { json } from "@/lib/http";
+import { isForeignCheckoutHost } from "@/lib/checkout-domain-check";
 import { log } from "@/lib/log";
 import { PICKUP_COUNTRIES, pickupConfigured, searchPickupPoints } from "@/lib/pickup";
 import { clientIp, rateLimit } from "@/lib/ratelimit";
@@ -19,8 +20,9 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const url = new URL(req.url);
   const parsed = query.safeParse(Object.fromEntries(url.searchParams));
   if (!parsed.success) return json({ error: "Code postal ou pays invalide", code: "pickup_invalid" }, { status: 400 });
-  const session = await db.checkoutSession.findUnique({ where: { id }, select: { store: { select: { mondialRelayEnseigne: true, mondialRelayKey: true } } } });
-  if (!session) return json({ error: "Session introuvable" }, { status: 404 });
+  const session = await db.checkoutSession.findUnique({ where: { id }, select: { store: { select: { id: true, checkoutDomain: true, mondialRelayEnseigne: true, mondialRelayKey: true } } } });
+  // Another store's checkout domain never serves this session (see isForeignCheckoutHost).
+  if (!session || (await isForeignCheckoutHost(req, session.store))) return json({ error: "Session introuvable" }, { status: 404 });
   if (!pickupConfigured(session.store)) return json({ error: "Retrait en point relais indisponible", code: "pickup_unavailable" }, { status: 409 });
   try {
     const points = await searchPickupPoints(session.store, parsed.data);

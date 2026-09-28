@@ -74,20 +74,42 @@ export async function handleEvent(type: string, data: Record<string, unknown>, s
       }
       const sessionId = await sessionIdFor(data, storeId);
       if (sessionId) {
+        // A late failure of an earlier attempt never erases a newer one (a "Pay" click or a PayPal
+        // window after this payment was created): the session keeps that attempt's state (PAYING,
+        // in flight). Unknown creation time: counted as the latest (as before). The rule, per time:
+        // - payClickedAt (our confirm, always BEFORE the payment it creates): newer only when later
+        //   than created_at + 1 s. The 1 s covers Whop's second-precision (truncated) created_at, so
+        //   the current attempt's own failure is never "older"; a retry clicked 2 s after the first
+        //   payment's creation is newer, so that first failure can't mark FAILED under the retry.
+        // - paypalWindowAt (a window from Whop's own button: the payment is created by that click,
+        //   our stamp lands AFTER it, once the page lost the focus and the POST arrived): newer only
+        //   when later than created_at + 5 s. (Our own PayPal confirm stamps it equal to its click,
+        //   which the strict rule above already covers.)
+        // - paypalBeatAt (heartbeat / late popup): liveness only, never an attempt, never compared.
+        const createdAt = paymentCreatedAt(data);
+        const notNewer: Prisma.CheckoutSessionWhereInput = createdAt
+          ? {
+              AND: [
+                { OR: [{ payClickedAt: null }, { payClickedAt: { lte: new Date(createdAt.getTime() + 1000) } }] },
+                { OR: [{ paypalWindowAt: null }, { paypalWindowAt: { lte: new Date(createdAt.getTime() + 5000) } }] },
+              ],
+            }
+          : {};
         const changed = await db.checkoutSession.updateMany({
-          where: { id: sessionId, status: { not: "PAID" } },
+          where: { id: sessionId, status: { not: "PAID" }, ...notNewer },
           data: { status: "FAILED", paymentFailedAt: new Date() },
         });
+        const reason = `${typeof data.failure_message === "string" && data.failure_message ? ` : ${data.failure_message}` : ""}${
+          typeof data.payment_method_type === "string" ? ` (${data.payment_method_type})` : ""
+        }`;
         // In the order's timeline: why the bank refused (the buyer can still retry).
         if (changed.count) {
-          await recordEvent({
-            storeId,
-            sessionId,
-            kind: "payment.failed",
-            message: `Paiement refusé${typeof data.failure_message === "string" && data.failure_message ? ` : ${data.failure_message}` : ""}${
-              typeof data.payment_method_type === "string" ? ` (${data.payment_method_type})` : ""
-            }`,
-          });
+          await recordEvent({ storeId, sessionId, kind: "payment.failed", message: `Paiement refusé${reason}` });
+        } else if (createdAt && (await db.checkoutSession.count({ where: { id: sessionId, status: { not: "PAID" } } }))) {
+          // A real decline all the same: counted by the analytics (paymentFailedAt, first one only),
+          // the status of the newer attempt left alone.
+          await db.checkoutSession.updateMany({ where: { id: sessionId, status: { not: "PAID" }, paymentFailedAt: null }, data: { paymentFailedAt: new Date() } });
+          await recordEvent({ storeId, sessionId, kind: "payment.failed", message: `Paiement refusé${reason} — tentative antérieure, un nouvel essai est en cours.` });
         }
       }
       return null;
@@ -283,6 +305,16 @@ async function sessionIdFor(data: Record<string, unknown>, storeId: string): Pro
     select: { id: true },
   });
   return fromMeta || configId ? (session?.id ?? null) : null;
+}
+
+/**
+ * When Whop created the payment (`created_at`: an ISO date, or Unix seconds/ms), null when absent
+ * or unreadable. Pure.
+ */
+export function paymentCreatedAt(data: Record<string, unknown>): Date | null {
+  const v = data.created_at;
+  const ms = typeof v === "number" && Number.isFinite(v) ? (v < 1e12 ? v * 1000 : v) : typeof v === "string" && v ? (/^\d+$/.test(v) ? Number(v) * (v.length <= 10 ? 1000 : 1) : Date.parse(v)) : NaN;
+  return Number.isFinite(ms) && ms > 0 ? new Date(ms) : null;
 }
 
 /** Keeps the raw event for audit and replay (bounded size; a truncated one can't be replayed). */

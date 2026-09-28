@@ -245,16 +245,30 @@
   function nativeCheckout(items) {
     bypass = true;
     overlay(false);
-    if (items && items.some(function (i) { return i.selling_plan; })) {
-      // A subscription bought with "buy now": add it with its plan, then Shopify's checkout.
-      fetch("/cart/add.js", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "same-origin",
-        body: JSON.stringify({ items: items.map(function (i) { return { id: Number(i.variant_id), quantity: i.quantity, selling_plan: Number(i.selling_plan) }; }) }),
-      }).finally(function () {
-        location.href = "/checkout";
-      });
+    if (items && items.some(function (i) { return i.selling_plan || i.properties; })) {
+      // A subscription or a personalized / bundle item bought with "buy now": add it with its plan
+      // and properties (a cart permalink would lose them), then Shopify's checkout. The cart is
+      // emptied first: "buy now" buys just this item, not whatever the cart already held.
+      fetch("/cart/clear.js", { method: "POST", credentials: "same-origin" })
+        .catch(function () {})
+        .then(function () {
+          return fetch("/cart/add.js", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "same-origin",
+            body: JSON.stringify({
+              items: items.map(function (i) {
+                var it = { id: Number(i.variant_id), quantity: i.quantity };
+                if (i.selling_plan) it.selling_plan = Number(i.selling_plan);
+                if (i.properties) it.properties = i.properties;
+                return it;
+              }),
+            }),
+          });
+        })
+        .finally(function () {
+          location.href = "/checkout";
+        });
     } else if (items) {
       // Buy-now fallback: Shopify cart permalink for just these items.
       location.href =
@@ -290,6 +304,53 @@
     });
   }
 
+  /*
+   * Bundle / personalization apps. Line item properties (hidden "_…" keys included) go with the
+   * line; the server re-reads the cart itself for prices (never these figures). Lines an app may
+   * have priced (bundle components, a final price that isn't the plain price minus its discounts)
+   * are flagged so the server checks them, or sends the buyer to Shopify's checkout.
+   */
+  function lineProperties(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    var out = {};
+    var n = 0;
+    Object.keys(raw).forEach(function (k) {
+      var v = raw[k];
+      if (n >= 25 || v == null || !k) return;
+      if (typeof v === "object") {
+        try {
+          v = JSON.stringify(v);
+        } catch (e) {
+          return;
+        }
+      }
+      // Byte for byte: hidden app keys ("_…", "__kaching_bundles" JSON) are kept whole, or left out
+      // when over 2000 characters (a cut JSON would be invalid app data).
+      v = String(v);
+      if (String(k).charAt(0) === "_" && v.length > 2000) return log("hidden property too long, left out:", String(k).slice(0, 60));
+      out[String(k).slice(0, 255)] = String(k).charAt(0) === "_" ? v : v.slice(0, 255);
+      n++;
+    });
+    return n ? out : null;
+  }
+
+  function appPriced(cart) {
+    var items = cart.items || [];
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var comps = it.item_components || it.components;
+      if (it.has_components === true || (Array.isArray(comps) && comps.length)) return true;
+      if (typeof it.final_line_price !== "number") continue;
+      var allocated = 0;
+      (it.line_level_discount_allocations || []).forEach(function (a) {
+        allocated += Number((a && a.amount) || 0);
+      });
+      if (typeof it.original_line_price === "number" && it.final_line_price + allocated !== it.original_line_price) return true;
+      if (typeof it.price === "number" && typeof it.original_price === "number" && it.price !== it.original_price) return true;
+    }
+    return false;
+  }
+
   function hasAutomaticDiscounts(cart) {
     var apps = cart.cart_level_discount_applications || [];
     for (var i = 0; i < apps.length; i++) if (apps[i] && apps[i].type === "automatic") return true;
@@ -299,6 +360,117 @@
       for (var k = 0; k < allocs.length; k++) if (allocs[k] && allocs[k].discount_application && allocs[k].discount_application.type === "automatic") return true;
     }
     return false;
+  }
+
+  // The session POST goes to the store's checkout domain (checkout.<shop>.com). If that domain can't be
+  // reached from this browser (DNS not propagated here, network filter, certificate being renewed), the
+  // same request goes to the app's own API (where this script comes from) before Shopify's checkout.
+  // Reachability is decided up front by a light ping (started when the config loads, 3 s max), so the
+  // POST itself never times out on a slow cart pricing; and the POST carries a random key of the click,
+  // so a retry on the app's API gets the session the first request created (one session, one conversion).
+  // The ping fetches a static file served by the CDN (never a function: no cold start, no cost per
+  // pageview), and its answer is kept for 10 minutes in the tab (one ping per visit, not per page).
+  var viaApp = false;
+  var domainPing = null;
+  var PING_ASSET = "/checkout-icon.svg";
+  var PING_CACHE_MS = 10 * 60 * 1000;
+  function sessionsUrl() {
+    return API + "/api/public/sessions";
+  }
+  function cachedPing(origin) {
+    try {
+      var v = JSON.parse(sessionStorage.getItem("whopco_ping") || "null");
+      if (v && v.origin === origin && typeof v.ok === "boolean" && Date.now() - v.at < PING_CACHE_MS && Date.now() >= v.at) return v.ok;
+    } catch (e) {
+      /* storage blocked: ping again */
+    }
+    return null;
+  }
+  function pingCheckoutDomain() {
+    if (!config || !config.sessionEndpoint || config.sessionEndpoint === sessionsUrl()) return;
+    var origin;
+    try {
+      origin = new URL(config.sessionEndpoint).origin;
+    } catch (e) {
+      return;
+    }
+    var known = cachedPing(origin);
+    if (known !== null) {
+      domainPing = Promise.resolve(known);
+      return;
+    }
+    // Opaque (no-cors) answer: any HTTP answer means the domain is reachable; only a network error isn't.
+    var ping = fetch(origin + PING_ASSET, { mode: "no-cors", cache: "no-store", credentials: "omit" }).then(
+      function () {
+        return true;
+      },
+      function () {
+        return false;
+      }
+    );
+    var timeout = new Promise(function (resolve) {
+      setTimeout(function () {
+        resolve(false);
+      }, 3000);
+    });
+    domainPing = Promise.race([ping, timeout]).then(function (ok) {
+      log(ok ? "checkout domain reachable" : "checkout domain unreachable, the app's API will be used");
+      try {
+        sessionStorage.setItem("whopco_ping", JSON.stringify({ origin: origin, ok: ok, at: Date.now() }));
+      } catch (e) {
+        /* storage blocked */
+      }
+      return ok;
+    });
+  }
+  function requestKey() {
+    try {
+      var b = new Uint8Array(16);
+      crypto.getRandomValues(b);
+      return Array.prototype.map
+        .call(b, function (x) {
+          return ("0" + x.toString(16)).slice(-2);
+        })
+        .join("");
+    } catch (e) {
+      return (Date.now().toString(36) + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)).slice(0, 40);
+    }
+  }
+  function postSession(init) {
+    var direct = sessionsUrl();
+    viaApp = false;
+    if (config.sessionEndpoint === direct) return fetch(direct, init);
+    return (domainPing || Promise.resolve(true)).then(function (reachable) {
+      if (!reachable) {
+        viaApp = true;
+        return fetch(direct, init);
+      }
+      // Safety net only (a domain that stops answering mid-request): long enough for a cold cart
+      // pricing, and the request key makes the retry return the same session anyway.
+      var first = init;
+      if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+        first = Object.assign({}, init, { signal: AbortSignal.timeout(20000) });
+      }
+      return fetch(config.sessionEndpoint, first).catch(function (err) {
+        log("checkout domain unreachable, retrying on the app:", err && err.message);
+        viaApp = true;
+        return fetch(direct, init);
+      });
+    });
+  }
+
+  // After that fallback, the checkout opens on the app's host too (via=app keeps it there).
+  function onAppHost(url) {
+    if (!viaApp) return url;
+    try {
+      var u = new URL(url);
+      if (u.origin === API) return url;
+      var app = new URL(u.pathname + u.search + u.hash, API);
+      app.searchParams.set("via", "app");
+      return app.href;
+    } catch (e) {
+      return url;
+    }
   }
 
   function goToCheckout(items) {
@@ -319,7 +491,8 @@
         if (excluded(cartItems)) throw new Error("excluded product");
         // Subscriptions (selling plans) and gift cards stay on Shopify's checkout, whole cart.
         if (unsupported(cartItems)) throw new Error("subscription or gift card");
-        return fetch(config.sessionEndpoint, {
+        var key = requestKey();
+        return postSession({
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -329,6 +502,8 @@
               var plan = sellingPlan(i);
               if (plan) item.selling_plan = plan;
               if (i.gift_card === true) item.gift_card = true;
+              var props = lineProperties(i.properties);
+              if (props) item.properties = props;
               return item;
             }),
             returnUrl: location.origin + "/",
@@ -339,12 +514,19 @@
             // The server re-reads this cart (by its token) to keep the automatic discounts Shopify computed.
             cartToken: typeof cart.token === "string" ? cart.token : undefined,
             automaticDiscounts: hasAutomaticDiscounts(cart),
+            appPricing: appPriced(cart),
+            // Cart note and attributes, copied to the order (the server's own re-read wins).
+            note: typeof cart.note === "string" && cart.note ? cart.note.slice(0, 5000) : undefined,
+            attributes: lineProperties(cart.attributes) || undefined,
+            // Same key on the retry (app's API): the server answers the same session.
+            requestKey: key,
           }),
         });
       })
       .then(function (res) {
         return res.json().then(function (body) {
           if (!res.ok || !body.url) throw new Error(body.error || "session failed");
+          body.url = onAppHost(body.url);
           keepVisitorId(body.visitorId);
           log("redirect", body.url);
           try {
@@ -374,6 +556,17 @@
     var item = { variant_id: String(id), quantity: qty, handle: location.pathname.split("/products/")[1] || "" };
     var plan = fd.get("selling_plan");
     if (plan) item.selling_plan = String(plan);
+    // Personalization fields of the product form ("properties[Gravure]").
+    var props = {};
+    var hasProps = false;
+    fd.forEach(function (v, k) {
+      var m = /^properties\[(.+)\]$/.exec(k);
+      if (m && typeof v === "string" && v !== "") {
+        props[m[1]] = v;
+        hasProps = true;
+      }
+    });
+    if (hasProps) item.properties = lineProperties(props);
     return [item];
   }
 
@@ -474,6 +667,7 @@
     .then(function (c) {
       config = c;
       log("config", c);
+      if (c && c.enabled) pingCheckoutDomain();
       if (!DEBUG) return;
       if (!c.enabled) return badge("Whop Checkout : désactivé (checkout Shopify natif)", false);
       badge("Whop Checkout : interception active ✓", true);

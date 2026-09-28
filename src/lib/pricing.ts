@@ -23,7 +23,46 @@ export type CartLine = {
   gift?: boolean;
   /** Shopify gift card product (sold on Shopify's checkout only). */
   giftCard?: boolean;
+  /**
+   * Line item properties of the Shopify cart line (personalization, bundle apps' hidden `_…` keys),
+   * copied to the Shopify order line. Never priced: they change nothing to the amounts here.
+   */
+  properties?: LineProperty[];
+  /**
+   * Unit price an app set on the Shopify cart (Cart Transform: bundle / "merge" modes), lower than
+   * the variant's price, as re-read server-side from /cart.js. `unitPriceCents` is already that
+   * price; `originalUnitCents` is the variant's own price (shown struck through, journaled).
+   */
+  appPrice?: { unitCents: number; originalUnitCents: number };
+  /** An app's free gift from the Shopify cart (Kaching gift / BXGY, BOGOS): never counts for the checkout's own offers. */
+  appGift?: boolean;
+  /**
+   * A bundle / offer app's line Shopify discounts automatically (Kaching discount-function mode: an
+   * app's hidden key plus an automatic allocation): already an offer, left out of the checkout's own.
+   */
+  appDiscounted?: boolean;
+  /**
+   * Bundle parent expanded by Shopify (Cart Transform): the order gets these component variants
+   * (inventory), sharing the line's paid amount in proportion to `weightCents` (their prices in
+   * the cart). `quantity` is the component's total quantity for the whole line.
+   */
+  components?: LineComponent[];
+  /** Quantity fixed by the Shopify cart (app pricing, properties, bundle): changed from the cart only. */
+  locked?: boolean;
+  /**
+   * Shopify's ProductVariant.requiresComponents: a bundle parent sold only through its components
+   * (Shopify Bundles, Cart Transform). Without components from the cart it can't be ordered here.
+   */
+  requiresComponents?: boolean;
 };
+
+export type LineProperty = { name: string; value: string };
+export type LineComponent = { variantId: string; quantity: number; weightCents: number; title?: string | null };
+
+/** Properties shown to the buyer: Shopify hides the ones whose name starts with "_". Pure. */
+export function visibleProperties(l: Pick<CartLine, "properties">): LineProperty[] {
+  return (l.properties ?? []).filter((p) => p && typeof p.name === "string" && !p.name.startsWith("_") && typeof p.value === "string" && p.value !== "");
+}
 
 export type RateInput = {
   id: string;
@@ -479,6 +518,14 @@ export function breakDeal(b: QuantityBreak): BreakDeal {
 }
 
 /**
+ * Lines the checkout's own quantity breaks and gifts count and discount: an app's bundle price or
+ * gift already is an offer (no combination rules with ours: counting them would discount twice). Pure.
+ */
+export function offerBaseLines(lines: CartLine[]): CartLine[] {
+  return lines.filter((l) => !l.gift && !l.appPrice && !l.appGift && !l.appDiscounted);
+}
+
+/**
  * Scoped version of quantityBreakFor: each tier counts its own items. The reached tier
  * with the biggest discount applies; `next` is the closest better tier and `missing`
  * the items still to add (in its scope).
@@ -585,8 +632,9 @@ export function computeTotals(input: {
   const sub = subtotal(input.lines);
   const needsShipping = input.lines.some((l) => l.requiresShipping);
   const automaticCents = Math.min(sub, Math.max(0, Math.round(input.automaticDiscountCents ?? 0)));
-  const tier = quantityBreakForLines(input.quantityBreaks ?? [], input.lines).current;
-  const tierCents = tier ? breakDiscountCents(tier, input.lines) : 0;
+  const offerLines = offerBaseLines(input.lines);
+  const tier = quantityBreakForLines(input.quantityBreaks ?? [], offerLines).current;
+  const tierCents = tier ? breakDiscountCents(tier, offerLines) : 0;
 
   // The discounts present, with their stacking rules. Order of application: Shopify's automatic
   // discounts, then the quantity break, then the code on what remains (never beyond the subtotal).
@@ -676,7 +724,7 @@ export function eligibleRemaining(
     } else take(buyer, automaticCents);
   }
   if (volumeCents > 0 && tier) {
-    const scoped = new Set(scopedLines(lines, tier.productIds));
+    const scoped = new Set(scopedLines(offerBaseLines(lines), tier.productIds));
     take(buyer.filter((i) => scoped.has(lines[i])), volumeCents);
   }
   const eligible = new Set(eligibleVariantIds.map(productKey));

@@ -26,8 +26,13 @@ import {
   saveSettingsBatchAction,
   saveSettingsAction,
   saveShieldAction,
+  saveCheckoutDomainAction,
   testAlertAction,
+  verifyCheckoutDomainAction,
 } from "../../../../actions";
+import { CheckoutDomainCard } from "@/components/dashboard/CheckoutDomainCard";
+import { env } from "@/lib/env";
+import { vercelConfig } from "@/lib/vercel-domains";
 import { SecretInput } from "@/components/dashboard/SecretInput";
 import { ConfirmButton } from "@/components/dashboard/ConfirmButton";
 import { CostsSettingsCard } from "@/components/dashboard/CostsSettingsCard";
@@ -96,6 +101,17 @@ export default async function SettingsPage({
                 </div>
               </DirtyForm>
             </Card>
+          </Anchor>
+
+          <Anchor id="domaine">
+            <CheckoutDomainCard
+              store={store}
+              appHost={new URL(env.appUrl).hostname}
+              vercelAuto={!!vercelConfig()}
+              timeZone={tzOf(store)}
+              saveAction={saveCheckoutDomainAction.bind(null, store.id)}
+              verifyAction={verifyCheckoutDomainAction.bind(null, store.id)}
+            />
           </Anchor>
 
           <Anchor id="checkout">
@@ -444,6 +460,7 @@ export default async function SettingsPage({
 
 const SECTIONS: Section[] = [
   { id: "boutique", label: "Boutique" },
+  { id: "domaine", label: "Domaine du checkout" },
   { id: "checkout", label: "Options du checkout" },
   { id: "reseau", label: "Réseau" },
   { id: "secours", label: "Checkout de secours" },
@@ -469,6 +486,7 @@ const CLONED = [
 ];
 const NOT_CLONED = [
   "Connexions Shopify et Whop",
+  "Domaine du checkout",
   "Jetons des pixels (Meta, TikTok, GA4)",
   "Identifiants Mondial Relay",
   "Libellé bancaire",

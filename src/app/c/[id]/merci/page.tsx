@@ -19,6 +19,7 @@ import { AdPixels } from "@/components/checkout/AdPixels";
 import { labelsFor } from "@/components/checkout/i18n";
 import { localizeBlock, localizeRate, recordText } from "@/components/checkout/localize";
 import { buyerIcons, checkoutLang, CheckoutHtmlLang } from "@/app/c/lang";
+import { keepOnCheckoutHost } from "@/app/c/host";
 import { crossRate, ecbRates } from "@/lib/fx";
 import { localRatesFor, type LocalRates } from "@/components/checkout/localCurrency";
 
@@ -77,6 +78,8 @@ export default async function ThankYouPage({ params, searchParams }: PageProps) 
   // Express wallets (Apple/Google Pay) land here before the webhook marks the session:
   // show "processing" for any session that reached a Whop checkout.
   if (!session || (session.status === "OPEN" && !session.whopCheckoutId)) notFound();
+  // Whop's return parameters are kept (payment status on the store's own domain).
+  await keepOnCheckoutHost(session.store, `/c/${id}/merci`, (await searchParams) as Record<string, string | string[] | undefined>);
 
   const design = await designFor(session.store, session);
   const storeTheme = loadTheme(design.theme, session.store.name);

@@ -2,6 +2,7 @@ import { z } from "zod";
 import { clientIp, rateLimit } from "@/lib/ratelimit";
 import { db } from "@/lib/db";
 import { json, readJson } from "@/lib/http";
+import { isForeignCheckoutHost } from "@/lib/checkout-domain-check";
 import { route } from "@/lib/route";
 import { after } from "next/server";
 import { deliverLoginCode, loginCodeEnabled, normalEmail } from "@/lib/returning";
@@ -24,7 +25,7 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
     (await rateLimit(`otp:e:${email}`, 3, 10 * 60_000));
   if (!allowed) return json({ error: "Trop de demandes, réessayez dans quelques minutes.", code: "rate_limited" }, { status: 429 });
   const session = await db.checkoutSession.findUnique({ where: { id }, include: { store: true } });
-  if (!session || session.status === "PAID") return json({ error: "Session introuvable" }, { status: 404 });
+  if (!session || session.status === "PAID" || (await isForeignCheckoutHost(req, session.store))) return json({ error: "Session introuvable" }, { status: 404 });
   if (!(await loginCodeEnabled(session.store))) return json({ error: "Indisponible", code: "disabled" }, { status: 404 });
   // Same answer, same timing for every e-mail: the customer lookup, the code and the e-mail run
   // after the response (a slow answer would tell that this e-mail has an order here).

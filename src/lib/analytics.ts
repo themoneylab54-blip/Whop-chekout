@@ -3,6 +3,7 @@ import { stopForTime } from "./deadline";
 import { Prisma } from "@prisma/client";
 import { db } from "./db";
 import { recordEvent } from "./log";
+import { lockStore, withoutMissingMedia } from "./media";
 import { CAMPAIGN_ROWS, DETAIL_PREFIX, spendCoverage, spendLevel } from "./adspend";
 import { addDays, DEFAULT_TZ, tzOf, zonedDay, zonedDayStart, zonedHour } from "./time";
 import { sqlTimeZone } from "./time-db";
@@ -3225,25 +3226,20 @@ export async function autoPromoteExperiments(deadline = Infinity): Promise<numbe
     const publishedDuring = !!store?.publishedAt && store.publishedAt > exp.startedAt;
     let applied = false;
     if (bWins && !publishedDuring) {
-      const v = await db.layoutVersion.findUnique({ where: { id: exp.versionId } });
-      if (v) {
-        await db.$transaction([
-          db.layoutVersion.create({
-            data: {
-              storeId: exp.storeId,
-              label: `Gagnant « ${exp.name} » (${new Date().toLocaleDateString("fr-FR", { timeZone: tzOf(store) })})`.slice(0, 120),
-              theme: v.theme as Prisma.InputJsonValue,
-              checkoutLayout: v.checkoutLayout as Prisma.InputJsonValue,
-              thankYouLayout: v.thankYouLayout as Prisma.InputJsonValue,
-            },
-          }),
-          db.store.update({
-            where: { id: exp.storeId },
-            data: { theme: v.theme as Prisma.InputJsonValue, checkoutLayout: v.checkoutLayout as Prisma.InputJsonValue, thankYouLayout: v.thankYouLayout as Prisma.InputJsonValue, publishedAt: new Date() },
-          }),
-        ]);
-        applied = true;
-      }
+      // Under the Store row lock image deletes take, with any image deleted meanwhile emptied: the
+      // winner never goes live with a broken image.
+      applied = await db.$transaction(async (tx) => {
+        await lockStore(tx, exp.storeId);
+        const v = await tx.layoutVersion.findUnique({ where: { id: exp.versionId } });
+        if (!v) return false;
+        const d = await withoutMissingMedia(tx, exp.storeId, { theme: v.theme, checkoutLayout: v.checkoutLayout, thankYouLayout: v.thankYouLayout });
+        const design = { theme: d.theme as Prisma.InputJsonValue, checkoutLayout: d.checkoutLayout as Prisma.InputJsonValue, thankYouLayout: d.thankYouLayout as Prisma.InputJsonValue };
+        await tx.layoutVersion.create({
+          data: { storeId: exp.storeId, label: `Gagnant « ${exp.name} » (${new Date().toLocaleDateString("fr-FR", { timeZone: tzOf(store) })})`.slice(0, 120), ...design },
+        });
+        await tx.store.update({ where: { id: exp.storeId }, data: { ...design, publishedAt: new Date() } });
+        return true;
+      });
     }
     await db.experiment.update({ where: { id: exp.id }, data: { status: "STOPPED", endedAt: new Date() } });
     const lift = new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 1, signDisplay: "always" }).format((metric === "profit" ? verdict.ppvLift : verdict.rpvLift) * 100);

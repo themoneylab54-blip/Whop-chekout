@@ -86,6 +86,9 @@ model Store {
   telegramBotToken String? // encrypted
   telegramChatId   String?
 
+  // --- Reviews ("Avis clients" block import) ---
+  judgemeApiToken String? // encrypted, Judge.me private API token
+
   // --- Dispute shield ---
   pushTracking          Boolean @default(true)
   autoDisputeEvidence   Boolean @default(true)
@@ -165,10 +168,24 @@ model Store {
 
   // --- Round 14 (migration 0023_correctness_round14) ---
   // Country the merchant is established in (VAT of unknown destinations, EU sales under the OSS threshold, ad invoices)
-  homeCountry               String   @default("FR")
+  homeCountry            String   @default("FR")
   // Whether Shopify's asyncUsageCount counts the orders this app creates (orderCreate): null = not calibrated yet
   // (a Shopify code's uses = Shopify's count + this app's ledger), true = max of both, false = sum (measured)
-  shopifyCountsApiOrders    Boolean?
+  shopifyCountsApiOrders Boolean?
+
+  // --- Checkout domain (migration 0026_checkout_domains) ---
+  // Hostname the store's checkout is served on (checkout.seyuna.com, seyuna.example-operator.com…):
+  // lowercase, no scheme/port/path. Buyer URLs use it only once verified (else APP_URL).
+  checkoutDomain             String?   @unique
+  // Last successful check that https://<domain>/.well-known/whop-checkout-ping answers this store's token
+  checkoutDomainVerifiedAt   DateTime?
+  // Last failed check, "<kind>:<message in French>" (kind: dns, tls, timeout, mismatch, http, vercel)
+  checkoutDomainError        String?
+  // Last check (throttles the tick's re-checks)
+  checkoutDomainCheckedAt    DateTime?
+  // Not verified since (saved, or lost): the tick's re-checks back off after 48 h, then 7 days
+  // (migration 0030_checkout_domain_pending_since). Null once verified.
+  checkoutDomainPendingSince DateTime?
 
   shippingRates    ShippingRate[]
   discounts        DiscountCode[]
@@ -186,6 +203,8 @@ model Store {
   externalOrders   ExternalOrder[]
   shopifyCustomers ShopifyCustomer[]
   productVat       ProductVat[]
+  // Images uploaded in the builder (migration 0028_media_uploads)
+  media            StoreMedia[]
 }
 
 model ShippingRate {
@@ -326,6 +345,13 @@ model CheckoutSession {
   // Funnel
   preparedAt      DateTime? // payment form ready
   payClickedAt    DateTime? // buyer clicked "Pay"
+  // A PayPal window opened from Whop's own button (paypal-window route): keeps the payment in
+  // flight without touching payClickedAt (the order timeline's "Pay" click)
+  paypalWindowAt  DateTime?
+  // Liveness only: the heartbeat of an open PayPal window (and a late popup of ours after a
+  // "blocked" verdict). Keeps the payment in flight (inFlightMethod) but is never an attempt: the
+  // payment.failed webhook's stale check ignores it. Lowered when the window closes.
+  paypalBeatAt    DateTime?
   termsAcceptedAt DateTime?
 
   // Created while the store was in test mode (excluded from analytics by default)
@@ -395,12 +421,12 @@ model CheckoutSession {
   trackingGaveUpAt         DateTime?
 
   // Attribution & ads (fbp, fbc, ttp, ttclid, marketing consent…)
-  tracking      Json?
-  clientIp      String?
-  userAgent     String?
-  pixelSentAt   DateTime? // every configured platform accepted the purchase
-  pixelStatus   Json? // { meta: "sent" | "failed", tiktok: … }
-  pixelAttempts Int       @default(0)
+  tracking           Json?
+  clientIp           String?
+  userAgent          String?
+  pixelSentAt        DateTime? // every configured platform accepted the purchase
+  pixelStatus        Json? // { meta: "sent" | "failed", tiktok: … }
+  pixelAttempts      Int       @default(0)
   // Next background retry of a failed purchase event (backoff), null = due
   pixelNextAttemptAt DateTime?
 
@@ -428,6 +454,10 @@ model CheckoutSession {
   cartToken               String?
   // Automatic discounts Shopify computed for the cart, verified server-side: { lines, orderCents, titles, items, at }
   cartDiscounts           Json?
+  // Shopify cart's note and attributes (re-read from /cart.js), copied to the order: { note?, attributes?: [{ key, value }] }
+  cartContext             Json?
+  // Redacted /cart.js of a cart with app lines (bundle / gift / upsell apps), kept 7 days for support
+  cartSnapshot            CartSnapshot?
   // Currency the buyer is charged in when it isn't the shop's (local currency option), and its rate
   chargeCurrency          String?
   chargeFxRate            Float?
@@ -457,7 +487,12 @@ model CheckoutSession {
   // Buyer's orders on the Shopify store before this one (customer.numberOfOrders at order
   // creation, this order excluded); null = unknown (order created before this was recorded)
   shopifyPriorOrders      Int?
+  // --- Migration 0029_session_request_key ---
+  // Random key the storefront loader sends with the session POST: a retry of the same click
+  // (timeout on the checkout domain, then the app's API) gets the same session, never a second one
+  requestKey              String?
 
+  @@unique([storeId, requestKey])
   @@index([storeId, googleAdsAdjustDue])
   @@index([storeId, createdAt])
   @@index([storeId, status])
@@ -641,6 +676,20 @@ model AppSetting {
   key       String   @id
   value     String
   updatedAt DateTime @updatedAt
+}
+
+/// Redacted copy of the buyer's Shopify cart (/cart.js) when it held app lines (bundles, gifts,
+/// upsells, unknown hidden keys): the merchant can send it to support. Purged after 7 days.
+model CartSnapshot {
+  sessionId   String          @id
+  session     CheckoutSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  // Apps recognized (kaching, bogos, upcart, cart_transform…) and hidden keys nobody recognized
+  apps        String[]
+  unknownKeys String[]
+  data        Json
+  createdAt   DateTime        @default(now())
+
+  @@index([createdAt])
 }
 
 /// One row per Whop checkout configuration: the exact quote it charges.
@@ -863,15 +912,15 @@ model CheckoutTest {
 /// markPaid's transaction under a per-code lock, so a usage limit or "once per customer" holds even
 /// between two payments landing together (Shopify's own count only moves once the orders exist).
 model ShopifyCodeUse {
-  id        String   @id @default(cuid())
-  storeId   String
-  store     Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  id                 String   @id @default(cuid())
+  storeId            String
+  store              Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
   // Upper-cased code
-  code      String
-  sessionId String   @unique
+  code               String
+  sessionId          String   @unique
   // Lower-cased buyer e-mail (once per customer)
-  email     String?
-  createdAt DateTime @default(now())
+  email              String?
+  createdAt          DateTime @default(now())
   // Shopify's asyncUsageCount read with the paid quote (before this use): calibrates shopifyCountsApiOrders
   shopifyCountBefore Int?
 
@@ -982,4 +1031,20 @@ model ProviderMetric {
 
   @@id([provider, bucket])
   @@index([bucket])
+}
+
+/// An image the merchant uploaded in the builder (logo, banner, block image), served publicly at
+/// /api/public/media/<id> (immutable: a new upload is a new id). At most 50 per store, 2 MB each.
+model StoreMedia {
+  id        String   @id @default(cuid())
+  storeId   String
+  store     Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  mime      String
+  bytes     Bytes
+  size      Int
+  width     Int?
+  height    Int?
+  createdAt DateTime @default(now())
+
+  @@index([storeId, createdAt])
 }

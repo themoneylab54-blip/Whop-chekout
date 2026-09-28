@@ -320,9 +320,17 @@ describe.skipIf(!hasDb)("round 9 (integration)", async () => {
     const q = await quoteSession(session, { addOnIds: [] });
     expect(q.automaticDiscount).toEqual({ cents: 1500, titles: ["Soldes"] });
     expect(q.totals.totalCents).toBe(8500);
-    // The buyer adds one: Shopify's figure no longer applies.
+    // Shopify's figure holds for this exact cart only: a plain cart stays editable, a change drops
+    // the discount (and says so).
     const changed = await quoteSession(session, { addOnIds: [], quantities: { "gid://shopify/ProductVariant/11": 3 } });
-    expect([changed.automaticDiscount, changed.totals.totalCents]).toEqual([null, 15000]);
+    expect([changed.automaticDiscount, changed.totals.totalCents, changed.cartLocked, changed.lines[0].quantity, changed.lines[0].locked, changed.automaticDiscountLost]).toEqual([
+      null,
+      15000,
+      undefined,
+      3,
+      undefined,
+      ["Soldes"],
+    ]);
   });
 
   it("charges in the buyer's currency at the ECB rate and reads Whop's amounts back", async () => {

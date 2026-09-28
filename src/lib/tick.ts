@@ -25,6 +25,7 @@ import { captureException, flushCaptures } from "./sentry";
 import { recordIncident } from "./incidents";
 import { paymentInfoFromWhop, storeClient, whopCallOptions } from "./whop";
 import { fairByStore, rotateJobs, rotateStores, roundRobinByStore } from "./rotation";
+import { recheckCheckoutDomains } from "./checkout-domain-check";
 
 export { rotateJobs, rotateStores, roundRobinByStore };
 
@@ -206,6 +207,8 @@ export const TICK_JOBS: JobSpec[] = [
   { name: "dailyReport", job: sendDailyReport, money: false },
   // A day's leakage the report had to hold (import not yet past the day): alerted once the import is.
   { name: "leakageAlerts", job: sendLateLeakageAlerts, money: false },
+  // Checkout domains (checkout.seyuna.com…): pending ones every 10 min, verified ones hourly (alert when one stops answering); retired ones removed from Vercel after 48 h.
+  { name: "checkoutDomains", job: recheckCheckoutDomains, money: false },
   { name: "cleaned", job: cleanup, money: false },
 ];
 
@@ -1238,7 +1241,9 @@ export async function cleanup(): Promise<number> {
     // Provider metrics (5-min buckets): 14 days.
     purgeProviderMetrics(),
   ]);
-  return limits.count + events.count + webhooks.count + alerts.count + metrics;
+  // Redacted /cart.js copies (bundle apps diagnostics): 7 days.
+  const snapshots = await db.cartSnapshot.deleteMany({ where: { createdAt: { lt: new Date(Date.now() - 7 * day) } } });
+  return limits.count + events.count + webhooks.count + alerts.count + metrics + snapshots.count;
 }
 
 /** Last tick report, for the dashboard and /api/health. */

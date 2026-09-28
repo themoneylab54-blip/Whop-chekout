@@ -36,9 +36,13 @@ import {
   type OfferArm,
   formatRatingScore,
   ratingIsSet,
+  type ReviewItem,
+  type ReviewSummary,
 } from "@/lib/layout";
+import { importedReviewsOrigin, orderReviewsForCart, type CartProducts } from "@/lib/reviews-import";
 import { BlockIcon, ICONS, IconTile } from "@/components/icons";
-import { errorText, localeOf, type Labels, type Lang } from "./i18n";
+import { honestReviewItems, isSampleOnly, isSampleReview, liveReviewItems, liveStatItems, liveTextProps } from "@/lib/sample-content";
+import { errorText, localeOf, type Labels, type Lang, type ReviewsNoteSummary } from "./i18n";
 import { SafeImg } from "./SafeImg";
 import type { CartLine } from "@/lib/pricing";
 
@@ -74,9 +78,11 @@ export function StyledBlock({ style, children }: { style: BlockStyle; children: 
   if (style.customText) css.color = style.customText;
   const card = style.card ? "border border-[var(--border)] px-4 rounded-[var(--radius)] bg-white shadow-[0_1px_2px_rgba(15,23,42,.04)]" : "";
   const rounded = style.background !== "none" || style.customBackground ? "rounded-[var(--radius)]" : "";
+  // "wc-boxed": a card / colored box goes edge to edge on phones with the banner it holds (globals.css).
+  const boxed = card || rounded ? "wc-boxed" : "";
   return (
     <div
-      className={[SPACING[style.spacing], ALIGN[style.align], SIZE[style.textSize], TEXT[style.textColor], BG[style.background], DIVIDER[style.divider], card, rounded]
+      className={[SPACING[style.spacing], ALIGN[style.align], SIZE[style.textSize], TEXT[style.textColor], BG[style.background], DIVIDER[style.divider], card, rounded, boxed]
         .filter(Boolean)
         .join(" ")}
       style={css}
@@ -90,13 +96,35 @@ export function StyledBlock({ style, children }: { style: BlockStyle; children: 
 /* Small shared pieces                                                 */
 /* ------------------------------------------------------------------ */
 
-export function Stars({ n, size = 14, className = "" }: { n: number; size?: number; className?: string }) {
-  const full = Math.round(n);
+/** Stars drawn for a score: floored to the half star below (4.8 → 4½, 4.4 → 4), never rounded up. */
+export function starFill(n: number): { full: number; half: boolean } {
+  const v = Number.isFinite(n) ? Math.max(0, Math.min(5, Math.floor(n * 2 + 1e-9) / 2)) : 0;
+  const full = Math.floor(v);
+  return { full, half: v - full === 0.5 };
+}
+
+/**
+ * Star row. `label`: what screen readers hear, in the buyer's language ("4 étoiles sur 5");
+ * without it the stars are decoration (hidden), for rows next to a visible "4,8/5".
+ */
+export function Stars({ n, size = 14, className = "", label }: { n: number; size?: number; className?: string; label?: string }) {
+  const { full, half } = starFill(n);
+  const on = "fill-amber-400 text-amber-400";
+  const off = "fill-neutral-200 text-neutral-200";
   return (
-    <span className={`inline-flex items-center gap-0.5 ${className}`} role="img" aria-label={`${n}/5`}>
-      {[0, 1, 2, 3, 4].map((i) => (
-        <Star key={i} style={{ width: size, height: size }} className={i < full ? "fill-amber-400 text-amber-400" : "fill-neutral-200 text-neutral-200"} />
-      ))}
+    <span className={`inline-flex items-center gap-0.5 ${className}`} {...(label ? { role: "img", "aria-label": label } : { "aria-hidden": true })}>
+      {[0, 1, 2, 3, 4].map((i) =>
+        i === full && half ? (
+          <span key={i} className="relative inline-block" style={{ width: size, height: size }} data-star="half">
+            <Star style={{ width: size, height: size }} className={`absolute inset-0 ${off}`} />
+            <span className="absolute inset-y-0 left-0 overflow-hidden" style={{ width: size / 2 }}>
+              <Star style={{ width: size, height: size }} className={`max-w-none ${on}`} />
+            </span>
+          </span>
+        ) : (
+          <Star key={i} style={{ width: size, height: size }} className={i < full ? on : off} data-star={i < full ? "full" : "empty"} />
+        ),
+      )}
     </span>
   );
 }
@@ -115,6 +143,40 @@ const PAYMENT_ICON_LABEL: Record<string, string> = {
   sepa: "SEPA",
   crypto: "Crypto",
 };
+
+/**
+ * Logos shown small next to the Payment title: the payment-logos block's methods, kept only
+ * when this checkout really offers them (card brands with the card form, Apple Pay / Google
+ * Pay only when their express button shows; SEPA / crypto are never offered here). Pure.
+ */
+export function offeredPaymentLogos(methods: readonly string[], offered: { applePay: boolean; googlePay: boolean }): string[] {
+  return methods.filter((m) => m === "visa" || m === "mastercard" || m === "amex" || (m === "applepay" && offered.applePay) || (m === "gpay" && offered.googlePay));
+}
+
+/**
+ * The payment-logos block whose logos the Payment title shows (checkout): the first visible one,
+ * when the Payment section shows and at least one of its logos is offered. Null otherwise (the
+ * block is then either absent, skipped or drawn on its own). Pure.
+ */
+export function headerLogosBlockId(blocks: readonly Block[], offered: { applePay: boolean; googlePay: boolean }): string | null {
+  if (!blocks.some((b) => b.type === "payment" && !b.hidden)) return null;
+  const icons = blocks.find((b) => b.type === "payment_icons" && !b.hidden);
+  return icons?.type === "payment_icons" && offeredPaymentLogos(icons.props.methods, offered).length > 0 ? icons.id : null;
+}
+
+/** The small logo row of the Payment section header (see offeredPaymentLogos). */
+export function PaymentHeaderLogos({ methods, label }: { methods: readonly string[]; label: string }) {
+  if (methods.length === 0) return null;
+  return (
+    <ul aria-label={label} className="flex min-w-0 max-w-full flex-wrap justify-end gap-1">
+      {methods.map((m) => (
+        <li key={m} className="rounded border border-[var(--border)] bg-white px-1.5 py-0.5 text-[11px] leading-4 font-bold text-neutral-700">
+          {PAYMENT_ICON_LABEL[m]}
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 function addDays(from: Date, days: number, businessOnly: boolean) {
   const d = new Date(from);
@@ -180,7 +242,7 @@ function Countdown({ label, endsAt, labels, preview }: BlockOf<"countdown">["pro
   const parts = [Math.floor(s / 86400), Math.floor((s % 86400) / 3600), Math.floor((s % 3600) / 60), s % 60];
   const text = (parts[0] ? `${parts[0]}${labels.daysShort} ` : "") + parts.slice(1).map((p) => String(p).padStart(2, "0")).join(":");
   return (
-    <div className="flex items-center justify-between gap-3 rounded-[var(--radius)] border border-red-200/70 bg-gradient-to-r from-red-50 to-orange-50 px-4 py-3 text-red-700">
+    <div className="wc-bleed flex items-center justify-between gap-3 rounded-[var(--radius)] border border-red-200/70 bg-gradient-to-r from-red-50 to-orange-50 px-4 py-3 text-red-700">
       <span className="flex items-center gap-2 text-sm font-medium">
         <Timer className="h-4 w-4" /> {label}
       </span>
@@ -214,7 +276,7 @@ function FreeShippingBar({ message, success, threshold, ctx }: BlockOf<"free_shi
   const left = Math.max(0, target - ctx.subtotalCents);
   const pct = Math.min(100, Math.round((ctx.subtotalCents / target) * 100));
   return (
-    <div className="rounded-[var(--radius)] border border-[var(--border)] bg-white p-4">
+    <div className="wc-bleed rounded-[var(--radius)] border border-[var(--border)] bg-white p-4">
       <p className="mb-2.5 flex items-center gap-2 text-sm font-medium">
         <Truck className="h-4 w-4 text-[var(--accent)]" />
         {left === 0 ? success : message.replace("{amount}", ctx.money(left))}
@@ -266,58 +328,205 @@ function DeliveryEstimate({ label, minDays, maxDays, businessDays, showTimeline,
   );
 }
 
-function Reviews({ title, layout, items, labels }: BlockOf<"reviews">["props"] & { labels: Labels }) {
-  const [i, setI] = useState(0);
-  if (items.length === 0) return null;
-  const review = (r: (typeof items)[number], key?: number) => (
-    <figure key={key} className="rounded-[var(--radius)] border border-[var(--border)] bg-white p-4 text-left shadow-[0_1px_2px_rgba(15,23,42,.04)]">
-      <div className="flex items-center justify-between">
-        <Stars n={r.stars} />
+/** "12 mars 2024" in the buyer's language (UTC: the same text on the server and in the browser). */
+function reviewDate(date: string, lang: Lang): string {
+  const t = Date.parse(`${date}T00:00:00Z`);
+  return Number.isNaN(t) ? "" : new Date(t).toLocaleDateString(localeOf(lang), { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+}
+
+/** Reviews listed before "Show more" (list layout). */
+const REVIEWS_SHOWN = 3;
+
+function ReviewCard({ r, labels, lang }: { r: ReviewItem; labels: Labels; lang: Lang }) {
+  const date = r.date ? reviewDate(r.date, lang) : "";
+  return (
+    <figure className="flex h-full flex-col rounded-[var(--radius)] border border-[var(--border)] bg-white p-4 text-left text-neutral-900 shadow-[0_1px_2px_rgba(15,23,42,.04)]">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <Stars n={r.stars} label={labels.starsOutOf5(r.stars.toLocaleString(localeOf(lang)), r.stars)} />
         {r.verified && (
-          <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700">
+          <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-800">
             <BadgeCheck className="h-3.5 w-3.5" aria-hidden /> {labels.verifiedPurchase}
           </span>
         )}
       </div>
-      <blockquote className="mt-2 text-sm leading-relaxed">« {r.text} »</blockquote>
-      <figcaption className="mt-2 text-xs font-semibold text-[var(--muted)]">{r.name}</figcaption>
+      <div className="mt-2 flex gap-3">
+        <div className="min-w-0 flex-1">
+          {r.title && <p className="text-sm font-semibold leading-snug break-words">{r.title}</p>}
+          <blockquote className={`${r.title ? "mt-1" : ""} text-sm leading-relaxed whitespace-pre-line break-words`}>{r.text}</blockquote>
+        </div>
+        {r.photoUrl && (
+          <SafeImg src={r.photoUrl} alt={labels.reviewPhoto} loading="lazy" className="h-16 w-16 shrink-0 rounded-[calc(var(--radius)*.6)] object-cover" fallback={null} />
+        )}
+      </div>
+      {(r.name || date || r.productTitle) && (
+        <figcaption className="mt-auto pt-2.5 text-xs break-words text-neutral-600">
+          {r.name && <span className="font-semibold text-neutral-800">{r.name}</span>}
+          {r.name && date && " · "}
+          {date && <time dateTime={r.date}>{date}</time>}
+          {r.productTitle && <span className="block truncate">{r.productTitle}</span>}
+        </figcaption>
+      )}
     </figure>
   );
+}
+
+/** "★★★★★ 4,8/5 · 1 234 avis": only from real data (all the store's published reviews). */
+function ReviewsSummary({ summary, labels, lang }: { summary: ReviewSummary; labels: Labels; lang: Lang }) {
+  const score = formatRatingScore(summary.score, localeOf(lang));
+  const count = summary.count.toLocaleString(localeOf(lang));
+  // A paragraph with an aria-label is not read out: the sentence is real (screen-reader only)
+  // text, the stars and figures are decoration for sighted buyers.
+  return (
+    <p className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+      <span className="sr-only">{labels.reviewsSummary(score, count, summary.count)}</span>
+      <span aria-hidden="true" className="contents">
+        <Stars n={summary.score} size={16} />
+        <span className="font-semibold">{score}/5</span>
+        <span className="text-[var(--muted)]">· {labels.reviewsCount(count, summary.count)}</span>
+      </span>
+    </p>
+  );
+}
+
+/** More reviews than this: a "3 / 20" counter instead of one dot per review. */
+const CAROUSEL_MAX_DOTS = 6;
+
+function ReviewsCarousel({ items, labels, lang, title }: { items: ReviewItem[]; labels: Labels; lang: Lang; title?: string }) {
+  // Back to the first review whenever the list changes (reordered, removed, cart order).
+  const sig = items.map((r) => `${r.name}\u0001${r.text}`).join("\u0002");
+  const [state, setState] = useState({ sig, i: 0 });
+  const n = items.length;
+  const at = state.sig === sig ? state.i % n : 0;
+  const setI = (i: number) => setState({ sig, i });
+  return (
+    <div className="relative" role="region" aria-roledescription={labels.reviewsCarousel} aria-label={title || labels.reviewsCarousel}>
+      {/* Every card sits in the same grid cell: the carousel keeps the tallest card's height (no jump). */}
+      <p className="sr-only" aria-live="polite" aria-atomic="true">
+        {n > 1 ? `${labels.reviewN(at + 1)} / ${n}` : ""}
+      </p>
+      <div className="grid">
+        {items.map((r, k) => (
+          <div
+            key={k}
+            className={`[grid-area:1/1] ${k === at ? "" : "invisible"}`}
+            role="group"
+            aria-roledescription={labels.reviewSlide}
+            aria-label={`${k + 1} / ${n}`}
+            aria-hidden={k === at ? undefined : true}
+          >
+            <ReviewCard r={r} labels={labels} lang={lang} />
+          </div>
+        ))}
+      </div>
+      {n > 1 && (
+        <div className="mt-2.5 flex items-center justify-between">
+          {n > CAROUSEL_MAX_DOTS ? (
+            <span className="text-sm text-[var(--muted)] tabular-nums" aria-hidden="true">
+              {at + 1} / {n}
+            </span>
+          ) : (
+            <div className="-ml-2 flex flex-wrap">
+              {items.map((_, k) => (
+                <button
+                  key={k}
+                  type="button"
+                  aria-label={labels.reviewN(k + 1)}
+                  aria-current={k === at ? "true" : undefined}
+                  onClick={() => setI(k)}
+                  className="flex h-11 min-w-6 items-center justify-center px-1"
+                >
+                  <span className={`block h-1.5 rounded-full transition-all ${k === at ? "w-5 bg-[var(--accent)]" : "w-1.5 bg-black/30"}`} />
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="flex gap-1">
+            <button type="button" aria-label={labels.prevReview} onClick={() => setI((at - 1 + items.length) % items.length)} className="flex h-11 w-11 items-center justify-center rounded-full border border-[var(--border)] bg-white text-neutral-900 hover:bg-black/[.03]">
+              <ChevronLeft className="h-4 w-4" aria-hidden />
+            </button>
+            <button type="button" aria-label={labels.nextReview} onClick={() => setI((at + 1) % items.length)} className="flex h-11 w-11 items-center justify-center rounded-full border border-[var(--border)] bg-white text-neutral-900 hover:bg-black/[.03]">
+              <ChevronRight className="h-4 w-4" aria-hidden />
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReviewsList({ items, labels, lang }: { items: ReviewItem[]; labels: Labels; lang: Lang }) {
+  const [all, setAll] = useState(false);
+  const shown = all ? items : items.slice(0, REVIEWS_SHOWN);
+  return (
+    <div>
+      <ul className="space-y-2.5">
+        {shown.map((r, k) => (
+          <li key={k}>
+            <ReviewCard r={r} labels={labels} lang={lang} />
+          </li>
+        ))}
+      </ul>
+      {items.length > shown.length && (
+        <button type="button" onClick={() => setAll(true)} className="mt-1 inline-flex min-h-11 items-center text-sm font-medium underline underline-offset-2">
+          {labels.moreReviews(items.length - shown.length)}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * What the shown average covers, for the transparency note: Shopify metafields (active products)
+ * every published review of the store, or part of them when the read was capped; a partial
+ * Judge.me import only its N most recent reviews; a CSV every review of the merchant's file;
+ * a full Judge.me import every published review.
+ */
+function noteSummary(summary: ReviewSummary | null | undefined, lang: Lang): ReviewsNoteSummary {
+  if (!summary) return false;
+  if (summary.source === "shopify") return summary.partial ? "store-partial" : "store";
+  if (summary.partial) return { recent: summary.count.toLocaleString(localeOf(lang)) };
+  return summary.source === "csv" ? "file" : true;
+}
+
+function Reviews({ title, layout, items, summary, labels, lang }: BlockOf<"reviews">["props"] & { labels: Labels; lang: Lang }) {
+  if (items.length === 0) return null;
+  // EU Omnibus: where the shown reviews come from and what "Verified purchase" means, only when
+  // imported reviews are among them (hand-typed only: nothing to disclose about an app).
+  // The shipped examples never count (old untagged blocks saved them with an import source).
+  const real = items.filter((it) => !isSampleReview(it));
+  const origin = importedReviewsOrigin(real);
+  // A selection (never "all the reviews"); hand-typed ones among them are not called imported.
+  const mixed = real.some((it) => it.source == null || it.source === "manual");
   return (
     <div>
       <Heading>{title}</Heading>
+      {summary && <ReviewsSummary summary={summary} labels={labels} lang={lang} />}
       {layout === "stack" ? (
-        <div className="space-y-2.5">{items.map((r, k) => review(r, k))}</div>
+        <ReviewsList items={items} labels={labels} lang={lang} />
+      ) : layout === "carousel" ? (
+        <ReviewsCarousel items={items} labels={labels} lang={lang} title={title} />
       ) : (
-        <div className="relative">
-          {review(items[i % items.length])}
-          {items.length > 1 && (
-            <div className="mt-2.5 flex items-center justify-between">
-              <div className="-ml-2 flex">
-                {items.map((_, k) => (
-                  <button
-                    key={k}
-                    type="button"
-                    aria-label={labels.reviewN(k + 1)}
-                    aria-current={k === i % items.length ? "true" : undefined}
-                    onClick={() => setI(k)}
-                    className="flex h-11 min-w-6 items-center justify-center px-1"
-                  >
-                    <span className={`block h-1.5 rounded-full transition-all ${k === i % items.length ? "w-5 bg-[var(--accent)]" : "w-1.5 bg-black/30"}`} />
-                  </button>
-                ))}
-              </div>
-              <div className="flex gap-1">
-                <button type="button" aria-label={labels.prevReview} onClick={() => setI((i - 1 + items.length) % items.length)} className="flex h-11 w-11 items-center justify-center rounded-full border border-[var(--border)] bg-white hover:bg-black/[.03]">
-                  <ChevronLeft className="h-4 w-4" aria-hidden />
-                </button>
-                <button type="button" aria-label={labels.nextReview} onClick={() => setI((i + 1) % items.length)} className="flex h-11 w-11 items-center justify-center rounded-full border border-[var(--border)] bg-white hover:bg-black/[.03]">
-                  <ChevronRight className="h-4 w-4" aria-hidden />
-                </button>
-              </div>
-            </div>
-          )}
+        // Auto: one card at a time in a narrow column (mobile), the first reviews listed when wide.
+        <div className="@container">
+          <div className="@md:hidden">
+            <ReviewsCarousel items={items} labels={labels} lang={lang} title={title} />
+          </div>
+          <div className="hidden @md:block">
+            <ReviewsList items={items} labels={labels} lang={lang} />
+          </div>
         </div>
+      )}
+      {origin ? (
+        <p data-imported-reviews-note className="mt-2 text-xs leading-snug text-[var(--muted)]">
+          {labels.importedReviewsNote(origin === "judgeme" ? "Judge.me" : null, { mixed, summary: noteSummary(summary, lang) })}
+        </p>
+      ) : (
+        // An average shown above hand-typed (or example) reviews only: what it covers, no app named.
+        summary && (
+          <p data-reviews-average-note className="mt-2 text-xs leading-snug text-[var(--muted)]">
+            {labels.averageScope(noteSummary(summary, lang) || true)}
+          </p>
+        )
       )}
     </div>
   );
@@ -371,9 +580,11 @@ function OrderNote({ title, placeholder, ctx }: BlockOf<"order_note">["props"] &
         maxLength={1000}
         value={ctx.note}
         autoFocus={!ctx.preview && !ctx.note}
+        readOnly={!!ctx.noteLockedBy}
+        aria-describedby={ctx.noteLockedBy ?? undefined}
         onChange={(e) => ctx.setNote(e.target.value)}
         placeholder={placeholder}
-        className="w-full resize-y rounded-[var(--radius)] border border-[var(--border)] bg-white px-3.5 py-3 text-base outline-none focus:border-[var(--accent)]"
+        className="w-full resize-y rounded-[var(--radius)] border border-[var(--field-border,var(--border))] bg-white px-3.5 py-3 text-base outline-none focus:border-[var(--accent)]"
       />
     </label>
   );
@@ -411,6 +622,8 @@ export type ContentContext = {
   money: (cents: number) => string;
   note: string;
   setNote: (v: string) => void;
+  /** A PayPal payment is pending: the id of the checkout's lock note; the order note is read-only. */
+  noteLockedBy?: string | null;
   /** Thank-you page, live: one-click post-purchase offers. */
   upsell?: UpsellContext;
   /** Thank-you page: end of the one-click offer window (ms), for the "valid N more min" line. */
@@ -426,7 +639,26 @@ export type ContentContext = {
    * offers are charged in the shop's, so the offer says so. { shop, paid } currency codes.
    */
   offerCurrency?: { shop: string; paid: string } | null;
+  /** Products of the order (live): the reviews block shows theirs first. */
+  cartProducts?: CartProducts | null;
+  /**
+   * Wallets this checkout really offers (live): the payment-logos block keeps only those
+   * (offeredPaymentLogos). Unknown (thank-you page): card brands only.
+   */
+  offeredWallets?: { applePay: boolean; googlePay: boolean };
+  /** Checkout: the logos show next to the Payment title, so the block is skipped live (shown once). */
+  paymentLogosInHeader?: boolean;
+  /**
+   * Preview: the payment-logos block whose logos the Payment title already shows
+   * (headerLogosBlockId). It draws a slim placeholder instead of its logos, so they aren't drawn twice.
+   */
+  headerLogosBlockId?: string | null;
 };
+
+/** Payment logos buyers see: in preview the merchant's list, live only what is really offered. */
+export function livePaymentLogos(methods: readonly string[], ctx: Pick<ContentContext, "preview" | "offeredWallets">): string[] {
+  return ctx.preview ? [...methods] : offeredPaymentLogos(methods, ctx.offeredWallets ?? { applePay: false, googlePay: false });
+}
 
 /** Thank-you page state of the one-click offers (live only). */
 export type UpsellContext = {
@@ -492,8 +724,24 @@ export function isEmptyInLive(block: Block, ctx: ContentContext, now: number): b
       return !block.props.url || !videoEmbed(block.props.url);
     case "logos":
       return block.props.logos.length === 0;
+    // Shipped sample proof (reviews, figures, testimonial, coupon, announcement, placeholder
+    // text) of a block tagged `sample` never reaches buyers: the builder flags it until the
+    // merchant writes their own. Untagged blocks (published before) render as they always did.
     case "reviews":
-      return block.props.items.length === 0;
+      return isSampleOnly(block) || liveReviewItems(block).length === 0;
+    case "stats":
+    case "testimonial":
+    case "coupon":
+    case "announcement":
+      return isSampleOnly(block);
+    case "text": {
+      // Nothing left to read (both parts empty, placeholders of a tagged block included): no empty card.
+      const t = liveTextProps(block);
+      return isSampleOnly(block) || (!t.heading.trim() && !t.body.trim());
+    }
+    case "payment_icons":
+      // Shown once, next to the Payment title (checkout); elsewhere only the logos really offered.
+      return !!ctx.paymentLogosInHeader || livePaymentLogos(block.props.methods, ctx).length === 0;
     case "rating":
       return !ratingIsSet(block.props);
     case "social": {
@@ -501,8 +749,9 @@ export function isEmptyInLive(block: Block, ctx: ContentContext, now: number): b
       return !p.instagram && !p.tiktok && !p.facebook && !p.youtube;
     }
     case "support": {
+      // A contact channel is required: "Besoin d'aide ?" without any way to reach you helps no one.
       const p = block.props;
-      return !p.email && !p.phone && !p.whatsapp.replace(/[^\d]/g, "") && !p.text;
+      return !p.email.trim() && !p.phone.trim() && !p.whatsapp.replace(/[^\d]/g, "");
     }
     case "button_link":
       return !block.props.url;
@@ -532,24 +781,30 @@ export function isEmptyInLive(block: Block, ctx: ContentContext, now: number): b
 
 export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext }) {
   switch (block.type) {
-    case "text":
+    case "text": {
+      // Live: a placeholder part ("Titre", "Votre texte ici.") of a sample block is left out.
+      const { heading, body } = ctx.preview ? block.props : liveTextProps(block);
+      // Builder: an empty text block stays visible and selectable (live skips it: isEmptyInLive).
+      if (ctx.preview && !heading.trim() && !body.trim()) return <Placeholder inlineField="body">Bloc texte vide</Placeholder>;
       return (
         <div className="space-y-1">
-          {block.props.heading && (
+          {heading && (
             <h3 data-inline-field="heading" className="font-[family-name:var(--heading-font)] text-base font-semibold tracking-tight">
-              {block.props.heading}
+              {heading}
             </h3>
           )}
-          {block.props.body && (
+          {body && (
             <p data-inline-field="body" className="whitespace-pre-line opacity-80">
-              {block.props.body}
+              {body}
             </p>
           )}
         </div>
       );
+    }
     case "image": {
       if (!block.props.url) return ctx.preview ? <Placeholder>Bloc image — ajoutez une URL</Placeholder> : null;
-      const width = { sm: "max-w-[160px]", md: "max-w-[280px]", lg: "max-w-[420px]", full: "w-full" }[block.props.size];
+      // Large and full-width images are banners: edge to edge on phones (small ones stay inset).
+      const width = { sm: "max-w-[160px]", md: "max-w-[280px]", lg: "wc-bleed max-w-[420px]", full: "wc-bleed w-full" }[block.props.size];
       return (
         <SafeImg
           src={block.props.url}
@@ -566,9 +821,9 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
             <SafeImg src={block.props.photoUrl} alt="" className="h-10 w-10 shrink-0 rounded-full object-cover ring-2 ring-white" fallback={null} />
           )}
           <div className="space-y-1">
-            <Stars n={block.props.stars} />
+            <Stars n={block.props.stars} label={ctx.labels.starsOutOf5(block.props.stars.toLocaleString(localeOf(ctx.lang)), block.props.stars)} />
             <blockquote className="text-sm">« {block.props.quote} »</blockquote>
-            <figcaption className="text-xs font-semibold text-[var(--muted)]">{block.props.author}</figcaption>
+            {block.props.author && <figcaption className="text-xs font-semibold text-[var(--muted)]">{block.props.author}</figcaption>}
           </div>
         </figure>
       );
@@ -580,7 +835,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
           <Stars n={block.props.score} size={18} />
           <span className="font-semibold">{formatRatingScore(block.props.score, localeOf(ctx.lang))}/5</span>
           <span className="text-sm text-[var(--muted)]">
-            {block.props.count > 0 && `${ctx.labels.reviewsCount(block.props.count.toLocaleString(localeOf(ctx.lang)))} · `}
+            {block.props.count > 0 && `${ctx.labels.reviewsCount(block.props.count.toLocaleString(localeOf(ctx.lang)), block.props.count)} · `}
             {block.props.label}
           </span>
         </div>
@@ -633,12 +888,33 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
         </ul>
       );
     case "payment_icons":
+      if (ctx.preview && ctx.headerLogosBlockId === block.id) {
+        // Merchant-only (preview): its logos are drawn next to the Payment title, not twice.
+        return (
+          <div
+            data-logos-in-header
+            className="flex min-h-14 items-start justify-center rounded-md border border-dashed border-[var(--border)] px-3 pt-2 text-center text-[11px] leading-4 text-[var(--muted)]"
+          >
+            Logos affichés à côté du titre « Paiement »
+          </div>
+        );
+      }
+      // Preview of the thank-you page (no wallet offered there): the merchant's list, with the
+      // logos buyers won't see (Apple Pay, Google Pay, SEPA, crypto) greyed.
+      const shownLive = ctx.preview && !ctx.offeredWallets ? offeredPaymentLogos(block.props.methods, { applePay: false, googlePay: false }) : null;
       return (
         <div className="space-y-2">
           {block.props.label && <p className="text-xs text-[var(--muted)]">{block.props.label}</p>}
           <div className="flex flex-wrap justify-center gap-1.5">
-            {block.props.methods.map((m) => (
-              <span key={m} className="rounded-md border border-[var(--border)] bg-white px-2 py-1 text-[11px] font-bold text-neutral-700 shadow-[0_1px_1px_rgba(0,0,0,.04)]">
+            {livePaymentLogos(block.props.methods, ctx).map((m) => (
+              <span
+                key={m}
+                data-not-shown={shownLive && !shownLive.includes(m) ? "" : undefined}
+                title={shownLive && !shownLive.includes(m) ? "Pas affiché sur la page de remerciement" : undefined}
+                className={`rounded-md border border-[var(--border)] bg-white px-2 py-1 text-[11px] font-bold text-neutral-700 shadow-[0_1px_1px_rgba(0,0,0,.04)] ${
+                  shownLive && !shownLive.includes(m) ? "line-through opacity-40" : ""
+                }`}
+              >
                 {PAYMENT_ICON_LABEL[m]}
               </span>
             ))}
@@ -649,7 +925,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
       return (
         <div
           data-inline-field="text"
-          className="rounded-[var(--radius)] bg-[image:var(--accent-bg)] px-4 py-2.5 text-center text-sm font-medium text-[var(--accent-fg)] shadow-sm"
+          className="wc-bleed rounded-[var(--radius)] bg-[image:var(--accent-bg)] px-4 py-2.5 text-center text-sm font-medium text-[var(--accent-fg)] shadow-sm"
         >
           {block.props.text}
         </div>
@@ -678,7 +954,17 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
     case "delivery_estimate":
       return <DeliveryEstimate {...block.props} ctx={ctx} />;
     case "reviews":
-      return <Reviews {...block.props} labels={ctx.labels} />;
+      // Buyers never see the shipped example reviews (the builder still shows them, flagged).
+      // Live: reviews of the products in the cart first, then the general ones. "Achat vérifié"
+      // never shows on example or hand-typed reviews (old untagged blocks included).
+      return (
+        <Reviews
+          {...block.props}
+          items={honestReviewItems(ctx.preview ? block.props.items : orderReviewsForCart(liveReviewItems(block), ctx.cartProducts))}
+          labels={ctx.labels}
+          lang={ctx.lang}
+        />
+      );
     case "comparison":
       return (
         <div>
@@ -708,7 +994,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
       if (!embed) return ctx.preview ? <Placeholder>Vidéo : collez un lien YouTube, Vimeo ou .mp4</Placeholder> : null;
       return (
         <figure>
-          <div className="aspect-video overflow-hidden rounded-[var(--radius)] bg-black shadow-sm">
+          <div className="wc-bleed aspect-video overflow-hidden rounded-[var(--radius)] bg-black shadow-sm">
             {embed.kind === "iframe" ? (
               <iframe
                 src={embed.src}
@@ -740,10 +1026,12 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
           </div>
         </div>
       );
-    case "stats":
+    case "stats": {
+      // Buyers never see the shipped example figures (the builder still shows them, flagged).
+      const items = ctx.preview ? block.props.items : liveStatItems(block);
       return (
-        <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${Math.max(1, block.props.items.length)}, minmax(0, 1fr))` }}>
-          {block.props.items.map((s, i) => (
+        <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${Math.max(1, items.length)}, minmax(0, 1fr))` }}>
+          {items.map((s, i) => (
             <div key={i} className="rounded-[var(--radius)] border border-[var(--border)] bg-white px-2 py-3 text-center">
               <p className="bg-[image:var(--accent-bg)] bg-clip-text font-[family-name:var(--heading-font)] text-xl font-bold tracking-tight text-transparent">{s.value}</p>
               <p className="text-[11px] text-[var(--muted)]">{s.label}</p>
@@ -751,6 +1039,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
           ))}
         </div>
       );
+    }
     case "benefits":
       return (
         <div>
@@ -975,9 +1264,20 @@ export function Recommendations({
   );
 }
 
-export function Placeholder({ children }: { children: ReactNode }) {
+/**
+ * Merchant-only placeholder (preview). `inlineField`: the empty text field it stands for, so a
+ * double-click on the canvas edits that field (data-inline-empty: the editor opens blank, not
+ * with the placeholder's wording).
+ */
+export function Placeholder({ children, inlineField }: { children: ReactNode; inlineField?: string }) {
   return (
-    <div className="rounded-[var(--radius)] border-2 border-dashed border-neutral-300 px-4 py-6 text-center text-sm text-neutral-500">{children}</div>
+    <div
+      data-inline-field={inlineField}
+      data-inline-empty={inlineField ? "" : undefined}
+      className="rounded-[var(--radius)] border-2 border-dashed border-neutral-300 px-4 py-6 text-center text-sm text-neutral-500"
+    >
+      {children}
+    </div>
   );
 }
 
@@ -1368,7 +1668,7 @@ function Survey({ block, ctx }: { block: BlockOf<"survey">; ctx: ContentContext 
             maxLength={SURVEY_OTHER_MAX}
             placeholder={L.surveyOtherLabel}
             onChange={(e) => setText(e.target.value)}
-            className="min-h-11 min-w-0 flex-1 rounded-[var(--radius)] border border-neutral-300 bg-white px-3 text-sm"
+            className="min-h-11 min-w-0 flex-1 rounded-[var(--radius)] border border-[var(--field-border,#8f8f99)] bg-white px-3 text-sm"
           />
           <button
             type="submit"

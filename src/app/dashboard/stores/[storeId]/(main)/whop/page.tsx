@@ -5,13 +5,15 @@ import { DirtyForm } from "@/components/dashboard/DirtyForm";
 import { requireAdmin } from "@/lib/auth";
 import { daysAgo, tzOf } from "@/lib/time";
 import { db } from "@/lib/db";
-import { OPTIONAL_PAYMENT_METHODS, whopWebhookUrl, WHOP_WEBHOOK_EVENTS } from "@/lib/whop";
+import { applePayDomainStatuses, OPTIONAL_PAYMENT_METHODS, whopWebhookUrl, WHOP_WEBHOOK_EVENTS } from "@/lib/whop";
+import { checkoutHostOf } from "@/lib/checkout-domain";
 import { Badge, Card, Flash, Input, Label, PageHeader, SubmitButton, Textarea, buttonClass } from "@/components/ui";
 import { CopyField } from "@/components/dashboard/CopyField";
 import { env as appEnv } from "@/lib/env";
 import { ConfirmButton } from "@/components/dashboard/ConfirmButton";
 import { formatDate, formatDateTime } from "@/components/dashboard/format";
-import { connectWhopAction, disconnectWhopAction, refreshWhopWebhookAction, savePaymentMethodsAction, setupApplePayAction } from "../../../../actions";
+import { paypalHiddenLines, paypalRefusals } from "@/lib/checkout";
+import { connectWhopAction, disconnectWhopAction, reactivatePaypalAction, refreshWhopWebhookAction, savePaymentMethodsAction, setupApplePayAction } from "../../../../actions";
 
 export const metadata: Metadata = { title: "Whop" };
 
@@ -25,15 +27,21 @@ export default async function WhopPage({
   await requireAdmin();
   const { storeId } = await params;
   const sp = await searchParams;
-  const [store, applePayFile, methodsRejected] = await Promise.all([
+  const [store, applePayFile, methodsRejected, paypalHidden] = await Promise.all([
     db.store.findUnique({ where: { id: storeId } }),
     db.appSetting.findUnique({ where: { key: "apple_pay_domain_association" } }),
     // Recent rejection of the optional methods (last 7 days).
     db.eventLog.findFirst({ where: { storeId, kind: "payment_methods.rejected", createdAt: { gt: daysAgo(7) } }, orderBy: { createdAt: "desc" }, select: { createdAt: true, data: true } }),
+    // PayPal express hidden because Whop refused it (24 h hold) or said it's off, by currency.
+    paypalRefusals(storeId),
   ]);
   if (!store) notFound();
   const connected = !!store.whopConnectedAt;
-  const checkoutHost = new URL(appEnv.appUrl).hostname;
+  // Where buyers pay: the store's verified checkout domain (checkout.seyuna.com), else APP_URL's host.
+  const appHost = new URL(appEnv.appUrl).hostname;
+  const checkoutHost = checkoutHostOf(store);
+  const applePayHosts = [...new Set([checkoutHost, appHost])];
+  const applePay = connected && applePayFile ? await applePayDomainStatuses(store, applePayHosts) : null;
   const env = store.testMode ? "sandbox" : "production";
 
   return (
@@ -115,8 +123,38 @@ export default async function WhopPage({
               />
               <SubmitButton>{applePayFile ? "Vérifier le domaine" : "Installer et vérifier"}</SubmitButton>
             </DirtyForm>
+            {applePay && (
+              <ul aria-label="État Apple Pay par domaine" className="mt-4 space-y-1.5 text-sm">
+                {applePayHosts.map((h) => (
+                  <li key={h} className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="min-w-0 font-mono text-xs break-all text-zinc-700">
+                      {h}
+                      {h === checkoutHost && applePayHosts.length > 1 ? " (domaine du checkout)" : ""}
+                    </span>
+                    <Badge color={applePay[h] === "verified" ? "green" : applePay[h] === "absent" ? "zinc" : "amber"}>
+                      {applePay[h] === "verified" ? "Vérifié" : applePay[h] === "absent" ? "Non enregistré" : "En attente Apple"}
+                    </Badge>
+                  </li>
+                ))}
+              </ul>
+            )}
           </Card>
           <Card icon={Wallet} iconColor="#0ea5e9" title="PayPal, Google Pay & autres" description="Proposés automatiquement dans le formulaire de paiement dès qu'ils sont actifs sur votre compte Whop.">
+            {paypalHidden.length > 0 && (
+              <div className="mb-4 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900 ring-1 ring-amber-600/20" data-testid="paypal-hidden">
+                <p>Bouton PayPal express masqué :</p>
+                {/* Each currency with its own state and date (refusals differ per currency). */}
+                <ul className="mt-1 list-disc space-y-0.5 pl-5">
+                  {paypalHiddenLines(paypalHidden, (d) => formatDateTime(d, false, tzOf(store))).map((line, i) => (
+                    <li key={paypalHidden[i].currency}>{line}</li>
+                  ))}
+                </ul>
+                <p className="mt-1">Une fois PayPal actif dans Whop, réactivez-le sans attendre.</p>
+                <form action={reactivatePaypalAction.bind(null, store.id)} className="mt-2">
+                  <SubmitButton variant="secondary">Réactiver PayPal</SubmitButton>
+                </form>
+              </div>
+            )}
             <ul className="space-y-2 text-sm text-zinc-700">
               <li>
                 <strong>PayPal</strong> : activez-le dans Whop → <strong>Paramètres → Moyens de paiement</strong>. Il apparaît ensuite tout seul au checkout.

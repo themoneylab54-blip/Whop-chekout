@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Code2, Crosshair, ExternalLink, LifeBuoy, MousePointerClick, ScanEye } from "lucide-react";
+import { Boxes, Code2, Crosshair, ExternalLink, LifeBuoy, MousePointerClick, ScanEye } from "lucide-react";
 import { notFound } from "next/navigation";
 import { DirtyForm } from "@/components/dashboard/DirtyForm";
 import { requireAdmin } from "@/lib/auth";
@@ -95,6 +95,17 @@ export default async function InterceptionPage({
             ) : (
               <p className="text-sm text-zinc-500">Connectez d&apos;abord Shopify.</p>
             )}
+          </Card>
+
+          <Card icon={Boxes} iconColor="#8b5cf6" title="Apps de lots, upsell et personnalisation" description="Kaching Bundles, Fast Bundle, Bundler, Zepto, EasyBundle, options produit…">
+            <ul className="list-disc space-y-1.5 pl-5 text-sm text-zinc-600">
+              <li>Les propriétés des lignes du panier (gravure, fichiers, clés cachées « _… » des apps) et les attributs / la note du panier sont repris sur la commande Shopify ; les propriétés visibles s&apos;affichent au checkout.</li>
+              <li>Les remises des apps (fonctions de remise) et les prix de lot fixés par une app (Cart Transform) sont relus côté serveur dans le panier Shopify : l&apos;acheteur paie exactement le prix du panier, jamais plus.</li>
+              <li>La quantité d&apos;un lot ou d&apos;un article personnalisé se modifie depuis le panier (bouton désactivé au checkout).</li>
+              <li>
+                Un panier impossible à reproduire fidèlement (lot inconnu, prix supérieur ou non réconciliable, autre devise, lot en quantité &gt; 1, même article sur plusieurs lignes) part sur le checkout Shopify natif, comme les abonnements et cartes cadeaux, avec une entrée « cart.unsupported_app_pricing » au journal.
+              </li>
+            </ul>
           </Card>
 
           <Card icon={LifeBuoy} iconColor="#71717a" title="Plan B : installation manuelle" description="Seulement si votre thème bloque le script automatique.">

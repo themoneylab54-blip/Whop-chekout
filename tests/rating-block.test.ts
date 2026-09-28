@@ -26,7 +26,11 @@ describe("rating block: formatting", () => {
     expect(formatRatingScore(4.8, "en-US")).toBe("4.8");
     expect(formatRatingScore(4.8, "de-DE")).toBe("4,8");
     expect(formatRatingScore(5, "fr-FR")).toBe("5,0");
-    expect(formatRatingScore(4.75, "en-US")).toBe("4.8");
+    // Floored, never rounded up.
+    expect(formatRatingScore(4.75, "en-US")).toBe("4.7");
+    expect(formatRatingScore(4.96, "fr-FR")).toBe("4,9");
+    expect(formatRatingScore(4.3, "fr-FR")).toBe("4,3");
+    expect(formatRatingScore(4.1, "en-US")).toBe("4.1");
     expect(formatRatingScore(0, "it-IT")).toBe("0,0");
   });
 });

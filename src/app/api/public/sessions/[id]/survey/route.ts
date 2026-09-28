@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { db } from "@/lib/db";
+import { isForeignCheckoutHost } from "@/lib/checkout-domain-check";
 import { json, readJson } from "@/lib/http";
 import { clientIp, rateLimit } from "@/lib/ratelimit";
 import { route } from "@/lib/route";
@@ -18,7 +19,7 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const parsed = schema.safeParse(await readJson(req));
   if (!parsed.success) return json({ error: "Requête invalide", code: "survey_invalid" }, { status: 400 });
   const session = await db.checkoutSession.findUnique({ where: { id }, include: { store: true } });
-  if (!session || session.status !== "PAID") return json({ error: "Commande introuvable", code: "survey_unavailable" }, { status: 404 });
+  if (!session || session.status !== "PAID" || (await isForeignCheckoutHost(req, session.store))) return json({ error: "Commande introuvable", code: "survey_unavailable" }, { status: 404 });
   const design = await designFor(session.store, session);
   const block = loadThankYouLayout(design.thankYouLayout).blocks.find((b) => b.type === "survey" && !b.hidden);
   if (!block || block.type !== "survey") return json({ error: "Questionnaire indisponible", code: "survey_unavailable" }, { status: 404 });

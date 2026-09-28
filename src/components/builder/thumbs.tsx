@@ -1,5 +1,6 @@
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { BlockType } from "@/lib/layout";
+import { renderedColumns, type Spec } from "./templates";
 
 /*
  * Tiny schematic previews (no text, no real content): enough to recognise a block or a
@@ -295,7 +296,7 @@ export function BlockThumb({ type }: { type: BlockType }) {
         <Frame>
           {bar("60%")}
           <span className="flex h-3 w-full items-center justify-center rounded-[3px] border border-dashed border-indigo-400 bg-indigo-50">
-            <span className="font-mono text-[6px] leading-none font-bold text-indigo-600">MERCI10</span>
+            <span className="font-mono text-[6px] leading-none font-bold text-indigo-600">CODE</span>
           </span>
         </Frame>
       );
@@ -343,8 +344,6 @@ export function BlockThumb({ type }: { type: BlockType }) {
       );
   }
 }
-
-type SpecEntry = [BlockType, { placement?: "form" | "summary" }?];
 
 const line = (w: string, cls = "bg-zinc-300") => <span className={`block h-[2px] rounded-full ${cls}`} style={{ width: w }} />;
 
@@ -405,7 +404,7 @@ function Mini({ type }: { type: BlockType }) {
       return (
         <span className="flex flex-col gap-[2px]">
           <span className="block h-2 w-full rounded-[2px] border border-zinc-300 bg-white" />
-          <span className="block h-2.5 w-full rounded-[2px] bg-zinc-800" />
+          <span className="block h-2.5 w-full rounded-[var(--thumb-btn-radius,2px)] bg-[image:var(--thumb-accent,linear-gradient(#27272a,#27272a))]" />
         </span>
       );
     case "order_addons":
@@ -583,31 +582,59 @@ function Mini({ type }: { type: BlockType }) {
   }
 }
 
+/** Colors and shapes of a styled template, painted on its thumbnail. */
+export type ThumbLook = {
+  headerBackground: string;
+  pageBackground: string;
+  formBackground: string;
+  summaryBackground: string;
+  accentColor: string;
+  accentColor2: string;
+  buttonShape: "default" | "pill" | "square";
+  radius: number;
+};
+
 /**
  * Schematic of a whole template: each block drawn with its own silhouette (banner,
- * reviews, offer card…), with the summary column on checkout.
+ * reviews, offer card…), with the summary column on checkout. With a look, the header,
+ * backgrounds and pay button take the template's colors.
  */
-export function TemplateThumb({ spec, page }: { spec: SpecEntry[]; page: "checkout" | "thank-you" }) {
-  const form = spec.filter(([, o]) => o?.placement !== "summary");
-  const side = spec.filter(([, o]) => o?.placement === "summary");
+export function TemplateThumb({ spec, page, look }: { spec: Spec[]; page: "checkout" | "thank-you"; look?: ThumbLook }) {
+  // Checkout: the columns as the page draws them (reassurance widgets in the summary column,
+  // content blocks under the payment), not the list order.
+  const { form, summary: side } =
+    page === "checkout" ? renderedColumns(spec) : { form: spec.map(([type]) => type), summary: [] as BlockType[] };
+  const vars = look
+    ? ({
+        "--thumb-accent": `linear-gradient(90deg, ${look.accentColor}, ${look.accentColor2 || look.accentColor})`,
+        "--thumb-btn-radius": look.buttonShape === "pill" ? "999px" : look.buttonShape === "square" ? "0px" : `${Math.min(look.radius / 4, 3)}px`,
+        background: look.pageBackground || "#ffffff",
+      } as CSSProperties)
+    : undefined;
   return (
-    <span aria-hidden className="flex h-[92px] w-[104px] shrink-0 gap-1 overflow-hidden rounded-lg bg-zinc-50 p-1.5 ring-1 ring-zinc-200">
-      <span className="flex min-w-0 flex-1 flex-col gap-[3px]">
-        {form.map(([type], i) => (
-          <Mini key={i} type={type} />
-        ))}
-      </span>
-      {page === "checkout" && (
-        <span className="flex w-[36%] flex-col gap-[3px] rounded-[3px] bg-zinc-200/70 p-[3px]">
-          <span className="flex flex-col gap-[2px] rounded-[2px] bg-white p-[2px]">
-            {line("80%")}
-            {line("60%")}
-          </span>
-          {side.map(([type], i) => (
+    <span aria-hidden style={vars} className="flex h-[92px] w-[104px] shrink-0 flex-col overflow-hidden rounded-lg bg-zinc-50 ring-1 ring-zinc-200">
+      {look && <span className="block h-2 w-full shrink-0 border-b border-black/10" style={{ background: look.headerBackground }} />}
+      <span className="flex min-h-0 flex-1 gap-1 p-1.5">
+        <span className="flex min-w-0 flex-1 flex-col gap-[3px]" style={look?.formBackground ? { background: look.formBackground } : undefined}>
+          {form.map((type, i) => (
             <Mini key={i} type={type} />
           ))}
         </span>
-      )}
+        {page === "checkout" && (
+          <span
+            className="flex w-[36%] flex-col gap-[3px] rounded-[3px] bg-zinc-200/70 p-[3px]"
+            style={look ? { background: look.summaryBackground || look.pageBackground || "#ffffff", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.06)" } : undefined}
+          >
+            <span className="flex flex-col gap-[2px] rounded-[2px] bg-white p-[2px]">
+              {line("80%")}
+              {line("60%")}
+            </span>
+            {side.map((type, i) => (
+              <Mini key={i} type={type} />
+            ))}
+          </span>
+        )}
+      </span>
     </span>
   );
 }

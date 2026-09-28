@@ -3,6 +3,7 @@ import { DeadlineError, notePartial } from "./deadline";
 import { z } from "zod";
 import { Prisma, type CheckoutQuote, type CheckoutSession, type Store } from "@prisma/client";
 import { db } from "./db";
+import { thankYouReturnUrl } from "./checkout-domain";
 import { env } from "./env";
 import {
   checkDiscount,
@@ -10,6 +11,7 @@ import {
   giftLine,
   giftProgress,
   giftTitle,
+  offerBaseLines,
   parseQuantityTiers,
   quantityBreakForLines,
   ratesForCountry,
@@ -31,15 +33,17 @@ import { pickupPointSchema, type PickupPoint } from "./pickup";
 import { sendPurchaseConversions } from "./conversions";
 import { applyAppCosts } from "./costs";
 import { submitDisputeEvidence } from "./disputes";
-import { createCheckoutConfiguration } from "./whop";
+import { createCheckoutConfiguration, MethodUnavailableError } from "./whop";
 import { designFor } from "./experiments";
-import { loadCheckoutLayout, loadInterception, loadTheme } from "./layout";
-import { automaticDiscountFor, automaticStackFor, CALIBRATION_SETTLE_MS, canReadShopifyDiscounts, lookupShopifyCode, needsCollections, productCollections, shopifyCodeAsDiscount, shopifyCodeUses, type ShopifyCodeDiscount } from "./shopify-discounts";
+import { loadCheckoutLayout, loadInterception, loadTheme, paypalExpressAllowed } from "./layout";
+import { automaticDiscountFor, automaticStackFor, CALIBRATION_SETTLE_MS, canReadShopifyDiscounts, lookupShopifyCode, lookupShopifyCodeWithRetry, needsCollections, productCollections, shopifyCodeAsDiscount, shopifyCodeUses, type ShopifyCodeDiscount } from "./shopify-discounts";
 import { overridesFor, withAddOnOverrides, withProtectionOverride } from "./checkout-tests";
+import { PAYPAL_SERVER_IN_FLIGHT_MS } from "./paypal-timing";
 import { chargePlan, chargeFallback, toShopCents, type ChargePlan } from "./charge";
 import { recordIncident } from "./incidents";
 import { GOOGLE_ADJUST_DUE } from "./google-conversions";
 import { recordOrderCustomer } from "./shopify-history";
+import { carryCartExtras, cartHeldByApp, type CartContext } from "./cart-fidelity";
 
 /* ------------------------------------------------------------------ */
 /* Input validation                                                    */
@@ -71,6 +75,8 @@ export const quoteSchema = z.object({
   addOnIds: z.array(z.string().max(40)).max(20).default([]),
   /** Shipping protection toggle (checkout block); missing = the block's default. */
   protection: z.boolean().optional(),
+  /** "paypal": a checkout offering PayPal only (express PayPal button); missing = every method. */
+  method: z.enum(["paypal"]).nullable().optional(),
 });
 export type QuoteInput = z.infer<typeof quoteSchema>;
 
@@ -119,6 +125,17 @@ export type Quote = {
   protection: { selected: boolean; priceCents: number } | null;
   /** Custom order lines without an AddOn row (shipping protection), snapshotted with the add-ons. */
   extraAddOns: { id: string; title: string; priceCents: number; variantId: null; costCents: null }[];
+  /** The cart is fixed as a whole (an app's prices, gifts, offers or bundles): no line changed, removed or added. */
+  cartLocked?: boolean;
+  /** The Shopify cart's automatic discount no longer applies (the buyer changed the lines): its titles. */
+  automaticDiscountLost?: string[];
+  /**
+   * The Shopify cart's own code isn't applied here (`reason`: the discount error code, or
+   * "discount_amount" when it takes off less than in the cart). `blocking`: the code lowered the
+   * cart and, for these very lines, the checkout would charge more than the cart showed (or Shopify
+   * couldn't be asked, twice): payment is refused (assertPayable) — back to the cart / Shopify's checkout.
+   */
+  cartCodeLost?: { code: string; reason: string; blocking: boolean };
 };
 
 /** Id of the shipping protection in the paid snapshot's add-ons (Shopify line "Protection colis"). */
@@ -146,14 +163,30 @@ export function addOnEligible(showIf: unknown, ctx: { subtotalCents: number; pro
 }
 
 /**
+ * Whether the checkout's cart is fixed as a whole: an app's line (price, gift, discounted offer,
+ * bundle, hidden key) or a variant split over several lines — they hold for this exact set of lines
+ * only. A plain cart's sitewide automatic discount doesn't fix it: a change drops that discount. Pure.
+ */
+export function cartFrozen(lines: CartLine[]): boolean {
+  return cartHeldByApp(lines);
+}
+
+/**
  * Applies quantity changes: re-prices the changed cart with Shopify (price and stock
  * are never taken from the browser) and saves it on the session. Unchanged → as is.
  */
 async function linesFor(session: SessionWithStore, quantities: Record<string, number> | undefined): Promise<CartLine[]> {
   // Free gifts are re-derived by every quote: never a buyer line (a paid session's lines hold them).
-  const current = (session.lines as unknown as CartLine[]).filter((l) => !l.gift);
-  if (!quantities) return current;
-  const wanted = current.map((l) => ({ variantId: l.variantId, quantity: quantities[l.variantId] ?? l.quantity }));
+  const stored = (session.lines as unknown as CartLine[]).filter((l) => !l.gift);
+  // An app's price, gift or offer holds for this exact cart only: the whole cart is then fixed (no
+  // quantity change, no line removed or added) — else a line's app price would survive removing the
+  // lines it depended on, or a locked gift lose its discount. A plain cart's automatic discount
+  // simply stops applying once the lines change (automaticDiscountFor: same items only).
+  const frozen = cartFrozen(stored);
+  const current = frozen ? stored.map((l) => (l.locked ? l : { ...l, locked: true })) : stored;
+  if (!quantities || frozen) return current;
+  // A line the Shopify cart fixed (app price, properties, bundle) keeps its quantity: changed from the cart only.
+  const wanted = current.map((l) => ({ variantId: l.variantId, quantity: l.locked ? l.quantity : (quantities[l.variantId] ?? l.quantity) }));
   // Products added from the checkout ("Complétez votre commande"): new variant ids.
   const known = new Set(current.map((l) => l.variantId));
   const added = Object.entries(quantities)
@@ -163,14 +196,16 @@ async function linesFor(session: SessionWithStore, quantities: Record<string, nu
   if (!added.length && wanted.every((w, i) => w.quantity === current[i].quantity)) return current;
   const kept = [...wanted, ...added].filter((w) => w.quantity > 0);
   if (!kept.length) throw new CheckoutError("empty_cart", "Votre panier est vide.");
-  const priced = await priceCart(session.store, kept);
+  // Re-priced lines keep what the cart gave them (properties, bundle components, app price as a ceiling).
+  const priced = carryCartExtras(current, await priceCart(session.store, kept));
   if (!priced.length) throw new CheckoutError("empty_cart", "Ces articles ne sont plus disponibles.");
   // Products the merchant keeps on Shopify's checkout can't be added here either.
   const excluded = loadInterception(session.store.interception).excludedHandles;
-  if (priced.some((l) => !known.has(l.variantId) && (excluded.includes(l.productHandle) || l.giftCard))) {
+  if (priced.some((l) => !known.has(l.variantId) && (excluded.includes(l.productHandle) || l.giftCard || (l.requiresComponents && !l.components?.length)))) {
     throw new CheckoutError("empty_cart", "Ce produit ne peut pas être ajouté ici.");
   }
-  const lines = priced.map((l) => (l.inventory != null && l.inventory > 0 && l.quantity > l.inventory ? { ...l, quantity: l.inventory } : l));
+  // Capped at the stock (a locked bundle line stays whole: its components and price are for that quantity).
+  const lines = priced.map((l) => (!l.locked && l.inventory != null && l.inventory > 0 && l.quantity > l.inventory ? { ...l, quantity: l.inventory } : l));
   const saved = await db.checkoutSession.updateMany({
     where: { id: session.id, status: { not: "PAID" } },
     data: { lines: lines as unknown as Prisma.InputJsonValue, subtotalCents: subtotal(lines) },
@@ -202,12 +237,17 @@ const DISCOUNT_EXHAUSTED = "Ce code promo a atteint sa limite d'utilisation";
 
 export async function quoteSession(session: SessionWithStore, input: QuoteInput): Promise<Quote> {
   const buyerLines = await linesFor(session, session.status === "PAID" ? undefined : input.quantities);
+  // The Shopify cart's own code (a /discount/CODE link, Fast Bundle's code) while the buyer has typed
+  // none (null; "" = removed): looked up like a typed code, kept only when valid — else left out
+  // without a buyer-facing error (journaled).
+  const cartCode = input.discountCode == null ? ((session.cartContext as CartContext | null)?.discountCodes?.[0] ?? null) : null;
+  const discountCode = input.discountCode || cartCode;
   const [allRates, storeAddOns, discountRow, design, overrides] = await Promise.all([
     db.shippingRate.findMany({ where: { storeId: session.storeId }, orderBy: { position: "asc" } }),
     db.addOn.findMany({ where: { storeId: session.storeId, active: true } }),
-    input.discountCode
+    discountCode
       ? db.discountCode.findFirst({
-          where: { storeId: session.storeId, code: { equals: input.discountCode, mode: "insensitive" } },
+          where: { storeId: session.storeId, code: { equals: discountCode, mode: "insensitive" } },
         })
       : null,
     designFor(session.store, session),
@@ -218,7 +258,8 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
 
   // Quantity breaks v2: percent tiers (maybe scoped to products) and free gifts.
   const tiers = parseQuantityTiers(overrides.breaks ?? session.store.quantityBreaks);
-  const progress = giftProgress(tiers.gifts, buyerLines);
+  // An app's bundle price or gift already is an offer: the checkout's own gifts count the other lines.
+  const progress = giftProgress(tiers.gifts, offerBaseLines(buyerLines));
   const gifts = await giftLinesFor(session, progress.earned);
   const lines = [...buyerLines, ...gifts];
 
@@ -230,12 +271,13 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
   let shopifyCode: ShopifyCodeDiscount | null = null;
   let discountError: string | null = null;
   let discountErrorCode: string | null = null;
-  if (input.discountCode) {
+  if (discountCode) {
     // One message for unknown, inactive, expired or used-up codes: don't help guess private codes.
     const invalid = "Code promo invalide ou expiré";
     if (!discountRow && session.store.shopifyDiscountCodes && session.store.shopifyAccessToken && canReadShopifyDiscounts(session.store)) {
       // Not one of the app's codes: a code created in Shopify (amount off / free shipping).
-      const found = await lookupShopifyCode(session.store, input.discountCode);
+      // The Shopify cart's own code is asked twice when Shopify doesn't answer (never silently dropped).
+      const found = cartCode && discountCode === cartCode ? await lookupShopifyCodeWithRetry(session.store, discountCode) : await lookupShopifyCode(session.store, discountCode);
       if (found === "unavailable") {
         // Shopify couldn't be asked: not an invalid code, the buyer can retry.
         discountError = "Impossible de vérifier ce code pour le moment, réessayez.";
@@ -305,8 +347,18 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
   const automaticStack =
     automatic.cents > 0 && (discount || tiers.breaks.length) && canReadShopifyDiscounts(session.store) ? await automaticStackFor(session.store, automatic.titles) : null;
   const stack = { automaticDiscountCents: automatic.cents, automaticStack, breaksCombineWithCodes: session.store.breaksCombineWithCodes, automaticLineCents: automatic.lineCents };
-  const totals = computeTotals({ lines, rate, discount, addOns, quantityBreaks: tiers.breaks, protection: protectionOn ? protectionBlock!.props : null, ...stack });
-  const offered = protectionBlock ? computeTotals({ lines, rate, discount, addOns: [], quantityBreaks: tiers.breaks, protection: protectionBlock.props, ...stack }) : null;
+  let totals = computeTotals({ lines, rate, discount, addOns, quantityBreaks: tiers.breaks, protection: protectionOn ? protectionBlock!.props : null, ...stack });
+  let offered = protectionBlock ? computeTotals({ lines, rate, discount, addOns: [], quantityBreaks: tiers.breaks, protection: protectionBlock.props, ...stack }) : null;
+  // A code that doesn't combine with the automatic discount making an app's gift free (Kaching, BOGOS)
+  // would have the buyer pay for that gift: the code is refused instead.
+  if (totals.dropped?.includes("automatic") && discount && buyerLines.some((l) => l.appGift)) {
+    discount = null;
+    shopifyCode = null;
+    totals = computeTotals({ lines, rate, discount, addOns, quantityBreaks: tiers.breaks, protection: protectionOn ? protectionBlock!.props : null, ...stack });
+    offered = protectionBlock ? computeTotals({ lines, rate, discount, addOns: [], quantityBreaks: tiers.breaks, protection: protectionBlock.props, ...stack }) : null;
+    discountError = "Ce code ne se cumule pas avec la remise qui rend gratuit le cadeau de votre panier : il n'est pas appliqué";
+    discountErrorCode = "discount_not_combinable_gift";
+  }
   // A discount that doesn't combine with the others was left out (the best combination for the buyer is kept).
   if (totals.dropped?.includes("code") && discount) {
     discount = null;
@@ -315,7 +367,32 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
     discountErrorCode = "discount_not_combinable";
   }
   if (totals.dropped?.includes("automatic")) automatic = { cents: 0, titles: [] };
-  const volumeBreak = quantityBreakForLines(tiers.breaks, buyerLines);
+  // The cart's own code that doesn't apply here: left out of the code field (the buyer never typed
+  // it), journaled, and said (cartCodeLost). A code that lowered the cart (codeCheck, verified when the
+  // checkout opened) blocks payment when these very lines would cost more than the cart showed, or
+  // when Shopify couldn't be asked: never silently charged more.
+  let cartCodeLost: Quote["cartCodeLost"];
+  if (cartCode && !input.discountCode) {
+    const check = (session.cartContext as CartContext | null)?.codeCheck;
+    const required = !!check && check.code.toUpperCase() === cartCode.toUpperCase();
+    const overCart = required && sameCodeCart(check!.items, buyerLines) && totals.subtotalCents - totals.discountCents > check!.totalCents;
+    if (discountError) {
+      await noteCartCodeDropped(session, cartCode, discountErrorCode);
+      cartCodeLost = { code: cartCode, reason: discountErrorCode ?? "discount_invalid", blocking: required && (discountErrorCode === "discount_unavailable" || overCart) };
+      discountError = null;
+      discountErrorCode = null;
+    } else if (overCart) {
+      await noteCartCodeDropped(session, cartCode, "discount_amount");
+      cartCodeLost = { code: cartCode, reason: "discount_amount", blocking: true };
+    }
+  }
+  // The Shopify cart's automatic discount stopped applying because the buyer changed the lines.
+  const cartAutomatic = session.cartDiscounts as { totalCents?: unknown; titles?: unknown } | null;
+  const automaticLost =
+    !!cartAutomatic && Number(cartAutomatic.totalCents) > 0 && !totals.dropped?.includes("automatic") && automatic.cents === 0
+      ? (Array.isArray(cartAutomatic.titles) ? cartAutomatic.titles.map(String).slice(0, 5) : [])
+      : null;
+  const volumeBreak = quantityBreakForLines(tiers.breaks, offerBaseLines(buyerLines));
   const protectionCents = totals.protectionCents ?? 0;
   const discountedSub = totals.subtotalCents - totals.discountCents;
   const quote: Quote = {
@@ -347,10 +424,39 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
     },
     protection: protectionBlock ? { selected: protectionCents > 0, priceCents: offered?.protectionCents ?? 0 } : null,
     extraAddOns: protectionCents > 0 ? [{ id: PROTECTION_ADDON_ID, title: "Protection colis", priceCents: protectionCents, variantId: null, costCents: null }] : [],
+    ...(cartFrozen(buyerLines) ? { cartLocked: true } : {}),
+    ...(automaticLost ? { automaticDiscountLost: automaticLost } : {}),
+    ...(cartCodeLost ? { cartCodeLost } : {}),
   };
   // The Shopify code as read (limits, usage count): frozen on the snapshot, never sent to the browser.
   if (shopifyCode && discountSource === "shopify") shopifyCodeOf.set(quote, shopifyCode);
   return quote;
+}
+
+/** Whether the checkout's buyer lines are still the ones the cart's code was verified on. Pure. */
+function sameCodeCart(items: { variantId: string; quantity: number }[], lines: CartLine[]): boolean {
+  const key = (id: string) => id.match(/(\d+)\D*$/)?.[1] ?? id;
+  const qty = (list: { variantId: string; quantity: number }[]) => {
+    const m = new Map<string, number>();
+    for (const l of list) m.set(key(l.variantId), (m.get(key(l.variantId)) ?? 0) + l.quantity);
+    return m;
+  };
+  const a = qty(items);
+  const b = qty(lines.filter((l) => !l.gift));
+  return a.size === b.size && [...a].every(([k, n]) => b.get(k) === n);
+}
+
+/** A code the Shopify cart carried that the checkout can't apply: journaled once per store and hour. */
+async function noteCartCodeDropped(session: SessionWithStore, code: string, reason: string | null) {
+  if (!(await rateLimit(`journal:cart_code_dropped:${session.storeId}`, 1, 3600_000))) return;
+  await recordEvent({
+    storeId: session.storeId,
+    sessionId: session.id,
+    level: "warn",
+    kind: "cart.discount_code_dropped",
+    message: `Code du panier Shopify « ${code.slice(0, 60)} » non repris au checkout (${reason ?? "inapplicable"}) : vérifiez qu'il existe dans Shopify et que la lecture des codes Shopify est activée.`,
+    data: { code: code.slice(0, 60), reason },
+  });
 }
 
 /** Shopify code behind a quote (server side only: the quote itself goes to the browser). */
@@ -394,6 +500,12 @@ function assertPayable(session: SessionWithStore, quote: Quote, input: QuoteInpu
   const lines = session.lines as unknown as CartLine[];
   if (lines.length === 0) throw new CheckoutError("empty_cart", "Votre panier est vide");
   if (input.discountCode && quote.discountError) throw new CheckoutError(quote.discountErrorCode ?? "discount_invalid", quote.discountError);
+  // The Shopify cart's code can't be honored for this cart: never charged more than the cart showed.
+  if (quote.cartCodeLost?.blocking) {
+    throw quote.cartCodeLost.reason === "discount_unavailable"
+      ? new CheckoutError("discount_unavailable", "Impossible de vérifier le code de votre panier pour le moment, réessayez.")
+      : new CheckoutError("cart_code_lost", `Le code « ${quote.cartCodeLost.code} » de votre panier ne peut pas être appliqué ici. Retournez au panier pour finaliser votre commande.`);
+  }
   if (lines.some((l) => l.requiresShipping) && !quote.shippingRateId) {
     throw new CheckoutError("no_shipping", "Nous ne livrons pas encore dans ce pays");
   }
@@ -420,15 +532,123 @@ export function quoteFingerprint(quote: Pick<Quote, "totals" | "shippingRateId" 
 }
 
 /**
+ * Fingerprint of the snapshot holding a quote's Whop checkout. A PayPal-only checkout charges
+ * exactly the same thing but is another Whop configuration: its own snapshot (same content,
+ * suffixed fingerprint), so a buyer going back to the card gets the regular checkout again.
+ */
+export function snapshotFingerprint(quote: Parameters<typeof quoteFingerprint>[0], method?: "paypal" | null, returnUrl?: string | null): string {
+  return quoteFingerprint(quote) + (method === "paypal" ? "|m:paypal" : "") + returnHostSuffix(returnUrl);
+}
+
+/** Whether a snapshot fingerprint is a PayPal-only checkout's (segments: "…|m:paypal|h:host"). Pure. */
+export function isPaypalFingerprint(fingerprint: string | null | undefined): boolean {
+  return !!fingerprint && fingerprint.split("|").includes("m:paypal");
+}
+
+/**
+ * The Whop configuration also carries the return URL (thank-you page): one made for the checkout
+ * domain is never reused from APP_URL's host (loader fallback) and vice versa. APP_URL's host adds
+ * nothing (fingerprints of stores without a checkout domain unchanged). Pure.
+ */
+function returnHostSuffix(returnUrl: string | null | undefined, appUrl = env.appUrl): string {
+  if (!returnUrl) return "";
+  try {
+    const host = new URL(returnUrl).hostname.toLowerCase();
+    return host === new URL(appUrl).hostname.toLowerCase() ? "" : `|h:${host}`;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Where Whop's last word on PayPal is kept: per store AND charged currency (PayPal support
+ * depends on it), so a refusal in one currency never hides the button for the others.
+ */
+export function paypalSettingKey(storeId: string, currency: string): string {
+  return `paypal:${storeId}:${currency.toUpperCase()}`;
+}
+
+/** Whether the store's checkout offers PayPal in this currency (as Whop last said); unknown = yes. */
+export async function paypalOffered(storeId: string, currency: string): Promise<boolean> {
+  const row = await db.appSetting.findUnique({ where: { key: paypalSettingKey(storeId, currency) } });
+  // "off" (Whop's regular checkouts without PayPal) hides it; a refusal ("off:<date>") only for its 24 h.
+  const v = row?.value;
+  return !(v === "off" || refusalHolds(v));
+}
+
+/** A PayPal-only checkout Whop refused hides the button for a day, whatever regular checkouts say. */
+const PAYPAL_REFUSED_MS = 24 * 3600_000;
+
+/** Whether a remembered PayPal value is a refusal still holding the button hidden (24 h). Pure. */
+function refusalHolds(value: string | null | undefined, now = Date.now()): boolean {
+  return !!value?.startsWith("off:") && now - Date.parse(value.slice(4)) < PAYPAL_REFUSED_MS;
+}
+
+async function rememberPaypal(storeId: string, currency: string, offered: boolean, refused = false) {
+  const key = paypalSettingKey(storeId, currency);
+  const prev = await db.appSetting.findUnique({ where: { key } });
+  if (offered && refusalHolds(prev?.value)) return;
+  const value = offered ? "on" : refused ? `off:${new Date().toISOString()}` : "off";
+  if (prev?.value === value) return;
+  await db.appSetting.upsert({ where: { key }, create: { key, value }, update: { value } });
+  // Whop refused a PayPal-only checkout: told once to the merchant (journal + alert), not at every
+  // buyer (a refusal already holding the button hidden says nothing new).
+  if (refused && !refusalHolds(prev?.value)) {
+    await recordEvent({
+      storeId,
+      level: "warn",
+      kind: "paypal.refused",
+      message: `Whop a refusé PayPal (${currency.toUpperCase()}) : le bouton PayPal express est masqué 24 h. Vérifiez PayPal dans Whop → Paramètres → Moyens de paiement, puis « Réactiver PayPal » sur la page Whop.`,
+      data: { currency: currency.toUpperCase() },
+      alert: true,
+    });
+  }
+}
+
+/** PayPal refusals currently hiding the express button, by charged currency (dashboard > Whop). */
+export async function paypalRefusals(storeId: string): Promise<{ currency: string; since: Date | null }[]> {
+  const rows = await db.appSetting.findMany({ where: { key: { startsWith: `paypal:${storeId}:` } } });
+  return rows
+    .filter((r) => r.value === "off" || refusalHolds(r.value))
+    .map((r) => ({ currency: r.key.slice(`paypal:${storeId}:`.length), since: r.value.startsWith("off:") ? new Date(r.value.slice(4)) : null }))
+    .sort((a, b) => a.currency.localeCompare(b.currency));
+}
+
+/**
+ * One dashboard line per currency where PayPal express is hidden, each with its own state: refused
+ * by Whop on its own date (held 24 h), or simply not offered. `fmt` formats a date (store's zone). Pure.
+ */
+export function paypalHiddenLines(hidden: { currency: string; since: Date | null }[], fmt: (d: Date) => string): string[] {
+  return hidden.map((h) => `${h.currency} : ${h.since ? `refusé par Whop le ${fmt(h.since)} (masqué 24 h)` : "Whop ne le propose pas"}`);
+}
+
+/** Forgets what Whop said about PayPal for the store (every currency): the next checkout asks again. */
+export async function clearPaypalRefusals(storeId: string): Promise<number> {
+  return (await db.appSetting.deleteMany({ where: { key: { startsWith: `paypal:${storeId}:` } } })).count;
+}
+
+/**
  * Returns the Whop checkout configuration for the current quote, creating it (and a
  * frozen snapshot of what it charges) when this exact quote was never prepared.
  * The snapshot — not the session's latest state — later drives the Shopify order, so
  * racing requests or a stale wallet button can never pay for one thing and ship another.
  */
-export async function prepareSession(session: SessionWithStore, input: QuoteInput) {
+export async function prepareSession(session: SessionWithStore, input: QuoteInput, opts: { host?: string | null } = {}) {
   const quote = await quoteSession(session, input);
   assertPayable(session, quote, input);
-  const fingerprint = quoteFingerprint(quote);
+  const method = input.method === "paypal" ? ("paypal" as const) : null;
+  // The currency Whop charges (buyer's when the store charges in it): PayPal is remembered per currency.
+  const chargeCurrency = quote.charge?.currency ?? session.currency;
+  // The merchant's choice (builder > Paiement express): PayPal off, or the express section off or
+  // hidden (where its button lives) = no PayPal-only checkout at all.
+  const design = await designFor(session.store, session);
+  const paypalAllowed = paypalExpressAllowed(loadTheme(design.theme, session.store.name), loadCheckoutLayout(design.checkoutLayout));
+  if (method === "paypal" && (!paypalAllowed || !(await paypalOffered(session.storeId, chargeCurrency)))) {
+    throw new CheckoutError("paypal_unavailable", "PayPal n'est pas disponible pour cette commande.");
+  }
+  // Paid through the loader's APP_URL fallback: back to APP_URL (?via=app), not the unreachable domain.
+  const redirectUrl = thankYouReturnUrl(session.store, session.id, opts.host);
+  const fingerprint = snapshotFingerprint(quote, method, redirectUrl);
 
   let snapshot = await db.checkoutQuote.findFirst({
     where: { sessionId: session.id, fingerprint },
@@ -461,11 +681,24 @@ export async function prepareSession(session: SessionWithStore, input: QuoteInpu
       storeId: session.storeId,
       // Buyer's currency when the store charges in it (rate frozen on the snapshot below).
       totalCents: quote.charge?.totalCents ?? quote.totals.totalCents,
-      currency: quote.charge?.currency ?? session.currency,
+      currency: chargeCurrency,
       title: `Commande ${session.store.name}`,
-      redirectUrl: `${env.appUrl}/c/${session.id}/merci`,
+      redirectUrl,
       country: input.countryCode ?? null,
+      ...(method ? { methods: [method] } : {}),
+    }).catch(async (err) => {
+      // PayPal-only checkout refused (or PayPal dropped): the button hides; the regular form stays.
+      // Only a clear refusal lands here (whop.ts rethrows 5xx/429/timeouts as is: nothing remembered).
+      // A refusal that doesn't name PayPal / the payment method: unavailable for this session only
+      // (the buyer keeps the card; nothing remembered for the store).
+      if (err instanceof MethodUnavailableError) {
+        if (err.remember) await rememberPaypal(session.storeId, chargeCurrency, false, true);
+        throw new CheckoutError("paypal_unavailable", "PayPal n'est pas disponible pour cette commande.");
+      }
+      throw err;
     }), "whop");
+    // Whether Whop offers PayPal, as this new checkout says (the express button follows it).
+    if (typeof whop.paypal === "boolean") await rememberPaypal(session.storeId, chargeCurrency, whop.paypal);
     snapshot = await db.checkoutQuote.create({
       data: {
         sessionId: session.id,
@@ -511,7 +744,7 @@ export async function prepareSession(session: SessionWithStore, input: QuoteInpu
     },
   });
   if (!prepared.count) throw new CheckoutError("already_paid", "Cette commande est déjà payée.");
-  return { checkoutConfigurationId: snapshot.whopCheckoutId, totals: quote.totals, quote };
+  return { checkoutConfigurationId: snapshot.whopCheckoutId, totals: quote.totals, quote, paypal: paypalAllowed && (await paypalOffered(session.storeId, chargeCurrency)) };
 }
 
 function quoteFields(quote: Quote) {
@@ -528,17 +761,64 @@ function quoteFields(quote: Quote) {
 }
 
 /**
+ * The method of a payment possibly still going through: a PAYING session whose last attempt (the
+ * "Pay" click or a PayPal window from Whop's own button) is under PAYPAL_SERVER_IN_FLIGHT_MS old.
+ * The method is stored, not guessed from session.whopCheckoutId (a later prepare, e.g. from a second
+ * tab, replaces it): a PayPal confirm stamps paypalWindowAt with its payClickedAt, so the window
+ * being the latest attempt (or tied with the click) means PayPal; a card/wallet confirm leaves
+ * paypalWindowAt older. paypalBeatAt (the heartbeat of an open PayPal window, or a late popup of
+ * ours after a "blocked" verdict) is liveness only and always means PayPal: the latest of the three
+ * times decides. A FAILED session (a failed card) or an OPEN one (a blocked window dropped by the
+ * paypal-window route) counts only a PayPal window or beat after that attempt's click: "paypal".
+ * Null when nothing is in flight (PAID, ABANDONED, an OPEN/FAILED one without a later window or beat,
+ * or an old attempt). The one formula for the status route's paymentInFlight and confirmSession. Pure.
+ */
+export function inFlightMethod(
+  session: Pick<CheckoutSession, "status" | "payClickedAt" | "paypalWindowAt" | "paypalBeatAt">,
+  now = Date.now(),
+): "paypal" | "other" | null {
+  const clicked = session.payClickedAt?.getTime() ?? 0;
+  const paypalAt = Math.max(session.paypalWindowAt?.getTime() ?? 0, session.paypalBeatAt?.getTime() ?? 0);
+  if (session.status === "FAILED" || session.status === "OPEN") {
+    return paypalAt > clicked && now - paypalAt < PAYPAL_SERVER_IN_FLIGHT_MS ? "paypal" : null;
+  }
+  if (session.status !== "PAYING") return null;
+  const last = Math.max(clicked, paypalAt);
+  if (!last || now - last >= PAYPAL_SERVER_IN_FLIGHT_MS) return null;
+  return paypalAt >= clicked ? "paypal" : "other";
+}
+
+type InFlightFields = Pick<CheckoutSession, "status" | "payClickedAt" | "paypalWindowAt" | "paypalBeatAt">;
+
+/** Refuses a confirm with another method than the payment in flight (see inFlightMethod). */
+function assertNoOtherInFlight(session: InFlightFields, method: PayInput["method"]) {
+  const inFlight = inFlightMethod(session);
+  if (inFlight && inFlight !== (method === "paypal" ? "paypal" : "other")) {
+    throw new CheckoutError("payment_in_flight", "Un paiement est déjà en cours de validation, patientez quelques secondes.");
+  }
+}
+
+/**
  * Saves the buyer's details right before the embedded Whop form is submitted.
  * If the checkout the page holds doesn't charge exactly the current quote, returns
  * a fresh one instead so the buyer is never charged a stale amount.
  */
-export async function confirmSession(session: SessionWithStore, input: PayInput) {
+export async function confirmSession(session: SessionWithStore, input: PayInput, opts: { host?: string | null } = {}) {
+  // A payment still going through with another method (e.g. a PayPal window in a second tab):
+  // never a second charge on top of it. The same method (a card retried) and a FAILED session pass
+  // (unless a PayPal window opened after the failed card). Checked again atomically below.
+  assertNoOtherInFlight(session, input.method);
   const quoteInput = { ...input, countryCode: input.address.countryCode };
   const quote = await quoteSession(session, quoteInput);
   assertPayable(session, quote, quoteInput);
-  const theme = loadTheme((await designFor(session.store, session)).theme, session.store.name);
+  const design = await designFor(session.store, session);
+  const theme = loadTheme(design.theme, session.store.name);
   if (theme.requireTerms && !input.acceptsTerms) {
     throw new CheckoutError("terms_required", "Veuillez accepter les conditions générales de vente.");
+  }
+  // PayPal express switched off by the merchant: not even through a PayPal checkout prepared before.
+  if (input.method === "paypal" && !paypalExpressAllowed(theme, loadCheckoutLayout(design.checkoutLayout))) {
+    throw new CheckoutError("paypal_unavailable", "PayPal n'est pas disponible pour cette commande.");
   }
   // Shopify "once per customer" codes: not if this e-mail already paid an order with it here.
   if (quote.discount?.oncePerCustomer) {
@@ -558,28 +838,47 @@ export async function confirmSession(session: SessionWithStore, input: PayInput)
   const snapshot = configId
     ? await db.checkoutQuote.findUnique({ where: { whopCheckoutId: configId } })
     : null;
-  if (!snapshot || snapshot.sessionId !== session.id || snapshot.fingerprint !== quoteFingerprint(quote)) {
-    const prepared = await prepareSession(session, quoteInput);
+  // The checkout must charge this quote AND offer the chosen method (PayPal-only or regular).
+  if (!snapshot || snapshot.sessionId !== session.id || snapshot.fingerprint !== snapshotFingerprint(quote, input.method, thankYouReturnUrl(session.store, session.id, opts.host))) {
+    const prepared = await prepareSession(session, quoteInput, opts);
     return { ready: false as const, checkoutConfigurationId: prepared.checkoutConfigurationId, totals: prepared.totals };
   }
 
-  const confirmed = await db.checkoutSession.updateMany({
-    where: { id: session.id, status: { not: "PAID" } },
-    data: {
-      ...quoteFields(quote),
-      whopCheckoutId: snapshot.whopCheckoutId,
-      preparedTotalCents: snapshot.totalCents,
-      status: "PAYING",
-      payClickedAt: new Date(),
-      termsAcceptedAt: input.acceptsTerms ? new Date() : null,
-      email: input.email,
-      acceptsMarketing: input.acceptsMarketing,
-      shippingAddress: input.address as Prisma.InputJsonValue,
-      pickupPoint: pickup ? (input.pickupPoint as Prisma.InputJsonValue) : Prisma.DbNull,
-      note: input.note || null,
-    },
-  });
-  if (!confirmed.count) throw new CheckoutError("already_paid", "Cette commande est déjà payée.");
+  const clickedAt = new Date();
+  const data = {
+    ...quoteFields(quote),
+    whopCheckoutId: snapshot.whopCheckoutId,
+    preparedTotalCents: snapshot.totalCents,
+    status: "PAYING" as const,
+    payClickedAt: clickedAt,
+    // The in-flight method (inFlightMethod): a PayPal confirm opens a PayPal window too.
+    ...(input.method === "paypal" ? { paypalWindowAt: clickedAt } : {}),
+    termsAcceptedAt: input.acceptsTerms ? new Date() : null,
+    email: input.email,
+    acceptsMarketing: input.acceptsMarketing,
+    shippingAddress: input.address as Prisma.InputJsonValue,
+    pickupPoint: pickup ? (input.pickupPoint as Prisma.InputJsonValue) : Prisma.DbNull,
+    note: input.note || null,
+  };
+  // The in-flight check above, made atomic: written only if no attempt (a "Pay" click or a PayPal
+  // window) landed since the times it read. Two simultaneous confirms with different methods can't
+  // both pass: the loser reads the winner's attempt and is refused (payment_in_flight); the same
+  // method (a double click) goes through on the next round.
+  let seen: InFlightFields = session;
+  for (let round = 0; ; round++) {
+    const confirmed = await db.checkoutSession.updateMany({
+      where: { id: session.id, status: { not: "PAID" }, payClickedAt: seen.payClickedAt, paypalWindowAt: seen.paypalWindowAt, paypalBeatAt: seen.paypalBeatAt },
+      data,
+    });
+    if (confirmed.count) break;
+    const now = await db.checkoutSession.findUnique({ where: { id: session.id }, select: { status: true, payClickedAt: true, paypalWindowAt: true, paypalBeatAt: true } });
+    if (!now || now.status === "PAID") throw new CheckoutError("already_paid", "Cette commande est déjà payée.");
+    assertNoOtherInFlight(now, input.method);
+    // Attempts keep landing (never in practice): refused like one in flight, the buyer retries.
+    if (round >= 2) throw new CheckoutError("payment_in_flight", "Un paiement est déjà en cours de validation, patientez quelques secondes.");
+    seen = now;
+  }
+  if (input.method === "paypal") log.info("checkout.pay_method", "Paiement lancé avec PayPal (bouton express)", { storeId: session.storeId, sessionId: session.id, method: "paypal" });
   return { ready: true as const, checkoutConfigurationId: snapshot.whopCheckoutId, totals: quote.totals };
 }
 
@@ -599,7 +898,7 @@ type PaymentAddress = {
 
 export type PaymentBuyer = {
   email: string | null;
-  /** Shipping address collected by Whop (express wallets). Wins over the form's. */
+  /** Shipping address collected by Whop (express wallets). Wins over the form's, except for PayPal (paid after the form). */
   shippingAddress?: PaymentAddress | null;
   /** Billing address: only used when nothing better is known. */
   address: PaymentAddress | null;
@@ -707,9 +1006,14 @@ export async function markPaid(
   const walletAddress = payment.buyer?.shippingAddress
     ? addressFromPayment({ address: payment.buyer.shippingAddress, phone: payment.buyer.phone })
     : null;
+  // PayPal is paid after our form (express PayPal button included): the address the buyer typed
+  // (or the relay point's) was chosen for this order and wins over PayPal's account address.
+  const formAddress = session.shippingAddress as Address | null;
+  const paidWithPaypal = payment.paymentMethodType === "paypal" || isPaypalFingerprint(paid?.fingerprint);
   const address =
+    (paidWithPaypal ? formAddress : null) ??
     walletAddress ??
-    (session.shippingAddress as Address | null) ??
+    formAddress ??
     (payment.buyer ? addressFromPayment(payment.buyer) : null);
 
   // Charged in the buyer's currency: Whop's amounts are in that currency (compared as such, fee converted back).
@@ -722,6 +1026,14 @@ export async function markPaid(
   const feeCents =
     payment.feeCents != null && charged && payment.currency?.toUpperCase() === charged.currency.toUpperCase() ? toShopCents(payment.feeCents, charged.rate) : payment.feeCents;
   if (!paid) reasons.push("configuration de paiement inconnue");
+  // A physical order with no shipping address from the wallet nor from our form (e.g. Google Pay
+  // express: Whop collects no shipping address there): never shipped to a guess silently. Held for
+  // review, with the billing address (if any) as a starting point for the merchant.
+  const paidLines = (paid?.lines ?? session.lines) as { requiresShipping?: boolean }[] | null;
+  const shipsGoods = Array.isArray(paidLines) && paidLines.some((l) => l?.requiresShipping);
+  if (shipsGoods && !walletAddress && !formAddress) {
+    reasons.push(address ? "adresse de livraison absente du paiement (adresse de facturation reprise, à confirmer)" : "adresse de livraison absente du paiement");
+  }
 
   // One transaction: PAID, the discount use and the review decision become visible
   // together, so a concurrent delivery can never see "PAID, no hold" and sync an
@@ -1119,6 +1431,14 @@ async function buildOrderInput(session: SessionWithStore) {
     email: session.email ?? "",
     acceptsMarketing: session.acceptsMarketing,
     buyerNote: session.note,
+    // The Shopify cart's note and attributes (bundle / gift / delivery apps read them on the order).
+    cart: (session.cartContext as CartContext | null) ?? null,
+    // Titles of Shopify's automatic discounts (bundle apps' deals) the paid amount includes: stated on
+    // the order (orderCreate has no per-line discount; their amounts are folded into the line prices).
+    automaticTitles:
+      (snapshot?.automaticDiscountCents ?? 0) > 0 && Array.isArray((session.cartDiscounts as { titles?: unknown } | null)?.titles)
+        ? ((session.cartDiscounts as { titles: unknown[] }).titles.map(String).slice(0, 5))
+        : [],
     shippingAddress: session.shippingAddress as Address | null,
     pickupPoint: (session.pickupPoint as PickupPoint | null) ?? null,
     lines: ((snapshot?.lines as unknown as CartLine[] | null) ?? session.lines) as unknown as CartLine[],
@@ -1134,6 +1454,14 @@ async function buildOrderInput(session: SessionWithStore) {
       const native =
         snapshot?.discountSource === "shopify" && code && !freeShipping && (snapshot.codeDiscountCents ?? 0) > 0 ? { nativeCodeCents: snapshot.codeDiscountCents! } : {};
       return { code: code ?? "REMISE-QUANTITE", amountCents: cents, freeShipping: !!code && freeShipping, ...native };
+    })(),
+    // Shopify's automatic discount as paid, on the lines the cart put it on (the rest is spread by value).
+    automaticDiscount: (() => {
+      const cents = snapshot?.automaticDiscountCents ?? 0;
+      if (!(cents > 0)) return null;
+      const lines = ((snapshot?.lines as unknown as CartLine[] | null) ?? (session.lines as unknown as CartLine[])) ?? [];
+      const { lineCents } = automaticDiscountFor(session.cartDiscounts, lines, session.currency);
+      return { cents, ...(lineCents ? { lineCents } : {}) };
     })(),
     shipping,
     totalCents: snapshot?.totalCents ?? session.totalCents,

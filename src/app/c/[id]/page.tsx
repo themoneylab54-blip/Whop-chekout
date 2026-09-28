@@ -18,6 +18,7 @@ import { browserPixel } from "@/lib/conversions";
 import { AdPixels } from "@/components/checkout/AdPixels";
 import { DEFAULT_COUNTRIES, labelsFor, localeCountries } from "@/components/checkout/i18n";
 import { buyerIcons, checkoutLang, CheckoutHtmlLang } from "@/app/c/lang";
+import { keepOnCheckoutHost } from "@/app/c/host";
 import { priceCart } from "@/lib/shopify";
 import { crossRate, ecbRates } from "@/lib/fx";
 import { log } from "@/lib/log";
@@ -31,7 +32,7 @@ export const dynamic = "force-dynamic";
 const loadSession = cache((id: string) => db.checkoutSession.findUnique({ where: { id }, include: { store: true } }));
 
 /** Tab title "<Store> · Paiement" in the checkout's language (no app suffix). */
-type PageProps = { params: Promise<{ id: string }>; searchParams: Promise<{ lang?: string | string[] }> };
+type PageProps = { params: Promise<{ id: string }>; searchParams: Promise<{ lang?: string | string[]; via?: string | string[] }> };
 
 export async function generateMetadata({ params, searchParams }: PageProps): Promise<Metadata> {
   const { id } = await params;
@@ -112,7 +113,10 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
   const { id } = await params;
   const session = await loadSession(id);
   if (!session) notFound();
-  if (session.status === "PAID") redirect(`/c/${id}/merci`);
+  // The store's own checkout domain (checkout.seyuna.com) when it has a verified one.
+  await keepOnCheckoutHost(session.store, `/c/${id}`, (await searchParams) as Record<string, string | string[] | undefined>);
+  // via=app (loader fallback: the checkout domain is unreachable for this buyer) stays on APP_URL.
+  if (session.status === "PAID") redirect(`/c/${id}/merci${(await searchParams).via === "app" ? "?via=app" : ""}`);
 
   const { store } = session;
   const [rates, storeAddOns, discountCount, overrides] = await Promise.all([

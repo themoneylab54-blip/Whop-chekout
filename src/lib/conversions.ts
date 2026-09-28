@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import type { CheckoutSession, Prisma, Store } from "@prisma/client";
 import { db } from "./db";
 import { decrypt } from "./crypto";
-import { env } from "./env";
+import { checkoutBaseUrl } from "./checkout-domain";
 import { log, recordEvent } from "./log";
 import { boundedTimeout, DeadlineError, stopForTime } from "./deadline";
 import type { CartLine } from "./pricing";
@@ -220,7 +220,7 @@ export function metaPayload(session: Session, e: ConversionEvent) {
         event_time: Math.floor(e.time.getTime() / 1000),
         event_id: e.eventId,
         action_source: "website",
-        event_source_url: `${env.appUrl}/c/${session.id}`,
+        event_source_url: `${checkoutBaseUrl(session.store)}/c/${session.id}`,
         user_data: {
           em: sha(session.email) ? [sha(session.email)] : undefined,
           ph: sha(e164(a?.phone, a?.countryCode)) ? [sha(e164(a?.phone, a?.countryCode))] : undefined,
@@ -279,7 +279,7 @@ export function tiktokPayload(session: Session, e: ConversionEvent) {
           contents: e.lines.map((l) => ({ content_id: numericId(l.variantId), content_name: l.title, quantity: l.quantity, price: l.unitPriceCents / 100 })),
           order_id: e.kind === "purchase" ? e.eventId : undefined,
         },
-        page: { url: `${env.appUrl}/c/${session.id}` },
+        page: { url: `${checkoutBaseUrl(session.store)}/c/${session.id}` },
       },
     ],
   };

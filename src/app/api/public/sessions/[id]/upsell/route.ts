@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { db } from "@/lib/db";
+import { isForeignCheckoutHost } from "@/lib/checkout-domain-check";
 import { json, readJson } from "@/lib/http";
 import { clientIp, rateLimit } from "@/lib/ratelimit";
 import { acceptUpsell, declineUpsell, markUpsellShown, UpsellError } from "@/lib/upsell";
@@ -36,7 +37,8 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
     return json({ ok: true });
   }
   const session = await db.checkoutSession.findUnique({ where: { id }, include: { store: true } });
-  if (!session) return json({ error: "Session introuvable" }, { status: 404 });
+  // Another store's checkout domain never serves this session (see isForeignCheckoutHost).
+  if (!session || (await isForeignCheckoutHost(req, session.store))) return json({ error: "Session introuvable" }, { status: 404 });
   const accept = parsed.data.accept;
   const { blockId, quantity, variantId } = parsed.data;
   try {

@@ -73,13 +73,15 @@ body {
   padding: 0.75rem 0.875rem;
   color: inherit;
   background: #fff;
-  border: 1px solid var(--border, #d4d4d8);
+  /* --field-border: the theme border darkened to 3:1 on the form background (lib/contrast.ts fieldBorderColor) */
+  border: 1px solid var(--field-border, var(--border, #8f8f99));
   border-radius: var(--radius, 10px);
   outline: none;
   transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
 }
 .wc-input::placeholder {
-  color: color-mix(in srgb, currentColor 40%, transparent);
+  /* 65%: AA (4.5:1) on white and filled fields for the templates' text colors (lib/contrast.ts) */
+  color: color-mix(in srgb, currentColor 65%, transparent);
 }
 .wc-input:focus {
   border-color: var(--accent);
@@ -87,12 +89,17 @@ body {
 .wc-input[aria-invalid="true"] {
   border-color: #b91c1c;
 }
-.wc-input:disabled {
+.wc-input:disabled,
+.wc-input[aria-disabled="true"] {
   opacity: 0.6;
+}
+/* Locked but focusable (the country while a PayPal payment is pending): no change is taken. */
+.wc-input[aria-disabled="true"] {
+  cursor: not-allowed;
 }
 [data-inputs="filled"] .wc-input {
   background: color-mix(in srgb, var(--text, #111) 5%, white);
-  border-color: transparent;
+  /* The 5% fill alone is no visible boundary (WCAG 1.4.11): the field keeps its real border. */
 }
 [data-inputs="filled"] .wc-input:focus {
   background: #fff;
@@ -149,5 +156,35 @@ body {
   .wc-row:hover .wc-row-actions,
   .wc-row:focus-within .wc-row-actions {
     display: flex;
+  }
+}
+
+/* ---------- Checkout / thank-you: banners edge to edge on phones ----------
+   Pages under 640 px (the `wc-page` container, so the builder's mobile preview matches):
+   banner-like blocks (.wc-bleed) span the whole page width, with no side margin, rounded
+   corners or side borders; a card / colored box holding one follows it. The column is
+   centered so `50% - 50cqw` reaches both page edges; the page root clips any overflow.
+   `cqw` resolves against the nearest container of any name: never put a `container-type`
+   wrapper above a banner block, or it stays inset. */
+.wc-banner-capped {
+  max-height: var(--wc-banner-max);
+}
+@container wc-page (max-width: 639.98px) {
+  .wc-bleed,
+  .wc-boxed:has(.wc-bleed) {
+    width: 100cqw;
+    max-width: none;
+    margin-inline: calc(50% - 50cqw);
+    border-radius: 0;
+    border-inline-width: 0;
+  }
+  .wc-bleed-col {
+    margin-inline: auto;
+  }
+  /* Header banner in its own proportions: full width, height capped to a banner shape
+     (a square or portrait image never pushes the checkout below the fold, also in landscape);
+     anything taller is cropped or letterboxed by the image's fit. */
+  .wc-banner-capped {
+    max-height: min(56cqw, 40svh);
   }
 }

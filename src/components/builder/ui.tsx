@@ -53,7 +53,7 @@ export function EmptyState({ icon: Icon, title, children, action }: { icon: Luci
   );
 }
 
-/** Popover panel anchored under the top bar, right-aligned; fits a 390px screen. */
+/** Popover panel anchored under the top bar, right-aligned (or left: `side`); fits a 390px screen. */
 export function Panel({
   title,
   onClose,
@@ -61,6 +61,7 @@ export function Panel({
   footer,
   panelRef,
   width = "w-[22rem]",
+  side = "right",
 }: {
   title: string;
   onClose: () => void;
@@ -68,6 +69,7 @@ export function Panel({
   footer?: ReactNode;
   panelRef?: RefObject<HTMLDivElement | null>;
   width?: string;
+  side?: "left" | "right";
 }) {
   const localRef = useRef<HTMLDivElement>(null);
   const ownRef = panelRef ?? localRef;
@@ -113,7 +115,7 @@ export function Panel({
       role="dialog"
       aria-label={title}
       onKeyDown={onKeyDown}
-      className={`absolute top-full right-2 z-40 mt-2 ${width} max-w-[calc(100vw-1rem)] overflow-hidden rounded-xl border border-zinc-200 bg-white text-zinc-900 shadow-[0_20px_50px_-12px_rgba(15,23,42,.35),0_0_0_1px_rgba(15,23,42,.04)] sm:right-3`}
+      className={`absolute top-full z-40 mt-2 ${side === "left" ? "left-2 sm:left-3" : "right-2 sm:right-3"} ${width} max-w-[calc(100vw-1rem)] overflow-hidden rounded-xl border border-zinc-200 bg-white text-zinc-900 shadow-[0_20px_50px_-12px_rgba(15,23,42,.35),0_0_0_1px_rgba(15,23,42,.04)]`}
     >
       <div className="flex items-center justify-between border-b border-zinc-100 py-2 pr-2 pl-4">
         <p className="text-[11px] font-semibold tracking-[.08em] text-zinc-600 uppercase">{title}</p>

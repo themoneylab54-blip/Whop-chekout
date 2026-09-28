@@ -1,5 +1,6 @@
 import { clientIp, rateLimit } from "@/lib/ratelimit";
 import { db } from "@/lib/db";
+import { isForeignCheckoutHost } from "@/lib/checkout-domain-check";
 import { json, readJson } from "@/lib/http";
 import { CheckoutError, journalCheckoutFailure, prepareSession, quoteSchema } from "@/lib/checkout";
 import { route } from "@/lib/route";
@@ -11,10 +12,12 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const parsed = quoteSchema.safeParse(await readJson(req));
   if (!parsed.success) return json({ error: "Requête invalide" }, { status: 400 });
   const session = await db.checkoutSession.findUnique({ where: { id }, include: { store: true } });
-  if (!session) return json({ error: "Session introuvable" }, { status: 404 });
+  // Another store's checkout domain never serves this session (see isForeignCheckoutHost).
+  if (!session || (await isForeignCheckoutHost(req, session.store))) return json({ error: "Session introuvable" }, { status: 404 });
   try {
-    const { checkoutConfigurationId, totals } = await prepareSession(session, parsed.data);
-    return json({ checkoutConfigurationId, totals, environment: session.store.testMode ? "sandbox" : "production" });
+    const { checkoutConfigurationId, totals, paypal } = await prepareSession(session, parsed.data, { host: req.headers.get("host") });
+    // `paypal`: whether Whop offers PayPal on this store's checkout (the express PayPal button hides otherwise).
+    return json({ checkoutConfigurationId, totals, paypal, method: parsed.data.method ?? null, environment: session.store.testMode ? "sandbox" : "production" });
   } catch (err) {
     await journalCheckoutFailure(session, "prepare", err);
     if (err instanceof CheckoutError) return json({ error: err.message, code: err.code }, { status: 400 });

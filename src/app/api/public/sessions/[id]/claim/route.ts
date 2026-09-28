@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { clientIp, rateLimit } from "@/lib/ratelimit";
 import { json, readJson } from "@/lib/http";
+import { isForeignSessionHost } from "@/lib/checkout-domain-check";
 import { route } from "@/lib/route";
 import { MAX_CLAIM_BODY_BYTES, MAX_CLAIM_PHOTOS, MAX_PHOTO_BYTES, submitBuyerClaim, type ClaimPhotoInput } from "@/lib/claims";
 
@@ -29,6 +30,8 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
   if (!(await rateLimit(`claim:ip:${clientIp(req)}`, 5, 10 * 60_000)) || !(await rateLimit(`claim:s:${id}`, 5, 60 * 60_000))) {
     return json({ error: "Trop de demandes, réessayez plus tard.", code: "rate_limited" }, { status: 429 });
   }
+  // Another store's checkout domain never serves this session (see isForeignCheckoutHost).
+  if (await isForeignSessionHost(req, id)) return json({ error: "closed", code: "closed" }, { status: 404 });
   let raw: unknown;
   const photos: ClaimPhotoInput[] = [];
   if ((req.headers.get("content-type") ?? "").startsWith("multipart/form-data")) {

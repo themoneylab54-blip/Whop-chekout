@@ -14,6 +14,8 @@ import {
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Check, ChevronDown, ChevronRight, Gift, Info, Lock, Minus, Package, Plus, ShieldCheck, Tag, TrendingDown, UserRound, X } from "lucide-react";
 import type { Block, BlockOf, BlockType, Layout, Theme } from "@/lib/layout";
+import { cartShippable, expressMethodsShown, headerModeOf, offeredWalletsFor, type ExpressWallet } from "@/lib/layout";
+import { fieldBorderColor, HEADER_PLACEHOLDER_ON_DARK } from "@/lib/contrast";
 import {
   breakDeal,
   computeTotals,
@@ -24,10 +26,14 @@ import {
   type QuantityBreak,
   type RateInput,
   type Totals,
+  visibleProperties,
 } from "@/lib/pricing";
 import {
   ContentBlock,
   isEmptyInLive,
+  offeredPaymentLogos,
+  PaymentHeaderLogos,
+  headerLogosBlockId,
   Placeholder,
   Recommendations,
   StyledBlock,
@@ -44,12 +50,16 @@ import { sampleRecommendations, visibleRecommendations, type RecommendationView 
 import { AddressAutocomplete } from "./AddressAutocomplete";
 import { SafeImg } from "./SafeImg";
 import { PickupPicker, pickupPayload, type PickupPointView } from "./PickupPicker";
+import { cartProductsOf } from "@/lib/reviews-import";
 import {
   ExpressCheckout,
   ExpressPreview,
   PaymentPanel,
   PaymentPreview,
+  paypalStaysChosen,
   type ConfirmResult,
+  type PaidCheck,
+  type PanelLock,
   type Prepared,
 } from "./Payment";
 
@@ -133,6 +143,10 @@ type QuoteState = {
   gifts?: { earned: { title: string; variantId: string }[]; next: { title: string; missingQty: number | null; missingCents: number | null } | null };
   /** Shipping protection offered for this cart (server price). */
   protection?: { selected: boolean; priceCents: number } | null;
+  /** The cart is fixed as a whole (an app's prices, gifts or bundles): nothing can be added. */
+  cartLocked?: boolean;
+  /** The Shopify cart's automatic discount stopped applying (the buyer changed the lines). */
+  automaticDiscountLost?: string[];
 };
 
 /** Per line, as the server allows (checkout.ts MAX_LINE_QTY). */
@@ -181,6 +195,8 @@ export function themeVars(theme: Theme): CSSProperties {
     // Focus ring: the brand color when it stands out on white (3:1), else the text color.
     "--focus": contrastOnWhite(theme.accentColor) >= 3 ? theme.accentColor : theme.textColor,
     "--border": theme.borderColor,
+    // Form fields: the border darkened to 3:1 against the form background when needed (WCAG 1.4.11).
+    "--field-border": fieldBorderColor(theme),
     "--heading-font":
       theme.headingFont === "same" ? body : fontStack(theme.headingFont),
     fontFamily: body,
@@ -211,53 +227,109 @@ function readableOn(hex: string) {
     : "#ffffff";
 }
 
-export function StoreHeader({ theme }: { theme: Theme }) {
+/** Height cap of a banner shown in its own proportions (same 240 px as the fixed-height maximum). */
+export const BANNER_MAX_HEIGHT = "min(240px, 35vh)";
+
+export function StoreHeader({ theme, homeUrl = null }: { theme: Theme; homeUrl?: string | null }) {
   const justify = {
     left: "justify-start",
     center: "justify-center",
     right: "justify-end",
   }[theme.headerAlign];
-  // Without a logo the store name is the wordmark, even when "show name" is off:
-  // an empty header makes buyers wonder where they are paying.
-  const showName = !!theme.storeName && (theme.showStoreName || !theme.logoUrl);
+  const mode = headerModeOf(theme);
+  const border = theme.headerBorder ? "border-b border-[var(--border)]" : "";
+  const nameColor = readableOn(theme.headerBackground) === "#ffffff" ? "#fff" : undefined;
+  const nameHeader = (showLogo: boolean) => {
+    // Without a logo the store name is the wordmark, even when "show name" is off:
+    // an empty header makes buyers wonder where they are paying.
+    const showName = !!theme.storeName && (mode === "name" || theme.showStoreName || !showLogo);
+    return (
+      <header
+        className={border}
+        style={{ background: theme.headerBackground }}
+      >
+        <div
+          className={`mx-auto flex min-h-16 max-w-[1100px] items-center gap-3 px-5 py-3 ${justify}`}
+        >
+          {showLogo && (
+            <SafeImg
+              src={theme.logoUrl}
+              alt={theme.storeName}
+              style={{ height: theme.logoHeight }}
+              className="w-auto max-w-[60vw] object-contain"
+              // Logo gone (deleted, hotlink-protected): the store name instead of a broken image.
+              fallback={showName ? null : <span className="font-[family-name:var(--heading-font)] text-xl font-semibold tracking-tight" style={{ color: nameColor }}>{theme.storeName || "Ma boutique"}</span>}
+            />
+          )}
+          {showName && (
+            <span
+              className="font-[family-name:var(--heading-font)] text-xl font-semibold tracking-tight"
+              style={{ color: nameColor }}
+            >
+              {theme.storeName}
+            </span>
+          )}
+          {!showLogo && !theme.storeName && (
+            // Placeholder wordmark: readable on dark headers too (lib/contrast.ts checks both).
+            <span className="text-xl font-semibold text-[var(--muted)]" style={nameColor ? { color: HEADER_PLACEHOLDER_ON_DARK } : undefined}>
+              Ma boutique
+            </span>
+          )}
+        </div>
+      </header>
+    );
+  };
+  if (mode !== "banner") return nameHeader(mode === "logo" && !!theme.logoUrl);
+  // Full-width banner: its box is sized before the image loads (fixed height, or the image's
+  // own proportions measured in the builder), so nothing below it moves. In proportions mode the
+  // height is capped (a square image would otherwise make a header as tall as the page is wide):
+  // beyond the cap, the image is cropped ("cover") or letterboxed ("contain").
+  const ratio = theme.bannerAuto && theme.bannerRatio ? theme.bannerRatio : null;
+  const alt = theme.storeName || "Ma boutique";
+  const image = (
+    <SafeImg
+      src={theme.bannerUrl}
+      alt={alt}
+      className={`block h-full w-full ${theme.bannerFit === "contain" ? "object-contain" : "object-cover"}`}
+      // Image gone (deleted, hotlink-protected): the store name instead of an empty band.
+      fallback={
+        <span
+          className="flex h-full items-center justify-center font-[family-name:var(--heading-font)] text-xl font-semibold tracking-tight"
+          style={{ color: readableOn(theme.bannerBackground || theme.headerBackground) === "#ffffff" ? "#fff" : undefined }}
+        >
+          {alt}
+        </span>
+      }
+    />
+  );
   return (
     <header
-      className={theme.headerBorder ? "border-b border-[var(--border)]" : ""}
-      style={{ background: theme.headerBackground }}
+      className={border}
+      style={{ background: theme.bannerBackground || theme.headerBackground }}
+      data-header="banner"
     >
       <div
-        className={`mx-auto flex min-h-16 max-w-[1100px] items-center gap-3 px-5 py-3 ${justify}`}
+        // Phones: no height cap, the image spans the full width in its own proportions (globals.css).
+        className={`relative w-full overflow-hidden ${ratio ? "wc-banner-capped" : ""}`}
+        style={ratio ? ({ aspectRatio: String(ratio), "--wc-banner-max": BANNER_MAX_HEIGHT } as CSSProperties) : { height: theme.bannerHeight }}
       >
-        {theme.logoUrl && (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={theme.logoUrl}
-            alt={theme.storeName}
-            style={{ height: theme.logoHeight }}
-            className="w-auto max-w-[60vw] object-contain"
-          />
-        )}
-        {showName && (
-          <span
-            className="font-[family-name:var(--heading-font)] text-xl font-semibold tracking-tight"
-            style={{
-              color:
-                readableOn(theme.headerBackground) === "#ffffff"
-                  ? "#fff"
-                  : undefined,
-            }}
-          >
-            {theme.storeName}
-          </span>
-        )}
-        {!theme.logoUrl && !theme.storeName && (
-          <span className="text-xl font-semibold text-neutral-500">
-            Ma boutique
-          </span>
+        {theme.bannerLink && homeUrl ? (
+          <a href={homeUrl} className="block h-full w-full focus-visible:outline-2 focus-visible:outline-offset-[-4px] focus-visible:outline-[var(--accent)]">
+            {image}
+          </a>
+        ) : (
+          image
         )}
       </div>
     </header>
   );
+}
+
+/** The shop's home page from its cart URL (https://shop.com/cart → https://shop.com/), or null. */
+function storeHomeUrl(cartUrl: string | null | undefined): string | null {
+  if (!cartUrl || !URL.canParse(cartUrl)) return null;
+  const u = new URL(cartUrl);
+  return /^https?:$/.test(u.protocol) ? `${u.origin}/` : null;
 }
 
 /** Checkout / thank-you footer: trust line, legal links and (live pages) the language picker. */
@@ -348,8 +420,28 @@ const COMPACT_WIDGETS: ReadonlySet<BlockType> = new Set<BlockType>([
 const MAX_COMPACT_BEFORE_PAY = 2;
 /** Countries whose postal addresses use a state / province line. */
 const NEEDS_PROVINCE = new Set(["US", "CA", "AU", "IT", "ES", "MX", "BR", "JP", "IE", "AE", "HK"]);
+/**
+ * The lock notes shown while a PayPal payment is pending (see priceLocked): every delivery and
+ * contact field is read-only then (the order is made from what PayPal was opened with), and each
+ * read-only input points at its section's note (aria-describedby).
+ */
+const LOCK_NOTE_CONTACT_ID = "wc-lock-contact";
+const LOCK_NOTE_DELIVERY_ID = "wc-lock-delivery";
+/** An aria-describedby list: the ids given, without the empty ones (undefined when none). */
+function describedBy(...ids: (string | null | undefined | false)[]): string | undefined {
+  return ids.filter(Boolean).join(" ") || undefined;
+}
 /** Inputs that must be filled before paying: they keep their place in the form. */
 const FORM_INPUT_BLOCKS: ReadonlySet<BlockType> = new Set<BlockType>(["order_note"]);
+
+/**
+ * Wallet buttons (Apple Pay / Google Pay) can show: express checkout on in the theme, and the
+ * express block neither hidden nor turned off (then no wallet logo is claimed either). Pure.
+ */
+export function expressWalletsOn(expressCheckout: boolean, blocks: readonly Block[]): boolean {
+  const express = blocks.find((b) => b.type === "express");
+  return expressCheckout && !express?.hidden && !(express?.type === "express" && !express.props.enabled);
+}
 
 /** Splits the checkout layout into the main column, the reassurance column and the tail. */
 export function arrangeCheckout(blocks: Block[]) {
@@ -435,6 +527,20 @@ export function belowPaymentReason(blocks: Block[], id: string): "compact_limit"
 
 /** Short banners allowed above the payment (builder wording). */
 export const COMPACT_BEFORE_PAY_MAX = MAX_COMPACT_BEFORE_PAY;
+
+/** The PayPal state an ended PayPal choice goes back to (see paypalChoiceReset). */
+export type PaypalChoiceReset = { mode: false; prepared: null; doneSig: null; autoSubmit: false; notice: null; error?: null };
+
+/**
+ * Ending the PayPal choice, whichever way ("Pay another way", or PayPal withdrawn and dropped once
+ * the panel unlocks): the same reset, so a later PayPal click waits for a fresh PayPal-only
+ * checkout (its prepare's signature forgotten too) and never auto-submits a stale embed. Only
+ * "Pay another way" clears the PayPal message; a withdrawal keeps its "PayPal isn't available". Pure.
+ */
+export function paypalChoiceReset({ keepError }: { keepError: boolean }): PaypalChoiceReset {
+  const reset = { mode: false, prepared: null, doneSig: null, autoSubmit: false, notice: null } as const;
+  return keepError ? reset : { ...reset, error: null };
+}
 
 /* ---------- validation ---------- */
 
@@ -598,6 +704,85 @@ export function CheckoutView({
   const [prepareRef, setPrepareRef] = useState<string | null>(null);
   // Bumped by "Try again" to prepare the Whop checkout again without reloading.
   const [retryKey, setRetryKey] = useState(0);
+  // Express PayPal: whether Whop offers PayPal here (from prepare), the buyer chose it (the
+  // payment panel then shows a PayPal-only checkout), and that checkout's own state.
+  const [paypalOffered, setPaypalOffered] = useState(false);
+  const [paypalMode, setPaypalMode] = useState(false);
+  const [paypalPrepared, setPaypalPrepared] = useState<Prepared | null>(null);
+  // Whop refused PayPal for this session, by charged currency (a refusal may name only one; the
+  // server remembers clear refusals per currency too): another currency can still offer it.
+  const paypalRefused = useRef<Set<string>>(new Set());
+  // The currency Whop charges for the current quote (the buyer's when the store charges in it).
+  const chargeCurrency = (quote?.charge?.currency ?? currency).toUpperCase();
+  const chargeCurrencyRef = useRef(chargeCurrency);
+  useEffect(() => {
+    chargeCurrencyRef.current = chargeCurrency;
+  }, [chargeCurrency]);
+  const [paypalPreparing, setPaypalPreparing] = useState(false);
+  const [paypalError, setPaypalError] = useState<string | null>(null);
+  // Set by the express click on a complete form: the panel submits PayPal once its checkout is ready.
+  const [paypalAutoSubmit, setPaypalAutoSubmit] = useState(false);
+  const [paypalNotice, setPaypalNotice] = useState<string | null>(null);
+  // Bumped by the panel's "Try again" after the PayPal-only checkout failed to load.
+  const [paypalRetryKey, setPaypalRetryKey] = useState(0);
+  // The inputs of the last PayPal prepare that finished (see paypalPrepSig below).
+  const [paypalDoneSig, setPaypalDoneSig] = useState<string | null>(null);
+  /**
+   * Applies a PayPal choice reset (see paypalChoiceReset): "Pay another way", and PayPal dropped
+   * (withdrawn, refused) whether seen while rendering or by a prepare's answer (async).
+   */
+  function endPaypal(r: PaypalChoiceReset) {
+    setPaypalMode(r.mode);
+    setPaypalPrepared(r.prepared);
+    setPaypalDoneSig(r.doneSig);
+    setPaypalAutoSubmit(r.autoSubmit);
+    setPaypalNotice(r.notice);
+    if (r.error === null) setPaypalError(null);
+  }
+  // The payment panel submitting (or a PayPal payment possibly still going through): the express
+  // buttons are locked meanwhile, so no second payment can start from them.
+  const [panelLock, setPanelLock] = useState<PanelLock>(null);
+  // For the prepares below (async): PayPal can't be dropped while the panel is locked.
+  const panelLockRef = useRef<PanelLock>(null);
+  useEffect(() => {
+    panelLockRef.current = panelLock;
+  }, [panelLock]);
+  // A payment of this session still going through as the page loads (a second tab, a reload
+  // during a PayPal window): the payment panel starts in its server wait (see inFlightAtLoad).
+  const [inFlightAtLoad, setInFlightAtLoad] = useState(false);
+  useEffect(() => {
+    if (mode.kind !== "live") return;
+    let gone = false;
+    const url = `/api/public/sessions/${mode.sessionId}/status`;
+    void Promise.resolve()
+      .then(() => fetch(url, { cache: "no-store" }))
+      .then((res) => (res?.ok ? res.json() : null))
+      .then((body) => {
+        if (!gone && body?.paymentInFlight === true && body.status !== "PAID") setInFlightAtLoad(true);
+      })
+      .catch(() => undefined);
+    return () => {
+      gone = true;
+    };
+    // Once per page (session).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode.kind === "live" ? mode.sessionId : null]);
+  // A PayPal payment possibly going through (its window open or just closed): nothing that changes
+  // the price can be edited meanwhile (country and address, shipping rate, protection, add-ons,
+  // quantities, suggested products, discount code), or the total the buyer sees would no longer be
+  // the one PayPal charges. The details confirm() saved are locked too (e-mail, name, phone, the
+  // marketing and remember-me boxes): the pending payment goes with them.
+  const priceLocked = panelLock === "pending";
+  // Whop's PayPal checkout never got ready after an express click: no endless spinner on the button.
+  // Not while a payment is in progress (a PayPal window may be open for longer than that).
+  useEffect(() => {
+    if (!paypalAutoSubmit || panelLock) return;
+    const t = setTimeout(() => {
+      setPaypalAutoSubmit(false);
+      setPaypalError(L.paymentNotReady);
+    }, 20_000);
+    return () => clearTimeout(t);
+  }, [paypalAutoSubmit, panelLock, L]);
   const [summaryOpen, setSummaryOpen] = useState(false);
   // Which copy of the promo form (mobile drawer "m-" / desktop column "d-") was submitted:
   // only that one shows and announces the error.
@@ -639,7 +824,8 @@ export function CheckoutView({
   const confirmedKey = qtyKey(confirmedQty);
   const qtyTouched = sentQty != null;
   const displayLines = useMemo(() => {
-    const shown = serverLines.map((l) => ({ ...l, quantity: qty[l.variantId] ?? l.quantity }));
+    // A locked line keeps its own quantity (one variant can be on several locked lines: Kaching's paid + free).
+    const shown = serverLines.map((l) => ({ ...l, quantity: l.locked ? l.quantity : (qty[l.variantId] ?? l.quantity) }));
     // Suggested products just added: shown at once, confirmed (priced) by the next quote.
     const known = new Set(serverLines.map((l) => l.variantId));
     for (const r of recommendations ?? []) {
@@ -658,6 +844,7 @@ export function CheckoutView({
   }, [qty, sentQty, confirmedQty]);
 
   function changeQty(l: CartLine, next: number) {
+    if (priceLocked) return;
     const n = Math.max(0, Math.min(maxQty(l), next));
     if (n === (qty[l.variantId] ?? l.quantity)) return;
     setQtyError(null);
@@ -668,6 +855,7 @@ export function CheckoutView({
 
   /** "Ajouter" on a suggested product: one more line, re-quoted like a quantity change. */
   function addRecommended(r: RecommendationView) {
+    if (priceLocked) return;
     const current = qty[r.variantId] ?? 0;
     const n = Math.min(maxQty(r), current + 1);
     if (n === current) return;
@@ -709,6 +897,11 @@ export function CheckoutView({
   }, [rates, address.countryCode, rateId, addOns, addOnIds, displayLines, protectionBlock, protectionOn]);
 
   const liveSessionId = mode.kind === "live" ? mode.sessionId : null;
+  // The last quote request that finished (its signature): a newer one pending means the quote on
+  // screen may be stale (the PayPal panel counts it as preparing: never auto-submits meanwhile).
+  const [quotedSig, setQuotedSig] = useState<string | null>(null);
+  const quoteSig = JSON.stringify([{ countryCode: address.countryCode, shippingRateId: rateId, discountCode: appliedCode, addOnIds, protection }, sentQty ? qtyKey(sentQty) : null]);
+  const quoteLoading = !!liveSessionId && quotedSig !== quoteSig;
   useEffect(() => {
     if (!liveSessionId) return;
     const ctrl = new AbortController();
@@ -754,6 +947,8 @@ export function CheckoutView({
           const confirmed = qtyMap(buyerLines);
           setServerLines(buyerLines);
           const capped = sent && qtyKey(latestQty.current) === qtyKey(sent) && qtyKey(confirmed) !== qtyKey(sent);
+          // A plain cart's Shopify automatic discount holds for its exact lines: once they change, say so.
+          if (sent && Array.isArray(q.automaticDiscountLost)) setQtyError(L.automaticDiscountLost);
           // A suggested product Shopify no longer sells is dropped: say so (the follow-up quote keeps the message).
           if (sent && Object.entries(sent).some(([id, n]) => n > 0 && !(id in confirmed) && !(id in confirmedQty))) {
             pendingQtyAnnounce.current = null;
@@ -791,6 +986,8 @@ export function CheckoutView({
         setQuote({ ...q, appliedCode: q.discount?.code ?? null });
       } catch {
         if (!ctrl.signal.aborted) rollback();
+      } finally {
+        if (!ctrl.signal.aborted) setQuotedSig(signature);
       }
     }, 150);
     return () => {
@@ -848,6 +1045,13 @@ export function CheckoutView({
           }
           setPrepareError(null);
           setPrepareRef(null);
+          // PayPal refused for this session in this currency (see the PayPal prepare below): stays hidden here.
+          const offered = body.paypal !== false && !paypalRefused.current.has(chargeCurrencyRef.current);
+          setPaypalOffered(offered);
+          // No longer offered (merchant switch, Whop's word): PayPal can't stay the chosen method
+          // (any "PayPal isn't available" message stays; see stopPaypal). Not while a PayPal payment
+          // may still go through: only its express button goes, the choice once the panel unlocks.
+          if (!offered && panelLockRef.current === null) endPaypal(paypalChoiceReset({ keepError: true }));
           setPrepared((p) =>
             p?.configId === body.checkoutConfigurationId
               ? p
@@ -922,7 +1126,7 @@ export function CheckoutView({
     const missing = scope ? (volumeBreak?.missing ?? 0) : tierThreshold(next) - displayedItems;
     if (missing <= 0) return null;
     // "+1" on the cheapest line (of the tier's products) that can still grow.
-    const target = [...displayLines].filter((l) => l.quantity < maxQty(l) && inScope(l)).sort((a, b) => a.unitPriceCents - b.unitPriceCents)[0] ?? null;
+    const target = [...displayLines].filter((l) => !l.locked && l.quantity < maxQty(l) && inScope(l)).sort((a, b) => a.unitPriceCents - b.unitPriceCents)[0] ?? null;
     return { missing, tier: next, target };
   })();
   // "2 pour 49 €", "−5 € par article", "2 achetés, 1 offert" in the buyer's language (percent tiers keep their own wording).
@@ -997,6 +1201,84 @@ export function CheckoutView({
     terms: L.termsShort,
   };
   const invalidFields = FIELD_ORDER.filter((k) => fieldErrors[k]);
+  // Everything the order needs but the terms box (ticked last, right before paying).
+  const paypalDetailsReady = invalidFields.every((k) => k === "terms");
+  const paypalPrepWanted = !!liveSessionId && !quoteBlocking && paypalMode && paypalOffered && paypalDetailsReady;
+  // Inputs of the PayPal prepare below, and those of the last one that finished: preparing from the
+  // moment they differ (not only after the debounce), so a stale PayPal checkout never auto-submits.
+  const paypalPrepSig = JSON.stringify([address.countryCode, rateId, appliedCode, addOnIds, protection, confirmedKey, qtyTouched, paypalRetryKey]);
+  // (paypalDoneSig: declared with the other PayPal state, see endPaypal.)
+  const paypalPrepPending = paypalPrepWanted && paypalDoneSig !== paypalPrepSig;
+
+  // PayPal chosen: a PayPal-only Whop checkout for the same quote (same snapshot rules server-side),
+  // once the buyer's details are complete (no Whop checkout created for a form that can't pay yet).
+  useEffect(() => {
+    if (!paypalPrepWanted) return;
+    const sig = paypalPrepSig;
+    const ctrl = new AbortController();
+    const t = setTimeout(async () => {
+      setPaypalPreparing(true);
+      // PayPal dropped below (the full reset): its signature stays forgotten, so a later PayPal
+      // click prepares afresh.
+      let dropped = false;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const res = await fetch(`/api/public/sessions/${liveSessionId}/prepare`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              countryCode: address.countryCode,
+              shippingRateId: rateId,
+              discountCode: appliedCode,
+              addOnIds,
+              protection,
+              ...(qtyTouched ? { quantities: confirmedQty } : {}),
+              method: "paypal",
+            }),
+            signal: ctrl.signal,
+          });
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            // One silent retry on a 5xx; PayPal refused by Whop drops the choice (the card form stays).
+            if (res.status >= 500 && attempt === 0) continue;
+            if (body?.code === "paypal_unavailable") {
+              paypalRefused.current.add(chargeCurrencyRef.current);
+              setPaypalOffered(false);
+              // A PayPal payment possibly still going through keeps its checkout (dropped on unlock).
+              if (panelLockRef.current === null) {
+                endPaypal(paypalChoiceReset({ keepError: true }));
+                dropped = true;
+              }
+            }
+            setPaypalAutoSubmit(false);
+            setPaypalError(errorText(L, body));
+            break;
+          }
+          setPaypalError(null);
+          setPaypalPrepared((p) => (p?.configId === body.checkoutConfigurationId ? p : { configId: body.checkoutConfigurationId, environment: body.environment }));
+          break;
+        } catch (err) {
+          if (ctrl.signal.aborted) return;
+          if (attempt === 0) continue;
+          setPaypalAutoSubmit(false);
+          setPaypalError(err instanceof Error && err.message ? err.message : L.error);
+          break;
+        }
+      }
+      if (!ctrl.signal.aborted) {
+        setPaypalPreparing(false);
+        if (!dropped) setPaypalDoneSig(sig);
+      }
+    }, 300);
+    return () => {
+      clearTimeout(t);
+      ctrl.abort();
+      setPaypalPreparing(false);
+    };
+    // Same inputs as the regular prepare (confirmedKey stands for confirmedQty).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paypalPrepWanted, liveSessionId, quoteBlocking, paypalMode, paypalOffered, paypalDetailsReady, address.countryCode, rateId, appliedCode, addOnIds, protection, confirmedKey, qtyTouched, paypalRetryKey, L]);
+
 
   // Funnel beacons (analytics): e-mail left valid, then a complete address. Once per step.
   const beaconsSent = useRef<Set<string>>(new Set());
@@ -1039,7 +1321,8 @@ export function CheckoutView({
     live && !!saved && !savedAnswered && (!email.trim() || email.trim().toLowerCase() === saved.email.toLowerCase());
   const focusEmail = () => document.getElementById(fieldId("email"))?.focus({ preventScroll: true });
   function applySaved() {
-    if (!saved) return;
+    // Never over the details a pending PayPal payment was opened with (see priceLocked).
+    if (!saved || priceLocked) return;
     const shipsThere = countries.some((c) => c.code === saved.address.countryCode);
     setEmail(saved.email);
     setEmailSuggestion(null);
@@ -1053,6 +1336,7 @@ export function CheckoutView({
   }
   // Details of the last paid order, released by the right e-mail code (other device).
   function applyCodeBuyer(buyer: CodeBuyer) {
+    if (priceLocked) return;
     const shipsThere = countries.some((c) => c.code === buyer.address.countryCode);
     setEmail(buyer.email);
     setEmailSuggestion(null);
@@ -1073,7 +1357,14 @@ export function CheckoutView({
 
   const locked = false;
   // Same language on the thank-you page (also after the Whop / 3-D Secure redirect).
-  const thankYouUrl = liveSessionId ? `/c/${liveSessionId}/merci?lang=${theme.language}` : "#";
+  // via=app (the loader's APP_URL fallback: the checkout domain is unreachable for this buyer) is
+  // kept, or the thank-you page would send the buyer back to that domain.
+  const viaApp = useSyncExternalStore(
+    noopSubscribe,
+    () => new URLSearchParams(window.location.search).get("via") === "app",
+    () => false,
+  );
+  const thankYouUrl = liveSessionId ? `/c/${liveSessionId}/merci?lang=${theme.language}${viaApp ? "&via=app" : ""}` : "#";
   // Whop needs an absolute return URL; the origin is only known in the browser.
   const origin = useSyncExternalStore(
     noopSubscribe,
@@ -1081,6 +1372,50 @@ export function CheckoutView({
     () => "",
   );
   const onPaid = () => router.push(thankYouUrl);
+
+  // The express buttons the merchant chose (builder > Paiement express), for this cart.
+  // Free gifts ship too; a line at quantity 0 (being removed) ships nothing.
+  const expressShown = expressMethodsShown(theme.expressMethods, { shippable: cartShippable(displayLines, giftLines) });
+  // The wallets whose Whop button really showed on this device (for the Payment title's logos).
+  const [walletsRendered, setWalletsRendered] = useState<ExpressWallet[]>([]);
+  // PayPal is paid only while it is chosen, offered by Whop and allowed by the merchant (the panel
+  // shows the regular form otherwise). While the panel is locked (a PayPal payment submitting or
+  // possibly still going through) it stays chosen whatever changed: dropping it then would forget
+  // the pending payment and offer the card under an open PayPal window (see paypalStaysChosen).
+  const paypalActive = paypalStaysChosen({ mode: paypalMode, offered: paypalOffered && expressShown.paypal, lock: panelLock });
+  // No longer offered while it was locked: dropped once the panel unlocks (React's pattern for state
+  // following other state, adjusted while rendering).
+  // The same reset as stopPaypal (a later PayPal click prepares afresh), its message kept.
+  if (paypalMode && !paypalOffered && panelLock === null) endPaypal(paypalChoiceReset({ keepError: true }));
+
+  // A PayPal window signal to the paypal-window route ({ blocked | beat | closed }): same-origin,
+  // best effort, survives the page going away (keepalive).
+  function paypalWindowSignal(body: { blocked: true } | { beat: true } | { closed: true }) {
+    if (!liveSessionId) return;
+    void fetch(`/api/public/sessions/${liveSessionId}/paypal-window`, {
+      method: "POST",
+      keepalive: true,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).catch(() => undefined);
+  }
+
+  // Before leaving a PayPal payment that may have gone through (its window was open), and during
+  // the panel's server wait. A payment submitted moments ago (PAYING, recent "Pay" click or PayPal
+  // window) may still go through: inFlight. A failed check is no answer ("unknown"): never read as
+  // unpaid (fails closed).
+  async function checkPaid(): Promise<PaidCheck> {
+    if (!liveSessionId) return "unpaid";
+    try {
+      const res = await fetch(`/api/public/sessions/${liveSessionId}/status`, { cache: "no-store" });
+      if (!res.ok) return "unknown";
+      const body = await res.json().catch(() => null);
+      if (!body || typeof body.status !== "string") return "unknown";
+      return body.status === "PAID" ? "paid" : body.paymentInFlight === true ? "inFlight" : "unpaid";
+    } catch {
+      return "unknown";
+    }
+  }
 
   async function confirm(): Promise<ConfirmResult> {
     if (!liveSessionId) return { ok: false };
@@ -1097,7 +1432,9 @@ export function CheckoutView({
         acceptsTerms: termsAccepted,
         address,
         note: note.trim() || null,
-        checkoutConfigurationId: prepared?.configId ?? null,
+        // PayPal chosen: the PayPal-only checkout (the server swaps in a fresh one if it's stale).
+        checkoutConfigurationId: (paypalActive ? paypalPrepared?.configId : prepared?.configId) ?? null,
+        method: paypalActive ? "paypal" : null,
         countryCode: address.countryCode,
         shippingRateId: q.shippingRateId,
         discountCode: appliedCode,
@@ -1109,9 +1446,22 @@ export function CheckoutView({
       }),
     });
     const body = await res.json();
-    if (!res.ok) return { ok: false, error: errorText(L, body) };
+    if (!res.ok) {
+      // Whop refused PayPal at pay time: like the PayPal prepare, the choice is dropped (card form back).
+      if (paypalActive && body?.code === "paypal_unavailable") {
+        paypalRefused.current.add(chargeCurrencyRef.current);
+        setPaypalOffered(false);
+        // Never under a locked panel (a PayPal payment possibly still going through keeps its
+        // checkout): the render-time drop above ends PayPal once the panel unlocks.
+        if (panelLockRef.current === null) stopPaypal();
+      }
+      // Another payment of this session still going through (e.g. PayPal in another tab): the
+      // panel waits for it, polling the status (see PaymentPanel's server wait).
+      if (body?.code === "payment_in_flight") return { ok: false, error: L.paymentAlreadyInFlight, inFlight: true };
+      return { ok: false, error: errorText(L, body) };
+    }
     if (!body.ready) {
-      setPrepared({
+      (paypalActive ? setPaypalPrepared : setPrepared)({
         configId: body.checkoutConfigurationId,
         environment: body.environment,
       });
@@ -1161,6 +1511,42 @@ export function CheckoutView({
     document.getElementById("wc-pay-button")?.focus({ preventScroll: true });
   }
 
+  /**
+   * Express PayPal button: PayPal becomes the chosen method (the payment panel shows it). An
+   * incomplete form points the buyer to what's missing, exactly like the Pay button; a complete
+   * one pays at once through the PayPal-only checkout.
+   */
+  function startPaypal() {
+    setInteracted(true);
+    setPaypalError(null);
+    setPaypalMode(true);
+    if (invalidFields.length > 0) {
+      setPaypalAutoSubmit(false);
+      // Only the terms box left: say that, not "enter your delivery details".
+      setPaypalNotice(paypalDetailsReady ? L.termsRequired : L.paypalNeedsDetails);
+      revealErrors();
+      return;
+    }
+    setPaypalNotice(null);
+    setPaypalAutoSubmit(true);
+    document.getElementById("wc-payment")?.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
+    // Keyboard and screen-reader users land where PayPal continues ("Continue with PayPal").
+    document.getElementById("wc-pay-button")?.focus({ preventScroll: true });
+  }
+  function stopPaypal() {
+    endPaypal(paypalChoiceReset({ keepError: false }));
+  }
+  const expressPaypal =
+    paypalOffered && prepared && expressShown.paypal
+      ? {
+          onClick: startPaypal,
+          busy: paypalAutoSubmit || panelLock === "busy",
+          // Until the form is complete (then the Pay area offers "Continue with PayPal").
+          // Only the terms box left: that is what the notice says (it follows the form as the buyer fills it).
+          notice: paypalMode && invalidFields.length > 0 && paypalNotice ? (paypalDetailsReady ? L.termsRequired : L.paypalNeedsDetails) : null,
+        }
+      : null;
+
   /* ---------- rendering helpers ---------- */
 
   const freeShippingThresholdCents = useMemo(() => {
@@ -1169,22 +1555,43 @@ export function CheckoutView({
       .map((r) => r.freeOverCents as number);
     return thresholds.length ? Math.min(...thresholds) : null;
   }, [rates]);
+  // Payment logos: only the ones this checkout really offers (card brands with the card form,
+  // Apple Pay / Google Pay when their express button shows; never SEPA / crypto).
+  const walletsOn = expressWalletsOn(theme.expressCheckout, layout.blocks);
+  // Live: only the wallets whose Whop button really showed on this device (reported by ExpressCheckout).
+  const offeredWallets = offeredWalletsFor({
+    walletsOn,
+    pickupSelected,
+    configured: expressShown.wallets,
+    rendered: live ? walletsRendered : null,
+  });
   const ctx: ContentContext = {
     labels: L,
     lang: theme.language,
     lowestInventory,
     preview: !live,
+    offeredWallets,
+    // Shown once: next to the Payment title, so the payment-logos block itself is skipped live.
+    paymentLogosInHeader: layout.blocks.some((b) => b.type === "payment" && !b.hidden),
+    headerLogosBlockId: headerLogosBlockId(layout.blocks, offeredWallets),
     subtotalCents: totals.subtotalCents - totals.discountCents,
     freeShippingThresholdCents,
     money,
     note,
     setNote,
+    noteLockedBy: priceLocked ? LOCK_NOTE_DELIVERY_ID : null,
+    cartProducts: live ? cartProductsOf(serverLines) : null,
   };
   const arranged = arrangeCheckout(layout.blocks);
+  // Payment title: the payment-logos block's methods, small, only those this checkout offers.
+  const iconsBlock = layout.blocks.find((b) => b.type === "payment_icons" && !b.hidden);
+  const paymentLogos = iconsBlock?.type === "payment_icons" ? offeredPaymentLogos(iconsBlock.props.methods, offeredWallets) : [];
 
   // "Complétez votre commande": under the summary on desktop, above the payment on mobile.
   const recoBlock = arranged.recommendations;
-  const recoItems = recoBlock
+  // A cart fixed as a whole (app prices, Shopify automatic discounts) takes no suggested product.
+  const cartLocked = !!quote?.cartLocked || serverLines.some((l) => !!l.appPrice);
+  const recoItems = recoBlock && !(live && cartLocked)
     ? visibleRecommendations(
         live ? (recommendations ?? []) : sampleRecommendations(recoBlock.props.items, ["Produit recommandé", "Accessoire assorti"]),
         live ? displayLines : [],
@@ -1289,13 +1696,24 @@ export function CheckoutView({
       case "express":
         // Hidden by its own switch, or by the legacy theme switch (older designs).
         if (!block.props.enabled || !theme.expressCheckout) return null;
+        // Every express button switched off by the merchant (or none for this cart): no section, no "OR".
+        if (!expressShown.wallets.length && !expressShown.paypal) return null;
         // Nothing to show until the Whop checkout exists (no empty gap above Contact).
         if (mode.kind === "live" && !prepared) return null;
-        // Wallets ship to the wallet's address: they would skip the relay point choice.
-        if (mode.kind === "live" && pickupSelected) return null;
+        // Wallets ship to the wallet's address: they would skip the relay point choice (PayPal goes
+        // through the form, relay point included: it stays).
+        if (mode.kind === "live" && pickupSelected && !expressPaypal) return null;
         return mode.kind === "live" ? (
           <ExpressCheckout
             prepared={prepared}
+            paypal={expressPaypal}
+            // Every express button locked while the panel is (even with the PayPal button gone).
+            lock={panelLock}
+            wallets={!pickupSelected}
+            // The merchant's wallets; Google Pay only when nothing ships unless set to "always"
+            // (Whop's Google Pay express button collects no shipping address).
+            walletMethods={expressShown.wallets}
+            onWalletsShown={setWalletsRendered}
             theme={theme}
             labels={L}
             returnUrl={`${origin}${thankYouUrl}`}
@@ -1307,7 +1725,7 @@ export function CheckoutView({
             termsNotice={theme.requireTerms ? <TermsText L={L} theme={theme} express /> : null}
           />
         ) : (
-          <ExpressPreview labels={L} title={block.props.title} dividerLabel={block.props.dividerLabel} />
+          <ExpressPreview labels={L} title={block.props.title} dividerLabel={block.props.dividerLabel} walletMethods={expressShown.wallets} paypal={expressShown.paypal} />
         );
       case "contact":
         return (
@@ -1341,6 +1759,7 @@ export function CheckoutView({
                   </span>
                 </div>
               )}
+              {priceLocked && <PriceLockNote id={LOCK_NOTE_CONTACT_ID} text={L.paypalEditsLocked} />}
               <Field label={L.email} error={shownError("email")} field="email">
                 <input
                   type="email"
@@ -1349,6 +1768,7 @@ export function CheckoutView({
                   required
                   value={email}
                   disabled={locked}
+                  readOnly={priceLocked}
                   onChange={(e) => {
                     setEmail(e.target.value);
                     setEmailSuggestion(null);
@@ -1358,17 +1778,18 @@ export function CheckoutView({
                     touch("email");
                     setEmailSuggestion(suggestEmail(email));
                   }}
-                  aria-describedby={
-                    [shownError("email") ? `${fieldId("email")}-error` : null, emailSuggestion ? `${fieldId("email")}-suggest` : null].filter(Boolean).join(" ") ||
-                    undefined
-                  }
+                  aria-describedby={describedBy(
+                    shownError("email") && `${fieldId("email")}-error`,
+                    emailSuggestion && !priceLocked && `${fieldId("email")}-suggest`,
+                    priceLocked && LOCK_NOTE_CONTACT_ID,
+                  )}
                   className={inputCls}
                 />
               </Field>
-              {live && returningCode && liveSessionId && !showSavedPrompt && (
+              {live && returningCode && liveSessionId && !showSavedPrompt && !priceLocked && (
                 <ReturningBuyerCode sessionId={liveSessionId} email={email} L={L} inputCls={inputCls} onFilled={applyCodeBuyer} />
               )}
-              {emailSuggestion && (
+              {emailSuggestion && !priceLocked && (
                 <p id={`${fieldId("email")}-suggest`} className="mt-1.5 text-sm text-neutral-700">
                   <button
                     type="button"
@@ -1384,12 +1805,19 @@ export function CheckoutView({
                 </p>
               )}
               <label className="mt-2 flex min-h-11 cursor-pointer items-center gap-3 text-sm">
+                {/* Locked while a PayPal payment is pending (see priceLocked): still focusable, the lock note announced. */}
                 <input
                   type="checkbox"
                   checked={marketing}
                   disabled={locked}
-                  onChange={(e) => setMarketing(e.target.checked)}
-                  className="h-5 w-5 shrink-0 accent-[var(--accent)]"
+                  aria-disabled={priceLocked || undefined}
+                  aria-describedby={priceLocked ? LOCK_NOTE_CONTACT_ID : undefined}
+                  // Controlled: a change not taken snaps back.
+                  onChange={(e) => {
+                    if (!priceLocked) setMarketing(e.target.checked);
+                  }}
+                  data-testid="wc-marketing"
+                  className="h-5 w-5 shrink-0 accent-[var(--accent)] aria-disabled:cursor-not-allowed aria-disabled:opacity-60"
                 />
                 {L.marketing}
               </label>
@@ -1399,9 +1827,13 @@ export function CheckoutView({
                     type="checkbox"
                     checked={remember}
                     disabled={locked}
-                    onChange={(e) => setRemember(e.target.checked)}
-                    aria-describedby={remember ? "wc-remember-hint" : undefined}
-                    className="h-5 w-5 shrink-0 accent-[var(--accent)]"
+                    aria-disabled={priceLocked || undefined}
+                    onChange={(e) => {
+                      if (!priceLocked) setRemember(e.target.checked);
+                    }}
+                    aria-describedby={describedBy(remember && "wc-remember-hint", priceLocked && LOCK_NOTE_CONTACT_ID)}
+                    data-testid="wc-remember"
+                    className="h-5 w-5 shrink-0 accent-[var(--accent)] aria-disabled:cursor-not-allowed aria-disabled:opacity-60"
                   />
                   {L.rememberMe}
                 </label>
@@ -1426,6 +1858,7 @@ export function CheckoutView({
       case "delivery":
         return (
           <Section title={block.props.title || L.shippingAddress}>
+            {priceLocked && <PriceLockNote id={LOCK_NOTE_DELIVERY_ID} text={L.paypalEditsLocked} />}
             <div className="grid grid-cols-2 gap-3">
               <Field
                 label={L.country}
@@ -1438,10 +1871,16 @@ export function CheckoutView({
                   required
                   value={address.countryCode}
                   disabled={locked}
-                  onChange={(e) =>
-                    setAddress({ ...address, countryCode: e.target.value })
-                  }
+                  // Locked while a PayPal payment is pending, like a read-only field: still focusable
+                  // (the lock note is announced with it), but no change is taken (the controlled
+                  // value snaps back).
+                  aria-disabled={priceLocked || undefined}
+                  data-readonly={priceLocked || undefined}
+                  onChange={(e) => {
+                    if (!priceLocked) setAddress({ ...address, countryCode: e.target.value });
+                  }}
                   {...inputProps("countryCode")}
+                  aria-describedby={describedBy(inputProps("countryCode")["aria-describedby"], priceLocked && LOCK_NOTE_DELIVERY_ID)}
                   className={inputCls}
                 >
                   {countries.map((c) => (
@@ -1467,9 +1906,10 @@ export function CheckoutView({
                 .filter(([k]) => k !== "province" || NEEDS_PROVINCE.has(address.countryCode) || !!address.province)
                 .map(([k, label, auto, span]) => {
                 const validated = (FIELD_ORDER as readonly string[]).includes(k);
-                const props = validated
-                  ? inputProps(k as FieldKey)
-                  : { id: fieldId(k) };
+                // Every delivery field: read-only while a PayPal payment is pending (see priceLocked).
+                const readOnly = priceLocked;
+                const base = validated ? inputProps(k as FieldKey) : { id: fieldId(k), "aria-describedby": undefined };
+                const props = { ...base, readOnly, "aria-describedby": describedBy(base["aria-describedby"], readOnly && LOCK_NOTE_DELIVERY_ID) };
                 return (
                   <Field
                     key={k}
@@ -1486,6 +1926,8 @@ export function CheckoutView({
                         disabled={locked}
                         onChange={(v) => setAddress({ ...address, address1: v })}
                         onPick={(p) => {
+                          // A list still open (arrow keys) never changes a locked address.
+                          if (priceLocked) return;
                           setAddress({ ...address, ...p });
                           setTouched((t) => ({ ...t, address1: true, zip: true, city: true }));
                         }}
@@ -1534,7 +1976,7 @@ export function CheckoutView({
               <div
                 role="radiogroup"
                 aria-label={block.props.title || L.shippingMethod}
-                className="divide-y divide-neutral-200 overflow-hidden rounded-[var(--radius)] border border-neutral-200 bg-white"
+                className="divide-y divide-[var(--border)] overflow-hidden rounded-[var(--radius)] border border-[var(--border)] bg-white"
               >
                 {q.rates.map((r) => (
                   <label
@@ -1545,7 +1987,7 @@ export function CheckoutView({
                       type="radio"
                       name="rate"
                       checked={shownRateId === r.id}
-                      disabled={locked}
+                      disabled={locked || priceLocked}
                       onChange={() => setRateId(r.id)}
                       className="h-5 w-5 shrink-0 accent-[var(--accent)]"
                     />
@@ -1577,6 +2019,7 @@ export function CheckoutView({
                   addressCity={address.city}
                   value={validPickup}
                   onChange={(p) => {
+                    if (priceLocked) return;
                     setPickupPoint(p);
                     touch("pickup");
                   }}
@@ -1584,6 +2027,7 @@ export function CheckoutView({
                   lang={theme.language}
                   error={shownError("pickup")}
                   inputId={fieldId("pickup")}
+                  lockedBy={priceLocked ? LOCK_NOTE_DELIVERY_ID : null}
                 />
               ) : (
                 <div className="mt-3">
@@ -1602,7 +2046,7 @@ export function CheckoutView({
             <input
               type="checkbox"
               checked={protectionOn}
-              disabled={locked}
+              disabled={locked || priceLocked}
               onChange={(e) => setProtectionOn(e.target.checked)}
               className="h-5 w-5 shrink-0 accent-[var(--accent)]"
             />
@@ -1632,12 +2076,12 @@ export function CheckoutView({
                 return (
                   <label
                     key={a.id}
-                    className={`flex min-h-14 cursor-pointer items-center gap-3 rounded-[var(--radius)] border px-4 py-3 transition-colors ${on ? "border-[var(--accent)] bg-[color-mix(in_srgb,var(--accent)_6%,white)]" : "border-dashed border-neutral-300 bg-white"}`}
+                    className={`flex min-h-14 cursor-pointer items-center gap-3 rounded-[var(--radius)] border px-4 py-3 transition-colors ${on ? "border-[var(--accent)] bg-[color-mix(in_srgb,var(--accent)_6%,white)]" : "border-dashed border-[var(--border)] bg-white"}`}
                   >
                     <input
                       type="checkbox"
                       checked={on}
-                      disabled={locked}
+                      disabled={locked || priceLocked}
                       onChange={() =>
                         setAddOnIds(
                           on
@@ -1686,6 +2130,7 @@ export function CheckoutView({
             title={block.props.title || L.payment}
             id="wc-payment"
             sectionRef={paymentRef}
+            aside={iconsBlock?.type === "payment_icons" ? <PaymentHeaderLogos methods={paymentLogos} label={iconsBlock.props.label || L.acceptedPaymentMethods} /> : null}
           >
             {mode.kind === "live" ? (
               <PaymentPanel
@@ -1712,13 +2157,51 @@ export function CheckoutView({
                 }}
                 interacted={interacted}
                 errorRef={prepareRef}
+                onLockChange={setPanelLock}
+                paypal={{
+                  active: paypalActive,
+                  prepared: paypalPrepared,
+                  preparing: paypalPreparing || paypalPrepPending || qtyPending || quoteLoading,
+                  error: paypalError,
+                  autoSubmit: paypalAutoSubmit,
+                  onAutoSubmitted: () => setPaypalAutoSubmit(false),
+                  onCancel: stopPaypal,
+                  onRetry: () => {
+                    setPaypalError(null);
+                    setPaypalRetryKey((k) => k + 1);
+                  },
+                  // Ready after all (e.g. after the 20s "not ready" warning): that warning no longer applies.
+                  onReady: () => setPaypalError(null),
+                  // Whop's own PayPal button (after a blocked window) only for the details confirm() saved.
+                  formKey: JSON.stringify([email, address, note, termsAccepted, marketing, pickupSelected ? validPickup : null, paypalPrepSig]),
+                  // A PayPal window opened from Whop's own button: the session is PAYING again server
+                  // side, so the status checks report it in flight (best effort, nothing to wait for).
+                  onWhopWindow: () => {
+                    if (!liveSessionId) return;
+                    void fetch(`/api/public/sessions/${liveSessionId}/paypal-window`, { method: "POST", keepalive: true }).catch(() => undefined);
+                  },
+                  // The window of our own PayPal confirm was blocked: that attempt is dropped server
+                  // side, so switching to the card isn't refused as in flight (best effort).
+                  onWindowBlocked: () => paypalWindowSignal({ blocked: true }),
+                  // A PayPal window still open (heartbeat, late popup): liveness only server side.
+                  onWindowBeat: () => paypalWindowSignal({ beat: true }),
+                  // That window closed: its heartbeat stops counting ~10 s from now.
+                  onWindowClosed: () => paypalWindowSignal({ closed: true }),
+                  checkPaid,
+                }}
+                inFlightAtLoad={inFlightAtLoad}
               />
             ) : (
               <PaymentPreview
                 labels={L}
                 payLabel={payLabel}
                 beforeButton={termsBox}
-                hideWallets={theme.expressCheckout && layout.blocks.some((b) => b.type === "express" && !b.hidden && b.props.enabled)}
+                // Only the wallets whose express button is on (a wallet switched off there stays a tab).
+                hideWallets={
+                  theme.expressCheckout && layout.blocks.some((b) => b.type === "express" && !b.hidden && b.props.enabled)
+                    ? expressShown.wallets
+                    : []
+                }
               />
             )}
           </Section>
@@ -1743,6 +2226,7 @@ export function CheckoutView({
     money,
     hasDiscounts,
     onQty: changeQty,
+    cartUrl: cartUrl ?? null,
     qtyPending: live && qtyPending,
     qtyError,
     volumeNudge: volumeNudge
@@ -1786,16 +2270,21 @@ export function CheckoutView({
     discountNotice: !!codeError?.notice,
     promoSource,
     onApply: (source: string) => {
+      if (priceLocked) return;
       setCodeError(null);
       setPromoSource(source);
       setAppliedCode(codeInput.trim() || null);
     },
     onRemove: () => {
-      setAppliedCode(null);
+      if (priceLocked) return;
+      // "" (not null): the buyer removed the code — the Shopify cart's own code isn't re-applied.
+      setAppliedCode("");
       setCodeError(null);
       setCodeInput("");
     },
-    locked,
+    // Quantities, line removal, the volume nudge and the discount code: see priceLocked.
+    locked: locked || priceLocked,
+    lockNote: priceLocked ? L.paypalEditsLocked : null,
     shippingValue: !displayLines.some((l) => l.requiresShipping)
       ? null
       : q.shippingRateId
@@ -1821,7 +2310,9 @@ export function CheckoutView({
   };
 
   // Reassurance shown after the payment step on small screens (in the summary column on desktop).
-  const mobileAfterPay = [...arranged.summary, ...arranged.side];
+  // Widgets placed in the form column (payment logos, secure badge, guarantee next to the payment)
+  // come first, right under the pay button; blocks placed in the summary follow.
+  const mobileAfterPay = [...arranged.side, ...arranged.summary];
 
   return (
     <div
@@ -1831,8 +2322,8 @@ export function CheckoutView({
       onPointerDownCapture={interacted ? undefined : () => setInteracted(true)}
       onKeyDownCapture={interacted ? undefined : () => setInteracted(true)}
     >
-      <div className="@container min-h-full" data-inputs={theme.inputStyle}>
-        <StoreHeader theme={theme} />
+      <div className="@container/wc-page min-h-full overflow-x-clip" data-inputs={theme.inputStyle}>
+        <StoreHeader theme={theme} homeUrl={storeHomeUrl(cartUrl)} />
 
         {/* Mobile summary toggle */}
         <div
@@ -1872,7 +2363,7 @@ export function CheckoutView({
             className={`px-5 py-6 [direction:ltr] @3xl:flex @3xl:px-10 @3xl:py-10 ${live ? "pb-28 @3xl:pb-10" : ""} ${summaryLeft ? "@3xl:justify-start @3xl:border-l" : "@3xl:justify-end @3xl:border-r"} @3xl:border-[var(--border)]`}
             style={{ background: theme.formBackground || undefined }}
           >
-            <div className="w-full space-y-4" style={{ maxWidth: widths.form }}>
+            <div className="wc-bleed-col mx-auto w-full space-y-4 @3xl:mx-0" style={{ maxWidth: widths.form }}>
               <h1 className="sr-only">
                 {theme.storeName ? `${theme.storeName} · ${L.checkoutTitle}` : L.checkoutTitle}
               </h1>
@@ -1999,19 +2490,32 @@ function Section({
   title,
   id,
   sectionRef,
+  aside,
   children,
 }: {
   title: string;
   id?: string;
   sectionRef?: Ref<HTMLElement>;
+  /** Shown at the end of the title row (the Payment section's accepted-method logos). */
+  aside?: ReactNode;
   children: ReactNode;
 }) {
   const headingId = id ? `${id}-title` : undefined;
+  const heading = (
+    <h2 id={headingId} data-inline-field="title" className={`${aside ? "" : "mb-3 "}font-[family-name:var(--heading-font)] text-lg font-semibold tracking-tight`}>
+      {title}
+    </h2>
+  );
   return (
     <section id={id} ref={sectionRef} aria-labelledby={headingId} className="scroll-mt-4">
-      <h2 id={headingId} data-inline-field="title" className="mb-3 font-[family-name:var(--heading-font)] text-lg font-semibold tracking-tight">
-        {title}
-      </h2>
+      {aside ? (
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+          {heading}
+          {aside}
+        </div>
+      ) : (
+        heading
+      )}
       {children}
     </section>
   );
@@ -2065,6 +2569,8 @@ function OrderSummary(props: {
   onApply: (source: string) => void;
   onRemove: () => void;
   locked: boolean;
+  /** Why the summary is locked, when a PayPal payment is pending (see priceLocked). */
+  lockNote?: string | null;
   /** The code field is already on the page (small screens): not repeated in the folded summary. */
   hidePromo?: boolean;
   /** null when nothing ships (no shipping row). */
@@ -2076,6 +2582,8 @@ function OrderSummary(props: {
   idPrefix: string;
   /** Quantity stepper: new quantity for a line (0 removes it). */
   onQty: (line: CartLine, quantity: number) => void;
+  /** The shop's cart: lines fixed by the cart (bundles, app prices, personalization) are changed there. */
+  cartUrl?: string | null;
   /** A quantity change is being re-priced: totals are about to change. */
   qtyPending: boolean;
   qtyError: string | null;
@@ -2111,11 +2619,12 @@ function OrderSummary(props: {
   const canRemove = lines.length > 1 && !props.locked;
   return (
     <div className="space-y-5">
+      {props.lockNote && <PriceLockNote text={props.lockNote} />}
       <ul className="space-y-4">
-        {lines.map((l) => {
+        {lines.map((l, idx) => {
           const max = maxQty(l);
           return (
-            <li key={l.variantId} className="flex items-start gap-3">
+            <li key={`${l.variantId}-${idx}`} className="flex items-start gap-3">
               {/* Images on: every line keeps its 64 px slot (placeholder when a product has no photo), so rows stay aligned. */}
               {props.showImages && (
                 <div className="relative shrink-0">
@@ -2128,6 +2637,12 @@ function OrderSummary(props: {
                 {l.variantTitle && (
                   <p className="text-xs text-neutral-600">{l.variantTitle}</p>
                 )}
+                {/* Line item properties the buyer entered ("Gravure : Léa"); "_…" ones stay hidden, like on Shopify. */}
+                {visibleProperties(l).map((p) => (
+                  <p key={p.name} className="text-xs break-words text-neutral-600" data-testid="line-property">
+                    {p.name} : {/^https?:\/\//.test(p.value) ? <a href={p.value} target="_blank" rel="noopener noreferrer" className="underline underline-offset-2">{p.value.split("/").pop()}</a> : p.value}
+                  </p>
+                ))}
                 <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
                   <div
                     role="group"
@@ -2136,7 +2651,7 @@ function OrderSummary(props: {
                   >
                     <StepButton
                       label={L.qtyDecrease(l.title)}
-                      disabled={props.locked || l.quantity <= 1}
+                      disabled={props.locked || l.locked || l.quantity <= 1}
                       onClick={() => props.onQty(l, l.quantity - 1)}
                     >
                       <Minus className="h-3.5 w-3.5" aria-hidden />
@@ -2146,13 +2661,25 @@ function OrderSummary(props: {
                     </span>
                     <StepButton
                       label={l.quantity >= max ? `${L.qtyIncrease(l.title)} (${L.qtyMax})` : L.qtyIncrease(l.title)}
-                      disabled={props.locked || l.quantity >= max}
+                      disabled={props.locked || l.locked || l.quantity >= max}
                       onClick={() => props.onQty(l, l.quantity + 1)}
                     >
                       <Plus className="h-3.5 w-3.5" aria-hidden />
                     </StepButton>
                   </div>
-                  {canRemove && (
+                  {l.locked && (
+                    // Bundle / app price / personalization: the Shopify cart holds this line's quantity.
+                    <span className="text-xs text-neutral-600" data-testid="locked-line">
+                      {props.cartUrl ? (
+                        <a href={props.cartUrl} className="underline underline-offset-2 hover:text-neutral-900" title={L.lockedLineQty}>
+                          {L.lockedLineEdit}
+                        </a>
+                      ) : (
+                        L.lockedLineQty
+                      )}
+                    </span>
+                  )}
+                  {canRemove && !l.locked && (
                     <button
                       type="button"
                       onClick={() => props.onQty(l, 0)}
@@ -2443,7 +2970,14 @@ function TermsText({
   if (express) {
     return (
       <p className="mt-2 text-center text-xs text-neutral-600">
-        {L.expressTerms}
+        {/* Same terms page as the checkbox's link, when the merchant set one. */}
+        {href ? (
+          <a href={href} target="_blank" rel="noreferrer" className="underline underline-offset-2">
+            {L.expressTerms}
+          </a>
+        ) : (
+          L.expressTerms
+        )}
       </p>
     );
   }
@@ -2509,6 +3043,16 @@ function CheckoutSteps({ L, cartUrl }: { L: Labels; cartUrl: string | null }) {
         </a>
       )}
     </>
+  );
+}
+
+/** "PayPal payment in progress: changes are locked", over the fields and summary it locks. */
+function PriceLockNote({ text, id }: { text: string; id?: string }) {
+  return (
+    <p id={id} className="mb-3 flex items-start gap-1.5 rounded-[var(--radius)] bg-amber-50 px-3 py-2 text-sm text-amber-900" data-testid="wc-price-locked">
+      <Lock className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+      {text}
+    </p>
   );
 }
 

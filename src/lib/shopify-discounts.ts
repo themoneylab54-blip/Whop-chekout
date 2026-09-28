@@ -8,6 +8,7 @@ import { recordIncident } from "./incidents";
 import { externalCoveredUntil, externalImportStatus } from "./shopify-history";
 import { rateLimit } from "./ratelimit";
 import { productKey, subtotal, type CartLine, type Combines, type DiscountClass, type DiscountInput } from "./pricing";
+import { cartMerchandiseCents, reconcileCart, type CartContext, type CartJs as FidelityCartJs, type UnsupportedCartReason } from "./cart-fidelity";
 
 /*
  * Shopify's own discounts on the Whop checkout.
@@ -279,17 +280,25 @@ export function clearShopifyDiscountCache() {
 
 type LookupStore = Pick<Store, "id" | "shopDomain" | "shopifyAccessToken" | "shopCurrency">;
 
+/** lookupShopifyCode, asked once more (past the failure cache) when Shopify couldn't answer. */
+export async function lookupShopifyCodeWithRetry(store: LookupStore, code: string): Promise<ShopifyCodeDiscount | Unsupported> {
+  const first = await lookupShopifyCode(store, code);
+  return first === "unavailable" ? lookupShopifyCode(store, code, { retry: true }) : first;
+}
+
 /**
  * The Shopify discount behind a code (cached 60 s, misses too), or why it can't be used. A
  * Shopify failure (missing read_discounts scope, outage) is "unavailable" (cached 30 s), journaled.
  */
-export async function lookupShopifyCode(store: LookupStore, code: string): Promise<ShopifyCodeDiscount | Unsupported> {
+
+export async function lookupShopifyCode(store: LookupStore, code: string, opts: { retry?: boolean } = {}): Promise<ShopifyCodeDiscount | Unsupported> {
   const key = `${store.id}:${code.trim().toUpperCase()}`;
   const hit = codeCache.get(key);
   if (hit && Date.now() - hit.at < CODE_TTL_MS) return hit.value;
-  // A recent lookup failure: answered from memory for 30 s (an outage isn't hammered per keystroke).
+  // A recent lookup failure: answered from memory for 30 s (an outage isn't hammered per keystroke),
+  // except for the one retry of a code the Shopify cart carried (`retry`).
   const failed = failedLookups.get(key);
-  if (failed && Date.now() - failed < LOOKUP_FAILURE_TTL_MS) return "unavailable";
+  if (failed && !opts.retry && Date.now() - failed < LOOKUP_FAILURE_TTL_MS) return "unavailable";
   let value: ShopifyCodeDiscount | Unsupported;
   try {
     value = parseCodeDiscount(code.trim(), await shopifyGraphql(store, CODE_QUERY, { code: code.trim(), search: `code:${JSON.stringify(code.trim())}` }), store.shopCurrency);
@@ -752,17 +761,7 @@ export type CartDiscounts = {
   lineCents?: Record<string, number>;
 };
 
-type CartJs = {
-  token?: string;
-  currency?: string;
-  items?: {
-    variant_id?: number | string;
-    id?: number | string;
-    quantity?: number;
-    line_level_discount_allocations?: { amount?: number; discount_application?: { type?: string; title?: string } }[];
-  }[];
-  cart_level_discount_applications?: { type?: string; title?: string; total_allocated_amount?: number }[];
-};
+type CartJs = FidelityCartJs;
 
 const variantGidOf = (id: unknown) => {
   const s = String(id ?? "");
@@ -833,14 +832,16 @@ export function automaticDiscountsOf(cart: CartJs, lines?: PricedLine[]): CartDi
   };
 }
 
-/** Same set of variants and quantities. Pure. */
+/** Same set of variants and quantities (a variant on several lines counts once, quantities summed). Pure. */
 export function sameItems(a: { variantId: string; quantity: number }[], b: { variantId: string; quantity: number }[]): boolean {
-  const key = (x: { variantId: string; quantity: number }[]) =>
-    x
-      .filter((i) => i.quantity > 0)
-      .map((i) => `${productKey(i.variantId)}x${i.quantity}`)
+  const key = (x: { variantId: string; quantity: number }[]) => {
+    const qty = new Map<string, number>();
+    for (const i of x) if (i.quantity > 0) qty.set(productKey(i.variantId), (qty.get(productKey(i.variantId)) ?? 0) + i.quantity);
+    return [...qty]
+      .map(([k, n]) => `${k}x${n}`)
       .sort()
       .join(",");
+  };
   return key(a) === key(b);
 }
 
@@ -850,31 +851,42 @@ export function sameItems(a: { variantId: string; quantity: number }[], b: { var
  * cart shown in another currency — Shopify Markets — has amounts that aren't the checkout's).
  * Null on any doubt; failures are journaled (the buyer loses the discount).
  */
-export async function verifiedCartDiscounts(
-  store: Pick<Store, "id" | "shopDomain" | "shopCurrency">,
+/**
+ * The buyer's cart re-read from the storefront with its token (Shopify's AJAX cart API, 3 s by
+ * default): the server's own figures, never the browser's. Null on failure (journaled; `alert`
+ * false for a cart that looked plain: it goes on at the variants' prices, nothing is at stake).
+ */
+export async function readCartJs(
+  store: Pick<Store, "id" | "shopDomain">,
   cartToken: string,
-  lines: PricedLine[],
-): Promise<CartDiscounts | null> {
+  opts: { timeoutMs?: number; alert?: boolean } = {},
+): Promise<CartJs | null> {
   if (!store.shopDomain || !/^[\w\-?=&%.:]{8,300}$/.test(cartToken)) return null;
-  let cart: CartJs;
   try {
     const res = await extFetch("shopify", "cart.js", `https://${store.shopDomain}/cart.js`, {
       headers: { Accept: "application/json", Cookie: `cart=${cartToken}` },
-      signal: AbortSignal.timeout(3000),
+      signal: AbortSignal.timeout(opts.timeoutMs ?? 3000),
       cache: "no-store",
       redirect: "error",
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    cart = (await res.json()) as CartJs;
+    const cart = (await res.json()) as CartJs;
+    if (!cart || typeof cart !== "object" || !Array.isArray(cart.items)) throw new Error("unexpected cart body");
+    return cart;
   } catch (err) {
     await recordIncident({
       storeId: store.id,
       kind: "discount.cart_read_failed",
-      message: `Panier Shopify impossible à relire : ses remises automatiques ne sont pas appliquées au checkout (${err instanceof Error ? err.message.slice(0, 200) : String(err)}).`,
-      data: { err: err instanceof Error ? err.message : String(err) },
+      message: `Panier Shopify impossible à relire : ses remises automatiques et prix d'app ne sont pas repris au checkout (${err instanceof Error ? err.message.slice(0, 200) : String(err)}).`,
+      data: { err: err instanceof Error ? err.message : String(err), ...(opts.alert === false ? { plainCart: true } : {}) },
+      ...(opts.alert === false ? { alert: false } : {}),
     });
     return null;
   }
+}
+
+/** Automatic discounts of a re-read cart for these lines, or null (currency mismatch journaled). */
+async function discountsOfCart(store: Pick<Store, "id" | "shopCurrency">, cart: CartJs, lines: PricedLine[]): Promise<CartDiscounts | null> {
   const currency = String(cart.currency ?? "").toUpperCase();
   if (currency !== store.shopCurrency.toUpperCase()) {
     // Only when it would have mattered (the cart shows automatic discounts): once per store every 10 min.
@@ -891,6 +903,60 @@ export async function verifiedCartDiscounts(
   const found = automaticDiscountsOf(cart, lines);
   if (!found || !sameItems(found.items, lines)) return null;
   return found;
+}
+
+/**
+ * Re-reads the cart and keeps its automatic discounts when its lines are the checkout's and its
+ * currency is the shop's (a cart shown in another currency — Shopify Markets — has amounts that
+ * aren't the checkout's). Null on any doubt; failures are journaled (the buyer loses the discount).
+ */
+export async function verifiedCartDiscounts(
+  store: Pick<Store, "id" | "shopDomain" | "shopCurrency">,
+  cartToken: string,
+  lines: PricedLine[],
+): Promise<CartDiscounts | null> {
+  const cart = await readCartJs(store, cartToken);
+  return cart ? discountsOfCart(store, cart, lines) : null;
+}
+
+export type VerifiedCart =
+  | { status: "unreadable" }
+  | { status: "unsupported"; reason: UnsupportedCartReason; detail?: string; cart: CartJs }
+  | {
+      status: "ok";
+      lines: CartLine[];
+      discounts: CartDiscounts | null;
+      context: CartContext | null;
+      adjustedCents: number;
+      cart: CartJs;
+    };
+
+/**
+ * The checkout's lines made faithful to the buyer's Shopify cart, re-read server-side: line
+ * properties, prices an app set (Cart Transform, never above the variant's), bundle components,
+ * cart note / attributes, and (`discounts`) the automatic discounts Shopify computed — on the
+ * app-adjusted prices. "unsupported": the cart can't be represented, Shopify's checkout takes it.
+ */
+export async function verifiedCart(
+  store: Pick<Store, "id" | "shopDomain" | "shopCurrency">,
+  cartToken: string,
+  lines: CartLine[],
+  opts: { discounts: boolean; cart?: Promise<CartJs | null> },
+): Promise<VerifiedCart> {
+  const cart = await (opts.cart ?? readCartJs(store, cartToken));
+  if (!cart) return { status: "unreadable" };
+  const rec = reconcileCart(cart, lines, store.shopCurrency);
+  if (!rec.ok) return { status: "unsupported", reason: rec.reason, ...(rec.detail ? { detail: rec.detail } : {}), cart };
+  const priced = rec.lines.map((l) => ({ variantId: l.variantId, quantity: l.quantity, unitPriceCents: l.unitPriceCents }));
+  const discounts = opts.discounts ? await discountsOfCart(store, cart, priced) : null;
+  // Last safety net: this exact cart, in the shop's currency, must never cost more here than in
+  // Shopify's cart (its discount codes aside) — an app's price we couldn't read would show here.
+  const cartCents = cartMerchandiseCents(cart);
+  if (rec.matches && cartCents != null && String(cart.currency ?? "").toUpperCase() === store.shopCurrency.toUpperCase()) {
+    const ours = priced.reduce((s, l) => s + l.unitPriceCents * l.quantity, 0) - (discounts?.totalCents ?? 0);
+    if (ours > cartCents) return { status: "unsupported", reason: "price_unreconciled", detail: `${ours} > ${cartCents}`, cart };
+  }
+  return { status: "ok", lines: rec.lines, discounts, context: rec.context, adjustedCents: rec.adjustedCents, cart };
 }
 
 function rateLimitOnce(key: string): Promise<boolean> {

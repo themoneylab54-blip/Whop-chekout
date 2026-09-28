@@ -4,6 +4,8 @@ import { useId, useRef, useState, type ReactNode } from "react";
 import {
   ICON_KEYS,
   MAX_RECOMMENDATIONS,
+  MAX_REVIEW_ITEMS,
+  MEDIA_PATH_RE,
   SURVEY_KEYS,
   offerArmSchema,
   upsellSellable,
@@ -15,11 +17,14 @@ import {
   type OfferArmProps,
   type SurveyKey,
 } from "@/lib/layout";
-import { AlertTriangle, Check, ImageOff, Images, Star, X } from "lucide-react";
+import { AlertTriangle, Check, FolderOpen, ImageOff, Images, Star, Trash2, Upload, X } from "lucide-react";
+import { formatBytes, UPLOAD_ACCEPT, useMediaLibrary, type UploadedMedia } from "./media";
 import { BlockIcon, ICON_LABELS, isIconKey } from "@/components/icons";
 import type { Lang } from "@/components/checkout/i18n";
-import { emptyTextDefault } from "@/components/checkout/localize";
+import { emptyTextDefault, remapListTranslations } from "@/components/checkout/localize";
+import { confirmCouponCode, NEVER_OFFERED_LOGOS_WARNING, neverOfferedLogos, SAMPLE_COUPON_CODE, unconfirmCouponCode } from "@/lib/sample-content";
 import { EditorAccordion, UpsellQuantity, UpsellRules } from "./UpsellRules";
+import { ReviewsImport } from "./ReviewsImport";
 import { ProductPicker, type PickedVariant } from "@/components/dashboard/ProductPicker";
 import { centsToField, currencySymbol, parseMoney } from "@/components/dashboard/money";
 import { decimalRangeLabel, formatCount, formatDecimalField, MAX_REVIEW_COUNT, parseCount, parseDecimal, RATING_MIN_SCORE, ratingScoreWarning } from "./decimal";
@@ -31,6 +36,17 @@ import { decimalRangeLabel, formatCount, formatDecimalField, MAX_REVIEW_COUNT, p
 const input =
   "w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm outline-none focus:border-zinc-900 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-indigo-500 focus-visible:outline-solid";
 const ring = "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-500 focus-visible:outline-solid";
+
+/** The payment-logos picker's chips: display names, not the stored keys. */
+const PAYMENT_LOGO_NAMES: Record<"visa" | "mastercard" | "amex" | "applepay" | "gpay" | "sepa" | "crypto", string> = {
+  visa: "Visa",
+  mastercard: "Mastercard",
+  amex: "Amex",
+  applepay: "Apple Pay",
+  gpay: "Google Pay",
+  sepa: "SEPA",
+  crypto: "Crypto",
+};
 
 /** An image the merchant can pick instead of pasting a URL (product photos, logo…). */
 export type ImageSource = { url: string; label: string };
@@ -61,37 +77,60 @@ export function Text({ value, onChange, placeholder, label }: { value: string; o
   return <input className={input} value={value} placeholder={placeholder} aria-label={label} onChange={(e) => onChange(e.target.value)} />;
 }
 
-const isHttpUrl = (v: string) => /^https?:\/\/[^\s]+\.[^\s]+/i.test(v) && URL.canParse(v);
+// An uploaded image (/api/public/media/<id>, see ./media) is the one relative address accepted.
+const isHttpUrl = (v: string) => (/^https?:\/\/[^\s]+\.[^\s]+/i.test(v) && URL.canParse(v)) || MEDIA_PATH_RE.test(v);
+// Images: https only (an http image is blocked as mixed content on the https checkout).
+const isHttpsUrl = (v: string) => (/^https:\/\/[^\s]+\.[^\s]+/i.test(v) && URL.canParse(v)) || MEDIA_PATH_RE.test(v);
 
 /**
  * URL field that only commits a value the checkout accepts (http(s) or empty), so one
  * half-typed address can never make the whole design fail to save.
  */
-export function UrlText({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder?: string }) {
+export function UrlText({
+  value,
+  onChange,
+  placeholder,
+  label,
+  httpsOnly = false,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  label?: string;
+  /** Image fields: http:// refused (mixed content). */
+  httpsOnly?: boolean;
+}) {
+  const valid = httpsOnly ? isHttpsUrl : isHttpUrl;
   const [draft, setDraft] = useState(value);
   const [seen, setSeen] = useState(value);
   if (value !== seen) {
     setSeen(value);
     setDraft(value);
   }
-  const invalid = draft.trim() !== "" && !isHttpUrl(draft.trim());
+  const invalid = draft.trim() !== "" && !valid(draft.trim());
+  const insecure = invalid && httpsOnly && /^http:\/\//i.test(draft.trim());
   return (
     <div>
       <input
         className={`${input} ${invalid ? "border-amber-400 focus:border-amber-500" : ""}`}
         value={draft}
         placeholder={placeholder ?? "https://…"}
+        aria-label={label}
         inputMode="url"
         onChange={(e) => {
           const v = e.target.value;
           setDraft(v);
-          if (v.trim() === "" || isHttpUrl(v.trim())) onChange(v.trim());
+          if (v.trim() === "" || valid(v.trim())) onChange(v.trim());
         }}
         onBlur={() => {
           if (invalid) setDraft(value);
         }}
       />
-      {invalid && <p className="mt-1 text-[11px] text-amber-700">Adresse complète attendue, commençant par https://</p>}
+      {invalid && (
+        <p className="mt-1 text-[11px] text-amber-700">
+          {insecure ? "Lien http:// non sécurisé : utilisez l'adresse en https:// (sinon l'image est bloquée sur le checkout)." : "Adresse complète attendue, commençant par https://"}
+        </p>
+      )}
     </div>
   );
 }
@@ -390,8 +429,9 @@ export function StarPicker({ value, onChange, label = "Note" }: { value: number;
 }
 
 /**
- * Image URL field with a live thumbnail, a load-error state and, when the store has
- * images (product photos, logo, options), a one-click picker.
+ * Image field: a live thumbnail with a load-error state, any https image link, an upload of the
+ * merchant's own file (builder only, see ./media) with their gallery ("Mes images"), and, when the
+ * store has images (product photos, logo, options), a one-click picker.
  */
 export function ImageField({
   value,
@@ -407,11 +447,43 @@ export function ImageField({
   compact?: boolean;
 }) {
   const [failed, setFailed] = useState<string | null>(null);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState<"store" | "mine" | null>(null);
+  const [status, setStatus] = useState<{ kind: "busy" | "error" | "ok"; text: string } | null>(null);
   const pickerId = useId();
+  const fileRef = useRef<HTMLInputElement>(null);
+  const library = useMediaLibrary();
   const broken = !!value && failed === value;
   const size = compact ? "h-9 w-9" : "h-14 w-14";
   const choices = images.filter((im, i, all) => im.url && all.findIndex((x) => x.url === im.url) === i);
+  const linkBtn = `inline-flex items-center gap-1 rounded text-xs font-medium text-indigo-700 hover:underline disabled:opacity-50 ${ring}`;
+
+  async function onFile(file: File | undefined) {
+    if (!file || !library) return;
+    setStatus({ kind: "busy", text: "Envoi de l'image…" });
+    const res = await library.upload(file);
+    if (fileRef.current) fileRef.current.value = "";
+    if (!res.ok) return setStatus({ kind: "error", text: res.message });
+    onChange(res.media.url);
+    setStatus({ kind: "ok", text: `Image importée (${formatBytes(res.media.size)}).` });
+  }
+
+  async function onDelete(m: UploadedMedia) {
+    if (!library) return;
+    const usage = await library.usage(m.id);
+    if (usage?.published) {
+      return setStatus({ kind: "error", text: "Image affichée sur le checkout publié : remplacez-la dans le design et publiez avant de la supprimer." });
+    }
+    const where = usage ? [usage.draft && "le brouillon (le champ sera vidé)", usage.versions > 0 && `${usage.versions} version(s) de l'historique (les restaurer n'afficherait plus cette image)`].filter(Boolean) : [];
+    const msg = where.length ? `Cette image est encore utilisée dans ${where.join(" et ")}. La supprimer quand même ?` : "Supprimer cette image de « Mes images » ?";
+    if (!window.confirm(msg)) return;
+    const res = await library.remove(m.id, { versions: (usage?.versions ?? 0) > 0 });
+    if (!res.ok) return setStatus({ kind: "error", text: res.message });
+    // In the builder every draft field using it is emptied by the provider (BuilderApp).
+    if (!library.clearsFields && value === m.url) onChange("");
+    setStatus({ kind: "ok", text: "Image supprimée." });
+  }
+
+  const mine = library?.items ?? null;
   return (
     <div className="space-y-2">
       <div className="flex items-start gap-2">
@@ -428,46 +500,116 @@ export function ImageField({
           )}
         </span>
         <div className="min-w-0 flex-1">
-          <UrlText value={value} placeholder={placeholder ?? "https://…/image.jpg"} onChange={onChange} />
+          <UrlText httpsOnly value={value} placeholder={placeholder ?? "Coller un lien d'image (https://…)"} label={placeholder ?? "Lien de l'image"} onChange={onChange} />
           {broken && <p className="mt-1 text-[11px] text-amber-700">Image introuvable à cette adresse : vérifiez le lien.</p>}
+          {!compact && !value && <p className="mt-1 text-[11px] text-zinc-600">Tout lien d&apos;image en https:// fonctionne (pas http://), ou importez votre fichier.</p>}
         </div>
       </div>
-      {choices.length > 0 && (
-        <div>
-          <button
-            type="button"
-            aria-expanded={open}
-            aria-controls={pickerId}
-            onClick={() => setOpen((o) => !o)}
-            className={`inline-flex items-center gap-1 rounded text-xs font-medium text-indigo-700 hover:underline ${ring}`}
-          >
-            <Images className="h-3.5 w-3.5" /> Choisir parmi les images de la boutique
-          </button>
-          {open && (
-            <div id={pickerId} className="mt-2 grid grid-cols-5 gap-1.5">
-              {choices.slice(0, 15).map((im) => (
-                <button
-                  key={im.url}
-                  type="button"
-                  title={im.label}
-                  aria-label={im.label}
-                  aria-pressed={value === im.url}
-                  onClick={() => {
-                    onChange(im.url);
-                    setOpen(false);
-                  }}
-                  className={`relative aspect-square overflow-hidden rounded-md border bg-white ${ring} ${value === im.url ? "border-indigo-500 ring-2 ring-indigo-500/30" : "border-zinc-200 hover:border-zinc-400"}`}
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={im.url} alt="" className="h-full w-full object-cover" />
-                  {value === im.url && (
-                    <span className="absolute top-0.5 right-0.5 rounded-full bg-indigo-600 p-0.5 text-white">
-                      <Check className="h-2.5 w-2.5" />
-                    </span>
-                  )}
-                </button>
+      {(library || choices.length > 0) && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          {library && (
+            <>
+              <input
+                ref={fileRef}
+                type="file"
+                accept={UPLOAD_ACCEPT}
+                className="sr-only"
+                tabIndex={-1}
+                aria-hidden
+                onChange={(e) => void onFile(e.target.files?.[0])}
+              />
+              <button type="button" className={linkBtn} disabled={status?.kind === "busy"} onClick={() => fileRef.current?.click()}>
+                <Upload className="h-3.5 w-3.5" aria-hidden /> Importer une image
+              </button>
+              <button
+                type="button"
+                aria-expanded={open === "mine"}
+                aria-controls={pickerId}
+                className={linkBtn}
+                onClick={() => {
+                  if (open !== "mine") library.load();
+                  setOpen((o) => (o === "mine" ? null : "mine"));
+                }}
+              >
+                <FolderOpen className="h-3.5 w-3.5" aria-hidden /> Mes images{mine && mine.length > 0 ? ` (${mine.length})` : ""}
+              </button>
+            </>
+          )}
+          {choices.length > 0 && (
+            <button type="button" aria-expanded={open === "store"} aria-controls={pickerId} onClick={() => setOpen((o) => (o === "store" ? null : "store"))} className={linkBtn}>
+              <Images className="h-3.5 w-3.5" aria-hidden /> {compact || library ? "Images de la boutique" : "Choisir parmi les images de la boutique"}
+            </button>
+          )}
+        </div>
+      )}
+      <p role="status" aria-live="polite" className={`text-[11px] empty:hidden ${status?.kind === "error" ? "text-amber-700" : "text-zinc-600"}`}>
+        {status?.text ?? ""}
+      </p>
+      {open === "store" && (
+        <div id={pickerId} className="grid grid-cols-5 gap-1.5">
+          {choices.slice(0, 15).map((im) => (
+            <button
+              key={im.url}
+              type="button"
+              title={im.label}
+              aria-label={im.label}
+              aria-pressed={value === im.url}
+              onClick={() => {
+                onChange(im.url);
+                setOpen(null);
+              }}
+              className={`relative aspect-square overflow-hidden rounded-md border bg-white ${ring} ${value === im.url ? "border-indigo-500 ring-2 ring-indigo-500/30" : "border-zinc-200 hover:border-zinc-400"}`}
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={im.url} alt="" className="h-full w-full object-cover" />
+              {value === im.url && (
+                <span className="absolute top-0.5 right-0.5 rounded-full bg-indigo-600 p-0.5 text-white">
+                  <Check className="h-2.5 w-2.5" />
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+      {open === "mine" && library && (
+        <div id={pickerId}>
+          {mine === null ? (
+            <p className="text-[11px] text-zinc-600">Chargement…</p>
+          ) : library.loadError ? (
+            <p role="alert" className="text-[11px] text-red-700">
+              {library.loadError}
+            </p>
+          ) : mine.length === 0 ? (
+            <p className="text-[11px] text-zinc-600">Aucune image importée pour l&apos;instant.</p>
+          ) : (
+            <ul className="grid grid-cols-4 gap-1.5" aria-label="Mes images">
+              {mine.map((m, i) => (
+                <li key={m.id} className="relative">
+                  <button
+                    type="button"
+                    aria-label={`Utiliser l'image ${i + 1}${m.width && m.height ? ` (${m.width}×${m.height})` : ""}`}
+                    aria-pressed={value === m.url}
+                    onClick={() => {
+                      onChange(m.url);
+                      setOpen(null);
+                    }}
+                    className={`relative block aspect-square w-full overflow-hidden rounded-md border bg-[repeating-conic-gradient(#f4f4f5_0_25%,#fff_0_50%)] bg-[length:12px_12px] ${ring} ${value === m.url ? "border-indigo-500 ring-2 ring-indigo-500/30" : "border-zinc-200 hover:border-zinc-400"}`}
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={m.url} alt="" className="h-full w-full object-contain" loading="lazy" />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Supprimer l'image ${i + 1}`}
+                    title="Supprimer"
+                    onClick={() => void onDelete(m)}
+                    className={`absolute top-0.5 right-0.5 rounded-full bg-white/95 p-0.5 text-zinc-700 shadow hover:text-red-700 ${ring}`}
+                  >
+                    <Trash2 className="h-3 w-3" aria-hidden />
+                  </button>
+                </li>
               ))}
-            </div>
+            </ul>
           )}
         </div>
       )}
@@ -633,6 +775,8 @@ export type EditorContext = {
   lang?: Lang;
   /** A checkout A/B test runs on the shipping protection price (its name). */
   protectionTest?: string | null;
+  /** Changes a block as it is in the layout when applied (by id): for results landing after an await. */
+  updateBlock?: (id: string, fn: (b: Block) => Block) => void;
 };
 
 export function BlockContentEditor({
@@ -647,7 +791,8 @@ export function BlockContentEditor({
   context?: EditorContext;
 }) {
   function props<T extends Block["type"]>(b: BlockOf<T>, patch: Partial<BlockOf<T>["props"]>) {
-    onChange({ ...b, props: { ...b.props, ...patch } } as Block);
+    // Translations stored by position ("items.2.text") follow their item when a list changes.
+    onChange(remapListTranslations(b as Block, { ...b, props: { ...b.props, ...patch } } as Block));
   }
 
   switch (block.type) {
@@ -834,12 +979,36 @@ export function BlockContentEditor({
         />
       );
     case "payment_icons": {
-      const all = ["visa", "mastercard", "amex", "applepay", "gpay", "sepa", "crypto"] as const;
+      // SEPA / crypto are never offered on this checkout: only listed (to remove them) when selected.
+      const never = neverOfferedLogos(block.props.methods);
+      // Thank-you page (no Payment section): no wallet is offered there, card brands only.
+      const thankYouLogos = !!context && !context.blocks.some((b) => b.type === "payment");
+      const all = (["visa", "mastercard", "amex", "applepay", "gpay", "sepa", "crypto"] as const).filter((m) => (m !== "sepa" && m !== "crypto") || never.includes(m));
       return (
         <div className="space-y-3">
-          <F label="Libellé (facultatif)">
+          <F
+            label="Libellé (facultatif)"
+            hint="Visible seulement sur la page de remerciement ; sur le checkout, il nomme les logos pour les lecteurs d'écran."
+          >
             <Text value={block.props.label} onChange={(label) => props(block, { label })} />
           </F>
+          {thankYouLogos ? (
+            <p data-hint="thank-you-logos" className="text-[11px] leading-relaxed text-zinc-600">
+              Apple Pay / Google Pay ne s&apos;affichent pas sur la page de remerciement (aucun paiement n&apos;y est proposé) : seuls les logos de cartes y
+              apparaissent. Les autres sont grisés dans l&apos;aperçu.
+            </p>
+          ) : (
+            <p className="text-[11px] leading-relaxed text-zinc-600">
+              Sur le checkout, ces logos s&apos;affichent une seule fois, à côté du titre « Paiement », et seulement ceux que l&apos;acheteur peut vraiment utiliser :
+              Apple Pay / Google Pay uniquement quand leur bouton s&apos;est réellement affiché sur l&apos;appareil de l&apos;acheteur (jamais avec un point relais).
+            </p>
+          )}
+          {never.length > 0 && (
+            <p role="note" className="flex items-start gap-1.5 rounded-md bg-amber-50 px-2 py-1.5 text-[11px] leading-snug text-amber-900 ring-1 ring-amber-600/15">
+              <AlertTriangle className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden />
+              {NEVER_OFFERED_LOGOS_WARNING}.
+            </p>
+          )}
           <div className="flex flex-wrap gap-1.5">
             {all.map((m) => {
               const on = block.props.methods.includes(m);
@@ -851,7 +1020,7 @@ export function BlockContentEditor({
                   aria-pressed={on}
                   className={`rounded-full border px-2.5 py-1 text-xs ${ring} ${on ? "border-zinc-900 bg-zinc-900 text-white" : "border-zinc-300 text-zinc-600"}`}
                 >
-                  {m}
+                  {PAYMENT_LOGO_NAMES[m]}
                 </button>
               );
             })}
@@ -943,32 +1112,86 @@ export function BlockContentEditor({
       );
     case "reviews":
       return (
+        <FetchLock>
+          {(setFetching) => (
         <div className="space-y-3">
           <F label="Titre">
             <Text value={block.props.title} onChange={(title) => props(block, { title })} />
           </F>
-          <F label="Affichage">
-            <Segmented value={block.props.layout} options={[["carousel", "Carrousel"], ["stack", "Liste"]]} onChange={(layout) => props(block, { layout })} />
+          <F label="Affichage" hint="Auto : un avis à la fois sur mobile, les 3 premiers en liste sur grand écran.">
+            <Segmented
+              value={block.props.layout}
+              options={[
+                ["auto", "Auto"],
+                ["carousel", "Carrousel"],
+                ["stack", "Liste"],
+              ]}
+              onChange={(layout) => props(block, { layout })}
+            />
           </F>
-          <p className="text-[11px] text-zinc-600">Utilisez de vrais avis clients : les faux avis sont interdits (directive Omnibus).</p>
+          <ReviewsImport
+            block={block}
+            storeId={context?.storeId ?? null}
+            onChange={(patch) => props(block, patch)}
+            onFetching={setFetching}
+            updateBlockProps={
+              context?.updateBlock
+                ? (id, patch) => context.updateBlock?.(id, (b) => (b.type === "reviews" ? remapListTranslations(b, { ...b, props: { ...b.props, ...patch } } as Block) : b))
+                : undefined
+            }
+          />
+          <p className="text-[11px] text-zinc-600">
+            Utilisez uniquement de vrais avis clients : les faux avis sont interdits (directive Omnibus). Vous pouvez aussi en saisir à la main.
+          </p>
           <ListEditor
             items={block.props.items}
-            max={20}
-            addLabel="Ajouter un avis"
-            create={() => ({ name: "Prénom N.", text: "Votre avis…", stars: 5, verified: true })}
+            max={MAX_REVIEW_ITEMS}
+            addLabel="Ajouter un avis à la main"
+            create={() => ({ name: "", text: "", stars: 5, verified: false, source: "manual" as const })}
             onChange={(items) => props(block, { items })}
             render={(r, set) => (
               <>
-                <Text label="Nom du client" value={r.name} onChange={(name) => set({ ...r, name })} />
-                <Area value={r.text} rows={2} onChange={(text) => set({ ...r, text })} />
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                  <StarPicker value={r.stars} label={`Étoiles de l'avis de ${r.name || "ce client"}`} onChange={(stars) => set({ ...r, stars })} />
-                  <Toggle label="Achat vérifié" checked={r.verified} onChange={(verified) => set({ ...r, verified })} />
-                </div>
+                {r.source === "csv" || r.source === "judgeme" ? (
+                  // An imported review is shown as the customer wrote it: it can be removed, never edited.
+                  <div className="space-y-1 text-xs text-zinc-800">
+                    <p className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                      <span className="text-amber-600" role="img" aria-label={`${r.stars} sur 5`}>
+                        {"★".repeat(r.stars)}
+                        <span className="text-zinc-300">{"★".repeat(5 - r.stars)}</span>
+                      </span>
+                      <span className="font-medium break-words text-zinc-900">{r.name || "Client"}</span>
+                      {r.verified && <span className="text-[11px] font-medium text-emerald-800">Achat vérifié</span>}
+                    </p>
+                    {r.title && <p className="font-medium break-words">{r.title}</p>}
+                    <p className="line-clamp-4 break-words whitespace-pre-line text-zinc-700">{r.text}</p>
+                    <p className="text-[11px] text-zinc-500">Avis importé : non modifiable (vous pouvez le retirer).</p>
+                  </div>
+                ) : (
+                  // Typed by the merchant: never "Achat vérifié" (only a review app can say the reviewer bought).
+                  <>
+                    <Text label="Nom du client" placeholder="Prénom N." value={r.name} onChange={(name) => set({ ...r, name, verified: false })} />
+                    <Area value={r.text} rows={2} onChange={(text) => set({ ...r, text, verified: false })} />
+                    <StarPicker value={r.stars} label={`Étoiles de l'avis de ${r.name || "ce client"}`} onChange={(stars) => set({ ...r, stars, verified: false })} />
+                  </>
+                )}
+                {(r.source === "csv" || r.source === "judgeme" || r.productTitle || r.date) && (
+                  <p className="text-[11px] text-zinc-600">
+                    {[
+                      r.source === "judgeme" ? "Importé de Judge.me" : r.source === "csv" ? "Importé (CSV)" : "",
+                      r.date ? r.date.split("-").reverse().join("/") : "",
+                      r.productTitle || r.productHandle || "",
+                      r.photoUrl ? "avec photo" : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </p>
+                )}
               </>
             )}
           />
         </div>
+          )}
+        </FetchLock>
       );
     case "comparison":
       return (
@@ -1304,8 +1527,31 @@ export function BlockContentEditor({
             <Area value={block.props.text} rows={2} onChange={(text) => props(block, { text })} />
           </F>
           <F label="Code" hint="Créez-le aussi dans Promos & options pour qu'il fonctionne.">
-            <Text value={block.props.code} onChange={(code) => props(block, { code: code.toUpperCase() })} />
+            {/* A new code is not confirmed yet (codeConfirmed dropped). */}
+            <Text value={block.props.code} onChange={(code) => props(block, { code: code.toUpperCase(), codeConfirmed: undefined })} />
           </F>
+          {block.props.code.trim().toUpperCase() === SAMPLE_COUPON_CODE && (
+            <label className="flex cursor-pointer items-start gap-2 rounded-md bg-zinc-50 p-2 text-xs text-zinc-800 ring-1 ring-zinc-200">
+              <input
+                type="checkbox"
+                checked={block.props.codeConfirmed === true}
+                onChange={(e) => onChange(e.target.checked ? confirmCouponCode(block) : unconfirmCouponCode(block))}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-zinc-900"
+              />
+              <span>
+                <span className="block font-medium">Ce code existe dans ma boutique</span>
+                <span className="mt-0.5 block text-[11px] text-zinc-600">
+                  {block.props.codeConfirmed
+                    ? block.sample
+                      ? "Confirmé : le bloc est affiché à vos clients. Décochez pour le masquer à nouveau."
+                      : "Confirmé : le bloc est affiché à vos clients. Décochez si ce code n'existe pas."
+                    : block.sample
+                      ? `${SAMPLE_COUPON_CODE} est le code d'exemple : il reste masqué pour vos clients tant que vous ne confirmez pas l'avoir créé.`
+                      : `${SAMPLE_COUPON_CODE} est le code d'exemple et vos clients le voient : confirmez qu'il existe, sinon remplacez-le.`}
+                </span>
+              </span>
+            </label>
+          )}
         </div>
       );
     case "social":
@@ -1618,6 +1864,19 @@ function pickedTitle(picked: PickedVariant) {
 }
 
 /**
+ * A block editor locked (every field disabled) while a fetched result that patches the block
+ * is awaited, so nothing typed meanwhile is overwritten when it lands.
+ */
+function FetchLock({ children }: { children: (setFetching: (fetching: boolean) => void) => ReactNode }) {
+  const [fetching, setFetching] = useState(false);
+  return (
+    <fieldset disabled={fetching} aria-busy={fetching || undefined} className="m-0 min-w-0 border-0 p-0">
+      {children(setFetching)}
+    </fieldset>
+  );
+}
+
+/**
  * Products of "Complétez votre commande" (1 to 4): the dashboard's catalog search, as for the
  * one-click offer, with pasting a variant id as a fallback. Stored as variant GIDs.
  */
@@ -1627,9 +1886,10 @@ function RecommendationItems({ block, context, onChange }: { block: BlockOf<"rec
   // Remounts the pickers when the list shifts or an id is typed (a picker reads its value once).
   const [nonce, setNonce] = useState(0);
   const items = block.props.items;
-  const setItems = (next: typeof items) => onChange({ ...block, props: { ...block.props, items: next } });
+  // Translations stored by position ("items.2.title") follow their product when one is removed.
+  const setItems = (next: typeof items) => onChange(remapListTranslations(block, { ...block, props: { ...block.props, items: next } }));
   const setItem = (i: number, patch: Partial<(typeof items)[number]>) => setItems(items.map((it, j) => (j === i ? { ...it, ...patch } : it)));
-  const numeric = (v: string) => v.match(/(\d+)\D*$/)?.[1] ?? v;
+  const numeric =(v: string) => v.match(/(\d+)\D*$/)?.[1] ?? v;
   const toGid = (v: string) => variantGidOf(v) ?? v.trim();
   return (
     <div className="space-y-2">
