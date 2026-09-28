@@ -9,6 +9,8 @@ const VARIANTS = {
   danger: "bg-white text-red-600 shadow-[0_0_0_1px_rgba(220,38,38,.2)] hover:bg-red-50",
 };
 
+const OFF = "cursor-not-allowed bg-transparent text-zinc-400 shadow-[inset_0_0_0_1px_rgb(228_228_231)]";
+
 export function SubmitButton({
   children,
   variant = "primary",
@@ -18,16 +20,19 @@ export function SubmitButton({
   ...props
 }: ComponentProps<"button"> & { variant?: keyof typeof VARIANTS; size?: "sm" | "md"; confirm?: string }) {
   const { pending } = useFormStatus();
+  // Unavailable (disabled by the page) looks like an outline; submitting keeps its colors.
+  const look = props.disabled && !pending ? OFF : `${VARIANTS[variant]} disabled:cursor-wait disabled:opacity-80`;
   return (
     <button
       type="submit"
       {...props}
+      aria-busy={pending || undefined}
       disabled={pending || props.disabled}
       onClick={(e) => {
         if (confirm && !window.confirm(confirm)) e.preventDefault();
         props.onClick?.(e);
       }}
-      className={`inline-flex items-center justify-center gap-2 rounded-lg font-medium transition active:scale-[.98] disabled:cursor-not-allowed disabled:opacity-60 ${size === "sm" ? "px-2.5 py-1.5 text-xs" : "px-4 py-2 text-sm"} ${VARIANTS[variant]} ${className}`}
+      className={`inline-flex items-center justify-center gap-2 rounded-lg font-medium transition active:scale-[.98] ${size === "sm" ? "px-2.5 py-1.5 text-xs" : "px-4 py-2 text-sm"} ${look} ${className}`}
     >
       {pending && <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-r-transparent" />}
       {children}

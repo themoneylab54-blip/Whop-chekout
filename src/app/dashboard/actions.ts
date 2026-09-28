@@ -1,5 +1,6 @@
 "use server";
 
+import { whopRefundAmount } from "@/lib/charge";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { headers } from "next/headers";
@@ -8,6 +9,7 @@ import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { login, logout, requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { EU_VAT_AREA, STANDARD_VAT_RATES } from "@/lib/vat";
 import { decrypt, encrypt, randomToken } from "@/lib/crypto";
 import {
   checkoutLayoutSchema,
@@ -20,19 +22,28 @@ import {
 import { ensureScriptTag, installUrl, normalizeShopDomain, removeScriptTag } from "@/lib/shopify";
 import { OPTIONAL_PAYMENT_METHOD_IDS, refundPayment, registerApplePayDomain, setupWhop, statementDescriptor, teardownWhop } from "@/lib/whop";
 import { testConversions } from "@/lib/conversions";
-import { draftDesign } from "@/lib/design";
-import { recordEvent } from "@/lib/log";
-import { sendAlert } from "@/lib/notify";
+import { draftDesign, hasPublished, publishedDesign, sameDesign } from "@/lib/design";
+import { log, recordEvent } from "@/lib/log";
+import { buyerEmailAvailable, OPERATOR_FROM_SETTING, OPERATOR_KEY_SETTING, sendAlert } from "@/lib/notify";
+import { isStorableTimeZone } from "@/lib/time-db";
+import { addDays, tzOf, zonedDayStart } from "@/lib/time";
 import { env } from "@/lib/env";
-import { syncOrder } from "@/lib/checkout";
+import { syncOrder, syncOrderSafely, syncSkipMessage, type SyncSkipReason } from "@/lib/checkout";
+import { centsToDecimal, MAX_GIFT_TIERS, MAX_PERCENT_TIERS, validateQuantityTiers } from "@/lib/pricing";
+import { pickupConfigured, searchPickupPoints } from "@/lib/pickup";
+import { cleanRecordI18n } from "@/components/checkout/localize";
+import { recordValueModeChange } from "@/lib/value-mode";
+import { closeFallbackPeriod, recordCheckoutEnabled } from "@/lib/fallback";
+import { buyerName, sessionIdsByBuyerName } from "@/lib/order-search";
+import { flashUrl, issueField, type FlashParams } from "@/lib/flash";
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-function back(path: string, params: { ok?: string; error?: string } = {}): never {
-  const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v) as [string, string][]);
-  redirect(q.size ? `${path}?${q}` : path);
+/** Redirects back with a flash; a validation error names its `field` (shown inline, typed values restored). */
+function back(path: string, params: FlashParams = {}): never {
+  redirect(flashUrl(path, params));
 }
 
 function storePath(storeId: string, sub = "") {
@@ -56,7 +67,10 @@ const MAX_CENTS = 100_000_000;
 /** "12,50" | "12.5" | "12" → 1250 cents. Returns null when empty, invalid or absurdly large. */
 function cents(value: string): number | null {
   if (!value) return null;
-  const n = Number(value.replace(/\s/g, "").replace(",", "."));
+  const compact = value.replace(/\s/g, "");
+  // "12,505" is refused rather than silently rounded to 12,51.
+  if (!/^\d*(?:[.,]\d{0,2})?$/.test(compact) || !/\d/.test(compact)) return null;
+  const n = Number(compact.replace(",", "."));
   return Number.isFinite(n) && n >= 0 && n * 100 <= MAX_CENTS ? Math.round(n * 100) : null;
 }
 
@@ -65,7 +79,7 @@ function encryptOrBack(value: string, path: string): string {
   try {
     return encrypt(value);
   } catch (err) {
-    console.error("encryption failed", err);
+    log.error("crypto.encrypt_failed", "Could not encrypt a secret (ENCRYPTION_KEY?)", { err });
     back(path, { error: `Chiffrement impossible : ${errorMessage(err)}` });
   }
 }
@@ -83,13 +97,19 @@ function errorMessage(err: unknown) {
 /* Auth                                                                */
 /* ------------------------------------------------------------------ */
 
-export async function loginAction(fd: FormData) {
+export type LoginState = { error?: string; email?: string };
+
+/** Used with useActionState: a failed attempt returns the error and keeps the typed e-mail. */
+export async function loginAction(_prev: LoginState, fd: FormData): Promise<LoginState> {
+  const email = str(fd, "email").slice(0, 200);
   const h = await headers();
   const ip = h.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
-  if (!(await rateLimit(`login:${ip}`, 10))) back("/login", { error: "Trop de tentatives. Réessayez dans une minute." });
-  const ok = await login(str(fd, "email"), String(fd.get("password") ?? ""));
-  if (!ok) back("/login", { error: "E-mail ou mot de passe incorrect" });
-  redirect("/dashboard");
+  if (!(await rateLimit(`login:${ip}`, 10))) return { error: "Trop de tentatives. Réessayez dans une minute.", email };
+  const ok = await login(email, String(fd.get("password") ?? ""));
+  if (!ok) return { error: "E-mail ou mot de passe incorrect", email };
+  // A single store: land directly on it instead of the store list.
+  const stores = await db.store.findMany({ select: { id: true }, take: 2 });
+  redirect(stores.length === 1 ? storePath(stores[0].id) : "/dashboard");
 }
 
 export async function logoutAction() {
@@ -125,10 +145,146 @@ export async function deleteStoreAction(storeId: string) {
   redirect("/dashboard");
 }
 
+/** Published JSON setting → create input (null stays unset). */
+const jsonCopy = (v: Prisma.JsonValue | null) => (v === null ? undefined : (v as Prisma.InputJsonValue));
+
+/**
+ * "Cloner la boutique": a new, unconnected store with this store's configuration (design,
+ * interception, shipping rates, add-ons, discount codes with fresh counters, quantity breaks,
+ * costs & VAT, pixel IDs, alerts, safety net, conversion value). Never copied: Shopify / Whop
+ * connections, pixel tokens, Mondial Relay credentials, the bank statement label, orders and
+ * stats; the copy starts offline, in test mode, with its own publicId.
+ */
+export async function cloneStoreAction(storeId: string) {
+  const src = await getStore(storeId);
+  const [rates, addOns, discounts] = await Promise.all([
+    db.shippingRate.findMany({ where: { storeId }, orderBy: { position: "asc" } }),
+    db.addOn.findMany({ where: { storeId }, orderBy: { position: "asc" } }),
+    db.discountCode.findMany({ where: { storeId }, orderBy: { createdAt: "asc" } }),
+  ]);
+  const name = `${src.name.slice(0, 72)} (copie)`;
+  let copy: { id: string };
+  try {
+    copy = await db.store.create({
+      data: {
+        name,
+        testMode: true,
+        enabled: false,
+        shopCurrency: src.shopCurrency,
+        theme: jsonCopy(src.theme),
+        checkoutLayout: jsonCopy(src.checkoutLayout),
+        thankYouLayout: jsonCopy(src.thankYouLayout),
+        interception: jsonCopy(src.interception),
+        publishedAt: src.checkoutLayout ? new Date() : null,
+        paymentMethods: src.paymentMethods,
+        quantityBreaks: jsonCopy(src.quantityBreaks),
+        // Costs & VAT
+        fulfillmentFeeCents: src.fulfillmentFeeCents,
+        disputeFeeCents: src.disputeFeeCents,
+        fixedCostsMonthlyCents: src.fixedCostsMonthlyCents,
+        vatExempt: src.vatExempt,
+        vatDomesticOnly: src.vatDomesticOnly,
+        homeCountry: src.homeCountry,
+        adSpendVatNonReclaimable: src.adSpendVatNonReclaimable,
+        // One-click offers merged into the checkout's order (opt-in) and its window
+        mergeOffersIntoOrder: src.mergeOffersIntoOrder,
+        offerMergeWindowMin: src.offerMergeWindowMin,
+        // Checkout options (the e-mail code needs this store's own Resend key: not copied)
+        shopifyDiscountCodes: src.shopifyDiscountCodes,
+        chargeLocalCurrency: src.chargeLocalCurrency,
+        // Pixels: IDs and options only, never the access tokens
+        metaPixelId: src.metaPixelId,
+        tiktokPixelId: src.tiktokPixelId,
+        ga4MeasurementId: src.ga4MeasurementId,
+        pixelRequireConsent: src.pixelRequireConsent,
+        metaContentIdFormat: src.metaContentIdFormat,
+        metaCatalogCountry: src.metaCatalogCountry,
+        conversionValueMode: src.conversionValueMode,
+        // Alerts (the operator's own channels)
+        alertEmail: src.alertEmail,
+        emailFrom: src.emailFrom,
+        resendApiKey: src.resendApiKey,
+        telegramBotToken: src.telegramBotToken,
+        telegramChatId: src.telegramChatId,
+        // Safety net & dispute shield
+        autoFallback: src.autoFallback,
+        pushTracking: src.pushTracking,
+        autoDisputeEvidence: src.autoDisputeEvidence,
+        autoRefundFraudAlerts: src.autoRefundFraudAlerts,
+        shippingRates: {
+          create: rates.map((r) => ({
+            name: r.name,
+            deliveryTime: r.deliveryTime,
+            countries: r.countries,
+            priceCents: r.priceCents,
+            freeOverCents: r.freeOverCents,
+            position: r.position,
+            active: r.active,
+            costCents: r.costCents,
+            kind: r.kind,
+          })),
+        },
+        addOns: {
+          create: addOns.map((a) => ({
+            title: a.title,
+            description: a.description,
+            priceCents: a.priceCents,
+            variantId: a.variantId,
+            imageUrl: a.imageUrl,
+            position: a.position,
+            active: a.active,
+            costCents: a.costCents,
+            showIf: jsonCopy(a.showIf),
+          })),
+        },
+        discounts: {
+          create: discounts.map((d) => ({
+            code: d.code,
+            type: d.type,
+            value: d.value,
+            minSubtotalCents: d.minSubtotalCents,
+            startsAt: d.startsAt,
+            endsAt: d.endsAt,
+            usageLimit: d.usageLimit,
+            usageCount: 0,
+            active: d.active,
+          })),
+        },
+      },
+      select: { id: true },
+    });
+  } catch (err) {
+    log.error("store.clone_failed", "Store clone failed", { storeId, err });
+    back(storePath(storeId, "settings"), { error: `Duplication impossible : ${errorMessage(err)}` });
+  }
+  const counts = { shippingRates: rates.length, addOns: addOns.length, discounts: discounts.length };
+  await Promise.all([
+    recordEvent({
+      storeId,
+      kind: "store.cloned_to",
+      message: `Configuration dupliquée vers une nouvelle boutique « ${name} ».`,
+      data: { newStoreId: copy.id, ...counts },
+    }),
+    recordEvent({
+      storeId: copy.id,
+      kind: "store.cloned_from",
+      message: `Boutique créée par duplication de « ${src.name} » : design, livraison, options, codes promo, coûts, pixels (sans jetons) et alertes copiés. Shopify et Whop restent à connecter.`,
+      data: { sourceStoreId: storeId, ...counts },
+    }),
+  ]);
+  revalidatePath("/dashboard", "layout");
+  back(storePath(copy.id), { ok: `Configuration de « ${src.name} » copiée. Connectez Shopify puis Whop pour mettre cette boutique en ligne.` });
+}
+
 export async function saveSettingsAction(storeId: string, fd: FormData) {
   const store = await getStore(storeId);
   const testMode = fd.get("testMode") === "on";
   const name = str(fd, "name").slice(0, 80) || store.name;
+  // Time zone of the store's days and hours (analytics, reports, alerts); an unknown name keeps the current one.
+  const tzRaw = str(fd, "timezone");
+  // Postgres must know it too (analytics inline it in SQL): checked against pg_timezone_names.
+  if (tzRaw && tzRaw !== store.timezone && !(await isStorableTimeZone(tzRaw))) back(storePath(storeId, "settings"), { error: `Fuseau horaire inconnu : ${tzRaw.slice(0, 64)}`, field: "timezone" });
+  const timezone = tzRaw || store.timezone;
   const modeChanged = testMode !== store.testMode;
   if (modeChanged && store.whopConnectedAt) {
     // Sandbox and production use different Whop keys: the connection must be redone.
@@ -139,6 +295,7 @@ export async function saveSettingsAction(storeId: string, fd: FormData) {
     data: {
       name,
       testMode,
+      timezone,
       ...(modeChanged && store.whopConnectedAt
         ? {
             enabled: false,
@@ -152,6 +309,7 @@ export async function saveSettingsAction(storeId: string, fd: FormData) {
         : {}),
     },
   });
+  if (modeChanged && store.whopConnectedAt) await recordCheckoutEnabled(storeId, store.enabled, false, "Mode test / production changé");
   revalidatePath(storePath(storeId), "layout");
   if (modeChanged && store.whopConnectedAt) {
     back(storePath(storeId, "whop"), {
@@ -167,6 +325,8 @@ export async function setEnabledAction(storeId: string, enabled: boolean) {
     back(storePath(storeId), { error: "Connectez Shopify et Whop avant d'activer le checkout." });
   }
   await db.store.update({ where: { id: storeId }, data: { enabled } });
+  // Charts show the hours the checkout was off (sales on Shopify's checkout, outside these figures).
+  await recordCheckoutEnabled(storeId, store.enabled, enabled, enabled ? null : "Checkout Whop désactivé à la main");
   revalidatePath(storePath(storeId), "layout");
   back(storePath(storeId), {
     ok: enabled ? "Checkout Whop activé sur la boutique" : "Checkout Whop désactivé : la boutique utilise le checkout Shopify.",
@@ -181,15 +341,15 @@ export async function startShopifyInstallAction(storeId: string, fd: FormData) {
   const store = await getStore(storeId);
   const path = storePath(storeId, "shopify");
   const shop = normalizeShopDomain(str(fd, "shopDomain"));
-  if (!shop) back(path, { error: "Domaine invalide : utilisez l'adresse en .myshopify.com" });
+  if (!shop) back(path, { error: "Domaine invalide : utilisez l'adresse en .myshopify.com", field: "shopDomain" });
 
   const clientId = str(fd, "clientId") || store.shopifyClientId || "";
   const clientSecret = str(fd, "clientSecret");
-  if (!clientId) back(path, { error: "Client ID manquant" });
-  if (!clientSecret && !store.shopifyClientSecret) back(path, { error: "Client secret manquant" });
+  if (!clientId) back(path, { error: "Client ID manquant", field: "clientId" });
+  if (!clientSecret && !store.shopifyClientSecret) back(path, { error: "Client secret manquant", field: "clientSecret" });
 
   const other = await db.store.findFirst({ where: { shopDomain: shop, NOT: { id: storeId } } });
-  if (other) back(path, { error: `${shop} est déjà connectée à la boutique « ${other.name} ».` });
+  if (other) back(path, { error: `${shop} est déjà connectée à la boutique « ${other.name} ».`, field: "shopDomain" });
 
   const encryptedSecret = clientSecret ? encryptOrBack(clientSecret, path) : null;
   const state = `${storeId}.${randomToken()}`;
@@ -209,6 +369,7 @@ export async function startShopifyInstallAction(storeId: string, fd: FormData) {
         : {}),
     },
   });
+  if (domainChanged) await recordCheckoutEnabled(storeId, store.enabled, false, "Boutique Shopify changée");
   redirect(installUrl(shop, clientId, state));
 }
 
@@ -221,6 +382,7 @@ export async function disconnectShopifyAction(storeId: string) {
     where: { id: storeId },
     data: { shopifyAccessToken: null, scriptTagId: null, shopifyConnectedAt: null, shopifyScopes: null, enabled: false },
   });
+  await recordCheckoutEnabled(storeId, store.enabled, false, "Shopify déconnecté");
   revalidatePath(storePath(storeId), "layout");
   back(storePath(storeId, "shopify"), { ok: "Boutique déconnectée et script retiré." });
 }
@@ -244,7 +406,7 @@ export async function connectWhopAction(storeId: string, fd: FormData) {
   const store = await getStore(storeId);
   const path = storePath(storeId, "whop");
   const apiKey = str(fd, "apiKey");
-  if (!apiKey) back(path, { error: "Collez votre clé API Whop" });
+  if (!apiKey) back(path, { error: "Collez votre clé API Whop", field: "apiKey" });
   const encryptedKey = encryptOrBack(apiKey, path);
   let result;
   try {
@@ -257,7 +419,7 @@ export async function connectWhopAction(storeId: string, fd: FormData) {
       statementDescriptor: store.statementDescriptor,
     });
   } catch (err) {
-    back(path, { error: `Whop a refusé la connexion : ${errorMessage(err)}` });
+    back(path, { error: `Whop a refusé la connexion : ${errorMessage(err)}`, field: "apiKey" });
   }
   if (store.whopConnectedAt && store.whopWebhookId && store.whopWebhookId !== result.webhookId) {
     await teardownWhop(store).catch(() => undefined);
@@ -274,7 +436,13 @@ export async function connectWhopAction(storeId: string, fd: FormData) {
     },
   });
   revalidatePath(storePath(storeId), "layout");
-  back(path, { ok: `Compte Whop « ${result.accountName} » connecté. Produit et webhook créés automatiquement.` });
+  // Several stores on one Whop account work (each has its own product), but its events
+  // reach every store: say so, so "événement d'une autre boutique" lines don't surprise.
+  const siblings = await db.store.findMany({ where: { whopAccountId: result.accountId, id: { not: storeId } }, select: { name: true }, take: 5 });
+  const shared = siblings.length
+    ? ` Attention : ce compte Whop est aussi connecté à ${siblings.map((x) => `« ${x.name} »`).join(", ")}. Chaque boutique a son propre produit Whop ; les paiements, remboursements et litiges de l'autre boutique arrivent aussi ici et sont ignorés automatiquement (ligne d'information dans le journal).`
+    : "";
+  back(path, { ok: `Compte Whop « ${result.accountName} » connecté. Produit et webhook créés automatiquement.${shared}` });
 }
 
 export async function disconnectWhopAction(storeId: string) {
@@ -292,6 +460,7 @@ export async function disconnectWhopAction(storeId: string) {
       whopConnectedAt: null,
     },
   });
+  await recordCheckoutEnabled(storeId, store.enabled, false, "Whop déconnecté");
   revalidatePath(storePath(storeId), "layout");
   back(storePath(storeId, "whop"), { ok: "Whop déconnecté." });
 }
@@ -302,7 +471,7 @@ export async function setupApplePayAction(storeId: string, fd: FormData) {
   const path = storePath(storeId, "whop");
   const file = String(fd.get("association") ?? "").trim();
   if (file) {
-    if (file.length > 20000) back(path, { error: "Fichier Apple Pay trop volumineux : collez uniquement son contenu" });
+    if (file.length > 20000) back(path, { error: "Fichier Apple Pay trop volumineux : collez uniquement son contenu", field: "association" });
     await db.appSetting.upsert({
       where: { key: "apple_pay_domain_association" },
       update: { value: file },
@@ -339,7 +508,7 @@ export async function saveInterceptionAction(storeId: string, fd: FormData) {
       .map((h) => h.trim().toLowerCase())
       .filter(Boolean),
   });
-  if (!parsed.success) back(storePath(storeId, "interception"), { error: "Réglages invalides" });
+  if (!parsed.success) back(storePath(storeId, "interception"), { error: parsed.error.issues[0]?.message && issueField(parsed.error.issues) === "customSelectors" ? `Sélecteurs personnalisés : ${parsed.error.issues[0].message}` : "Réglages invalides", field: issueField(parsed.error.issues) });
   await db.store.update({ where: { id: storeId }, data: { interception: parsed.data } });
   back(storePath(storeId, "interception"), { ok: "Interception mise à jour — actif sur la boutique en quelques secondes." });
 }
@@ -353,12 +522,26 @@ export async function saveBuilderAction(
   page: "checkout" | "thank-you",
   theme: Theme,
   layout: Layout,
-): Promise<{ ok: true } | { ok: false; error: string }> {
-  await getStore(storeId);
+): Promise<{ ok: true; draft: boolean } | { ok: false; error: string }> {
+  const store = await getStore(storeId);
   const t = themeSchema.safeParse(theme);
   if (!t.success) return { ok: false, error: `Thème invalide : ${t.error.issues[0]?.path.join(".")} ${t.error.issues[0]?.message}` };
   const l = (page === "checkout" ? checkoutLayoutSchema : thankYouLayoutSchema).safeParse(layout);
   if (!l.success) return { ok: false, error: l.error.issues[0]?.message ?? "Mise en page invalide" };
+  // Edits undone back to the published design (both pages, normalised the same way):
+  // there is no draft any more, so "Publier" has nothing to do.
+  const next = {
+    ...store,
+    draftTheme: t.data as Prisma.JsonValue,
+    ...(page === "checkout" ? { draftCheckoutLayout: l.data as Prisma.JsonValue } : { draftThankYouLayout: l.data as Prisma.JsonValue }),
+  };
+  if (hasPublished(store) && sameDesign(draftDesign(next), publishedDesign(store))) {
+    await db.store.update({
+      where: { id: storeId },
+      data: { draftTheme: Prisma.DbNull, draftCheckoutLayout: Prisma.DbNull, draftThankYouLayout: Prisma.DbNull, draftUpdatedAt: null },
+    });
+    return { ok: true, draft: false };
+  }
   // Autosave goes to the draft: buyers keep seeing the published design until "Publier".
   await db.store.update({
     where: { id: storeId },
@@ -370,7 +553,7 @@ export async function saveBuilderAction(
       draftUpdatedAt: new Date(),
     },
   });
-  return { ok: true };
+  return { ok: true, draft: true };
 }
 
 /** Publishes the drafts (theme + both layouts) and keeps a version in the history. */
@@ -398,7 +581,7 @@ export async function publishDesignAction(storeId: string, label: string): Promi
     db.layoutVersion.create({
       data: {
         storeId,
-        label: label.trim().slice(0, 80) || `Publication du ${new Date().toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: "Europe/Paris" })}`,
+        label: label.trim().slice(0, 80) || `Publication du ${new Date().toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: tzOf(store) })}`,
         theme: t.data as Prisma.InputJsonValue,
         checkoutLayout: c.data as Prisma.InputJsonValue,
         thankYouLayout: y.data as Prisma.InputJsonValue,
@@ -443,17 +626,20 @@ export async function discardDraftAction(storeId: string): Promise<{ ok: true }>
 
 export async function startExperimentAction(storeId: string, fd: FormData) {
   await getStore(storeId);
-  const path = storePath(storeId, "analytics");
+  const path = storePath(storeId, "analytics?tab=tests");
   const versionId = str(fd, "versionId");
-  const split = Math.min(90, Math.max(10, parseInt(str(fd, "split"), 10) || 50));
   const version = await db.layoutVersion.findFirst({ where: { id: versionId, storeId } });
-  if (!version) back(path, { error: "Choisissez la version à tester (variante B)." });
+  if (!version) back(path, { error: "Choisissez la version à tester (variante B).", field: "versionId" });
+  // Refused rather than clamped: the test must run with the share that was chosen.
+  const splitRaw = str(fd, "split") || "50";
+  const split = /^\d{1,2}$/.test(splitRaw) ? Number(splitRaw) : NaN;
+  if (!(split >= 10 && split <= 90)) back(path, { error: "Part de trafic B : nombre entier entre 10 et 90 %", field: "split" });
   const store = await db.store.findUniqueOrThrow({ where: { id: storeId } });
   // Pin the control: publishing during the test must not change variant A.
   const control = await db.layoutVersion.create({
     data: {
       storeId,
-      label: `Contrôle A — ${new Date().toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: "Europe/Paris" })}`,
+      label: `Contrôle A — ${new Date().toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: tzOf(store) })}`,
       theme: (store.theme ?? {}) as Prisma.InputJsonValue,
       checkoutLayout: (store.checkoutLayout ?? { blocks: [] }) as Prisma.InputJsonValue,
       thankYouLayout: (store.thankYouLayout ?? { blocks: [] }) as Prisma.InputJsonValue,
@@ -469,7 +655,7 @@ export async function startExperimentAction(storeId: string, fd: FormData) {
 
 export async function stopExperimentAction(storeId: string, experimentId: string, promote: boolean) {
   await getStore(storeId);
-  const path = storePath(storeId, "analytics");
+  const path = storePath(storeId, "analytics?tab=tests");
   const exp = await db.experiment.findFirst({ where: { id: experimentId, storeId } });
   if (!exp) back(path, { error: "Test introuvable" });
   await db.experiment.update({ where: { id: exp.id }, data: { status: "STOPPED", endedAt: new Date() } });
@@ -506,23 +692,36 @@ const countriesField = (v: string): string[] | null => {
 };
 
 export async function saveRateAction(storeId: string, fd: FormData) {
-  await getStore(storeId);
+  const store = await getStore(storeId);
   const path = storePath(storeId, "shipping");
   const id = str(fd, "id");
   const name = str(fd, "name").slice(0, 80);
   const price = cents(str(fd, "price"));
-  if (!name || price == null) back(path, { error: "Nom et prix obligatoires (prix valide, max 1 000 000)" });
+  if (!name) back(path, { error: "Nom du tarif obligatoire", field: "name" });
+  if (price == null) back(path, { error: "Prix invalide (ex. 4,90 ; 2 décimales, max 1 000 000)", field: "price" });
   const countries = countriesField(str(fd, "countries"));
-  if (!countries) back(path, { error: "Pays : utilisez les codes à 2 lettres séparés par des virgules (ex. FR, BE, CH)" });
+  if (!countries) back(path, { error: "Pays : utilisez les codes à 2 lettres séparés par des virgules (ex. FR, BE, CH)", field: "countries" });
   const freeOverRaw = str(fd, "freeOver");
   const freeOver = cents(freeOverRaw);
-  if (freeOverRaw && freeOver == null) back(path, { error: "Seuil de livraison gratuite invalide" });
+  if (freeOverRaw && freeOver == null) back(path, { error: "Seuil de livraison gratuite invalide (ex. 50 ou 49,90)", field: "freeOver" });
+  const costRaw = str(fd, "cost");
+  const cost = cents(costRaw);
+  if (costRaw && cost == null) back(path, { error: "Coût réel invalide (ex. 4,90)", field: "cost" });
+  // Older forms have no "kind" field: keep home delivery.
+  const kind = str(fd, "kind") === "pickup" ? "pickup" : "home";
+  if (kind === "pickup" && !pickupConfigured(store)) {
+    back(path, { error: "Point relais : configurez d'abord Mondial Relay en haut de cette page (code enseigne + clé privée).", field: "kind" });
+  }
+  const i18n = fd.has("i18n") ? (cleanRecordI18n(fd.get("i18n"), ["name", "deliveryTime"]) ?? Prisma.DbNull) : undefined;
   const data = {
+    ...(i18n !== undefined ? { i18n } : {}),
     name,
     deliveryTime: str(fd, "deliveryTime").slice(0, 80) || null,
     countries,
     priceCents: price,
     freeOverCents: freeOver,
+    costCents: cost,
+    kind,
     active: fd.get("active") === "on",
   };
   if (id) await db.shippingRate.update({ where: { id, storeId }, data });
@@ -555,52 +754,90 @@ const discountForm = z.object({
   value: z.string(),
   minSubtotal: z.string(),
   endsAt: z.string(),
+  startsAt: z.string().optional().default(""),
   usageLimit: z.string(),
 });
 
-export async function createDiscountAction(storeId: string, fd: FormData) {
-  await getStore(storeId);
-  const path = storePath(storeId, "offers");
+/** Validates the discount form (create and edit share it); redirects back with the first error. */
+function parseDiscount(fd: FormData, path: string, tz: string) {
   const parsed = discountForm.safeParse(Object.fromEntries(fd));
-  if (!parsed.success) back(path, { error: parsed.error.issues[0]?.message ?? "Code invalide" });
+  if (!parsed.success) back(path, { error: parsed.error.issues[0]?.message ?? "Code invalide", field: issueField(parsed.error.issues) });
   const f = parsed.data;
   let value = 0;
   if (f.type === "PERCENT") {
-    value = Math.round(Number(f.value.replace(",", ".")));
-    if (!(value >= 1 && value <= 100)) back(path, { error: "Pourcentage entre 1 et 100" });
+    // "12,5" is refused, not rounded to 13: the checkout would apply a different discount than typed.
+    const raw = f.value.replace(/\s|%/g, "");
+    value = /^\d{1,3}$/.test(raw) ? Number(raw) : NaN;
+    if (!(value >= 1 && value <= 100)) back(path, { error: "Pourcentage entier entre 1 et 100", field: "value" });
   } else if (f.type === "FIXED") {
     value = cents(f.value) ?? 0;
-    if (value <= 0) back(path, { error: "Montant de réduction invalide" });
+    if (value <= 0) back(path, { error: "Montant de réduction invalide (ex. 5 ou 4,90)", field: "value" });
   }
-  if (f.minSubtotal && cents(f.minSubtotal) == null) back(path, { error: "Minimum de commande invalide" });
-  const usageLimit = f.usageLimit ? parseInt(f.usageLimit, 10) : null;
+  if (f.minSubtotal && cents(f.minSubtotal) == null) back(path, { error: "Minimum de commande invalide (ex. 40 ou 39,90)", field: "minSubtotal" });
+  // "10,5" or "12abc" is refused (parseInt would quietly keep 10 / 12).
+  const usageLimit = f.usageLimit ? (/^\d+$/.test(f.usageLimit.replace(/\s/g, "")) ? Number(f.usageLimit.replace(/\s/g, "")) : NaN) : null;
   if (usageLimit != null && !(usageLimit >= 1 && usageLimit <= 1_000_000)) {
-    back(path, { error: "Limite d'utilisation entre 1 et 1 000 000" });
+    back(path, { error: "Limite d'utilisation : nombre entier entre 1 et 1 000 000", field: "usageLimit" });
   }
-  // "Expire le 31/12" means usable all day on the 31st (Paris time, the merchant's zone).
-  const endsAt = f.endsAt ? endOfDayParis(f.endsAt) : null;
-  if (f.endsAt && !endsAt) back(path, { error: "Date d'expiration invalide" });
-  const exists = await db.discountCode.findUnique({ where: { storeId_code: { storeId, code: f.code } } });
-  if (exists) back(path, { error: `Le code ${f.code} existe déjà` });
+  // "Expire le 31/12" means usable all day on the 31st (the store's time zone, Paris by default).
+  const endsAt = f.endsAt ? endOfDayIn(frenchDateToIso(f.endsAt), tz) : null;
+  if (f.endsAt && !endsAt) back(path, { error: "Date d'expiration invalide : utilisez le format jj/mm/aaaa", field: "endsAt" });
+  // "Valable dès le 01/12" means from midnight in the store's time zone.
+  const startsAt = f.startsAt ? startOfDayIn(frenchDateToIso(f.startsAt), tz) : null;
+  if (f.startsAt && !startsAt) back(path, { error: "Date de début invalide : utilisez le format jj/mm/aaaa", field: "startsAt" });
+  if (startsAt && endsAt && startsAt > endsAt) back(path, { error: "La date de début doit précéder la date d'expiration", field: "startsAt" });
+  // "Cumulable avec les remises quantité" (unchecked: the code or the quantity break, whichever saves more).
+  const combinesWithBreaks = fd.get("combinesWithBreaks") === "on";
+  return { code: f.code, type: f.type, value, minSubtotalCents: cents(f.minSubtotal), startsAt, endsAt, usageLimit, combinesWithBreaks };
+}
+
+/** "31/12/2026" (or already "2026-12-31") → "2026-12-31"; anything else is returned as is (and rejected later). */
+function frenchDateToIso(v: string): string {
+  const m = v.trim().match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/);
+  if (!m) return v.trim();
+  const [, d, mo, y] = m;
+  const iso = `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`;
+  // Reject impossible dates (31/02) instead of letting Date roll them over.
+  const check = new Date(`${iso}T12:00:00Z`);
+  return !Number.isNaN(check.getTime()) && check.toISOString().slice(0, 10) === iso ? iso : "invalid";
+}
+
+export async function createDiscountAction(storeId: string, fd: FormData) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "offers");
+  const data = parseDiscount(fd, path, tzOf(store));
+  const exists = await db.discountCode.findUnique({ where: { storeId_code: { storeId, code: data.code } } });
+  if (exists) back(path, { error: `Le code ${data.code} existe déjà` });
   try {
-    await db.discountCode.create({
-      data: {
-        storeId,
-        code: f.code,
-        type: f.type,
-        value,
-        minSubtotalCents: cents(f.minSubtotal),
-        endsAt,
-        usageLimit,
-      },
-    });
+    await db.discountCode.create({ data: { storeId, ...data } });
   } catch (err) {
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-      back(path, { error: `Le code ${f.code} existe déjà` });
+      back(path, { error: `Le code ${data.code} existe déjà` });
     }
     throw err;
   }
-  back(path, { ok: `Code ${f.code} créé` });
+  back(path, { ok: `Code ${data.code} créé` });
+}
+
+export async function updateDiscountAction(storeId: string, id: string, fd: FormData) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "offers");
+  const current = await db.discountCode.findFirst({ where: { id, storeId } });
+  if (!current) back(path, { error: "Code introuvable" });
+  const data = parseDiscount(fd, path, tzOf(store));
+  if (data.code !== current.code) {
+    const clash = await db.discountCode.findUnique({ where: { storeId_code: { storeId, code: data.code } } });
+    if (clash) back(path, { error: `Le code ${data.code} existe déjà` });
+  }
+  try {
+    await db.discountCode.update({ where: { id, storeId }, data });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      back(path, { error: `Le code ${data.code} existe déjà` });
+    }
+    throw err;
+  }
+  back(path, { ok: `Code ${data.code} mis à jour` });
 }
 
 export async function toggleDiscountAction(storeId: string, id: string) {
@@ -616,31 +853,105 @@ export async function deleteDiscountAction(storeId: string, id: string) {
   back(storePath(storeId, "offers"), { ok: "Code supprimé" });
 }
 
-export async function createAddOnAction(storeId: string, fd: FormData) {
-  await getStore(storeId);
-  const path = storePath(storeId, "offers");
-  const title = str(fd, "title").slice(0, 80);
-  const price = cents(str(fd, "price"));
-  if (!title || price == null || price <= 0) back(path, { error: "Titre et prix obligatoires" });
-  const variant = str(fd, "variantId");
+const addOnForm = z.object({
+  title: z.string().trim().min(1, "Titre obligatoire").max(80, "Titre : 80 caractères maximum"),
+  description: z.string().trim().max(200, "Description : 200 caractères maximum"),
+  price: z.string().trim().min(1, "Prix obligatoire"),
+  variantId: z.string().trim(),
+  imageUrl: z.string().trim().refine((v) => !v || /^https?:\/\/\S+$/i.test(v), "Image : collez une adresse commençant par https://"),
+});
+
+const ruleProduct = z.object({ id: z.string().regex(/^gid:\/\/shopify\/Product\/\d+$/), title: z.string().trim().max(200) });
+
+/** « Conditions d'affichage » → AddOn.showIf (the shape addOnEligible reads), or null when always shown. */
+function parseShowIf(fd: FormData, path: string): Prisma.InputJsonValue | null {
+  const minRaw = str(fd, "ruleMinSubtotal");
+  const maxRaw = str(fd, "ruleMaxSubtotal");
+  const min = cents(minRaw);
+  const max = cents(maxRaw);
+  if (minRaw && min == null) back(path, { error: "Condition : panier minimum invalide (ex. 40)", field: "ruleMinSubtotal" });
+  if (maxRaw && max == null) back(path, { error: "Condition : panier maximum invalide (ex. 150)", field: "ruleMaxSubtotal" });
+  if (min != null && max != null && min > max) back(path, { error: "Condition : le panier minimum dépasse le panier maximum", field: "ruleMinSubtotal" });
+  const products: { id: string; title: string }[] = [];
+  for (const raw of fd.getAll("ruleProducts")) {
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(String(raw));
+    } catch {
+      /* rejected below */
+    }
+    const p = ruleProduct.safeParse(parsed);
+    if (!p.success) back(path, { error: "Condition : produit Shopify invalide" });
+    if (!products.some((x) => x.id === p.data.id)) products.push(p.data);
+  }
+  if (products.length > 20) back(path, { error: "Condition : 20 produits maximum" });
+  const countries = [...new Set(fd.getAll("ruleCountries").map((c) => String(c).trim().toUpperCase()))];
+  if (countries.some((c) => !/^[A-Z]{2}$/.test(c))) back(path, { error: "Condition : code pays invalide" });
+  const rules: Record<string, Prisma.InputJsonValue> = {};
+  if (min != null) rules.minSubtotalCents = min;
+  if (max != null) rules.maxSubtotalCents = max;
+  if (products.length) {
+    rules.productIds = products.map((p) => p.id);
+    rules.productTitles = Object.fromEntries(products.map((p) => [p.id, p.title]));
+  }
+  if (countries.length) rules.countries = countries;
+  return Object.keys(rules).length ? rules : null;
+}
+
+/** Validates the add-on form (create and edit share it); redirects back with the first error. */
+function parseAddOn(fd: FormData, path: string) {
+  const parsed = addOnForm.safeParse({
+    title: str(fd, "title"),
+    description: str(fd, "description"),
+    price: str(fd, "price"),
+    variantId: str(fd, "variantId"),
+    imageUrl: str(fd, "imageUrl"),
+  });
+  if (!parsed.success) back(path, { error: parsed.error.issues[0]?.message ?? "Option invalide", field: issueField(parsed.error.issues) });
+  const f = parsed.data;
+  const price = cents(f.price);
+  if (price == null || price <= 0) back(path, { error: "Prix invalide (ex. 2,99)", field: "price" });
+  const variant = f.variantId;
   // Accepts a bare id, a gid, or a Shopify admin URL (…/variants/456): the last number wins.
   const variantNum = variant.startsWith("gid://") ? null : variant.match(/(\d+)\D*$/)?.[1];
   if (variant && !variant.startsWith("gid://shopify/ProductVariant/") && !variantNum) {
-    back(path, { error: "ID de variante invalide : collez le numéro de la variante Shopify" });
+    back(path, { error: "ID de variante invalide : collez le numéro de la variante Shopify", field: "variantId" });
   }
+  const costRaw = str(fd, "cost");
+  const cost = cents(costRaw);
+  if (costRaw && cost == null) back(path, { error: "Coût du produit invalide (ex. 3,20)", field: "cost" });
+  // Forms without the rules disclosure (none today) must not wipe saved rules.
+  const showIf = fd.has("ruleMinSubtotal") ? parseShowIf(fd, path) : undefined;
+  // Buyer-language title / description (Shopify lines keep the base title).
+  const i18n = fd.has("i18n") ? (cleanRecordI18n(fd.get("i18n"), ["title", "description"]) ?? Prisma.DbNull) : undefined;
+  return {
+    costCents: cost,
+    ...(i18n !== undefined ? { i18n } : {}),
+    ...(showIf !== undefined ? { showIf: showIf ?? Prisma.DbNull } : {}),
+    title: f.title,
+    description: f.description || null,
+    priceCents: price,
+    variantId: variant ? (variant.startsWith("gid://") ? variant : `gid://shopify/ProductVariant/${variantNum}`) : null,
+    imageUrl: f.imageUrl || null,
+  };
+}
+
+export async function createAddOnAction(storeId: string, fd: FormData) {
+  await getStore(storeId);
+  const path = storePath(storeId, "offers");
+  const data = parseAddOn(fd, path);
   const count = await db.addOn.count({ where: { storeId } });
-  await db.addOn.create({
-    data: {
-      storeId,
-      title,
-      description: str(fd, "description").slice(0, 200) || null,
-      priceCents: price,
-      variantId: variant ? (variant.startsWith("gid://") ? variant : `gid://shopify/ProductVariant/${variantNum}`) : null,
-      imageUrl: /^https?:\/\//i.test(str(fd, "imageUrl")) ? str(fd, "imageUrl") : null,
-      position: count,
-    },
-  });
+  await db.addOn.create({ data: { storeId, ...data, position: count } });
   back(path, { ok: "Option ajoutée" });
+}
+
+export async function updateAddOnAction(storeId: string, id: string, fd: FormData) {
+  await getStore(storeId);
+  const path = storePath(storeId, "offers");
+  const data = parseAddOn(fd, path);
+  const updated = await db.addOn.updateMany({ where: { id, storeId }, data });
+  if (updated.count === 0) back(path, { error: "Option introuvable" });
+  back(path, { ok: `Option « ${data.title} » mise à jour` });
 }
 
 export async function toggleAddOnAction(storeId: string, id: string) {
@@ -670,7 +981,48 @@ export async function resyncOrderAction(storeId: string, sessionId: string) {
   } catch (err) {
     back(path, { error: `Échec de la synchronisation : ${errorMessage(err)}` });
   }
-  back(path, { ok: "Commande synchronisée dans Shopify" });
+  // syncOrder returns quietly when it could not claim the order: say why, never "synchronisée".
+  const after = await db.checkoutSession.findUnique({
+    where: { id: sessionId },
+    select: { status: true, shopifyOrderId: true, shopifyOrderName: true, syncHandledAt: true, syncSkippedReason: true, syncStartedAt: true, syncAmbiguousAt: true },
+  });
+  revalidatePath(storePath(storeId), "layout");
+  if (after?.shopifyOrderId) back(path, { ok: `Commande ${after.shopifyOrderName ?? ""} synchronisée dans Shopify`.replace("  ", " ") });
+  if (!after || after.status !== "PAID") back(path, { error: "Seule une commande payée peut être créée dans Shopify." });
+  if (after.syncSkippedReason) back(path, { ok: syncSkipMessage(after.syncSkippedReason as SyncSkipReason) });
+  if (after.syncHandledAt) back(path, { error: `Cette commande est liée à la main à ${after.shopifyOrderName ?? "une commande Shopify"} : aucune création automatique.` });
+  const { AMBIGUOUS_WAIT_MS, SYNC_LEASE_MS } = await import("@/lib/checkout");
+  const minutesLeft = (from: Date | null, window: number) => (from ? Math.max(1, Math.ceil((window - (Date.now() - from.getTime())) / 60_000)) : 0);
+  if (after.syncAmbiguousAt && Date.now() - after.syncAmbiguousAt.getTime() < AMBIGUOUS_WAIT_MS)
+    back(path, {
+      error: `Shopify n'a pas répondu au dernier essai : la commande existe peut-être déjà. Réessayez dans ${minutesLeft(after.syncAmbiguousAt, AMBIGUOUS_WAIT_MS)} min (vérification anti-doublon).`,
+    });
+  if (after.syncStartedAt && Date.now() - after.syncStartedAt.getTime() < SYNC_LEASE_MS)
+    back(path, { error: `Une création de cette commande est déjà en cours : réessayez dans ${minutesLeft(after.syncStartedAt, SYNC_LEASE_MS)} min si elle n'apparaît pas.` });
+  back(path, { error: "La commande n'a pas été créée dans Shopify. Consultez le journal de la commande." });
+}
+
+/** Retries the Shopify order creation for a paid order (failures are logged and rescheduled by the sync itself). */
+export async function retryShopifySyncAction(storeId: string, sessionId: string) {
+  await getStore(storeId);
+  const path = storePath(storeId, `orders/${sessionId}`);
+  const session = await db.checkoutSession.findFirst({ where: { id: sessionId, storeId }, select: { status: true, shopifyOrderId: true, syncAmbiguousAt: true, syncHandledAt: true, syncSkippedReason: true } });
+  if (!session) back(path, { error: "Commande introuvable" });
+  if (session.status !== "PAID") back(path, { error: "Seule une commande payée peut être créée dans Shopify." });
+  if (session.syncSkippedReason) back(path, { ok: syncSkipMessage(session.syncSkippedReason as SyncSkipReason) });
+  if (session.shopifyOrderId || session.syncHandledAt) back(path, { ok: "Cette commande existe déjà dans Shopify." });
+  // Shopify may have created the order during the failed attempt: its search needs a few
+  // minutes to see it, and retrying earlier could create a duplicate.
+  if (session.syncAmbiguousAt && Date.now() - session.syncAmbiguousAt.getTime() < 5 * 60_000) {
+    const wait = Math.ceil((5 * 60_000 - (Date.now() - session.syncAmbiguousAt.getTime())) / 60_000);
+    back(path, { error: `Shopify n'a pas répondu au dernier essai : la commande existe peut-être déjà. Réessayez dans ${wait} min (vérification anti-doublon).` });
+  }
+  await syncOrderSafely(sessionId);
+  const after = await db.checkoutSession.findUnique({ where: { id: sessionId }, select: { shopifyOrderName: true, shopifyOrderId: true, syncError: true, syncSkippedReason: true } });
+  revalidatePath(storePath(storeId), "layout");
+  if (after?.shopifyOrderId) back(path, { ok: `Commande ${after.shopifyOrderName ?? ""} créée dans Shopify`.replace("  ", " ") });
+  if (after?.syncSkippedReason) back(path, { ok: syncSkipMessage(after.syncSkippedReason as SyncSkipReason) });
+  back(path, { error: `La synchronisation a encore échoué${after?.syncError ? ` : ${after.syncError}` : ""}. Un nouvel essai automatique est programmé.` });
 }
 
 export async function refundOrderAction(storeId: string, sessionId: string, fd: FormData) {
@@ -681,28 +1033,98 @@ export async function refundOrderAction(storeId: string, sessionId: string, fd: 
   const remaining = session.totalCents - session.refundedCents;
   const raw = str(fd, "amount");
   const amount = raw ? cents(raw) : remaining;
-  if (amount == null || amount <= 0 || amount > remaining) back(path, { error: "Montant de remboursement invalide" });
+  if (amount == null || amount <= 0 || amount > remaining) back(path, { error: "Montant de remboursement invalide", field: "amount" });
+  const full = amount === remaining;
+  const amountLabel = `${centsToDecimal(amount).replace(".", ",")} ${session.currency}`;
   try {
-    await refundPayment(store, session.whopPaymentId, amount === session.totalCents ? undefined : amount);
+    // Same order state + same amount = same key: a double submit or an SDK retry can't refund twice.
+    await refundPayment(
+      store,
+      session.whopPaymentId,
+      // Charged in the buyer's currency: Whop refunds in that currency (the amount typed is in the shop's),
+      // the rest being exactly what remains of the charge.
+      whopRefundAmount({
+        amountCents: amount,
+        totalCents: session.totalCents,
+        refundedCents: session.refundedCents,
+        chargeTotalCents: session.chargeCurrency && session.chargeFxRate && session.paidQuoteId ? ((await db.checkoutQuote.findUnique({ where: { id: session.paidQuoteId }, select: { chargeTotalCents: true } }))?.chargeTotalCents ?? null) : null,
+        refundedChargeCents: session.refundedChargeCents,
+        rate: session.chargeFxRate,
+        currency: session.chargeCurrency,
+      }),
+      `refund_${session.id}_${(str(fd, "nonce") || `${session.refundedCents}_${amount}`).slice(0, 64)}`,
+    );
   } catch (err) {
+    await recordEvent({
+      storeId,
+      sessionId,
+      level: "warn",
+      kind: "refund.request_failed",
+      message: `Remboursement de ${amountLabel} refusé par Whop : ${errorMessage(err)}`,
+      data: { amountCents: amount, paymentId: session.whopPaymentId, source: "dashboard" },
+    });
     back(path, { error: `Whop a refusé le remboursement : ${errorMessage(err)}` });
   }
+  await recordEvent({
+    storeId,
+    sessionId,
+    kind: "refund.requested",
+    message: `Remboursement ${full ? "total" : "partiel"} de ${amountLabel} demandé depuis le dashboard`,
+    data: { amountCents: amount, full, paymentId: session.whopPaymentId, source: "dashboard" },
+  });
   // The refund.created webhook records it in Shopify.
-  back(path, { ok: "Remboursement demandé à Whop. Il apparaîtra dans Shopify dès confirmation." });
+  back(path, { ok: `Remboursement de ${amountLabel} demandé à Whop. Il apparaîtra dans Shopify dès confirmation.` });
 }
 
-/** "2026-12-31" → 2026-12-31T23:59:59.999 Europe/Paris, as a UTC Date. */
-function endOfDayParis(day: string): Date | null {
+export type OrderSearchHit = { id: string; shopifyOrderName: string | null; email: string | null; name: string | null; status: string; totalCents: number; currency: string; createdAt: string };
+
+/** ⌘K palette: top 8 orders of the store matching an order number ("#1042", "1042"), an e-mail, the buyer's name or an id. */
+export async function searchOrdersAction(storeId: string, q: string): Promise<OrderSearchHit[]> {
+  await requireAdmin();
+  const term = q.trim().slice(0, 100);
+  if (term.length < 2) return [];
+  const digits = term.replace(/^#/, "");
+  // Buyer name ("Marie Dupont", "dupont marie"): only in the shipping address JSON.
+  const byName = /\p{L}/u.test(term) ? await sessionIdsByBuyerName(storeId, term) : [];
+  const rows = await db.checkoutSession.findMany({
+    where: {
+      storeId,
+      OR: [
+        { shopifyOrderName: { contains: digits, mode: "insensitive" } },
+        { email: { contains: term, mode: "insensitive" } },
+        { id: term },
+        { whopPaymentId: term },
+        ...(byName.length ? [{ id: { in: byName } }] : []),
+      ],
+    },
+    orderBy: [{ paidAt: { sort: "desc", nulls: "last" } }, { createdAt: "desc" }],
+    take: 8,
+    select: { id: true, shopifyOrderName: true, email: true, shippingAddress: true, status: true, totalCents: true, subtotalCents: true, currency: true, createdAt: true },
+  });
+  return rows.map((r) => ({
+    id: r.id,
+    shopifyOrderName: r.shopifyOrderName,
+    email: r.email,
+    name: buyerName(r.shippingAddress),
+    status: r.status,
+    totalCents: r.totalCents || r.subtotalCents,
+    currency: r.currency,
+    createdAt: r.createdAt.toISOString(),
+  }));
+}
+
+/** "2026-12-01" → 00:00:00.000 that day in the store's time zone, as a UTC Date (DST-safe). */
+function startOfDayIn(day: string, tz: string): Date | null {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
-  const utc = new Date(`${day}T23:59:59.999Z`);
-  if (Number.isNaN(utc.getTime())) return null;
-  // Offset of Paris vs UTC on that day (+1h winter, +2h summer).
-  const parisHour = Number(
-    new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Paris", hour: "2-digit", hourCycle: "h23" }).format(
-      new Date(`${day}T12:00:00Z`),
-    ),
-  );
-  return new Date(utc.getTime() - (parisHour - 12) * 3600_000);
+  const check = new Date(`${day}T12:00:00.000Z`);
+  if (Number.isNaN(check.getTime()) || check.toISOString().slice(0, 10) !== day) return null;
+  return zonedDayStart(day, tz);
+}
+
+/** "2026-12-31" → 23:59:59.999 that day in the store's time zone, as a UTC Date (DST-safe). */
+function endOfDayIn(day: string, tz: string): Date | null {
+  if (!startOfDayIn(day, tz)) return null;
+  return new Date(zonedDayStart(addDays(day, 1), tz).getTime() - 1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -721,6 +1143,10 @@ export async function saveTrackingAction(storeId: string, fd: FormData) {
   const path = storePath(storeId, "growth");
   const metaPixelId = str(fd, "metaPixelId").replace(/\D/g, "").slice(0, 30) || null;
   const tiktokPixelId = str(fd, "tiktokPixelId").replace(/[^A-Za-z0-9]/g, "").slice(0, 40) || null;
+  // Absent from older forms: keep the current mode. Anything else than the two modes is refused.
+  const modeRaw = fd.has("conversionValueMode") ? str(fd, "conversionValueMode") : store.conversionValueMode;
+  if (modeRaw !== "revenue" && modeRaw !== "profit") back(path, { error: "Valeur de conversion inconnue : choisissez le montant de la commande ou la marge HT." });
+  const conversionValueMode = modeRaw;
   await db.store.update({
     where: { id: storeId },
     data: {
@@ -729,11 +1155,16 @@ export async function saveTrackingAction(storeId: string, fd: FormData) {
       metaTestEventCode: str(fd, "metaTestEventCode").slice(0, 40) || null,
       tiktokPixelId,
       tiktokAccessToken: secretField(fd, "tiktokAccessToken", store.tiktokAccessToken, path),
+      ga4MeasurementId: /^G-[A-Z0-9]{4,20}$/i.test(str(fd, "ga4MeasurementId")) ? str(fd, "ga4MeasurementId").toUpperCase() : null,
+      ga4ApiSecret: secretField(fd, "ga4ApiSecret", store.ga4ApiSecret, path),
       pixelRequireConsent: fd.get("pixelRequireConsent") === "on",
       metaContentIdFormat: str(fd, "metaContentIdFormat") === "shopify" ? "shopify" : "variant",
       metaCatalogCountry: /^[A-Za-z]{2}$/.test(str(fd, "metaCatalogCountry")) ? str(fd, "metaCatalogCountry").toUpperCase() : "FR",
+      conversionValueMode,
     },
   });
+  // Kept per day on the imported ad spend: a platform's reported value is a margin on "profit" days.
+  await recordValueModeChange(storeId, store.conversionValueMode, conversionValueMode).catch(() => undefined);
   back(path, { ok: "Pixels enregistrés" });
 }
 
@@ -754,10 +1185,10 @@ export async function saveAlertsAction(storeId: string, fd: FormData) {
   const store = await getStore(storeId);
   const path = storePath(storeId, "settings");
   const alertEmail = str(fd, "alertEmail").slice(0, 200) || null;
-  if (alertEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(alertEmail)) back(path, { error: "E-mail d'alerte invalide" });
+  if (alertEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(alertEmail)) back(path, { error: "E-mail d'alerte invalide", field: "alertEmail" });
   const emailFrom = str(fd, "emailFrom").slice(0, 200) || null;
   if (emailFrom && !/^([^<>]+<)?[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+>?$/.test(emailFrom)) {
-    back(path, { error: "Expéditeur invalide : ex. « Alertes <alertes@maboutique.fr> »" });
+    back(path, { error: "Expéditeur invalide : ex. « Alertes <alertes@maboutique.fr> »", field: "emailFrom" });
   }
   await db.store.update({
     where: { id: storeId },
@@ -788,7 +1219,7 @@ export async function saveShieldAction(storeId: string, fd: FormData) {
   const path = storePath(storeId, "settings");
   const raw = str(fd, "statementDescriptor");
   const descriptor = raw ? statementDescriptor(raw) : null;
-  if (raw && !descriptor) back(path, { error: "Libellé bancaire : il doit contenir au moins une lettre." });
+  if (raw && !descriptor) back(path, { error: "Libellé bancaire : il doit contenir au moins une lettre.", field: "statementDescriptor" });
   await db.store.update({
     where: { id: storeId },
     data: {
@@ -799,6 +1230,187 @@ export async function saveShieldAction(storeId: string, fd: FormData) {
     },
   });
   back(path, { ok: "Bouclier anti-litiges enregistré" });
+}
+
+/* ------------------------------------------------------------------ */
+/* Quantity breaks (offers), margins, fallback, relay points (shipping) */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Quantity breaks v2 form → raw tiers: one `tier` field per row ("percent:<key>" /
+ * "gift:<key>") with its own fields; scoped rows post their products as JSON
+ * `{id, title}` under `scope-<key>` (titles are kept to show the chips again).
+ */
+function parseQuantityBreaksForm(fd: FormData): { ok: true; raw: Record<string, unknown>[]; titles: Record<string, string> } | { ok: false; error: string } {
+  const text = (name: string) => String(fd.get(name) ?? "").trim();
+  const titles: Record<string, string> = {};
+  const raw: Record<string, unknown>[] = [];
+  const rows = fd.getAll("tier").map(String);
+  if (rows.length > MAX_PERCENT_TIERS + MAX_GIFT_TIERS) return { ok: false, error: "Trop de paliers" };
+  for (const row of rows) {
+    const m = /^(percent|gift):(\d{1,6})$/.exec(row);
+    if (!m) return { ok: false, error: "Paliers illisibles : réessayez" };
+    const [, kind, key] = m;
+    const scope: string[] = [];
+    for (const item of fd.getAll(`scope-${key}`)) {
+      let p: unknown = null;
+      try {
+        p = JSON.parse(String(item));
+      } catch {
+        /* rejected below */
+      }
+      const id = (p as { id?: unknown })?.id;
+      const title = (p as { title?: unknown })?.title;
+      if (typeof id !== "string" || !/^gid:\/\/shopify\/Product\/\d+$/.test(id)) return { ok: false, error: "Produit Shopify invalide dans un palier" };
+      if (!scope.includes(id)) scope.push(id);
+      if (typeof title === "string" && title.trim()) titles[id] = title.trim().slice(0, 120);
+    }
+    // "Only some products" without any product would silently apply to the whole cart.
+    if (fd.get(`scopeMode-${key}`) === "some" && !scope.length) return { ok: false, error: "choisissez au moins un produit pour un palier « certains produits »" };
+    const scoped = scope.length ? { productIds: scope } : {};
+    if (kind === "percent") {
+      // Discount tier of any format (percent, amount off, bundle price, buy X get Y): validated by pricing.ts.
+      const minQty = Number(text(`minQty-${key}`));
+      const dec = (name: string) => Number(text(name).replace(/\s/g, "").replace(",", "."));
+      // Amounts: 2 decimals at most ("4,995" is refused by the tier check, not rounded to 5,00).
+      const money = (name: string) => (/[.,]\d{3,}$/.test(text(name).replace(/\s/g, "")) ? NaN : dec(name));
+      const format = text(`format-${key}`) || "percent";
+      if (format === "amount") raw.push({ kind: "amount", minQty, amountCents: Math.round(money(`amount-${key}`) * 100), per: text(`per-${key}`) === "bundle" ? "bundle" : "unit", ...scoped });
+      else if (format === "price") raw.push({ kind: "price", minQty, priceCents: Math.round(money(`price-${key}`) * 100), ...scoped });
+      else if (format === "bxgy") raw.push({ kind: "bxgy", minQty, freeQty: Number(text(`freeQty-${key}`) || "1"), ...scoped });
+      else if (format === "percent") raw.push({ minQty, percent: dec(`percent-${key}`), ...scoped });
+      else return { ok: false, error: "Type de palier inconnu" };
+    } else {
+      const thresholdRaw = text(`giftThreshold-${key}`).replace(/\s/g, "");
+      const threshold = /[.,]\d{3,}$/.test(thresholdRaw) ? NaN : Number(thresholdRaw.replace(",", "."));
+      const byQty = text(`giftMode-${key}`) === "qty";
+      raw.push({
+        type: "gift",
+        variantId: text(`giftVariant-${key}`),
+        title: text(`giftTitle-${key}`),
+        ...(() => {
+          // Buyer-language names ({ [lang]: { title } }), from the row's translations panel.
+          const t = cleanRecordI18n(fd.get(`giftI18n-${key}`), ["title"]);
+          return t ? { i18n: t } : {};
+        })(),
+        ...(byQty ? { minQty: threshold } : { minSubtotalCents: Math.round(threshold * 100) }),
+        ...scoped,
+      });
+    }
+  }
+  return { ok: true, raw, titles };
+}
+
+export async function saveQuantityBreaksAction(storeId: string, fd: FormData) {
+  await getStore(storeId);
+  const path = storePath(storeId, "offers");
+  const form = parseQuantityBreaksForm(fd);
+  if (!form.ok) back(path, { error: `Remises par quantité : ${form.error}` });
+  // Same rules as the checkout (pricing.ts): nothing the checkout would drop is saved.
+  const checked = validateQuantityTiers(form.raw);
+  if (!checked.ok) back(path, { error: `Remises par quantité : ${checked.error}` });
+  const tiers = checked.tiers.map((t) =>
+    t.productIds?.length ? { ...t, productTitles: Object.fromEntries(t.productIds.filter((id) => form.titles[id]).map((id) => [id, form.titles[id]])) } : t,
+  );
+  await db.store.update({ where: { id: storeId }, data: { quantityBreaks: tiers.length ? (tiers as unknown as Prisma.InputJsonValue) : Prisma.DbNull } });
+  revalidatePath(storePath(storeId), "layout");
+  back(path, { ok: tiers.length ? "Remises par quantité et cadeaux enregistrés" : "Remises par quantité désactivées" });
+}
+
+export async function saveMarginsAction(storeId: string, fd: FormData) {
+  await getStore(storeId);
+  const path = storePath(storeId, "settings");
+  const feeRaw = str(fd, "fulfillmentFee");
+  const fee = feeRaw ? cents(feeRaw) : 0;
+  if (fee == null || fee > 100_000) back(path, { error: "Coût de préparation invalide (ex. 1,50 ; 1 000 max.)", field: "fulfillmentFee" });
+  const homeCountry = (str(fd, "homeCountry") || "FR").toUpperCase();
+  if (!EU_VAT_AREA.has(homeCountry) || STANDARD_VAT_RATES[homeCountry] == null) back(path, { error: "Pays d'établissement invalide (pays de l'Union européenne ou Monaco)", field: "homeCountry" });
+  await db.store.update({
+    where: { id: storeId },
+    data: {
+      homeCountry,
+      vatExempt: fd.get("vatExempt") === "on",
+      vatDomesticOnly: fd.get("vatDomesticOnly") === "on",
+      adSpendVatNonReclaimable: fd.get("adSpendVatNonReclaimable") === "on",
+      fulfillmentFeeCents: fee,
+    },
+  });
+  revalidatePath(storePath(storeId), "layout");
+  back(path, { ok: "Marges enregistrées" });
+}
+
+/** Shopify › "Offres post-achat": merge one-click offers into the checkout's order (opt-in) and its window. */
+export async function saveOfferMergeAction(storeId: string, fd: FormData) {
+  await getStore(storeId);
+  const path = storePath(storeId, "shopify");
+  const mergeOffersIntoOrder = fd.get("mergeOffersIntoOrder") === "on";
+  const windowMin = Number(str(fd, "offerMergeWindowMin") || "10");
+  if (!Number.isInteger(windowMin) || windowMin < 1 || windowMin > 1440) back(path, { error: "Fenêtre d'ajout invalide (1 à 1 440 minutes)", field: "offerMergeWindowMin" });
+  await db.store.update({ where: { id: storeId }, data: { mergeOffersIntoOrder, offerMergeWindowMin: windowMin } });
+  await recordEvent({
+    storeId,
+    kind: "settings.offer_merge",
+    message: mergeOffersIntoOrder
+      ? `Offres post-achat ajoutées à la commande d'origine pendant ${windowMin} min après la commande (sinon commande séparée)`
+      : "Offres post-achat : toujours une commande Shopify séparée",
+  });
+  revalidatePath(storePath(storeId), "layout");
+  back(path, { ok: "Réglage des offres post-achat enregistré" });
+}
+
+export async function saveFallbackAction(storeId: string, fd: FormData) {
+  await getStore(storeId);
+  const autoFallback = fd.get("autoFallback") === "on";
+  await db.store.update({ where: { id: storeId }, data: { autoFallback } });
+  back(storePath(storeId, "settings"), { ok: autoFallback ? "Checkout de secours activé" : "Checkout de secours désactivé" });
+}
+
+export async function clearFallbackAction(storeId: string) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "settings");
+  if (!store.fallbackActiveAt) back(path, { ok: "Le checkout Whop est déjà actif" });
+  await db.store.update({ where: { id: storeId }, data: { fallbackActiveAt: null, fallbackReason: null } });
+  await closeFallbackPeriod(storeId);
+  await recordEvent({
+    storeId,
+    kind: "fallback.cleared_manually",
+    message: "Checkout Whop réactivé manuellement depuis les réglages (le checkout Shopify de secours n'est plus utilisé).",
+    data: { since: store.fallbackActiveAt.toISOString(), reason: store.fallbackReason },
+  });
+  revalidatePath(storePath(storeId), "layout");
+  back(path, { ok: "Checkout Whop réactivé. Si Whop échoue encore, le secours se réenclenchera tout seul." });
+}
+
+export async function savePickupAction(storeId: string, fd: FormData) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "shipping");
+  const enseigne = str(fd, "mondialRelayEnseigne").toUpperCase();
+  if (enseigne && !/^[A-Z0-9]{2,10}$/.test(enseigne)) back(path, { error: "Code enseigne Mondial Relay invalide (ex. BDTEST13)", field: "mondialRelayEnseigne" });
+  const key = secretField(fd, "mondialRelayKey", store.mondialRelayKey, path);
+  await db.store.update({ where: { id: storeId }, data: { mondialRelayEnseigne: enseigne || null, mondialRelayKey: key } });
+  const ready = !!enseigne && !!key;
+  const pickupRates = await db.shippingRate.count({ where: { storeId, kind: "pickup", active: true } });
+  back(path, {
+    ok: !ready
+      ? "Point relais enregistré (incomplet : code enseigne et clé sont nécessaires)"
+      : pickupRates
+        ? "Mondial Relay enregistré"
+        : "Mondial Relay enregistré. Ajoutez un tarif de type « Point relais » ci-dessous pour le proposer.",
+  });
+}
+
+export async function testPickupAction(storeId: string) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "shipping");
+  if (!pickupConfigured(store)) back(path, { error: "Enregistrez d'abord le code enseigne et la clé privée Mondial Relay." });
+  let found = 0;
+  try {
+    found = (await searchPickupPoints(store, { country: "FR", zip: "75002" })).length;
+  } catch (err) {
+    back(path, { error: `Test Mondial Relay échoué : ${errorMessage(err)}` });
+  }
+  if (!found) back(path, { error: "Mondial Relay répond mais ne trouve aucun point relais autour de Paris 2ᵉ (75002) : vérifiez le code enseigne." });
+  back(path, { ok: `Mondial Relay fonctionne : ${found} point${found > 1 ? "s" : ""} relais trouvé${found > 1 ? "s" : ""} autour de Paris 2ᵉ (75002).` });
 }
 
 export async function savePaymentMethodsAction(storeId: string, fd: FormData) {
@@ -838,8 +1450,172 @@ export async function refreshWhopWebhookAction(storeId: string) {
   back(path, { ok: "Webhook Whop mis à jour (alertes de fraude incluses)." });
 }
 
+/* ------------------------------------------------------------------ */
+/* Settings page: one save bar for every section                       */
+/* ------------------------------------------------------------------ */
+
+/** Section key (the DirtyForm label) → the action that saves it. */
+/**
+ * Checkout options (Réglages): Shopify discount codes, charging in the buyer's currency and the
+ * "Déjà client ?" e-mail code. The e-mail code needs a Resend key and sender (Alertes).
+ */
+export async function saveCheckoutOptionsAction(storeId: string, fd: FormData) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "settings");
+  const returningBuyerCode = fd.get("returningBuyerCode") === "on";
+  if (returningBuyerCode && !(await buyerEmailAvailable(store))) {
+    back(path, { field: "returningBuyerCode", error: "« Déjà client ? » envoie le code par e-mail : renseignez d'abord la clé Resend et l'expéditeur (section Alertes), ou le compte Resend de l'opérateur (section Réseau)." });
+  }
+  await db.store.update({
+    where: { id: storeId },
+    data: {
+      shopifyDiscountCodes: fd.get("shopifyDiscountCodes") === "on",
+      chargeLocalCurrency: fd.get("chargeLocalCurrency") === "on",
+      returningBuyerCode,
+      storeNetwork: fd.get("storeNetwork") === "on",
+      breaksCombineWithCodes: fd.get("breaksCombineWithCodes") === "on",
+    },
+  });
+  revalidatePath(path);
+  back(path, { ok: "Options du checkout enregistrées" });
+}
+
+async function settingsSectionAction(key: string): Promise<((storeId: string, fd: FormData) => Promise<void>) | null> {
+  switch (key) {
+    case "Boutique":
+      return saveSettingsAction;
+    case "Checkout de secours":
+      return saveFallbackAction;
+    case "Marges & coûts":
+      return saveMarginsAction;
+    case "Coûts":
+      return (await import("./stores/[storeId]/(main)/analytics/actions")).saveCostsAction;
+    case "Alertes":
+      return saveAlertsAction;
+    case "Bouclier anti-litiges":
+      return saveShieldAction;
+    case "Options du checkout":
+      return saveCheckoutOptionsAction;
+    default:
+      return null;
+  }
+}
+
+/** The ok / error flash of a redirect thrown by a section action. */
+function redirectFlash(err: unknown): FlashParams | null {
+  if (!isRedirect(err)) return null;
+  const url = String((err as { digest: string }).digest).split(";").slice(2, -2).join(";");
+  const q = new URL(url, "http://x").searchParams;
+  return { ok: q.get("ok") ?? undefined, error: q.get("error") ?? undefined, field: q.get("field") ?? undefined };
+}
+
+/**
+ * Saves several settings sections at once (the save bar, when more than one card changed).
+ * Fields arrive as "<section>::<name>"; each section runs its own action and validation, in
+ * page order, and the first error stops the rest.
+ */
+export async function saveSettingsBatchAction(storeId: string, fd: FormData) {
+  await getStore(storeId);
+  const path = storePath(storeId, "settings");
+  const sections = fd.getAll("__section").map(String);
+  const oks: string[] = [];
+  for (const key of sections) {
+    const action = await settingsSectionAction(key);
+    if (!action) back(path, { error: `Section inconnue : ${key}` });
+    const sub = new FormData();
+    for (const [k, v] of fd.entries()) if (k.startsWith(`${key}::`)) sub.append(k.slice(key.length + 2), v);
+    try {
+      await action(storeId, sub);
+    } catch (err) {
+      const flash = redirectFlash(err);
+      if (!flash) throw err;
+      if (flash.error) back(path, { error: `${key} : ${flash.error}${oks.length ? ` (déjà enregistré : ${oks.join(", ")})` : ""}`, field: flash.field, form: key });
+      oks.push(key);
+      continue;
+    }
+    oks.push(key);
+  }
+  revalidatePath(storePath(storeId), "layout");
+  const ok = oks.length > 1 ? `${oks.length} sections enregistrées : ${oks.join(", ")}` : oks.length ? `${oks[0]} : enregistré` : "Rien à enregistrer";
+  // "saved" makes every batch land on a new URL: the save bar waits for it to reset the forms.
+  redirect(`${path}?${new URLSearchParams({ ok, saved: String(Date.now()) })}`);
+}
+
 function isRedirect(err: unknown) {
   return err instanceof Error && "digest" in err && String((err as { digest?: string }).digest).startsWith("NEXT_REDIRECT");
+}
+
+/**
+ * Items the automation gave up on (refund mirrors, alerts, Whop events): start their
+ * retries over now. For when the cause was fixed (Shopify reconnected, Telegram token…).
+ */
+export async function retryGaveUpAction(storeId: string) {
+  await getStore(storeId);
+  const { retryGaveUp } = await import("@/lib/maintenance");
+  const n = await retryGaveUp(storeId);
+  await recordEvent({ storeId, kind: "maintenance.retry_all", message: `Relance manuelle de ${n} élément(s) abandonné(s) par l'automatisation.` });
+  const { runTick } = await import("@/lib/tick");
+  await runTick();
+  back(storePath(storeId, "journal"), { ok: n ? `${n} élément(s) relancé(s). Voir l'état ci-dessous.` : "Rien à relancer." });
+}
+
+/** The merchant handled them by hand (refund reported in Shopify, event checked in Whop): stop flagging. */
+export async function markGaveUpHandledAction(storeId: string) {
+  await getStore(storeId);
+  const { markGaveUpHandled } = await import("@/lib/maintenance");
+  const n = await markGaveUpHandled(storeId);
+  await recordEvent({ storeId, level: "warn", kind: "maintenance.marked_handled", message: `${n} élément(s) abandonné(s) marqué(s) comme traités à la main.` });
+  back(storePath(storeId, "journal"), { ok: n ? `${n} élément(s) marqué(s) comme traités.` : "Rien à marquer." });
+}
+
+/** One gave-up item from the journal list: retry it now, or mark it handled by hand. */
+export async function gaveUpItemAction(storeId: string, kind: string, id: string, fd: FormData) {
+  await getStore(storeId);
+  const path = storePath(storeId, "journal");
+  const { GAVE_UP_KINDS, gaveUpItem } = await import("@/lib/maintenance");
+  if (!(GAVE_UP_KINDS as readonly string[]).includes(kind)) back(path, { error: "Élément inconnu." });
+  const handled = str(fd, "op") === "handled";
+  // Handling a missing Shopify order means linking the order made by hand: done on the order page.
+  if (kind === "sync" && handled) back(storePath(storeId, `orders/${id}`), { error: "Indiquez ci-dessous le numéro de la commande créée à la main dans Shopify." });
+  const n = await gaveUpItem(storeId, kind as (typeof GAVE_UP_KINDS)[number], id, handled);
+  if (!n) back(path, { error: "Cet élément a déjà été relancé ou traité." });
+  await recordEvent({
+    storeId,
+    level: handled ? "warn" : "info",
+    kind: handled ? "maintenance.marked_handled" : "maintenance.retry_one",
+    message: handled ? `Élément abandonné (${kind}) marqué comme traité à la main.` : `Relance manuelle d'un élément abandonné (${kind}).`,
+    data: { kind, id },
+  });
+  if (!handled) {
+    const { runTick } = await import("@/lib/tick");
+    await runTick();
+  }
+  back(path, { ok: handled ? "Marqué comme traité." : "Relancé. Voir l'état ci-dessous." });
+}
+
+/**
+ * The merchant created the Shopify order by hand (the automatic sync gave up or was
+ * wrong): link it so nothing ever creates another one, and stop flagging it.
+ */
+export async function markOrderHandledAction(storeId: string, sessionId: string, fd: FormData) {
+  await getStore(storeId);
+  const path = storePath(storeId, `orders/${sessionId}`);
+  const name = str(fd, "orderName").slice(0, 40);
+  if (!/^#?[A-Za-z0-9-]{1,30}$/.test(name)) back(path, { error: "Indiquez le numéro de la commande Shopify créée à la main (ex. #1234).", field: "orderName" });
+  const { linkOrderByHand } = await import("@/lib/maintenance");
+  const res = await linkOrderByHand(storeId, sessionId, name);
+  if (!res.ok)
+    back(path, {
+      error:
+        res.reason === "in_progress"
+          ? "Une création automatique de cette commande est en cours : attendez 2 min et vérifiez Shopify avant de lier une commande faite à la main."
+          : res.reason === "already_linked"
+            ? "Cette commande est déjà liée à Shopify."
+            : "Commande introuvable ou non payée.",
+    });
+  await recordEvent({ storeId, sessionId, level: "warn", kind: "order.linked_manually", message: `Commande liée à la main à ${name} dans Shopify : plus aucune création automatique.` });
+  revalidatePath(storePath(storeId), "layout");
+  back(path, { ok: "Commande liée. Les remboursements et litiges de cette commande sont à reporter à la main dans Shopify (une alerte vous le rappellera)." });
 }
 
 export async function runTickAction(storeId: string) {
@@ -849,4 +1625,27 @@ export async function runTickAction(storeId: string) {
   back(storePath(storeId, "journal"), {
     ok: `Maintenance terminée : ${Number(report.reconciled) || 0} paiement(s) récupéré(s), ${Number(report.syncRetried) || 0} synchro(s) relancée(s).`,
   });
+}
+
+/**
+ * Operator-level Resend account (Réglages › Réseau): one key and sender for the buyer e-mails of
+ * every store without its own Resend account. Blank key keeps the stored one; "clear" removes it.
+ */
+export async function saveOperatorMailAction(storeId: string, fd: FormData) {
+  await getStore(storeId);
+  const path = storePath(storeId, "settings");
+  const key = str(fd, "operatorResendApiKey");
+  const from = str(fd, "operatorEmailFrom").slice(0, 200);
+  if (fd.get("operatorResendApiKeyClear") === "on") {
+    await db.appSetting.deleteMany({ where: { key: { in: [OPERATOR_KEY_SETTING, OPERATOR_FROM_SETTING] } } });
+    back(path, { ok: "Compte Resend de l'opérateur supprimé." });
+  }
+  if (from && !/^([^<>]{1,80}<)?[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+>?$/.test(from)) back(path, { error: "Expéditeur invalide (ex. Boutiques <noreply@mondomaine.fr>).", field: "operatorEmailFrom" });
+  if (key && !/^re_[\w-]{10,200}$/.test(key)) back(path, { error: "Clé Resend invalide (commence par re_).", field: "operatorResendApiKey" });
+  const ops = [];
+  if (key) ops.push(db.appSetting.upsert({ where: { key: OPERATOR_KEY_SETTING }, create: { key: OPERATOR_KEY_SETTING, value: encrypt(key) }, update: { value: encrypt(key) } }));
+  if (from) ops.push(db.appSetting.upsert({ where: { key: OPERATOR_FROM_SETTING }, create: { key: OPERATOR_FROM_SETTING, value: from }, update: { value: from } }));
+  if (ops.length) await db.$transaction(ops);
+  revalidatePath(path);
+  back(path, { ok: "Compte Resend de l'opérateur enregistré : il envoie les e-mails clients des boutiques sans clé Resend." });
 }

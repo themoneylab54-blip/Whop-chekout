@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState, type InputHTMLAttributes } from "react";
+import { MapPin } from "lucide-react";
 
 /*
  * French address autocomplete on the official Base Adresse Nationale (free, no key,
@@ -33,15 +34,27 @@ export function AddressAutocomplete({
   onChange,
   onPick,
   enabled,
+  lookup = true,
   className,
   disabled,
+  placeholder,
+  suggestionsLabel,
+  inputProps,
 }: {
   value: string;
   onChange: (v: string) => void;
   onPick: (a: AddressPick) => void;
+  /** Autocomplete available for this country (shows the pin and the hint). */
   enabled: boolean;
+  /** Query the address API (off in the builder preview). */
+  lookup?: boolean;
   className: string;
   disabled?: boolean;
+  placeholder?: string;
+  /** "3 suggested addresses: use the arrow keys…" for screen readers. */
+  suggestionsLabel?: (n: number) => string;
+  /** id / required / aria-invalid / aria-describedby / onBlur from the form. */
+  inputProps?: InputHTMLAttributes<HTMLInputElement> & { "aria-invalid"?: boolean };
 }) {
   const [items, setItems] = useState<Feature[]>([]);
   const [open, setOpen] = useState(false);
@@ -50,7 +63,7 @@ export function AddressAutocomplete({
   const listId = useId();
 
   useEffect(() => {
-    if (!enabled || !typed.current || value.trim().length < 4) return;
+    if (!enabled || !lookup || !typed.current || value.trim().length < 4) return;
     const ctrl = new AbortController();
     const t = setTimeout(() => {
       search(value, ctrl.signal, "housenumber")
@@ -66,7 +79,7 @@ export function AddressAutocomplete({
       clearTimeout(t);
       ctrl.abort();
     };
-  }, [value, enabled]);
+  }, [value, enabled, lookup]);
 
   function pick(f: Feature) {
     typed.current = false;
@@ -74,14 +87,19 @@ export function AddressAutocomplete({
     onPick({ address1: f.properties.name, zip: f.properties.postcode, city: f.properties.city });
   }
 
+  const optionId = (i: number) => `${listId}-opt-${i}`;
   return (
     <div className="relative">
       <input
+        {...inputProps}
         autoComplete="address-line1"
         role="combobox"
         aria-expanded={open}
         aria-controls={listId}
         aria-autocomplete="list"
+        aria-activedescendant={open && active >= 0 ? optionId(active) : undefined}
+        placeholder={enabled ? placeholder : undefined}
+        data-with-icon={enabled || undefined}
         value={value}
         disabled={disabled}
         onChange={(e) => {
@@ -90,7 +108,14 @@ export function AddressAutocomplete({
           if (e.target.value.trim().length < 4) setOpen(false);
         }}
         onKeyDown={(e) => {
-          if (!open) return;
+          if (!open) {
+            if (e.key === "ArrowDown" && items.length > 0) {
+              e.preventDefault();
+              setOpen(true);
+              setActive(0);
+            }
+            return;
+          }
           if (e.key === "ArrowDown") {
             e.preventDefault();
             setActive((i) => Math.min(items.length - 1, i + 1));
@@ -100,28 +125,46 @@ export function AddressAutocomplete({
           } else if (e.key === "Enter" && active >= 0) {
             e.preventDefault();
             pick(items[active]);
-          } else if (e.key === "Escape") setOpen(false);
+          } else if (e.key === "Escape") {
+            // Close the list only; the page keeps its own Escape handling otherwise.
+            e.preventDefault();
+            setOpen(false);
+          }
         }}
-        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        onBlur={(e) => {
+          inputProps?.onBlur?.(e);
+          setTimeout(() => setOpen(false), 150);
+        }}
         className={className}
       />
+      {enabled && (
+        <MapPin className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-neutral-400" aria-hidden />
+      )}
+      <p className="sr-only" aria-live="polite">
+        {open && suggestionsLabel ? suggestionsLabel(items.length) : ""}
+      </p>
       {open && (
         <ul id={listId} role="listbox" className="absolute inset-x-0 top-full z-20 mt-1 overflow-hidden rounded-[var(--radius)] border border-neutral-200 bg-white text-sm shadow-lg">
           {items.map((f, i) => (
             <li
               key={f.properties.label}
+              id={optionId(i)}
               role="option"
               aria-selected={i === active}
               onMouseDown={(e) => {
                 e.preventDefault();
                 pick(f);
               }}
-              className={`cursor-pointer px-3 py-2.5 ${i === active ? "bg-neutral-100" : "hover:bg-neutral-50"}`}
+              onMouseEnter={() => setActive(i)}
+              className={`flex min-h-11 cursor-pointer items-start gap-2 px-3 py-3 ${i === active ? "bg-neutral-100" : "hover:bg-neutral-50"}`}
             >
+              <MapPin className="mt-0.5 h-4 w-4 shrink-0 text-neutral-400" aria-hidden />
+              <span>
               <span className="font-medium">{f.properties.name}</span>
-              <span className="text-neutral-500">
+              <span className="text-neutral-600">
                 {" "}
                 · {f.properties.postcode} {f.properties.city}
+              </span>
               </span>
             </li>
           ))}

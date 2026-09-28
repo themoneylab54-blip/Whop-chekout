@@ -7,7 +7,8 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="fr">
+    // Checkout pages switch `lang` to the buyer's language before hydration (src/app/c/lang.tsx).
+    <html lang="fr" suppressHydrationWarning>
       <body>{children}</body>
     </html>
   );

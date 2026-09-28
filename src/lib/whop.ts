@@ -5,7 +5,8 @@ import type { Store } from "@prisma/client";
 import { decrypt } from "./crypto";
 import { env } from "./env";
 import { centsToDecimal } from "./pricing";
-import { recordEvent } from "./log";
+import { log, recordEvent } from "./log";
+import { assertBreakerClosed, DeadlineError, isTimeoutError, timeLeft, tripBreaker } from "./deadline";
 import { db } from "./db";
 
 /** Events the app subscribes to when it creates the Whop webhook itself. */
@@ -15,15 +16,68 @@ export const WHOP_WEBHOOK_EVENTS = [
   "refund.created",
   "refund.updated",
   "dispute.created",
+  "dispute.updated",
   "dispute_alert.created",
 ] as const;
 
+/**
+ * Request options of ONE Whop call, computed when the call starts (not when the client was created):
+ * bounded so a slow Whop can't outlast a 60 s function (the SDK default is 60 s x 3). Inside background
+ * maintenance: no SDK retry (it may wait up to 60 s on Retry-After) and never past the run's hard
+ * deadline nor the money job's own deadline; DeadlineError when a call couldn't finish (the tick
+ * retries next run). Pass it as the second argument of every call made in a bounded run
+ * (`client.payments.list(params, whopCallOptions())`): a client created early in a job, then used
+ * for several pages, otherwise keeps the timeout of its creation time.
+ */
+export function whopCallOptions(what = "Whop"): { timeoutInSeconds: number; maxRetries: number } {
+  // Whop hung earlier in this background run: refused at once (the run's other jobs keep their time).
+  assertBreakerClosed("whop", what);
+  const left = timeLeft();
+  // One Whop request (no SDK retry inside a bounded run) answers well under a second: 2 s is a real window.
+  if (left != null && left < 2_000) throw new DeadlineError(what);
+  return {
+    timeoutInSeconds: left == null ? 12 : Math.max(1, Math.min(12, Math.floor((left - 500) / 100) / 10)),
+    maxRetries: left == null ? 1 : 0,
+  };
+}
+
 export function whopClient(apiKey: string, testMode: boolean) {
+  // Defaults for calls made right away; calls made later in a bounded run pass whopCallOptions().
   return new WhopClient({
     token: apiKey,
     environment: testMode ? WhopEnvironment.Sandbox : WhopEnvironment.Production,
+    ...whopCallOptions(),
+    fetch: timedFetch,
   });
 }
+
+/** Every Whop API call logged like Shopify's: operation, status, duration, Whop's request id. */
+const timedFetch: typeof fetch = async (input, init) => {
+  const started = Date.now();
+  const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  const op = `${init?.method ?? "GET"} ${new URL(url).pathname.replace(/\/(pay|biz|plan|prod|re|dp|chk|mem|ship)_[A-Za-z0-9]+/g, "/:id")}`;
+  try {
+    const res = await fetch(input, init);
+    const ms = Date.now() - started;
+    (ms > 5000 || res.status >= 400 ? log.warn : log.info)("ext.call", `Whop ${op} ${res.status} in ${ms} ms`, {
+      provider: "whop",
+      op,
+      status: res.status,
+      ms,
+      upstreamId: res.headers.get("x-request-id"),
+      retryAfter: res.headers.get("retry-after"),
+    });
+    return res;
+  } catch (err) {
+    log.warn("ext.call", `Whop ${op} failed`, { provider: "whop", op, ms: Date.now() - started, err });
+    // Hung until its timeout inside a background run: the run's Whop breaker opens (its other Whop
+    // calls are refused at once), so the Shopify-side money jobs still get their time.
+    if (isTimeoutError(err, init?.signal) && tripBreaker("whop", `Whop ${op}`)) {
+      log.warn("tick.breaker_open", `Whop hung (${op}): its calls are suspended for the rest of this run`, { provider: "whop", op, ms: Date.now() - started });
+    }
+    throw err;
+  }
+};
 
 export function storeClient(store: Pick<Store, "whopApiKey" | "testMode">) {
   if (!store.whopApiKey) throw new Error("Compte Whop non connecté");
@@ -98,7 +152,7 @@ async function findStoreProduct(client: Client, accountId: string, storeId: stri
       if (++seen >= MAX_SCAN) break;
     }
   } catch (err) {
-    console.warn("Whop product lookup failed, creating a new one", err);
+    log.warn("whop.product_lookup_failed", "Whop product lookup failed, creating a new one", { err });
   }
   return null;
 }
@@ -113,7 +167,7 @@ async function deleteWebhooksForUrl(client: Client, accountId: string, url: stri
     }
     await Promise.all(stale.map((id) => client.webhooks.delete({ id })));
   } catch (err) {
-    console.warn("Whop webhook cleanup failed", err);
+    log.warn("whop.webhook_cleanup_failed", "Whop webhook cleanup failed", { err });
   }
 }
 
@@ -150,10 +204,51 @@ export const OPTIONAL_PAYMENT_METHODS = [
 export type OptionalPaymentMethod = (typeof OPTIONAL_PAYMENT_METHODS)[number]["id"];
 export const OPTIONAL_PAYMENT_METHOD_IDS: readonly string[] = OPTIONAL_PAYMENT_METHODS.map((m) => m.id);
 
+const EEA = ["AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "IS", "LI", "NO"];
+type MethodRule = { countries?: string[]; currencies?: string[]; minCents?: number; maxCents?: number };
+/**
+ * Where each optional method can actually be used (buyer country, currency, basket
+ * range). Offering an ineligible method only makes the buyer fail at the last step,
+ * and Whop may reject the whole configuration for it.
+ */
+export const METHOD_RULES: Record<string, MethodRule> = {
+  klarna: { countries: ["AT", "BE", "CH", "CZ", "DE", "DK", "ES", "FI", "FR", "GB", "GR", "IE", "IT", "NL", "NO", "PL", "PT", "SE"], minCents: 100, maxCents: 1_000_000 },
+  alma: { countries: ["FR", "BE", "IT", "ES", "DE", "NL", "PT", "LU", "IE", "AT"], currencies: ["EUR"], minCents: 5_000, maxCents: 300_000 },
+  oney_3x: { countries: ["FR", "BE", "ES", "IT", "PT"], currencies: ["EUR"], minCents: 10_000, maxCents: 300_000 },
+  oney_4x: { countries: ["FR", "BE", "ES", "IT", "PT"], currencies: ["EUR"], minCents: 10_000, maxCents: 300_000 },
+  scalapay: { countries: ["FR", "IT", "ES", "BE", "DE", "NL", "PT", "AT", "FI"], currencies: ["EUR"], minCents: 500, maxCents: 150_000 },
+  bancontact: { countries: ["BE"], currencies: ["EUR"] },
+  ideal: { countries: ["NL"], currencies: ["EUR"] },
+  twint: { countries: ["CH"], currencies: ["CHF"] },
+  sepa_debit: { countries: EEA.concat(["CH", "GB", "MC", "SM", "AD", "VA"]), currencies: ["EUR"] },
+  eps: { countries: ["AT"], currencies: ["EUR"] },
+  p24: { countries: ["PL"], currencies: ["PLN", "EUR"] },
+  blik: { countries: ["PL"], currencies: ["PLN"] },
+  multibanco: { countries: ["PT"], currencies: ["EUR"] },
+  mb_way: { countries: ["PT"], currencies: ["EUR"] },
+  satispay: { countries: ["IT", "FR", "DE", "LU", "BE"], currencies: ["EUR"] },
+  revolut_pay: { countries: EEA.concat(["GB", "CH"]) },
+};
+
+/** Optional methods usable for this basket. An unknown country keeps country-bound methods (Whop still filters by buyer). */
+export function eligibleMethods(methods: string[], ctx: { country: string | null; currency: string; totalCents: number }): string[] {
+  const currency = ctx.currency.toUpperCase();
+  const country = ctx.country?.toUpperCase() ?? null;
+  return methods.filter((m) => {
+    const r = METHOD_RULES[m];
+    if (!r) return true;
+    if (r.currencies && !r.currencies.includes(currency)) return false;
+    if (r.minCents != null && ctx.totalCents < r.minCents) return false;
+    if (r.maxCents != null && ctx.totalCents > r.maxCents) return false;
+    if (country && r.countries && !r.countries.includes(country)) return false;
+    return true;
+  });
+}
+
 /** Creates the one-off checkout for a session; the embed is rendered with its id. */
 export async function createCheckoutConfiguration(
   store: Pick<Store, "whopApiKey" | "testMode" | "whopAccountId" | "whopProductId"> & { paymentMethods?: string[] },
-  opts: { sessionId: string; storeId: string; totalCents: number; currency: string; title: string; redirectUrl: string },
+  opts: { sessionId: string; storeId: string; totalCents: number; currency: string; title: string; redirectUrl: string; country?: string | null },
 ) {
   if (!store.whopAccountId || !store.whopProductId) throw new Error("Compte Whop non configuré");
   const client = storeClient(store);
@@ -174,7 +269,10 @@ export async function createCheckoutConfiguration(
       metadata: { checkout_session_id: opts.sessionId },
     },
   };
-  const optional = (store.paymentMethods ?? []).filter((m) => OPTIONAL_PAYMENT_METHOD_IDS.includes(m));
+  const optional = eligibleMethods(
+    (store.paymentMethods ?? []).filter((m) => OPTIONAL_PAYMENT_METHOD_IDS.includes(m)),
+    { country: opts.country ?? null, currency: opts.currency, totalCents: opts.totalCents },
+  );
   const attempts: string[][] = [
     [...CHECKOUT_PAYMENT_METHODS, ...optional],
     // An ineligible optional method must not cost the buyer PayPal & wallets.
@@ -225,15 +323,23 @@ export async function registerApplePayDomain(
   return client.paymentMethodDomains.create({ account_id: store.whopAccountId ?? undefined, hostname });
 }
 
+/**
+ * Refunds a payment. `idempotencyKey` is required: the SDK retries on 5xx/timeouts,
+ * and a refund Whop committed before a lost answer must not be issued twice.
+ */
 export async function refundPayment(
   store: Pick<Store, "whopApiKey" | "testMode">,
   paymentId: string,
-  amountCents?: number,
+  amountCents: number | undefined,
+  idempotencyKey: string,
 ) {
-  return storeClient(store).payments.refund({
-    id: paymentId,
-    partial_amount: amountCents == null ? undefined : Number(centsToDecimal(amountCents)),
-  });
+  return storeClient(store).payments.refund(
+    {
+      id: paymentId,
+      partial_amount: amountCents == null ? undefined : Number(centsToDecimal(amountCents)),
+    },
+    { idempotencyKey: idempotencyKey.slice(0, 200) },
+  );
 }
 
 export type WhopEvent = {
@@ -257,8 +363,11 @@ export function eventType(evt: WhopEvent): string {
 /** Whop money objects are `{ amount: "12.34" }` or plain numbers depending on the event. */
 export function moneyToCents(value: unknown): number | null {
   if (value == null) return null;
-  if (typeof value === "number") return Math.round(value * 100);
-  if (typeof value === "string") return Math.round(Number(value) * 100);
+  if (typeof value === "number") return Number.isFinite(value) ? Math.round(value * 100) : null;
+  if (typeof value === "string") {
+    const n = Number(value);
+    return value.trim() !== "" && Number.isFinite(n) ? Math.round(n * 100) : null;
+  }
   if (typeof value === "object" && "amount" in value) return moneyToCents((value as { amount: unknown }).amount);
   return null;
 }

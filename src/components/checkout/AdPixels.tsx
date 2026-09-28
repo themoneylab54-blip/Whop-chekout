@@ -15,7 +15,8 @@ export type PixelEvent = {
   kind: "checkout" | "purchase";
   /** Same id as the server-side event, so Meta/TikTok count the conversion once. */
   eventId: string;
-  value: number;
+  /** Null: no value to send (profit mode without the order's product costs). */
+  value: number | null;
   currency: string;
   /** Meta content ids (same format as the server-side event). */
   contentIds: string[];
@@ -55,7 +56,7 @@ export function AdPixels({ metaPixelId, tiktokPixelId, event }: { metaPixelId: s
         window.fbq?.(
           "track",
           event.kind === "purchase" ? "Purchase" : "InitiateCheckout",
-          { value: event.value, currency: event.currency, content_ids: event.contentIds, content_type: "product" },
+          { ...(event.value != null ? { value: event.value } : {}), currency: event.currency, content_ids: event.contentIds, content_type: "product" },
           { eventID: event.eventId },
         );
       }
@@ -63,7 +64,7 @@ export function AdPixels({ metaPixelId, tiktokPixelId, event }: { metaPixelId: s
         loadTikTok(tiktokPixelId);
         window.ttq?.track(
           event.kind === "purchase" ? "CompletePayment" : "InitiateCheckout",
-          { value: event.value, currency: event.currency, content_type: "product", contents: event.variantIds.map((id) => ({ content_id: id })) },
+          { ...(event.value != null ? { value: event.value } : {}), currency: event.currency, content_type: "product", contents: event.variantIds.map((id) => ({ content_id: id })) },
           { event_id: event.eventId },
         );
       }

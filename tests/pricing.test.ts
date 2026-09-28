@@ -59,7 +59,7 @@ describe("computeTotals", () => {
       discount: null,
       addOns: [{ id: "a", title: "Cadeau", priceCents: 299, active: true }],
     });
-    expect(t).toEqual({ subtotalCents: 8988, discountCents: 0, shippingCents: 490, addOnsCents: 299, totalCents: 9777, itemCount: 3 });
+    expect(t).toEqual({ subtotalCents: 8988, discountCents: 0, volumeDiscountCents: 0, shippingCents: 490, addOnsCents: 299, totalCents: 9777, itemCount: 3 });
   });
 
   it("applies percent discounts to merchandise only", () => {

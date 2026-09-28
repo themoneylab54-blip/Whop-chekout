@@ -4,9 +4,11 @@ import { decrypt, encrypt, safeEqual } from "@/lib/crypto";
 import { env } from "@/lib/env";
 import { currentAdminId } from "@/lib/auth";
 import { ensureScriptTag, exchangeCodeForToken, getShopInfo, normalizeShopDomain, verifyOauthHmac } from "@/lib/shopify";
+import { route } from "@/lib/route";
+import { log } from "@/lib/log";
 
 /** Shopify OAuth redirect: verify, exchange the code, store the token, install the loader. */
-export async function GET(req: Request) {
+async function handle(req: Request) {
   const url = new URL(req.url);
   const q = url.searchParams;
   const state = q.get("state") ?? "";
@@ -49,8 +51,10 @@ export async function GET(req: Request) {
       },
     });
   } catch (err) {
-    console.error("Shopify OAuth failed", err);
+    log.error("shopify.oauth_failed", "Shopify OAuth failed", { err });
     return fail(store.id, err instanceof Error ? err.message : "Connexion Shopify impossible.");
   }
   return NextResponse.redirect(`${env.appUrl}/dashboard/stores/${store.id}/shopify?connected=1`);
 }
+
+export const GET = route("shopify.callback", handle);

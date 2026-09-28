@@ -13,7 +13,7 @@ export default async function SetupPage({ searchParams }: { searchParams: Promis
   if ((await db.adminUser.count()) > 0) redirect("/login");
   const { error } = await searchParams;
   return (
-    <AuthShell title="Crée ton compte admin" subtitle="Cette page ne sert qu'une fois : elle se désactive dès que le compte est créé.">
+    <AuthShell title="Créez votre compte admin" subtitle="Cette page ne sert qu'une fois : elle se désactive dès que le compte est créé.">
       <Flash error={error} />
       <form action={setupAction} className="space-y-4">
         <div>

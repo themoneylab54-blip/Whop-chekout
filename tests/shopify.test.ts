@@ -62,10 +62,15 @@ describe("buildOrderCreateInput", () => {
     expect(order.tags).toContain("test");
   });
 
-  it("records free-shipping codes as Shopify discount codes", () => {
-    const order = buildOrderCreateInput({ ...base, discount: { code: "FREESHIP", amountCents: 0, freeShipping: true }, totalCents: 5500 + 490 + 299 });
-    expect(order.discountCode).toEqual({ freeShippingDiscountCode: { code: "FREESHIP" } });
-    expect(sum(order)).toBe(5500 + 490 + 299);
+  it("records free-shipping codes as Shopify discount codes only when shipping was free as paid", () => {
+    const free = buildOrderCreateInput({ ...base, shipping: { title: "Colissimo", priceCents: 0 }, discount: { code: "FREESHIP", amountCents: 0, freeShipping: true }, totalCents: 5500 + 299 });
+    expect(free.discountCode).toEqual({ freeShippingDiscountCode: { code: "FREESHIP" } });
+    expect(sum(free)).toBe(5500 + 299);
+    // Shipping still paid (e.g. rate above the code's maximum): Shopify would zero it, so note only.
+    const paid = buildOrderCreateInput({ ...base, discount: { code: "FREESHIP", amountCents: 0, freeShipping: true }, totalCents: 5500 + 490 + 299 });
+    expect(paid.discountCode).toBeUndefined();
+    expect(paid.note).toContain("FREESHIP");
+    expect(sum(paid)).toBe(5500 + 490 + 299);
   });
 });
 

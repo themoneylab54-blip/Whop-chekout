@@ -23,17 +23,17 @@ model Store {
   updatedAt DateTime @updatedAt
 
   // --- Shopify ---
-  shopDomain            String?  @unique
-  shopifyClientId       String?
-  shopifyClientSecret   String? // encrypted
-  shopifyAccessToken    String? // encrypted, offline token
-  shopifyScopes         String?
-  shopifyOauthState     String?
-  shopCurrency          String   @default("EUR")
+  shopDomain          String?   @unique
+  shopifyClientId     String?
+  shopifyClientSecret String? // encrypted
+  shopifyAccessToken  String? // encrypted, offline token
+  shopifyScopes       String?
+  shopifyOauthState   String?
+  shopCurrency        String    @default("EUR")
   // Primary storefront host (custom domain), used to validate return URLs
-  storefrontHost        String?
-  scriptTagId           String?
-  shopifyConnectedAt    DateTime?
+  storefrontHost      String?
+  scriptTagId         String?
+  shopifyConnectedAt  DateTime?
 
   // --- Whop ---
   whopApiKey        String? // encrypted
@@ -49,10 +49,10 @@ model Store {
 
   // --- Settings (validated by zod in src/lib/layout) ---
   // Published design (what buyers see)
-  theme          Json?
-  checkoutLayout Json?
-  thankYouLayout Json?
-  interception   Json?
+  theme               Json?
+  checkoutLayout      Json?
+  thankYouLayout      Json?
+  interception        Json?
   // Builder drafts: autosaved here, copied to the fields above on "Publier"
   draftTheme          Json?
   draftCheckoutLayout Json?
@@ -67,17 +67,17 @@ model Store {
   statementDescriptor String?
 
   // --- Ads tracking (server-side conversions) ---
-  metaPixelId       String?
-  metaAccessToken   String? // encrypted
-  metaTestEventCode String?
-  tiktokPixelId     String?
-  tiktokAccessToken String? // encrypted
+  metaPixelId         String?
+  metaAccessToken     String? // encrypted
+  metaTestEventCode   String?
+  tiktokPixelId       String?
+  tiktokAccessToken   String? // encrypted
   // Only send conversions when the storefront banner explicitly allowed marketing
   pixelRequireConsent Boolean @default(false)
   // Meta content_ids format: "variant" (variant id) or "shopify" (shopify_FR_<product>_<variant>, Shopify catalog)
-  metaContentIdFormat String @default("variant")
+  metaContentIdFormat String  @default("variant")
   // Country of the Meta catalog for "shopify" content ids (shopify_<country>_…)
-  metaCatalogCountry  String @default("FR")
+  metaCatalogCountry  String  @default("FR")
 
   // --- Alerts (Telegram and/or e-mail through Resend) ---
   resendApiKey     String? // encrypted
@@ -94,28 +94,119 @@ model Store {
   // --- Health ---
   lastWebhookAt DateTime?
 
-  shippingRates ShippingRate[]
-  discounts     DiscountCode[]
-  addOns        AddOn[]
-  sessions      CheckoutSession[]
-  versions      LayoutVersion[]
-  experiments   Experiment[]
-  events        EventLog[]
+  // --- Margins ---
+  // Micro-entreprise "franchise en base" etc.: prices carry no VAT
+  vatExempt           Boolean @default(false)
+  // Pick/pack/label cost per order (profit analytics)
+  fulfillmentFeeCents Int     @default(0)
+  // [{ minQty, percent }]: automatic quantity breaks on the cart
+  quantityBreaks      Json?
+
+  // --- Ad spend import (ROAS / profit after ads) ---
+  metaAdAccountId    String?
+  tiktokAdvertiserId String?
+  // GA4 Measurement Protocol (server-side purchase)
+  ga4MeasurementId   String?
+  ga4ApiSecret       String? // encrypted
+
+  // --- Pickup points (Mondial Relay) ---
+  mondialRelayEnseigne String?
+  mondialRelayKey      String? // encrypted
+
+  // --- Safety net: fall back to Shopify's own checkout while Whop is failing ---
+  autoFallback             Boolean   @default(true)
+  // Chargeback fee charged per dispute (profit analytics), and monthly fixed costs
+  disputeFeeCents          Int       @default(1500)
+  fixedCostsMonthlyCents   Int       @default(0)
+  // Ad conversion value sent to Meta/TikTok/GA4: "revenue" (order total) or "profit" (margin HT, for POAS bidding)
+  conversionValueMode      String    @default("revenue")
+  // EU distance sales under the 10 k€ OSS threshold: French VAT on every EU order
+  vatDomesticOnly          Boolean   @default(false)
+  // Paid-ad attribution window (days a paid click keeps credit on later visits)
+  attributionDays          Int       @default(7)
+  // Dropshipping: the supplier order is placed at payment, so a refund before shipping still costs the product
+  supplierPaidAtPayment    Boolean   @default(false)
+  fallbackActiveAt         DateTime?
+  fallbackReason           String?
+  // VAT-exempt store (franchise en base): the VAT self-assessed on foreign ad invoices (Meta,
+  // TikTok, Google bill from Ireland) can't be reclaimed, so it is part of the ad cost
+  adSpendVatNonReclaimable Boolean   @default(false)
+  // One-click offers added to the checkout's own Shopify order (order edit) instead of their own
+  // order. Off by default: an order already sent to the supplier (DSers, AutoDS…) would never ship
+  // the offer. Only within offerMergeWindowMin of the order's creation, never on held/tagged orders.
+  mergeOffersIntoOrder     Boolean   @default(false)
+  offerMergeWindowMin      Int       @default(10)
+
+  // --- Round 9 (migration 0017_product_round9) ---
+  // Google Ads API spend import (OAuth refresh token + developer token + customer ids)
+  googleAdsCustomerId      String?
+  googleAdsLoginCustomerId String?
+  googleAdsDeveloperToken  String? // encrypted
+  googleAdsClientId        String?
+  googleAdsClientSecret    String? // encrypted
+  googleAdsRefreshToken    String? // encrypted
+  // Charge buyers in their own currency (Whop-supported ones) at the ECB rate; off = always the shop currency
+  chargeLocalCurrency      Boolean @default(false)
+  // "Déjà client ?" e-mail code that fills the buyer's saved contact and address (needs Resend)
+  returningBuyerCode       Boolean @default(false)
+  // Shopify discount codes (Admin API) accepted on the checkout when not in the app's own list
+  // (default off since 0019: only used when the read_discounts scope was granted)
+  shopifyDiscountCodes     Boolean @default(false)
+
+  // --- Round 10 (migration 0018_product_round10) ---
+  // IANA time zone of the merchant's days and hours (analytics, reports, alerts, offer tests)
+  timezone                  String  @default("Europe/Paris")
+  // "Réseau de boutiques": returning buyers are recognized on every store of the operator that opted in
+  storeNetwork              Boolean @default(false)
+  // Quantity breaks (a product discount) stack with discount codes; off = best for the buyer
+  breaksCombineWithCodes    Boolean @default(true)
+  // Google Ads offline conversions: conversion action resource name (customers/<id>/conversionActions/<id>)
+  googleAdsConversionAction String?
+
+  // --- Round 14 (migration 0023_correctness_round14) ---
+  // Country the merchant is established in (VAT of unknown destinations, EU sales under the OSS threshold, ad invoices)
+  homeCountry               String   @default("FR")
+  // Whether Shopify's asyncUsageCount counts the orders this app creates (orderCreate): null = not calibrated yet
+  // (a Shopify code's uses = Shopify's count + this app's ledger), true = max of both, false = sum (measured)
+  shopifyCountsApiOrders    Boolean?
+
+  shippingRates    ShippingRate[]
+  discounts        DiscountCode[]
+  addOns           AddOn[]
+  sessions         CheckoutSession[]
+  versions         LayoutVersion[]
+  experiments      Experiment[]
+  events           EventLog[]
+  adSpend          AdSpend[]
+  productCosts     ProductCost[]
+  checkoutTests    CheckoutTest[]
+  shopifyCodeUses  ShopifyCodeUse[]
+  // --- Round 12 analytics (migration 0022_analytics_round12) ---
+  fallbackPeriods  FallbackPeriod[]
+  externalOrders   ExternalOrder[]
+  shopifyCustomers ShopifyCustomer[]
+  productVat       ProductVat[]
 }
 
 model ShippingRate {
-  id              String   @id @default(cuid())
-  storeId         String
-  store           Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  name            String
-  deliveryTime    String?
+  id            String   @id @default(cuid())
+  storeId       String
+  store         Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  name          String
+  deliveryTime  String?
   // ISO 3166-1 alpha-2 codes; empty = every country in the store's list
-  countries       String[]
-  priceCents      Int
+  countries     String[]
+  priceCents    Int
   // free when the discounted subtotal reaches this amount
-  freeOverCents   Int?
-  position        Int      @default(0)
-  active          Boolean  @default(true)
+  freeOverCents Int?
+  position      Int      @default(0)
+  active        Boolean  @default(true)
+  // What the carrier costs the merchant (profit analytics)
+  costCents     Int?
+  // "home" | "pickup" (relay point chosen at checkout)
+  kind          String   @default("home")
+  // Buyer-language texts: { [lang]: { name?, deliveryTime? } } (the base texts are the store's language)
+  i18n          Json?
 }
 
 enum DiscountType {
@@ -125,20 +216,22 @@ enum DiscountType {
 }
 
 model DiscountCode {
-  id            String       @id @default(cuid())
-  storeId       String
-  store         Store        @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  code          String
-  type          DiscountType
+  id                 String       @id @default(cuid())
+  storeId            String
+  store              Store        @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  code               String
+  type               DiscountType
   // percent: 1-100 ; fixed: cents ; free shipping: ignored
-  value         Int
-  minSubtotalCents Int?
-  startsAt      DateTime?
-  endsAt        DateTime?
-  usageLimit    Int?
-  usageCount    Int          @default(0)
-  active        Boolean      @default(true)
-  createdAt     DateTime     @default(now())
+  value              Int
+  minSubtotalCents   Int?
+  startsAt           DateTime?
+  endsAt             DateTime?
+  usageLimit         Int?
+  usageCount         Int          @default(0)
+  active             Boolean      @default(true)
+  createdAt          DateTime     @default(now())
+  // "Cumulable avec les remises quantité": off = the code or the quantity break, whichever saves more
+  combinesWithBreaks Boolean      @default(true)
 
   @@unique([storeId, code])
 }
@@ -155,6 +248,12 @@ model AddOn {
   imageUrl    String?
   position    Int     @default(0)
   active      Boolean @default(true)
+  // Product cost (profit analytics), snapshotted into the paid quote
+  costCents   Int?
+  // Display rules: { minSubtotalCents?, maxSubtotalCents?, productIds?: string[], countries?: string[] }
+  showIf      Json?
+  // Buyer-language texts: { [lang]: { title?, description? } } (Shopify lines keep the base title)
+  i18n        Json?
 }
 
 enum SessionStatus {
@@ -174,12 +273,12 @@ model CheckoutSession {
   updatedAt DateTime      @updatedAt
   paidAt    DateTime?
 
-  currency  String
+  currency       String
   // Server-priced cart lines: CartLine[] (src/lib/pricing.ts)
-  lines     Json
+  lines          Json
   // Selected add-on ids
-  addOnIds  String[]
-  discountCode String?
+  addOnIds       String[]
+  discountCode   String?
   shippingRateId String?
 
   // Totals in cents, computed server-side at pay time
@@ -190,11 +289,11 @@ model CheckoutSession {
   totalCents    Int @default(0)
 
   // Customer
-  email           String?
+  email            String?
   acceptsMarketing Boolean @default(false)
   // Buyer's note from the "order_note" block, copied to the Shopify order
   note             String?
-  shippingAddress Json?
+  shippingAddress  Json?
 
   // Attribution
   returnUrl String?
@@ -203,52 +302,107 @@ model CheckoutSession {
   // Whop — checkout configuration prepared for `preparedTotalCents` (one-page checkout)
   whopCheckoutId     String?
   preparedTotalCents Int?
-  whopPaymentId  String? @unique
+  whopPaymentId      String? @unique
 
   // Shopify sync
-  shopifyOrderId   String?
-  shopifyOrderName String?
-  syncError        String?
+  shopifyOrderId      String?
+  shopifyOrderName    String?
+  syncError           String?
   // Lease taken while creating the Shopify order (prevents duplicates on webhook retries)
-  syncStartedAt    DateTime?
-  refundedCents    Int     @default(0)
+  syncStartedAt       DateTime?
+  refundedCents       Int       @default(0)
   // Part of refundedCents already mirrored on the Shopify order (claimed atomically)
-  refundMirroredCents Int  @default(0)
-  disputed         Boolean @default(false)
+  refundMirroredCents Int       @default(0)
+  disputed            Boolean   @default(false)
   // Set when a payment needs a human look (amount/country/code mismatch, extra payment):
   // the Shopify order is then only created by a manual "sync" from the dashboard.
-  reviewNote       String?
+  reviewNote          String?
   // Other Whop payments received for this same cart (e.g. wallet + card): to refund
-  extraPaymentIds  String[]  @default([])
+  extraPaymentIds     String[]  @default([])
   // Automatic retries of the Shopify sync (exponential backoff)
-  syncAttempts     Int       @default(0)
-  nextSyncAt       DateTime?
+  syncAttempts        Int       @default(0)
+  nextSyncAt          DateTime?
 
   // Funnel
-  preparedAt    DateTime? // payment form ready
-  payClickedAt  DateTime? // buyer clicked "Pay"
+  preparedAt      DateTime? // payment form ready
+  payClickedAt    DateTime? // buyer clicked "Pay"
   termsAcceptedAt DateTime?
 
   // Created while the store was in test mode (excluded from analytics by default)
-  test       Boolean  @default(false)
+  test                     Boolean   @default(false)
   // Stable anonymous visitor id from the storefront (A/B stickiness, unique visitors)
-  visitorId  String?
+  visitorId                String?
   // Whop payment method used (card, apple_pay, paypal, klarna…)
-  paymentMethodType String?
+  paymentMethodType        String?
   // Whop's fees on this payment (total − amount after fees), for net-margin analytics
-  whopFeeCents      Int?
+  whopFeeCents             Int?
   // Open dispute awaiting evidence submission (sent once tracking exists, or near the deadline)
-  disputeId         String?
-  paymentFailedAt   DateTime?
-  upsellShownAt     DateTime?
+  disputeId                String?
+  disputeDueAt             DateTime?
+  disputeEvidenceTries     Int       @default(0)
+  paymentFailedAt          DateTime?
+  upsellShownAt            DateTime?
+  // Offer blocks actually displayed (per-offer acceptance rate)
+  upsellShownBlocks        String[]  @default([])
+  // Order bumps actually displayed (attach rate = taken / shown)
+  addOnsShown              String[]  @default([])
+  // Dispute outcome (won | lost | closed) and the amount lost to it
+  disputeStatus            String?
+  disputeLostCents         Int       @default(0)
+  // Fraud-alert auto-refund decided, not yet confirmed (backstopped by the tick)
+  alertRefundPendingAt     DateTime?
+  alertRefundKey           String?
+  // Last Shopify order creation failed ambiguously (timeout): wait for search consistency
+  syncAmbiguousAt          DateTime?
+  // The merchant created/linked the Shopify order by hand
+  syncHandledAt            DateTime?
+  // Fraud-alert auto-refund retries (backoff, so a failing refund isn't journaled every tick)
+  alertRefundAttempts      Int       @default(0)
+  alertRefundNextAt        DateTime?
+  // Lease of the fraud-alert refund being sent (webhook's after-response run vs the tick's retry)
+  alertRefundStartedAt     DateTime?
+  // The Shopify order carries the "litige-whop" tag (tick backstop of the deferred tagging)
+  disputeTaggedAt          DateTime?
+  // Checkout language actually used, first paid touch, post-purchase survey answer
+  lang                     String?
+  firstUtm                 Json?
+  surveyAnswer             String?
+  // Funnel steps inside the one-page form
+  emailEnteredAt           DateTime?
+  addressEnteredAt         DateTime?
+  shippingChosenAt         DateTime?
+  // Relay point chosen for a pickup rate: { provider, id, name, address1, zip, city, countryCode }
+  pickupPoint              Json?
+  // Refund mirroring: lease + backoff (never claims the amount before Shopify confirms)
+  refundMirrorStartedAt    DateTime?
+  refundMirrorAttempts     Int       @default(0)
+  nextRefundMirrorAt       DateTime?
+  disputeOpenedAt          DateTime?
+  disputeLastTryAt         DateTime?
+  disputeEvidenceStartedAt DateTime?
+  // Set with syncHandledAt when the order was deliberately not created in Shopify
+  // ("refunded": fully refunded before creation, "dispute_lost": chargeback lost)
+  syncSkippedReason        String?
+  // Last Whop refund applied (ages the "refund not yet mirrored" backlog)
+  lastRefundAt             DateTime?
+  // "litige-whop" tag backstop: retries with backoff, then gives up (a human tags it)
+  disputeTagAttempts       Int       @default(0)
+  nextDisputeTagAt         DateTime?
+  disputeTagGaveUpAt       DateTime?
+  // Tracking push to Whop: failed tries (journaled from the 3rd), then given up
+  trackingPushAttempts     Int       @default(0)
+  trackingPushError        String?
+  trackingGaveUpAt         DateTime?
 
   // Attribution & ads (fbp, fbc, ttp, ttclid, marketing consent…)
-  tracking   Json?
-  clientIp   String?
-  userAgent  String?
-  pixelSentAt DateTime? // every configured platform accepted the purchase
-  pixelStatus Json?     // { meta: "sent" | "failed", tiktok: … }
-  pixelAttempts Int     @default(0)
+  tracking      Json?
+  clientIp      String?
+  userAgent     String?
+  pixelSentAt   DateTime? // every configured platform accepted the purchase
+  pixelStatus   Json? // { meta: "sent" | "failed", tiktok: … }
+  pixelAttempts Int       @default(0)
+  // Next background retry of a failed purchase event (backoff), null = due
+  pixelNextAttemptAt DateTime?
 
   // A/B test
   experimentId String?
@@ -259,30 +413,85 @@ model CheckoutSession {
   whopPaymentMethodId String?
   upsells             UpsellCharge[]
 
-
   // Dispute shield
-  trackingNumber    String?
-  trackingPushedAt  DateTime?
-  trackingCheckedAt DateTime?
-  disputeEvidenceAt DateTime?
+  trackingNumber          String?
+  trackingPushedAt        DateTime?
+  trackingCheckedAt       DateTime?
+  disputeEvidenceAt       DateTime?
   // Snapshot of the exact quote the buyer paid (see CheckoutQuote)
-  paidQuoteId      String?
-  quotes           CheckoutQuote[]
+  paidQuoteId             String?
+  quotes                  CheckoutQuote[]
+  // Visitor's country from the IP (x-vercel-ip-country), for the funnel of buyers who never typed an address
+  geoCountry              String?
+  protectionClaims        ProtectionClaim[]
+  // Shopify cart token (/cart.js): lets the server re-read the discounts Shopify computed for that cart
+  cartToken               String?
+  // Automatic discounts Shopify computed for the cart, verified server-side: { lines, orderCents, titles, items, at }
+  cartDiscounts           Json?
+  // Currency the buyer is charged in when it isn't the shop's (local currency option), and its rate
+  chargeCurrency          String?
+  chargeFxRate            Float?
+  // --- Round 11 reliability (migration 0019_reliability_round11) ---
+  // Refunded amount in the charge currency (charged in the buyer's currency): exact remaining refund
+  refundedChargeCents     Int               @default(0)
+  // Checkout A/B tests (quantity breaks, order bump, shipping protection): { [testId]: "A" | "B" }
+  checkoutTestArms        Json?
+  // Google Ads offline conversion (ClickConversion upload): done, tries, last error
+  googleAdsUploadedAt     DateTime?
+  googleAdsUploadAttempts Int               @default(0)
+  googleAdsUploadError    String?
+  // --- Round 12 correctness (migration 0020_correctness_round12) ---
+  // When this app recorded the Shopify order (Shopify's code usage count lags behind new orders)
+  shopifyOrderAt          DateTime?
+  // Google Ads: value Google has for the conversion (cents), retraction done, adjustment retries
+  googleAdsValueCents     Int?
+  googleAdsRetractedAt    DateTime?
+  googleAdsAdjustAttempts Int               @default(0)
+  googleAdsAdjustError    String?
+  googleAdsAdjustNextAt   DateTime?
+  // --- Round 13 correctness (migration 0021_correctness_round13) ---
+  // Google Ads: the conversion's target value may have changed (refund, dispute outcome, offer
+  // paid); set by those writers, cleared once adjusted or found unchanged (adjustment candidates)
+  googleAdsAdjustDue      Boolean           @default(false)
+  // --- Round 12 analytics (migration 0022_analytics_round12) ---
+  // Buyer's orders on the Shopify store before this one (customer.numberOfOrders at order
+  // creation, this order excluded); null = unknown (order created before this was recorded)
+  shopifyPriorOrders      Int?
 
+  @@index([storeId, googleAdsAdjustDue])
   @@index([storeId, createdAt])
   @@index([storeId, status])
   @@index([status, createdAt])
+  @@index([whopCheckoutId])
+  @@index([storeId, paidAt])
+  @@index([extraPaymentIds], type: Gin)
+  @@index([refundedCents])
+  @@index([disputeId])
 }
 
 model WebhookEvent {
-  id         String   @id // webhook-id header
-  storeId    String
-  type       String
-  receivedAt DateTime @default(now())
+  // webhook-id header. Keyed per store: with several stores on one Whop account, the same
+  // delivery id reaches each store's endpoint and each must claim (and apply) its own copy.
+  id              String
+  storeId         String
+  type            String
+  receivedAt      DateTime  @default(now())
   // Set once fully handled; a claim left unprocessed (crash) is taken over by a redelivery
-  processedAt DateTime?
+  processedAt     DateTime?
   // Raw event body, kept for audit and replay
-  payload    Json?
+  payload         Json?
+  // First receipt (receivedAt moves with each claim): bounds how long a failing event is retried
+  firstReceivedAt DateTime  @default(now())
+  // Local replay of events whose handling failed (kept, retried with backoff); Whop's own
+  // redeliveries are counted apart (deliveries) and never consume the local budget
+  attempts        Int       @default(0)
+  deliveries      Int       @default(0)
+  lastError       String?
+  nextAttemptAt   DateTime?
+
+  @@id([storeId, id])
+  @@index([id])
+  @@index([processedAt, receivedAt])
 }
 
 /// Audit trail and alert source: every notable thing that happens to a store.
@@ -291,14 +500,15 @@ model EventLog {
   storeId   String?
   store     Store?   @relation(fields: [storeId], references: [id], onDelete: Cascade)
   sessionId String?
-  level     String   // info | warn | error
-  kind      String   // e.g. order.synced, sync.failed, review.hold, dispute.created
+  level     String // info | warn | error
+  kind      String // e.g. order.synced, sync.failed, review.hold, dispute.created
   message   String
   data      Json?
   createdAt DateTime @default(now())
 
   @@index([storeId, createdAt])
   @@index([sessionId])
+  @@index([kind, createdAt])
 }
 
 /// Published designs, for history/restore and A/B tests.
@@ -317,51 +527,106 @@ model LayoutVersion {
 
 /// A/B test: variant B renders a saved LayoutVersion to `splitB`% of new checkouts.
 model Experiment {
-  id        String    @id @default(cuid())
-  storeId   String
-  store     Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  name      String
+  id          String    @id @default(cuid())
+  storeId     String
+  store       Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  name        String
   // Control (A) is pinned to the design published when the test started
-  versionIdA String?
-  versionId String
-  splitB    Int       @default(50)
+  versionIdA  String?
+  versionId   String
+  splitB      Int       @default(50)
   // Stop automatically and publish the winner once the result is significant
   autoPromote Boolean   @default(false)
-  status    String    @default("RUNNING") // RUNNING | STOPPED
-  startedAt DateTime  @default(now())
-  endedAt   DateTime?
+  status      String    @default("RUNNING") // RUNNING | STOPPED
+  startedAt   DateTime  @default(now())
+  endedAt     DateTime?
 
   @@index([storeId, status])
 }
 
 /// One-click post-purchase offer charged on the saved payment method.
 model UpsellCharge {
-  id               String          @id @default(cuid())
-  sessionId        String
-  session          CheckoutSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  blockId          String
-  title            String
-  variantId        String
-  productId        String?
-  amountCents      Int
+  id                       String          @id @default(cuid())
+  sessionId                String
+  session                  CheckoutSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  blockId                  String
+  title                    String
+  variantId                String
+  productId                String?
+  amountCents              Int
   // Idempotency: Whop request key = "<id>:<chargeAttempts>", so SDK retries never charge twice
-  chargeAttempts   Int             @default(0)
-  disputed         Boolean         @default(false)
-  pixelSentAt      DateTime?
-  pixelAttempts    Int             @default(0)
-  status           String          @default("PENDING") // PENDING | PAID | FAILED | DECLINED
-  whopPaymentId    String?         @unique
-  shopifyOrderId   String?
-  shopifyOrderName String?
-  error            String?
-  syncAttempts     Int             @default(0)
+  chargeAttempts           Int             @default(0)
+  // Start of the current charge attempt (the sweep's time limits run from here)
+  chargeStartedAt          DateTime?
+  // Part of refundedCents already reported on the offer's Shopify order
+  refundMirroredCents      Int             @default(0)
+  refundMirrorStartedAt    DateTime?
+  refundMirrorAttempts     Int             @default(0)
+  nextRefundMirrorAt       DateTime?
+  disputeOpenedAt          DateTime?
+  disputeLastTryAt         DateTime?
+  disputeEvidenceStartedAt DateTime?
+  quantity                 Int             @default(1)
+  disputeStatus            String?
+  disputeLostCents         Int             @default(0)
+  // Payment ids of earlier attempts (a retried charge gets a new payment)
+  previousPaymentIds       String[]        @default([])
+  // Sweep backoff for charges waiting on the buyer (3-D Secure)
+  nextCheckAt              DateTime?
+  // Whop's fee on the offer's payment
+  whopFeeCents             Int?
+  // Unit cost of the offered product (margin analytics): Shopify's, or the app's ("Coûts produits")
+  costCents                Int?
+  // "app" when costCents comes from the costs entered in the app (it then overrides Shopify's)
+  costSource               String?
+  // Shopify's own unit cost when an app cost overrides it (restored if the app cost is removed)
+  shopifyCostCents         Int?
+  // "merged": added to the checkout's Shopify order (order edit); "separate": its own order
+  orderMode                String?
+  // Line item of the offer in the checkout's order (merged mode: refunds target it)
+  shopifyLineItemId        String?
+  // Merged mode: the offer's Whop payment is recorded on the shared order (or nothing is owed);
+  // null = balance still unpaid in Shopify (retried by the tick, shown in health)
+  balanceSettledAt         DateTime?
+  balanceAttempts          Int             @default(0)
+  // Next retry of an unpaid merged balance (backoff like the order sync); null = due now
+  nextBalanceAt            DateTime?
+  // Dispute on the offer's own payment (evidence sent once tracked, or before the due date)
+  disputeId                String?
+  disputeDueAt             DateTime?
+  disputeEvidenceAt        DateTime?
+  disputeEvidenceTries     Int             @default(0)
+  disputed                 Boolean         @default(false)
+  pixelSentAt              DateTime?
+  pixelAttempts            Int             @default(0)
+  // Next background retry of a failed offer purchase event (backoff), null = due
+  pixelNextAttemptAt       DateTime?
+  status                   String          @default("PENDING") // PENDING | PAID | FAILED | DECLINED
+  whopPaymentId            String?         @unique
+  shopifyOrderId           String?
+  shopifyOrderName         String?
+  error                    String?
+  syncAttempts             Int             @default(0)
   // Lease + backoff for creating the offer's Shopify order (same scheme as sessions)
-  syncStartedAt    DateTime?
-  nextSyncAt       DateTime?
-  refundedCents    Int             @default(0)
-  createdAt        DateTime        @default(now())
+  syncStartedAt            DateTime?
+  nextSyncAt               DateTime?
+  refundedCents            Int             @default(0)
+  createdAt                DateTime        @default(now())
+  syncHandledAt            DateTime?
+  // Last order creation failed ambiguously (timeout) or was cut short: wait for search consistency
+  syncAmbiguousAt          DateTime?
+  disputeTaggedAt          DateTime?
+  // Offer order deliberately not created in Shopify (see CheckoutSession.syncSkippedReason)
+  syncSkippedReason        String?
+  lastRefundAt             DateTime?
+  disputeTagAttempts       Int             @default(0)
+  nextDisputeTagAt         DateTime?
+  disputeTagGaveUpAt       DateTime?
 
   @@unique([sessionId, blockId])
+  @@index([status, createdAt])
+  @@index([previousPaymentIds], type: Gin)
+  @@index([disputeId])
 }
 
 /// Shared fixed-window counters (works across serverless instances).
@@ -381,27 +646,340 @@ model AppSetting {
 /// One row per Whop checkout configuration: the exact quote it charges.
 /// The paid configuration — not the session's latest state — drives the Shopify order.
 model CheckoutQuote {
-  id                   String          @id @default(cuid())
-  sessionId            String
-  session              CheckoutSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  whopCheckoutId       String          @unique
-  fingerprint          String
-  currency             String
-  subtotalCents        Int
-  discountCents        Int
-  shippingCents        Int
-  addOnsCents          Int
-  totalCents           Int
-  shippingRateId       String?
-  shippingRateName     String?
+  id                         String          @id @default(cuid())
+  sessionId                  String
+  session                    CheckoutSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  whopCheckoutId             String          @unique
+  fingerprint                String
+  currency                   String
+  subtotalCents              Int
+  discountCents              Int
+  shippingCents              Int
+  addOnsCents                Int
+  totalCents                 Int
+  shippingRateId             String?
+  shippingRateName           String?
+  // Carrier cost of the chosen rate at quote time (profit analytics)
+  shippingCostCents          Int?
+  // Cart lines priced for this quote (quantities can change on the checkout)
+  lines                      Json?
   // Countries the rate covers (empty = everywhere)
-  shippingCountries    String[]
-  discountCode         String?
-  discountFreeShipping Boolean         @default(false)
+  shippingCountries          String[]
+  discountCode               String?
+  discountFreeShipping       Boolean         @default(false)
+  // "app" (DiscountCode row) | "shopify" (Shopify discount code, recorded on the order as such)
+  discountSource             String?
+  // Part of discountCents from the code, and from Shopify's automatic cart discounts
+  codeDiscountCents          Int?
+  automaticDiscountCents     Int             @default(0)
+  // Charged in another currency than the shop's (local currency option): amount, currency, rate used
+  chargeCurrency             String?
+  chargeTotalCents           Int?
+  chargeFxRate               Float?
+  // --- Round 11 reliability (0019) --- Shopify code limits as read at quote time (the paid
+  // order's ledger check in markPaid): usage limit, Shopify's usage count then, when, once per customer
+  shopifyCodeUsageLimit      Int?
+  shopifyCodeUsageCount      Int?
+  shopifyCodeCheckedAt       DateTime?
+  shopifyCodeOncePerCustomer Boolean         @default(false)
   // [{ id, title, priceCents, variantId }]
-  addOns               Json
-  addOnIds             String[]
-  createdAt            DateTime        @default(now())
+  addOns                     Json
+  addOnIds                   String[]
+  createdAt                  DateTime        @default(now())
 
   @@index([sessionId, fingerprint])
+}
+
+/// Daily ad spend per campaign, imported from Meta / TikTok (or typed in).
+model AdSpend {
+  id                           String   @id @default(cuid())
+  storeId                      String
+  store                        Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  day                          String // YYYY-MM-DD (Paris)
+  platform                     String // meta | tiktok | google | other
+  campaignId                   String
+  campaignName                 String
+  spendCents                   Int
+  currency                     String
+  // Ad account billing in another currency: original amount and the rate used
+  originalSpendCents           Int?
+  originalCurrency             String?
+  fxRate                       Float?
+  // What the ad platform itself reports (its own attribution): purchases, their value (store
+  // currency, cents) and its ROAS (Meta purchase_roas); compared with our real orders
+  platformConversions          Float?
+  platformConversionValueCents Int?
+  platformRoas                 Float?
+  // Value the platform received for its conversions at import: "revenue" (CA TTC) or "profit"
+  // (the order's margin, Store.conversionValueMode); null = imported before it was recorded
+  valueMode                    String?
+  updatedAt                    DateTime @updatedAt
+
+  @@unique([storeId, day, platform, campaignId])
+  @@index([storeId, day])
+}
+
+/// Alerts waiting for delivery (retried by the tick when every channel failed).
+model AlertOutbox {
+  id            String    @id @default(cuid())
+  storeId       String
+  sessionId     String?
+  kind          String
+  message       String
+  attempts      Int       @default(0)
+  lastError     String?
+  nextAttemptAt DateTime  @default(now())
+  sentAt        DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([sentAt, nextAttemptAt])
+}
+
+/// Every Whop refund applied, dated (refunds of the period, CSV, audit).
+model RefundRecord {
+  id          String   @id // Whop refund id
+  storeId     String
+  sessionId   String
+  chargeId    String?
+  amountCents Int
+  currency    String
+  createdAt   DateTime @default(now())
+
+  @@index([storeId, createdAt])
+  @@index([sessionId])
+}
+
+/// Product costs kept in the app (dropshippers rarely fill Shopify's unit cost), by effective date.
+model ProductCost {
+  id            String   @id @default(cuid())
+  storeId       String
+  store         Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  variantId     String // Shopify variant GID
+  title         String?
+  costCents     Int
+  effectiveFrom DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  @@unique([storeId, variantId, effectiveFrom])
+  @@index([storeId, variantId])
+}
+
+/// Shipping protection claim (lost, stolen or damaged parcel): what the merchant paid to make it right.
+model ProtectionClaim {
+  id                     String          @id @default(cuid())
+  storeId                String
+  sessionId              String
+  session                CheckoutSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  // "reship" (sent again) | "refund" (refunded outside the Whop refund, e.g. a voucher)
+  kind                   String
+  // Cost to the merchant (product + carrier for a reship, amount for a refund)
+  costCents              Int
+  note                   String?
+  // "approved" (counted in the P&L) | "pending" (reported by the buyer, awaiting the merchant) | "rejected"
+  status                 String          @default("approved")
+  // "merchant" (typed on the order page) | "buyer" (reported from the order status page)
+  source                 String          @default("merchant")
+  // Buyer's report: problem (lost | stolen | damaged | late | other), description, optional photo link
+  reason                 String?
+  photoUrl               String?
+  decidedAt              DateTime?
+  // Day of the claim (P&L: counted on the claim date)
+  createdAt              DateTime        @default(now())
+  // Approved reship: the 0 € Shopify replacement order (lease while creating it, idempotent)
+  replacementOrderId     String?
+  replacementOrderName   String?
+  replacementStartedAt   DateTime?
+  replacementError       String?
+  // Items the merchant kept for the replacement order (keys, see replacementItems); null = all
+  replacementLines       Json?
+  // Last orderCreate whose outcome is unknown (timeout, 5xx): no new try before AMBIGUOUS_WAIT_MS
+  replacementAmbiguousAt DateTime?
+  // Decision e-mail sent to the buyer (their checkout language)
+  buyerNotifiedAt        DateTime?
+  photos                 ClaimPhoto[]
+
+  @@index([storeId, createdAt])
+  @@index([storeId, status])
+  @@index([sessionId])
+}
+
+/// "Déjà client ?" one-time e-mail code: 6 digits, stored hashed, valid 10 minutes, few attempts.
+model BuyerLoginCode {
+  id        String    @id @default(cuid())
+  storeId   String
+  // Lower-cased e-mail the code was sent to
+  email     String
+  // The checkout that asked for it (the code only fills this checkout)
+  sessionId String
+  codeHash  String
+  expiresAt DateTime
+  attempts  Int       @default(0)
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([storeId, email, createdAt])
+  @@index([sessionId])
+}
+
+/// Photo attached by the buyer to a protection claim (image only, 5 MB max, 3 per claim).
+model ClaimPhoto {
+  id        String          @id @default(cuid())
+  claimId   String
+  claim     ProtectionClaim @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  storeId   String
+  mime      String
+  size      Int
+  data      Bytes
+  createdAt DateTime        @default(now())
+
+  @@index([claimId])
+}
+
+/// A/B test of a checkout element (quantity breaks, an order bump, the shipping protection price):
+/// arm B's settings go to `splitB` % of visitors (sticky per visitor), decided on margin per visitor.
+model CheckoutTest {
+  id        String    @id @default(cuid())
+  storeId   String
+  store     Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  // "breaks" (tiers set B) | "addon" (order bump price / visibility) | "protection" (price)
+  kind      String
+  // AddOn id for "addon"
+  targetId  String?
+  name      String
+  splitB    Int       @default(50)
+  // Arm B's settings: breaks → tiers; addon → { priceCents?, hidden? }; protection → pricing
+  configB   Json
+  // Arm A as it was when the test started (what "keep A" restores)
+  configA   Json?
+  status    String    @default("RUNNING") // RUNNING | STOPPED
+  winner    String?
+  startedAt DateTime  @default(now())
+  endedAt   DateTime?
+
+  @@index([storeId, status])
+}
+
+/// Round 11 reliability (0019): ledger of this app's paid uses of Shopify discount codes, written in
+/// markPaid's transaction under a per-code lock, so a usage limit or "once per customer" holds even
+/// between two payments landing together (Shopify's own count only moves once the orders exist).
+model ShopifyCodeUse {
+  id        String   @id @default(cuid())
+  storeId   String
+  store     Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  // Upper-cased code
+  code      String
+  sessionId String   @unique
+  // Lower-cased buyer e-mail (once per customer)
+  email     String?
+  createdAt DateTime @default(now())
+  // Shopify's asyncUsageCount read with the paid quote (before this use): calibrates shopifyCountsApiOrders
+  shopifyCountBefore Int?
+
+  @@index([storeId, code, createdAt])
+  @@index([storeId, code, email])
+}
+
+/// Periods when the storefront was sent back to Shopify's own checkout (automatic fallback while
+/// Whop failed, or until the merchant switched it back): flagged on the analytics charts and P&L.
+model FallbackPeriod {
+  id        String    @id @default(cuid())
+  storeId   String
+  store     Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  startedAt DateTime
+  // null while the fallback is still active
+  endedAt   DateTime?
+  reason    String?
+  // "fallback" (automatic, Whop failing) or "disabled" (checkout switched off by hand: enabled = false)
+  kind      String    @default("fallback")
+
+  @@index([storeId, startedAt])
+}
+
+/// Shopify orders not created by this app ("hors checkout Whop": native checkout, POS, drafts…),
+/// imported daily for the leakage indicator. Revenue only (no costs).
+model ExternalOrder {
+  id             String    @id @default(cuid())
+  storeId        String
+  store          Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  shopifyOrderId String
+  name           String
+  // Shopify's processedAt (order date)
+  orderedAt      DateTime
+  currency       String
+  // Current total (after refunds / edits), TTC, and the same without VAT (our VAT model)
+  totalCents     Int
+  htCents        Int
+  countryCode    String?
+  sourceName     String?
+  test           Boolean   @default(false)
+  cancelledAt    DateTime?
+  // Discount codes used on the order (upper-cased): calibrates Store.shopifyCountsApiOrders (outside uses)
+  discountCodes  String[]  @default([])
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([storeId, shopifyOrderId])
+  @@index([storeId, orderedAt])
+}
+
+/// Shopify customers with an order history (backfilled once when the store connects, then kept up
+/// to date by each order this app creates): new vs returning buyers beyond this app's own orders.
+model ShopifyCustomer {
+  id                String    @id @default(cuid())
+  storeId           String
+  store             Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  // Lower-cased e-mail
+  email             String
+  shopifyCustomerId String?
+  firstOrderAt      DateTime?
+  numberOfOrders    Int       @default(0)
+  updatedAt         DateTime  @updatedAt
+
+  @@unique([storeId, email])
+}
+
+/// VAT category of a variant (reduced rates: food, books, press…), used to take revenue HT.
+model ProductVat {
+  id        String   @id @default(cuid())
+  storeId   String
+  store     Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  // Shopify variant GID
+  variantId String
+  title     String?
+  // Key of VAT_CATEGORIES (src/lib/vat.ts)
+  category  String
+  updatedAt DateTime @updatedAt
+
+  @@unique([storeId, variantId])
+}
+
+/// Calls to the external providers (Shopify, Whop, Meta, TikTok, Google Ads, GA4, ECB, Resend,
+/// Mondial Relay…), rolled up per provider and 5-minute bucket from the ext.call instrumentation:
+/// calls, errors, timeouts and a fixed-bucket latency histogram (p50 / p95). Written in batches
+/// after the response / at the end of the tick (never on the money path); purged after 14 days.
+model ProviderMetric {
+  provider    String
+  // Start of the 5-minute bucket (UTC)
+  bucket      DateTime
+  calls       Int       @default(0)
+  // No answer, 5xx, 429 or an authentication refusal (401 / 403)
+  errors      Int       @default(0)
+  timeouts    Int       @default(0)
+  totalMs     BigInt    @default(0)
+  maxMs       Int       @default(0)
+  // Latency histogram: calls answered in <= 250 ms, 500 ms, 1 s, 2 s, 4 s, 8 s, 15 s, more
+  h0          Int       @default(0)
+  h1          Int       @default(0)
+  h2          Int       @default(0)
+  h3          Int       @default(0)
+  h4          Int       @default(0)
+  h5          Int       @default(0)
+  h6          Int       @default(0)
+  h7          Int       @default(0)
+  lastOkAt    DateTime?
+  lastErrorAt DateTime?
+  // Latest error of the bucket (scrubbed, 300 chars)
+  lastError   String?
+
+  @@id([provider, bucket])
+  @@index([bucket])
 }

@@ -4,9 +4,10 @@ import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { themeFontHrefs } from "@/lib/layout";
 import { draftDesign, hasDraft } from "@/lib/design";
-import { SAMPLE_LINES, sampleThankYou } from "@/lib/sample";
+import { previewLines, previewThankYou } from "../../builder/sample";
 import { CheckoutView } from "@/components/checkout/CheckoutView";
 import { ThankYouView } from "@/components/checkout/ThankYouView";
+import { canReadShopifyDiscounts } from "@/lib/shopify-discounts";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Aperçu", robots: { index: false } };
@@ -29,29 +30,36 @@ export default async function PreviewPage({ params }: { params: Promise<{ storeI
   const design = draftDesign(store);
   const theme = design.theme;
   const fonts = themeFontHrefs(theme);
+  const sample = await previewLines(store.id);
 
   return (
-    <>
+    // One tall wrapper: body is only 100vh high, so a sticky child of body would scroll away.
+    <div className="min-h-full" style={{ ["--wc-sticky-top" as string]: "2rem" }}>
       {fonts.map((href) => (
         <link key={href} rel="stylesheet" href={href} />
       ))}
-      <div className="sticky top-0 z-50 bg-zinc-900 px-4 py-2 text-center text-xs text-white">
-        {hasDraft(store) ? "Aperçu du brouillon (non publié)" : "Aperçu du design publié"} · données d&apos;exemple · rien n&apos;est facturé
+      <div className="sticky top-0 z-50 flex min-h-8 items-center justify-center bg-zinc-900 px-4 py-2 text-center text-xs text-white">
+        {hasDraft(store) ? "Aperçu du brouillon (non publié)" : "Aperçu du design publié"} ·{" "}
+        {sample.real ? "produits de votre dernier panier" : "données d\u2019exemple"} · rien n&apos;est facturé
       </div>
-      {page === "checkout" ? (
-        <CheckoutView
-          theme={theme}
-          layout={design.checkoutLayout}
-          currency={store.shopCurrency}
-          lines={SAMPLE_LINES}
-          rates={store.shippingRates}
-          addOns={store.addOns.map((a) => ({ id: a.id, title: a.title, description: a.description, priceCents: a.priceCents, imageUrl: a.imageUrl }))}
-          hasDiscounts={store._count.discounts > 0}
-          mode={{ kind: "preview" }}
-        />
-      ) : (
-        <ThankYouView theme={theme} layout={design.thankYouLayout} data={sampleThankYou(store.shopCurrency)} />
-      )}
-    </>
+      {/* The banner stays on top: the summary column sticks just below it. */}
+      <div>
+        {page === "checkout" ? (
+          <CheckoutView
+            theme={theme}
+            layout={design.checkoutLayout}
+            currency={store.shopCurrency}
+            lines={sample.lines}
+            rates={store.shippingRates}
+            addOns={store.addOns.map((a) => ({ id: a.id, title: a.title, description: a.description, priceCents: a.priceCents, imageUrl: a.imageUrl }))}
+            hasDiscounts={store._count.discounts > 0 || (store.shopifyDiscountCodes && canReadShopifyDiscounts(store))}
+            mode={{ kind: "preview" }}
+          />
+        ) : (
+          // Same as the builder canvas: offers are shown (answering them does nothing here).
+          <ThankYouView theme={theme} layout={design.thankYouLayout} data={previewThankYou(store.shopCurrency, sample.lines, store.shippingRates)} demoOffers />
+        )}
+      </div>
+    </div>
   );
 }

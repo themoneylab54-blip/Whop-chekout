@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, type ReactNode } from "react";
+import { Clock3, RefreshCw } from "lucide-react";
 import { WhopCheckoutEmbed, WhopExpressCheckoutButton, useCheckoutEmbedControls } from "@whop/checkout/react";
 import type { Theme } from "@/lib/layout";
 import type { Labels } from "./i18n";
@@ -37,6 +38,8 @@ export function ExpressCheckout({
   onPaid,
   saveCard,
   termsNotice,
+  title,
+  dividerLabel,
 }: {
   prepared: Prepared | null;
   theme: Theme;
@@ -47,12 +50,17 @@ export function ExpressCheckout({
   /** Save the payment method for the one-click post-purchase offer. */
   saveCard?: boolean;
   termsNotice?: ReactNode;
+  /** Merchant's wording for the heading and the "OR" divider (empty = translated default). */
+  title?: string;
+  dividerLabel?: string;
 }) {
   const [rendered, setRendered] = useState<string | null>(null);
   if (!prepared || rendered === "none") return null;
   return (
-    <section className="mb-2" aria-label={labels.expressCheckout}>
-      <p className="mb-3 text-center text-xs font-medium tracking-wide text-neutral-500 uppercase">{labels.expressCheckout}</p>
+    <section aria-label={title || labels.expressCheckout}>
+      <p data-inline-field="title" className="mb-3 text-center text-xs font-medium tracking-wide text-neutral-600 uppercase">
+        {title || labels.expressCheckout}
+      </p>
       <WhopExpressCheckoutButton
         key={prepared.configId}
         checkoutConfigurationId={prepared.configId}
@@ -68,12 +76,18 @@ export function ExpressCheckout({
         fallback={<div className="h-12 animate-pulse rounded-[var(--radius)] bg-neutral-100" />}
       />
       {termsNotice}
-      <div className="my-6 flex items-center gap-3 text-xs text-neutral-400">
-        <span className="h-px flex-1 bg-neutral-200" />
-        {labels.or}
-        <span className="h-px flex-1 bg-neutral-200" />
-      </div>
+      <Divider label={dividerLabel || labels.or} />
     </section>
+  );
+}
+
+function Divider({ label }: { label: string }) {
+  return (
+    <div className="mt-6 flex items-center gap-3 text-xs text-neutral-600">
+      <span className="h-px flex-1 bg-neutral-200" />
+      <span data-inline-field="dividerLabel">{label}</span>
+      <span className="h-px flex-1 bg-neutral-200" />
+    </div>
   );
 }
 
@@ -94,6 +108,13 @@ export function PaymentPanel({
   onPaid,
   saveCard,
   beforeButton,
+  incomplete = [],
+  showIncomplete = true,
+  incompleteHint,
+  onIncomplete,
+  onRetry,
+  interacted = false,
+  errorRef,
 }: {
   prepared: Prepared | null;
   preparing: boolean;
@@ -107,6 +128,20 @@ export function PaymentPanel({
   onPaid: () => void;
   saveCard?: boolean;
   beforeButton?: ReactNode;
+  /** Labels of the fields still missing or invalid: listed under the button. */
+  incomplete?: string[];
+  /** List them only once the buyer has left a field or tried to pay (never on a fresh page). */
+  showIncomplete?: boolean;
+  /** Replaces "Complete: …" when one clearer sentence says it ("Choose your pickup point"). */
+  incompleteHint?: string;
+  /** Shows every field error and focuses the first invalid field. */
+  onIncomplete?: () => void;
+  /** Prepares the Whop checkout again after a failure, without reloading the page. */
+  onRetry?: () => void;
+  /** The buyer has typed or clicked on the page: failures may interrupt them (role=alert). */
+  interacted?: boolean;
+  /** Support reference (request id) of the failed load, shown discreetly. */
+  errorRef?: string | null;
 }) {
   const controls = useCheckoutEmbedControls();
   const [ready, setReady] = useState(false);
@@ -138,11 +173,59 @@ export function PaymentPanel({
   }
 
   const busy = submitting || preparing || !prepared || !ready;
+  const blocked = busy || !!prepareError;
+  // The Whop form is being prepared or is booting: the button says so (one label, one spinner).
+  const loading = !prepareError && !submitting && (preparing || (!!prepared && !ready));
+  const hint = incomplete.length > 0 && showIncomplete ? (incompleteHint ?? labels.completeFields(incomplete.join(", "))) : null;
+
+  function onPayClick() {
+    // Never a silent dead button: an incomplete form points the buyer to what is missing.
+    if (incomplete.length > 0) {
+      onIncomplete?.();
+      return;
+    }
+    if (blocked) return;
+    void pay();
+  }
 
   return (
     <div className="space-y-3">
-      <div className="relative min-h-[120px] overflow-hidden rounded-[var(--radius)] border border-neutral-200 bg-white p-1">
-        {prepared ? (
+      {/* Height reserved for the Whop form so the page doesn't jump when it loads. */}
+      <div
+        className="relative min-h-[264px] overflow-hidden rounded-[var(--radius)] border border-neutral-200 bg-white p-1"
+        aria-busy={!prepareError && (!prepared || !ready)}
+      >
+        {prepareError && !prepared ? (
+          // Loading failed (after silent retries): a calm, static panel — never a pulsing
+          // skeleton next to an error.
+          <div
+            role={interacted ? "alert" : "status"}
+            className="flex min-h-[256px] flex-col items-center justify-center gap-3 px-6 py-8 text-center"
+          >
+            <span className="flex h-11 w-11 items-center justify-center rounded-full bg-neutral-100 text-neutral-600">
+              <Clock3 className="h-5 w-5" aria-hidden />
+            </span>
+            <p className="text-base font-semibold text-neutral-900">{labels.paymentUnavailable}</p>
+            <p className="max-w-[340px] text-sm leading-relaxed text-neutral-600">
+              {prepareError !== labels.errors.init_failed && prepareError !== labels.error ? prepareError : labels.paymentUnavailableHint}
+            </p>
+            {errorRef && (
+              <p className="font-mono text-[11px] text-neutral-500">
+                {labels.reference} {errorRef.slice(0, 8)}
+              </p>
+            )}
+            {onRetry && (
+              <button
+                type="button"
+                onClick={onRetry}
+                className="mt-1 inline-flex min-h-11 items-center gap-2 rounded-[var(--btn-radius)] border border-neutral-300 bg-white px-5 text-sm font-semibold text-neutral-900 transition hover:bg-neutral-50"
+              >
+                <RefreshCw className="h-4 w-4" aria-hidden />
+                {labels.retry}
+              </button>
+            )}
+          </div>
+        ) : prepared ? (
           <WhopCheckoutEmbed
             key={prepared.configId}
             ref={controls}
@@ -174,35 +257,52 @@ export function PaymentPanel({
         ) : (
           <PaymentSkeleton />
         )}
-        {(preparing || (prepared && !ready)) && (
+        {!prepareError && (preparing || (prepared && !ready)) && (
           <div className="pointer-events-none absolute inset-0 flex items-start justify-end p-3">
             <span className="h-4 w-4 animate-spin rounded-full border-2 border-neutral-300 border-r-transparent" />
           </div>
         )}
       </div>
 
-      {(error || prepareError) && (
-        <p role="alert" className="rounded-[var(--radius)] bg-red-50 px-4 py-3 text-sm text-red-700">
-          {error ?? prepareError}
-        </p>
+      {(error || (prepareError && prepared)) && (
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-2 rounded-[var(--radius)] bg-red-50 px-4 py-3 text-sm text-red-800">
+          <span>{error ?? prepareError}</span>
+          {prepareError && !error && onRetry && (
+            <button
+              type="button"
+              onClick={onRetry}
+              className="min-h-11 rounded-[var(--btn-radius)] border border-red-300 bg-white px-4 font-semibold text-red-800 hover:bg-red-100"
+            >
+              {labels.retry}
+            </button>
+          )}
+        </div>
       )}
 
       {beforeButton}
 
       <button
+        id="wc-pay-button"
         type="button"
-        disabled={busy || !!prepareError}
-        onClick={pay}
-        className="flex w-full items-center justify-center gap-2 rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-5 py-4 text-base font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)] transition hover:brightness-110 active:scale-[.99] disabled:cursor-not-allowed disabled:opacity-60"
+        aria-disabled={blocked || incomplete.length > 0}
+        aria-busy={submitting || loading || undefined}
+        aria-describedby={hint ? "wc-pay-hint" : undefined}
+        onClick={onPayClick}
+        className={`flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-5 py-4 text-base font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)] transition hover:brightness-110 active:scale-[.99] ${blocked && incomplete.length === 0 ? "cursor-progress opacity-70" : ""}`}
       >
-        {(submitting || preparing) && <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-r-transparent" />}
-        {payLabel}
+        {(submitting || loading) && <span className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-current border-r-transparent" aria-hidden />}
+        {submitting ? labels.paymentProcessing : loading ? labels.paymentLoading : payLabel}
       </button>
-      <p className="flex items-center justify-center gap-1.5 text-xs text-neutral-500">
+      {hint && (
+        <p id="wc-pay-hint" aria-live="polite" className="text-center text-sm text-neutral-700">
+          {hint}
+        </p>
+      )}
+      <p className="flex items-center justify-center gap-1.5 text-xs text-neutral-600">
         <LockIcon /> {labels.paymentSecure}
       </p>
       {testMode && (
-        <p className="rounded bg-amber-50 px-3 py-2 text-xs text-amber-800">Mode test : paiement sandbox Whop, aucune somme réelle débitée.</p>
+        <p className="rounded bg-amber-50 px-3 py-2 text-xs text-amber-800">{labels.testMode}</p>
       )}
     </div>
   );
@@ -211,11 +311,17 @@ export function PaymentPanel({
 function PaymentSkeleton() {
   return (
     <div className="space-y-3 p-4" aria-hidden>
+      <div className="flex gap-2">
+        <div className="h-10 flex-1 animate-pulse rounded-md bg-neutral-100" />
+        <div className="h-10 flex-1 animate-pulse rounded-md bg-neutral-100" />
+        <div className="h-10 flex-1 animate-pulse rounded-md bg-neutral-100" />
+      </div>
       <div className="h-11 animate-pulse rounded-md bg-neutral-100" />
       <div className="grid grid-cols-2 gap-3">
         <div className="h-11 animate-pulse rounded-md bg-neutral-100" />
         <div className="h-11 animate-pulse rounded-md bg-neutral-100" />
       </div>
+      <div className="h-11 animate-pulse rounded-md bg-neutral-100" />
     </div>
   );
 }
@@ -230,39 +336,57 @@ function LockIcon() {
 }
 
 /** Static stand-in for the builder preview (no live Whop form there). */
-export function PaymentPreview({ labels, payLabel, beforeButton }: { labels: Labels; payLabel: string; beforeButton?: ReactNode }) {
+export function PaymentPreview({
+  labels,
+  payLabel,
+  beforeButton,
+  hideWallets,
+}: {
+  labels: Labels;
+  payLabel: string;
+  beforeButton?: ReactNode;
+  /** The express block already shows Apple Pay / Google Pay above: not repeated as tabs. */
+  hideWallets?: boolean;
+}) {
+  const methods = [labels.methodCard, "PayPal", ...(hideWallets ? [] : ["Apple Pay", "Google Pay"])];
   return (
     <div className="space-y-3">
       <div className="space-y-3 rounded-[var(--radius)] border border-neutral-200 bg-white p-4">
         <div className="flex flex-wrap gap-2 text-xs font-semibold">
-          {["Carte", "PayPal", "Apple Pay", "Google Pay"].map((m, i) => (
+          {methods.map((m, i) => (
             <span key={m} className={`rounded-md border px-3 py-2 ${i === 0 ? "border-[var(--accent)] text-[var(--accent)]" : "border-neutral-200 text-neutral-600"}`}>
               {m}
             </span>
           ))}
         </div>
-        <div className="h-11 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3 text-sm text-neutral-400">1234 1234 1234 1234</div>
+        <div className="h-11 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3 text-sm text-neutral-500">1234 1234 1234 1234</div>
         <div className="grid grid-cols-2 gap-3">
-          <div className="h-11 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3 text-sm text-neutral-400">MM / AA</div>
-          <div className="h-11 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3 text-sm text-neutral-400">CVC</div>
+          <div className="h-11 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3 text-sm text-neutral-500">{labels.cardExpiryPlaceholder}</div>
+          <div className="h-11 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3 text-sm text-neutral-500">CVC</div>
         </div>
       </div>
       {beforeButton}
       <div className="flex w-full items-center justify-center rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-5 py-4 text-base font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)]">
         {payLabel}
       </div>
-      <p className="flex items-center justify-center gap-1.5 text-xs text-neutral-500">
+      <p className="flex items-center justify-center gap-1.5 text-xs text-neutral-600">
         <LockIcon /> {labels.paymentSecure}
       </p>
     </div>
   );
 }
 
-/** Static express buttons for the builder preview. */
-export function ExpressPreview({ labels }: { labels: Labels }) {
+/**
+ * Static express buttons for the builder preview. Live, Whop only shows them on a
+ * device/browser with a wallet set up (Safari + Apple Pay, Chrome + Google Pay) and
+ * hides the whole block otherwise: the builder chrome explains it (not the canvas).
+ */
+export function ExpressPreview({ labels, title, dividerLabel }: { labels: Labels; title?: string; dividerLabel?: string }) {
   return (
-    <section className="mb-2">
-      <p className="mb-3 text-center text-xs font-medium tracking-wide text-neutral-500 uppercase">{labels.expressCheckout}</p>
+    <section>
+      <p data-inline-field="title" className="mb-3 text-center text-xs font-medium tracking-wide text-neutral-600 uppercase">
+        {title || labels.expressCheckout}
+      </p>
       <div className="grid grid-cols-2 gap-2">
         <div className="flex h-12 items-center justify-center gap-1 rounded-[var(--radius)] bg-black text-[15px] font-semibold text-white">
           <AppleLogo /> Pay
@@ -271,11 +395,7 @@ export function ExpressPreview({ labels }: { labels: Labels }) {
           <GoogleG /> Pay
         </div>
       </div>
-      <div className="my-6 flex items-center gap-3 text-xs text-neutral-400">
-        <span className="h-px flex-1 bg-neutral-200" />
-        {labels.or}
-        <span className="h-px flex-1 bg-neutral-200" />
-      </div>
+      <Divider label={dividerLabel || labels.or} />
     </section>
   );
 }

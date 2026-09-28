@@ -1,16 +1,28 @@
 name: Background tick
 
 # Vercel's free plan runs crons once a day; this pings the app every 10 minutes
-# so reconciliation, retries and recovery e-mails run close to real time.
+# so reconciliation (payments, refunds, disputes), Shopify order / refund retries, dispute evidence and
+# alerts run close to real time.
 # Needs repository secrets APP_URL (e.g. https://whop-chekout.vercel.app) and CRON_SECRET.
+#
+# Limits of GitHub's scheduler (see README › Maintenance automatique): "*/10" runs are often
+# 5-30 min late, and GitHub disables scheduled workflows of a repository without activity for
+# 60 days. The keep-alive step below re-enables this workflow on each run (API "enable" on an
+# enabled workflow is a no-op that keeps it active); if it was disabled anyway, re-enable it in
+# Actions → Background tick → "Enable workflow". An external uptime monitor on /api/health (and
+# optionally /api/cron/tick) is part of the required setup, not an extra.
 on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
 
+permissions:
+  actions: write
+
 jobs:
   tick:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
       - name: Ping /api/cron/tick
         env:
@@ -18,4 +30,10 @@ jobs:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: |
           if [ -z "$APP_URL" ]; then echo "APP_URL secret not set, skipping"; exit 0; fi
-          curl -fsS --max-time 70 -H "Authorization: Bearer $CRON_SECRET" "$APP_URL/api/cron/tick"
+          curl -fsS --max-time 70 --retry 2 --retry-delay 10 -H "Authorization: Bearer $CRON_SECRET" "$APP_URL/api/cron/tick"
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/tick.yml/enable"

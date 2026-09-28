@@ -83,7 +83,9 @@ body {
 }
 .wc-input:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.wc-input[aria-invalid="true"] {
+  border-color: #b91c1c;
 }
 .wc-input:disabled {
   opacity: 0.6;
@@ -105,4 +107,47 @@ body {
 }
 [data-inputs="underline"] .wc-input:focus {
   box-shadow: 0 1.5px 0 0 var(--accent);
+}
+
+/* ---------- Checkout: focus, motion ---------- */
+/* A 2px solid ring in the brand color (or the text color when the brand is too light,
+   see --focus in themeVars) with an offset: visible on any background, WCAG 2.4.7/1.4.11. */
+/* Script-focused status lines / headings (tabindex="-1") are excluded: they carry their own
+   subtle focus-visible ring (Tailwind classes) instead of an outline around a sentence. */
+.wc-checkout :is(a, button, input, select, textarea, summary, [tabindex]:not([tabindex="-1"])):focus-visible {
+  outline: 2px solid var(--focus, #111827);
+  outline-offset: 2px;
+}
+.wc-checkout .wc-input:focus-visible {
+  outline-offset: 1px;
+}
+.wc-paybar {
+  transition: transform 0.2s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .wc-checkout *,
+  .wc-checkout *::before,
+  .wc-checkout *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ---------- Checkout: fields with an icon inside (valid check, address pin) ---------- */
+.wc-input[data-valid="true"],
+.wc-input[data-with-icon="true"] {
+  padding-right: 2.5rem;
+}
+
+/* ---------- Builder: block list rows (actions on hover / focus with a mouse, always on touch) ---------- */
+@media (hover: hover) and (pointer: fine) {
+  .wc-row .wc-row-actions {
+    display: none;
+  }
+  .wc-row:hover .wc-row-actions,
+  .wc-row:focus-within .wc-row-actions {
+    display: flex;
+  }
 }

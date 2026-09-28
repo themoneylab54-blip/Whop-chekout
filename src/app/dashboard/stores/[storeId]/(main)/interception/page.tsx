@@ -1,11 +1,16 @@
+import type { Metadata } from "next";
 import { Code2, Crosshair, ExternalLink, LifeBuoy, MousePointerClick, ScanEye } from "lucide-react";
 import { notFound } from "next/navigation";
+import { DirtyForm } from "@/components/dashboard/DirtyForm";
 import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { loadInterception } from "@/lib/layout";
 import { loaderUrl } from "@/lib/shopify";
-import { Badge, Card, CopyField, Flash, Label, PageHeader, SubmitButton, Textarea, Toggle, buttonClass } from "@/components/ui";
+import { Badge, Card, Flash, Label, PageHeader, SubmitButton, Textarea, Toggle, buttonClass } from "@/components/ui";
+import { CopyField } from "@/components/dashboard/CopyField";
 import { reinstallScriptAction, saveInterceptionAction } from "../../../../actions";
+
+export const metadata: Metadata = { title: "Interception" };
 
 export default async function InterceptionPage({
   params,
@@ -31,9 +36,9 @@ export default async function InterceptionPage({
       />
       <Flash ok={sp.ok} error={sp.error} />
 
-      <div className="grid gap-6 lg:grid-cols-[1.3fr_1fr]">
+      <div className="grid grid-cols-[minmax(0,1fr)] gap-6 lg:grid-cols-[1.3fr_1fr] [&>*]:min-w-0">
         <Card icon={MousePointerClick} title="Boutons interceptés" description="Les changements sont actifs sur la boutique en quelques secondes.">
-          <form action={saveInterceptionAction.bind(null, store.id)}>
+          <DirtyForm label="Boutons interceptés" action={saveInterceptionAction.bind(null, store.id)}>
             <div className="divide-y divide-zinc-100">
               <Toggle name="cartCheckout" defaultChecked={i.cartCheckout} label="Bouton « Paiement » de la page panier" hint="Le bouton Checkout de /cart." />
               <Toggle name="cartDrawer" defaultChecked={i.cartDrawer} label="Bouton « Paiement » du tiroir panier" hint="Cart drawer et notification d'ajout au panier." />
@@ -58,9 +63,8 @@ export default async function InterceptionPage({
                 </Label>
                 <Textarea id="excludedHandles" name="excludedHandles" rows={3} defaultValue={i.excludedHandles.join("\n")} className="font-mono text-xs" />
               </div>
-              <SubmitButton>Enregistrer</SubmitButton>
             </div>
-          </form>
+          </DirtyForm>
         </Card>
 
         <div className="space-y-6">
@@ -98,7 +102,7 @@ export default async function InterceptionPage({
               Shopify → Boutique en ligne → Thèmes → Modifier le code → <code>theme.liquid</code>, collez cette ligne juste avant{" "}
               <code>&lt;/head&gt;</code> :
             </p>
-            <CopyField value={`<script src="${loaderUrl(store.publicId)}" defer></script>`} />
+            <CopyField label="Ligne à coller dans theme.liquid" value={`<script src="${loaderUrl(store.publicId)}" defer></script>`} />
           </Card>
         </div>
       </div>

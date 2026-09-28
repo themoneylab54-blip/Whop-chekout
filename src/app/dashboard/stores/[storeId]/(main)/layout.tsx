@@ -1,12 +1,29 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ChevronsUpDown, FlaskConical, LogOut, Plus, ShoppingBag } from "lucide-react";
 import { after } from "next/server";
 import { requireAdmin } from "@/lib/auth";
-import { maybeTick } from "@/lib/tick";
+import { maybeTick, warnIfTickStale } from "@/lib/tick";
 import { db } from "@/lib/db";
-import { MobileNav, NavLink } from "@/components/dashboard/NavLink";
+import { MobileMenu, SidebarNav } from "@/components/dashboard/NavLink";
+import { CommandPalette, CommandPaletteTrigger } from "@/components/dashboard/CommandPalette";
+import { UnsavedChangesBar } from "@/components/dashboard/DirtyForm";
+import { PopoverDetails } from "@/components/dashboard/Popover";
+import { HashFocus } from "@/components/dashboard/HashFocus";
+import { FormDraftKeeper } from "@/components/dashboard/FormDraftKeeper";
+import "../../../dashboard.css";
 import { logoutAction } from "../../../actions";
+import { tzOf } from "@/lib/time";
+import { providersOverview, type ProviderOverview } from "@/lib/providers";
+import { providerStatus, type ProviderStatus } from "@/lib/provider-status";
+
+/**
+ * Dashboard visits run the background tick after answering (maybeTick in after()): its hard limit
+ * (HARD_LIMIT_MS, 50 s) assumes the same 60 s function limit as /api/cron/tick. Route segment config
+ * (valid in a layout: it applies to every page of this segment).
+ */
+export const maxDuration = 60;
 
 function initials(name: string) {
   return name
@@ -42,23 +59,58 @@ function StoreAvatar({ id, name, size = 32 }: { id: string; name: string; size?:
   );
 }
 
+/** Tab titles read "Réglages · Maison Lumière"; pages without a title show the store name. */
+export async function generateMetadata({ params }: { params: Promise<{ storeId: string }> }): Promise<Metadata> {
+  const { storeId } = await params;
+  const store = await db.store.findUnique({ where: { id: storeId }, select: { name: true } });
+  const name = store?.name ?? "Boutique";
+  return { title: { template: `%s · ${name}`, default: name } };
+}
+
 export default async function StoreLayout({ children, params }: { children: React.ReactNode; params: Promise<{ storeId: string }> }) {
   const adminId = await requireAdmin();
   const { storeId } = await params;
-  const [store, stores, admin, unsynced] = await Promise.all([
+  const [store, stores, admin, unsynced, providers] = await Promise.all([
     db.store.findUnique({ where: { id: storeId } }),
     db.store.findMany({ orderBy: { createdAt: "asc" }, select: { id: true, name: true, enabled: true, shopifyConnectedAt: true, whopConnectedAt: true } }),
     db.adminUser.findUnique({ where: { id: adminId }, select: { email: true } }),
-    db.checkoutSession.count({ where: { storeId, status: "PAID", shopifyOrderId: null } }),
+    db.checkoutSession.count({ where: { storeId, status: "PAID", shopifyOrderId: null, syncHandledAt: null } }),
+    // Same status as Journal › Services externes: a connected but failing provider shows red.
+    providersOverview().catch((): ProviderOverview[] => []),
   ]);
-  // Dashboard visits also keep background maintenance going (reconciliation, retries…).
-  after(() => maybeTick().catch(() => undefined));
+  const statusOf = (id: string) => {
+    const p = providers.find((x) => x.provider === id);
+    return p ? providerStatus(p) : null;
+  };
+  // Dashboard visits also keep background maintenance going (reconciliation, retries…),
+  // after alerting (throttled) when the scheduler itself has stopped.
+  after(async () => {
+    await warnIfTickStale(storeId);
+    await maybeTick().catch(() => undefined);
+  });
   if (!store) notFound();
   const base = `/dashboard/stores/${store.id}`;
   const live = store.enabled && !!store.shopifyConnectedAt && !!store.whopConnectedAt;
+  const badges = {
+    orders:
+      unsynced > 0 ? (
+        <span className="rounded-full bg-red-600 px-1.5 text-[11px] leading-[18px] font-semibold text-white" title={`${unsynced} commande(s) payée(s) à créer dans Shopify`}>
+          {unsynced}
+          <span className="sr-only"> à traiter</span>
+        </span>
+      ) : undefined,
+    shopify: <Dot ok={!!store.shopifyConnectedAt} status={statusOf("shopify")} />,
+    whop: <Dot ok={!!store.whopConnectedAt} status={statusOf("whop")} />,
+  };
 
   return (
-    <div className="flex min-h-full bg-[#f7f8fa]">
+    <div className="dash flex min-h-full bg-[#f7f8fa]">
+      <a
+        href="#contenu"
+        className="sr-only z-50 rounded-lg bg-white px-3 py-2 text-sm font-medium shadow-[var(--shadow-float)] focus:not-sr-only focus:fixed focus:top-2 focus:left-2"
+      >
+        Aller au contenu
+      </a>
       <aside className="sticky top-0 hidden h-screen w-[248px] shrink-0 flex-col border-r border-zinc-200/70 bg-[#f7f8fa] px-3 py-4 md:flex">
         <Link href="/dashboard" className="mb-5 flex items-center gap-2.5 px-2">
           <span className="relative flex h-8 w-8 items-center justify-center overflow-hidden rounded-[10px] bg-gradient-to-br from-indigo-500 via-violet-500 to-fuchsia-500 shadow-[inset_0_1px_0_rgba(255,255,255,.35),0_4px_12px_-4px_rgba(99,102,241,.7)]">
@@ -68,7 +120,7 @@ export default async function StoreLayout({ children, params }: { children: Reac
           <span className="text-[15px] font-semibold tracking-tight">Whop Checkout</span>
         </Link>
 
-        <details className="group relative mb-5">
+        <PopoverDetails className="group relative mb-5">
           <summary className="flex cursor-pointer list-none items-center gap-2.5 rounded-xl bg-white p-2 shadow-[var(--shadow-card)] transition hover:shadow-[var(--shadow-float)]">
             <StoreAvatar id={store.id} name={store.name} />
             <span className="min-w-0 flex-1">
@@ -78,10 +130,10 @@ export default async function StoreLayout({ children, params }: { children: Reac
                 {live ? (store.testMode ? "En ligne · test" : "En ligne") : "Hors ligne"}
               </span>
             </span>
-            <ChevronsUpDown className="h-4 w-4 text-zinc-400" />
+            <ChevronsUpDown className="h-4 w-4 text-zinc-500" aria-hidden />
           </summary>
           <div className="animate-fade-up absolute inset-x-0 top-full z-30 mt-1.5 rounded-xl bg-white p-1.5 shadow-[var(--shadow-float)]">
-            <p className="px-2 pt-1 pb-1.5 text-[10px] font-semibold tracking-[.1em] text-zinc-400 uppercase">Vos boutiques</p>
+            <p className="px-2 pt-1 pb-1.5 text-[11px] font-semibold tracking-[.08em] text-zinc-500 uppercase">Vos boutiques</p>
             {stores.map((s) => (
               <Link key={s.id} href={`/dashboard/stores/${s.id}`} className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-zinc-100">
                 <StoreAvatar id={s.id} name={s.name} size={22} />
@@ -93,56 +145,11 @@ export default async function StoreLayout({ children, params }: { children: Reac
               <Plus className="h-4 w-4" /> Ajouter une boutique
             </Link>
           </div>
-        </details>
+        </PopoverDetails>
 
-        <nav className="flex flex-1 flex-col gap-0.5 overflow-y-auto">
-          <NavLink href={base} exact icon="overview">
-            Vue d&apos;ensemble
-          </NavLink>
-          <NavLink
-            href={`${base}/orders`}
-            icon="orders"
-            badge={unsynced > 0 ? <span className="rounded-full bg-red-500 px-1.5 text-[10px] font-semibold text-white">{unsynced}</span> : undefined}
-          >
-            Commandes
-          </NavLink>
-          <NavLink href={`${base}/analytics`} icon="analytics">
-            Analytics
-          </NavLink>
-          <p className="mt-5 mb-1.5 px-2.5 text-[10px] font-semibold tracking-[.1em] text-zinc-400 uppercase">Connexions</p>
-          <NavLink href={`${base}/shopify`} icon="shopify" badge={<Dot ok={!!store.shopifyConnectedAt} />}>
-            Shopify
-          </NavLink>
-          <NavLink href={`${base}/whop`} icon="whop" badge={<Dot ok={!!store.whopConnectedAt} />}>
-            Whop
-          </NavLink>
-          <NavLink href={`${base}/interception`} icon="interception">
-            Interception
-          </NavLink>
-          <p className="mt-5 mb-1.5 px-2.5 text-[10px] font-semibold tracking-[.1em] text-zinc-400 uppercase">Checkout</p>
-          <NavLink href={`${base}/builder/checkout`} icon="design">
-            Design du checkout
-          </NavLink>
-          <NavLink href={`${base}/builder/thank-you`} icon="thankyou">
-            Page de remerciement
-          </NavLink>
-          <NavLink href={`${base}/shipping`} icon="shipping">
-            Livraison
-          </NavLink>
-          <NavLink href={`${base}/offers`} icon="offers">
-            Promos &amp; options
-          </NavLink>
-          <NavLink href={`${base}/growth`} icon="growth">
-            Pixels publicitaires
-          </NavLink>
-          <p className="mt-5 mb-1.5 px-2.5 text-[10px] font-semibold tracking-[.1em] text-zinc-400 uppercase">Compte</p>
-          <NavLink href={`${base}/journal`} icon="journal">
-            Journal &amp; santé
-          </NavLink>
-          <NavLink href={`${base}/settings`} icon="settings">
-            Réglages
-          </NavLink>
-        </nav>
+        <CommandPaletteTrigger />
+
+        <SidebarNav base={base} badges={badges} />
 
         <div className="mt-3 flex items-center gap-2.5 rounded-xl p-2 hover:bg-zinc-900/[.04]">
           <span className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-zinc-700 to-zinc-900 text-xs font-semibold text-white">
@@ -150,7 +157,7 @@ export default async function StoreLayout({ children, params }: { children: Reac
           </span>
           <span className="min-w-0 flex-1 truncate text-xs text-zinc-600">{admin?.email}</span>
           <form action={logoutAction}>
-            <button title="Se déconnecter" aria-label="Se déconnecter" className="rounded-md p-1.5 text-zinc-400 hover:bg-white hover:text-zinc-900">
+            <button title="Se déconnecter" aria-label="Se déconnecter" className="inline-flex h-8 w-8 items-center justify-center rounded-md text-zinc-500 hover:bg-white hover:text-zinc-900">
               <LogOut className="h-4 w-4" />
             </button>
           </form>
@@ -158,66 +165,91 @@ export default async function StoreLayout({ children, params }: { children: Reac
       </aside>
 
       <div className="min-w-0 flex-1">
-        <div className="sticky top-0 z-20 border-b border-zinc-200/70 bg-white/80 backdrop-blur-xl md:hidden">
-          <div className="flex items-center gap-2.5 px-4 pt-3 pb-2">
-            <details className="group relative min-w-0 flex-1">
-              <summary className="flex cursor-pointer list-none items-center gap-2.5">
-                <StoreAvatar id={store.id} name={store.name} size={26} />
+        <div className="sticky top-0 z-20 border-b border-zinc-200/70 bg-white/95 backdrop-blur-xl md:hidden">
+          <div className="flex items-center gap-2 px-4 py-2.5">
+            <PopoverDetails className="group relative min-w-0 flex-1">
+              <summary className="flex min-h-10 cursor-pointer list-none items-center gap-2.5 rounded-lg" aria-label={`Boutique : ${store.name}. Changer de boutique`}>
+                <StoreAvatar id={store.id} name={store.name} size={28} />
                 <span className="truncate font-semibold">{store.name}</span>
-                <span className={`h-2 w-2 shrink-0 rounded-full ${live ? "bg-emerald-500" : "bg-zinc-300"}`} />
-                <ChevronsUpDown className="h-4 w-4 shrink-0 text-zinc-400" />
+                <span className={`h-2 w-2 shrink-0 rounded-full ${live ? "bg-emerald-500" : "bg-zinc-300"}`} aria-hidden />
+                <span className="sr-only">{live ? "En ligne" : "Hors ligne"}</span>
+                <ChevronsUpDown className="h-4 w-4 shrink-0 text-zinc-500" aria-hidden />
               </summary>
-              <div className="absolute inset-x-0 top-full z-30 mt-2 w-64 rounded-xl bg-white p-1.5 shadow-[var(--shadow-float)]">
+              <div className="absolute left-0 top-full z-30 mt-2 w-[min(16rem,calc(100vw-2rem))] rounded-xl bg-white p-1.5 shadow-[var(--shadow-float)]">
+                <p className="px-2 pt-1 pb-1.5 text-[11px] font-semibold tracking-[.08em] text-zinc-500 uppercase">Vos boutiques</p>
                 {stores.map((s) => (
-                  <Link key={s.id} href={`/dashboard/stores/${s.id}`} className="flex items-center gap-2 rounded-lg px-2 py-2 text-sm hover:bg-zinc-100">
+                  <Link key={s.id} href={`/dashboard/stores/${s.id}`} className="flex min-h-10 items-center gap-2 rounded-lg px-2 text-sm hover:bg-zinc-100">
                     <StoreAvatar id={s.id} name={s.name} size={22} />
                     <span className="flex-1 truncate">{s.name}</span>
                   </Link>
                 ))}
-                <Link href="/dashboard/stores/new" className="flex items-center gap-2 rounded-lg px-2 py-2 text-sm font-medium text-indigo-600 hover:bg-indigo-50">
+                <Link href="/dashboard/stores/new" className="flex min-h-10 items-center gap-2 rounded-lg px-2 text-sm font-medium text-indigo-600 hover:bg-indigo-50">
                   <Plus className="h-4 w-4" /> Ajouter une boutique
                 </Link>
               </div>
-            </details>
-            <form action={logoutAction}>
-              <button title="Se déconnecter" aria-label="Se déconnecter" className="rounded-md p-2 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-900">
-                <LogOut className="h-4 w-4" />
-              </button>
-            </form>
+            </PopoverDetails>
+            <CommandPaletteTrigger variant="icon" />
+            <MobileMenu
+              base={base}
+              badges={badges}
+              header={
+                <span className="flex min-w-0 items-center gap-2.5">
+                  <StoreAvatar id={store.id} name={store.name} size={28} />
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm font-semibold">{store.name}</span>
+                    <span className="block text-xs text-zinc-500">{live ? (store.testMode ? "En ligne · test" : "En ligne") : "Hors ligne"}</span>
+                  </span>
+                </span>
+              }
+              footer={
+                <div className="flex items-center gap-2.5">
+                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-zinc-700 to-zinc-900 text-xs font-semibold text-white">
+                    {(admin?.email ?? "?")[0].toUpperCase()}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-xs text-zinc-600">{admin?.email}</span>
+                  <form action={logoutAction}>
+                    <button className="inline-flex min-h-10 items-center gap-1.5 rounded-lg px-3 text-sm font-medium text-zinc-700 hover:bg-zinc-900/[.05]">
+                      <LogOut className="h-4 w-4" aria-hidden /> Déconnexion
+                    </button>
+                  </form>
+                </div>
+              }
+            />
           </div>
-          <MobileNav
-            items={[
-              { href: base, label: "Vue d'ensemble", exact: true },
-              { href: `${base}/orders`, label: unsynced > 0 ? `Commandes (${unsynced})` : "Commandes" },
-              { href: `${base}/analytics`, label: "Analytics" },
-              { href: `${base}/shopify`, label: "Shopify" },
-              { href: `${base}/whop`, label: "Whop" },
-              { href: `${base}/interception`, label: "Interception" },
-              { href: `${base}/builder/checkout`, label: "Design" },
-              { href: `${base}/shipping`, label: "Livraison" },
-              { href: `${base}/offers`, label: "Promos" },
-              { href: `${base}/growth`, label: "Pixels" },
-              { href: `${base}/journal`, label: "Journal" },
-              { href: `${base}/settings`, label: "Réglages" },
-            ]}
-          />
         </div>
-        <div className="mx-auto max-w-[1080px] px-4 py-8 md:px-10 md:py-10">
+        {/* tabIndex -1: the skip link moves the keyboard focus here (no ring on a whole page region). */}
+        <main id="contenu" tabIndex={-1} className="mx-auto max-w-[1080px] px-4 py-6 outline-none focus:outline-none md:px-10 md:py-10">
           {store.testMode && (
             <div className="mb-6 flex items-center gap-2.5 rounded-xl bg-amber-50 px-4 py-2.5 text-sm text-amber-900 ring-1 ring-amber-600/15">
-              <FlaskConical className="h-4 w-4 shrink-0" />
+              <FlaskConical className="h-4 w-4 shrink-0" aria-hidden />
               <span>
                 <strong className="font-semibold">Mode test</strong> — paiements Whop sandbox, commandes Shopify marquées « test ».
               </span>
             </div>
           )}
           <div className="animate-fade-up">{children}</div>
-        </div>
+          <UnsavedChangesBar />
+        </main>
+        <CommandPalette base={base} storeId={store.id} tz={tzOf(store)} stores={stores.map((s) => ({ id: s.id, name: s.name }))} />
+        <HashFocus />
+        <FormDraftKeeper />
       </div>
     </div>
   );
 }
 
-function Dot({ ok }: { ok: boolean }) {
-  return <span className={`h-1.5 w-1.5 rounded-full ${ok ? "bg-emerald-500" : "bg-amber-400"}`} title={ok ? "Connecté" : "À connecter"} />;
+/** Connection dot: amber "À connecter"; connected, the provider's status (red "En panne", amber "Dégradé"). */
+function Dot({ ok, status }: { ok: boolean; status: ProviderStatus | null }) {
+  const [color, label] = !ok
+    ? ["bg-amber-400", "À connecter"]
+    : status?.level === "down"
+      ? ["bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,.18)]", `En panne${status.reason ? ` : ${status.reason}` : ""}`]
+      : status?.level === "degraded" || status?.level === "watch"
+        ? ["bg-amber-500", `${status.label}${status.reason ? ` : ${status.reason}` : ""}`]
+        : ["bg-emerald-500", "Connecté"];
+  return (
+    <span className={`h-1.5 w-1.5 rounded-full ${color}`} title={label}>
+      <span className="sr-only">{label}</span>
+    </span>
+  );
 }

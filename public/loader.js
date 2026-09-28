@@ -114,13 +114,73 @@
   /* Session creation                                                  */
   /* ---------------------------------------------------------------- */
 
-  function utm() {
-    var out = {};
-    ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "fbclid", "gclid", "ttclid"].forEach(function (k) {
-      var v = params.get(k) || sessionStorageGet("whopco_" + k);
-      if (v) out[k] = v.slice(0, 300);
+  /*
+   * Paid-ad attribution. A landing that carries any UTM or click id is a "touch": it replaces the
+   * last touch as a whole (never mixed with an older one) in localStorage `whopco_touch`, and the
+   * very first one is kept in `whopco_first_touch` (never overwritten). The last touch expires
+   * after the longest attribution window offered (28 days, or the store's if longer); analytics
+   * apply the store's window (1, 7 or 28 days) at query time from the touch's date.
+   */
+  // Click ids: Meta (fbclid), Google Ads (gclid; gbraid / wbraid on iOS app and web-to-app clicks),
+  // TikTok (ttclid), Microsoft Ads (msclkid).
+  var TOUCH_KEYS = ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "utm_id", "fbclid", "gclid", "gbraid", "wbraid", "ttclid", "msclkid"];
+  var MAX_TOUCH_DAYS = 28;
+  function localGet(k) {
+    try {
+      var v = localStorage.getItem(k);
+      return v ? JSON.parse(v) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  function localSet(k, v) {
+    try {
+      localStorage.setItem(k, JSON.stringify(v));
+    } catch (e) {}
+  }
+  function touchFromUrl() {
+    var t = null;
+    TOUCH_KEYS.forEach(function (k) {
+      var v = params.get(k);
+      if (v) {
+        t = t || {};
+        t[k] = v.slice(0, 300);
+      }
     });
+    if (t) t.ts = Date.now();
+    return t;
+  }
+  (function rememberTouch() {
+    var t = touchFromUrl();
+    if (!t) return;
+    localSet("whopco_touch", t);
+    if (!localGet("whopco_first_touch")) localSet("whopco_first_touch", t);
+  })();
+  function attributionDays() {
+    var d = config && Number(config.attributionDays);
+    return d > 0 && d <= 90 ? d : MAX_TOUCH_DAYS;
+  }
+  function validTouch(t, days) {
+    if (!t || typeof t !== "object" || typeof t.ts !== "number") return null;
+    if (days && Date.now() - t.ts > days * 86400000) return null;
+    var out = {};
+    TOUCH_KEYS.forEach(function (k) {
+      if (typeof t[k] === "string" && t[k]) out[k] = t[k].slice(0, 300);
+    });
+    out.ts = String(t.ts);
     return out;
+  }
+  // Last paid touch of the longest window analytics can apply (28 days), with its date: the
+  // store's window is applied by the server when analytics are read.
+  function utm() {
+    return validTouch(localGet("whopco_touch"), Math.max(attributionDays(), MAX_TOUCH_DAYS));
+  }
+  function firstUtm() {
+    return validTouch(localGet("whopco_first_touch"), 0);
+  }
+  function touchValue(k) {
+    var t = utm();
+    return params.get(k) || (t && t[k]) || null;
   }
   // Ad identifiers for server-side conversions (Meta CAPI, TikTok Events API).
   function cookie(name) {
@@ -131,14 +191,18 @@
     var out = {};
     var fbp = cookie("_fbp");
     var fbc = cookie("_fbc");
-    var fbclid = params.get("fbclid") || sessionStorageGet("whopco_fbclid");
+    var fbclid = touchValue("fbclid");
     if (!fbc && fbclid) fbc = "fb.1." + Date.now() + "." + fbclid;
     var ttp = cookie("_ttp");
-    var ttclid = params.get("ttclid") || sessionStorageGet("whopco_ttclid");
+    var ttclid = touchValue("ttclid");
     if (fbp) out.fbp = fbp.slice(0, 200);
     if (fbc) out.fbc = fbc.slice(0, 300);
     if (ttp) out.ttp = ttp.slice(0, 200);
     if (ttclid) out.ttclid = ttclid.slice(0, 300);
+    // Google Analytics client id ("GA1.1.123.456" -> "123.456") for GA4 server-side purchases.
+    var ga = cookie("_ga");
+    var gaMatch = ga && /^GA\d\.\d\.(\d+\.\d+)$/.exec(ga);
+    if (gaMatch) out.ga = gaMatch[1];
     // Shopify's cookie banner: respect a refusal of marketing tracking.
     try {
       var cp = window.Shopify && window.Shopify.customerPrivacy;
@@ -146,30 +210,18 @@
     } catch (e) {}
     return out;
   }
-  function sessionStorageGet(k) {
-    try {
-      return sessionStorage.getItem(k);
-    } catch (e) {
-      return null;
-    }
-  }
-  (function rememberUtm() {
-    try {
-      params.forEach(function (v, k) {
-        if (/^(utm_|fbclid|gclid|ttclid)/.test(k)) sessionStorage.setItem("whopco_" + k, v);
-      });
-    } catch (e) {}
-  })();
 
   // Stable anonymous visitor id (first-party cookie, 1 year): the same shopper keeps
-  // the same A/B variant across checkouts. Random, carries no personal data.
+  // the same A/B variant across checkouts. Issued and signed by the server (returned when a
+  // checkout is created), so a visitor can't choose their arm. Carries no personal data.
   function visitorId() {
     var v = cookie("whopco_vid");
-    if (!v) {
-      v = (window.crypto && crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now()).replace(/-/g, "");
+    return v ? v.slice(0, 100) : undefined;
+  }
+  function keepVisitorId(v) {
+    if (typeof v === "string" && /^[A-Za-z0-9._-]{8,100}$/.test(v) && v !== cookie("whopco_vid")) {
       document.cookie = "whopco_vid=" + v + "; path=/; max-age=31536000; SameSite=Lax";
     }
-    return v.slice(0, 64);
   }
 
   function overlay(show) {
@@ -193,7 +245,17 @@
   function nativeCheckout(items) {
     bypass = true;
     overlay(false);
-    if (items) {
+    if (items && items.some(function (i) { return i.selling_plan; })) {
+      // A subscription bought with "buy now": add it with its plan, then Shopify's checkout.
+      fetch("/cart/add.js", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ items: items.map(function (i) { return { id: Number(i.variant_id), quantity: i.quantity, selling_plan: Number(i.selling_plan) }; }) }),
+      }).finally(function () {
+        location.href = "/checkout";
+      });
+    } else if (items) {
       // Buy-now fallback: Shopify cart permalink for just these items.
       location.href =
         "/cart/" +
@@ -215,6 +277,30 @@
     });
   }
 
+  // Selling plan of a /cart.js line (subscription) or of a product form ("selling_plan" field).
+  function sellingPlan(i) {
+    var alloc = i.selling_plan_allocation;
+    var plan = (alloc && alloc.selling_plan && alloc.selling_plan.id) || i.selling_plan;
+    return plan ? String(plan) : null;
+  }
+
+  function unsupported(cartItems) {
+    return cartItems.some(function (i) {
+      return !!sellingPlan(i) || i.gift_card === true;
+    });
+  }
+
+  function hasAutomaticDiscounts(cart) {
+    var apps = cart.cart_level_discount_applications || [];
+    for (var i = 0; i < apps.length; i++) if (apps[i] && apps[i].type === "automatic") return true;
+    var items = cart.items || [];
+    for (var j = 0; j < items.length; j++) {
+      var allocs = items[j].line_level_discount_allocations || [];
+      for (var k = 0; k < allocs.length; k++) if (allocs[k] && allocs[k].discount_application && allocs[k].discount_application.type === "automatic") return true;
+    }
+    return false;
+  }
+
   function goToCheckout(items) {
     if (busy) return;
     busy = true;
@@ -231,24 +317,35 @@
         });
         if (!cartItems.length) throw new Error("empty cart");
         if (excluded(cartItems)) throw new Error("excluded product");
+        // Subscriptions (selling plans) and gift cards stay on Shopify's checkout, whole cart.
+        if (unsupported(cartItems)) throw new Error("subscription or gift card");
         return fetch(config.sessionEndpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             store: STORE,
             items: cartItems.map(function (i) {
-              return { variant_id: i.variant_id || i.id, quantity: i.quantity };
+              var item = { variant_id: i.variant_id || i.id, quantity: i.quantity };
+              var plan = sellingPlan(i);
+              if (plan) item.selling_plan = plan;
+              if (i.gift_card === true) item.gift_card = true;
+              return item;
             }),
             returnUrl: location.origin + "/",
-            utm: utm(),
+            utm: utm() || undefined,
+            firstUtm: firstUtm() || undefined,
             tracking: tracking(),
             visitorId: visitorId(),
+            // The server re-reads this cart (by its token) to keep the automatic discounts Shopify computed.
+            cartToken: typeof cart.token === "string" ? cart.token : undefined,
+            automaticDiscounts: hasAutomaticDiscounts(cart),
           }),
         });
       })
       .then(function (res) {
         return res.json().then(function (body) {
           if (!res.ok || !body.url) throw new Error(body.error || "session failed");
+          keepVisitorId(body.visitorId);
           log("redirect", body.url);
           try {
             sessionStorage.setItem("whopco_pending", "1");
@@ -274,7 +371,10 @@
     var id = fd.get("id");
     if (!id) return null;
     var qty = parseInt(fd.get("quantity") || "1", 10) || 1;
-    return [{ variant_id: String(id), quantity: qty, handle: location.pathname.split("/products/")[1] || "" }];
+    var item = { variant_id: String(id), quantity: qty, handle: location.pathname.split("/products/")[1] || "" };
+    var plan = fd.get("selling_plan");
+    if (plan) item.selling_plan = String(plan);
+    return [item];
   }
 
   /* ---------------------------------------------------------------- */

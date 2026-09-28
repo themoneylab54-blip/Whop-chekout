@@ -1,3 +1,4 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
@@ -18,114 +19,73 @@ import {
 } from "lucide-react";
 import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { formatMoney } from "@/lib/pricing";
+import { overviewStats } from "@/lib/dashboard-stats";
+import { zoneLabel } from "@/lib/time";
 import { IconTile } from "@/components/icons";
 import { BrandTile, type Brand } from "@/components/brands";
 import { Badge, Flash, SubmitButton } from "@/components/ui";
-import {
-  RevenueChart,
-  type DailyPoint,
-} from "@/components/dashboard/RevenueChart";
+import { RevenueChart, type DailyPoint } from "@/components/dashboard/RevenueChart";
+import { dayFlag, dayFlagKind } from "@/components/dashboard/dayFlags";
 import { HealthGrid } from "@/components/dashboard/HealthGrid";
+import { ConfirmButton } from "@/components/dashboard/ConfirmButton";
+import { Sparkline } from "@/components/dashboard/Trend";
+import { formatCents, formatNumber, formatPercent } from "@/components/dashboard/format";
+import { Delta, EstimatedBadge, InfoTip, type DeltaInput } from "@/components/dashboard/AnalyticsKit";
 import { storeHealth } from "@/lib/health";
 import { setEnabledAction } from "../../../actions";
+import { AnalyticsControls, parseControls, type ControlParams } from "@/components/dashboard/AnalyticsControls";
 
-const RANGES = { today: 1, "7d": 7, "30d": 30, "90d": 90 } as const;
-type Range = keyof typeof RANGES;
-const RANGE_LABEL: Record<Range, string> = {
-  today: "Aujourd'hui",
-  "7d": "7 j",
-  "30d": "30 j",
-  "90d": "90 j",
-};
+/** Same segment as the layout, so its "%s · store" template does not apply: built here. */
+export async function generateMetadata({ params }: { params: Promise<{ storeId: string }> }): Promise<Metadata> {
+  const { storeId } = await params;
+  const store = await db.store.findUnique({ where: { id: storeId }, select: { name: true } });
+  return { title: { absolute: store ? `Vue d'ensemble · ${store.name}` : "Boutique introuvable" } };
+}
+
+const noPrev: DeltaInput = { unavailable: "rien sur la période précédente" };
 
 export default async function OverviewPage({
   params,
   searchParams,
 }: {
   params: Promise<{ storeId: string }>;
-  searchParams: Promise<{ range?: string; ok?: string; error?: string }>;
+  searchParams: Promise<ControlParams & { ok?: string; error?: string }>;
 }) {
   await requireAdmin();
   const { storeId } = await params;
   const sp = await searchParams;
-  const range: Range =
-    sp.range && sp.range in RANGES ? (sp.range as Range) : "30d";
   const store = await db.store.findUnique({
     where: { id: storeId },
     include: { _count: { select: { shippingRates: true } } },
   });
   if (!store) notFound();
 
-  // Days are the merchant's days (Paris), not the server's UTC days.
-  const today = parisDay(new Date());
-  const sinceKey = addDays(today, -(RANGES[range] - 1));
-  const days = Math.max(RANGES[range], 7);
-  const chartStartKey = addDays(today, -(days - 1));
-  // Fetch a little before the earliest day so time-zone edges are included, then bucket precisely.
-  const fetchFrom = new Date(
-    `${chartStartKey < sinceKey ? chartStartKey : sinceKey}T00:00:00Z`,
-  );
-  fetchFrom.setUTCHours(fetchFrom.getUTCHours() - 14);
-  const since = new Date(`${sinceKey}T00:00:00Z`);
-  since.setUTCHours(since.getUTCHours() - 14);
+  // Same period, test filter and metric engine as the Analytics page (days of the store's time zone).
+  const state = parseControls({ range: sp.range, from: sp.from, to: sp.to, test: sp.test }, store);
+  const { range } = state;
+  const { analytics: a, daily } = await overviewStats(storeId, range, state.includeTest);
+  const money = (c: number) => formatCents(c, a.currency);
+  const vsLabel = range.key === "today" ? "vs hier" : range.key === "yesterday" ? "vs avant-hier" : `vs ${range.days} j précédents`;
+  const hasSpend = a.ads.spendCents > 0;
+  const profit = hasSpend ? a.ads.netAfterAdsCents : a.profit.grossProfitCents;
+  const prevProfit = hasSpend ? a.previous.netAfterAdsCents : a.previous.profitCents;
+  // Sparklines follow the chart window (≥ 7 days) so even "today" shows a trend.
+  const spark = {
+    orders: daily.map((d) => d.orders),
+    avg: daily.map((d) => (d.orders ? d.revenueCents / d.orders : 0)),
+    conv: daily.map((d) => (d.started ? d.orders / d.started : 0)),
+    profit: daily.map((d) => d.profitCents),
+  };
 
-  const [paidRows, startedRows, abandonedRows] = await Promise.all([
-    db.checkoutSession.findMany({
-      where: { storeId, status: "PAID", paidAt: { gte: fetchFrom } },
-      select: {
-        paidAt: true,
-        totalCents: true,
-        subtotalCents: true,
-        refundedCents: true,
-      },
-    }),
-    db.checkoutSession.findMany({
-      where: { storeId, createdAt: { gte: since } },
-      select: { createdAt: true },
-    }),
-    db.checkoutSession.findMany({
-      where: {
-        storeId,
-        createdAt: { gte: since },
-        status: { in: ["OPEN", "PAYING", "FAILED"] },
-      },
-      select: { createdAt: true },
-    }),
-  ]);
-  const inRange = (d: Date | null) => !!d && parisDay(d) >= sinceKey;
-  const paid = paidRows.filter((p) => inRange(p.paidAt));
-  const started = startedRows.filter((r) => inRange(r.createdAt)).length;
-  const abandoned = abandonedRows.filter((r) => inRange(r.createdAt)).length;
-  // Same amount as the Orders page (legacy rows may only carry the subtotal).
-  const amount = (p: { totalCents: number; subtotalCents: number }) =>
-    p.totalCents || p.subtotalCents;
-  const gross = paid.reduce((s, p) => s + amount(p), 0);
-  const revenue = gross - paid.reduce((s, p) => s + p.refundedCents, 0);
-  const orders = paid.length;
-  const money = (c: number) => formatMoney(c, store.shopCurrency);
-
-  const points: DailyPoint[] = Array.from({ length: days }, (_, i) => {
-    const key = addDays(chartStartKey, i);
-    return {
-      date: key,
-      label: new Date(`${key}T12:00:00Z`).toLocaleDateString("fr-FR", {
-        day: "numeric",
-        month: "short",
-        timeZone: "UTC",
-      }),
-      cents: 0,
-      orders: 0,
-    };
-  });
-  const byDay = new Map(points.map((p) => [p.date, p]));
-  for (const p of paidRows) {
-    const point = p.paidAt ? byDay.get(parisDay(p.paidAt)) : undefined;
-    if (point) {
-      point.cents += amount(p) - p.refundedCents;
-      point.orders += 1;
-    }
-  }
+  const points: DailyPoint[] = daily.map((d) => ({
+    date: d.date,
+    label: new Date(`${d.date}T12:00:00Z`).toLocaleDateString("fr-FR", { day: "numeric", month: "short", timeZone: "UTC" }),
+    cents: d.revenueHtCents,
+    orders: d.orders,
+    // Same remark and pattern as the Analytics chart (fallback, checkout switched off, or both).
+    flag: dayFlag(d),
+    flagKind: dayFlagKind(d),
+  }));
 
   const base = `/dashboard/stores/${store.id}`;
   const steps: {
@@ -139,7 +99,7 @@ export default async function OverviewPage({
     {
       done: !!store.shopifyConnectedAt,
       title: "Connecter Shopify",
-      text: "Installe le script sur ta boutique",
+      text: "Installez le script sur votre boutique",
       href: `${base}/shopify`,
       icon: ShoppingBag,
       brand: "shopify",
@@ -147,7 +107,7 @@ export default async function OverviewPage({
     {
       done: !!store.whopConnectedAt,
       title: "Connecter Whop",
-      text: "Encaisse les paiements sur ton compte",
+      text: "Encaissez les paiements sur votre compte",
       href: `${base}/whop`,
       icon: CreditCard,
       brand: "whop",
@@ -169,7 +129,7 @@ export default async function OverviewPage({
     {
       done: store.enabled,
       title: "Mettre en ligne",
-      text: "Remplace le checkout Shopify",
+      text: "Remplacez le checkout Shopify",
       href: null,
       icon: Rocket,
     },
@@ -181,50 +141,39 @@ export default async function OverviewPage({
 
   return (
     <>
-      <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
-        <div>
+      <div className="mb-7 flex flex-wrap items-end justify-between gap-4">
+        <div className="min-w-0">
           <p className="text-sm text-zinc-500">Vue d&apos;ensemble</p>
-          <h1 className="text-[26px] leading-tight font-semibold tracking-[-0.02em]">
-            {store.name}
-          </h1>
-        </div>
-        <div className="flex rounded-xl bg-white p-1 text-sm shadow-[var(--shadow-card)]">
-          {(Object.keys(RANGES) as Range[]).map((r) => (
-            <Link
-              key={r}
-              href={`${base}?range=${r}`}
-              className={`rounded-lg px-3 py-1 transition ${r === range ? "bg-zinc-900 font-medium text-white shadow-sm" : "text-zinc-500 hover:text-zinc-900"}`}
-            >
-              {RANGE_LABEL[r]}
-            </Link>
-          ))}
+          <h1 className="truncate text-[26px] leading-tight font-semibold tracking-[-0.02em] text-zinc-900">{store.name}</h1>
         </div>
       </div>
-      <Flash ok={sp.ok} error={sp.error} />
+      {/* In test mode the layout's banner already says test orders are included. */}
+      <AnalyticsControls base={base} state={state} options={{ sources: [], countries: [] }} testMode={store.testMode} showFilters={false} showTest={!store.testMode} zone={zoneLabel(store.timezone)} />
+      <Flash ok={sp.ok} error={sp.error ?? range.error} />
 
       {/* Hero: revenue + chart */}
-      <section className="mb-6 overflow-hidden rounded-2xl bg-white shadow-[var(--shadow-card)]">
-        <div className="grid gap-6 p-6 lg:grid-cols-[280px_1fr]">
-          <div className="flex flex-col justify-between gap-6">
+      <section aria-labelledby="revenue-title" className="mb-6 overflow-hidden rounded-2xl bg-white shadow-[var(--shadow-card)]">
+        <div className="grid grid-cols-[minmax(0,1fr)] gap-6 p-5 sm:p-6 lg:grid-cols-[260px_1fr] [&>*]:min-w-0">
+          <div className="flex flex-col gap-4">
             <div>
-              <p className="flex items-center gap-1.5 text-sm font-medium text-zinc-500">
-                <TrendingUp className="h-4 w-4 text-indigo-500" /> Chiffre
-                d&apos;affaires
-              </p>
-              <p className="mt-2 text-[40px] leading-none font-semibold tracking-[-0.03em] tabular-nums">
-                {money(revenue)}
-              </p>
-              <p className="mt-2 text-xs text-zinc-500">
-                Net des remboursements · {RANGE_LABEL[range].toLowerCase()}
-              </p>
+              <h2 id="revenue-title" className="flex items-center gap-1.5 text-sm font-medium text-zinc-500">
+                <TrendingUp className="h-4 w-4 text-indigo-500" aria-hidden /> Chiffre d&apos;affaires HT
+                <InfoTip label="À propos du chiffre d'affaires">
+                  Net des remboursements et litiges perdus, offres post-achat comprises, {range.label} ({zoneLabel(store.timezone)}). TVA retirée au taux du pays de livraison (taux réduits des variantes classées dans Coûts produits). Période
+                  précédente : {money(a.previous.revenueHtCents)} HT.
+                </InfoTip>
+              </h2>
+              <p className="mt-2 text-[34px] leading-none font-semibold tracking-[-0.03em] text-zinc-900 tabular-nums sm:text-[40px]">{money(a.revenueHtCents)}</p>
+              <p className="mt-1.5 text-sm text-zinc-500 tabular-nums">{money(a.revenueCents)} TTC</p>
+              <div className="mt-3 min-h-5">
+                <Delta d={a.previous.revenueHtCents || a.revenueHtCents ? { now: a.revenueHtCents, before: a.previous.revenueHtCents } : noPrev} label={vsLabel} />
+              </div>
             </div>
-            <div className="grid grid-cols-2 gap-3">
-              <MiniStat label="Commandes" value={String(orders)} />
-              <MiniStat
-                label="Panier moyen"
-                value={orders ? money(Math.round(gross / orders)) : "—"}
-              />
-            </div>
+            <p className="text-xs leading-relaxed text-zinc-500">
+              <Link href={`${base}/analytics${range.key === "30d" ? "" : `?${new URLSearchParams(range.key === "custom" ? { range: "custom", from: range.from, to: range.to } : { range: range.key })}`}`} className="font-medium text-indigo-700 hover:underline">
+                Détail dans Analytics →
+              </Link>
+            </p>
           </div>
           <div className="min-w-0">
             <RevenueChart points={points} currency={store.shopCurrency} />
@@ -232,61 +181,69 @@ export default async function OverviewPage({
         </div>
       </section>
 
-      <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
+      <div className="mb-6 grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4">
         <Kpi
           icon={Receipt}
-          color="#6366f1"
           label="Commandes"
-          value={String(orders)}
+          value={formatNumber(a.orders)}
           hint="payées sur la période"
+          change={<Delta d={a.orders || a.previous.orders ? { now: a.orders, before: a.previous.orders } : noPrev} label={vsLabel} />}
+          spark={spark.orders}
         />
         <Kpi
           icon={Wallet}
-          color="#0ea5e9"
           label="Panier moyen"
-          value={orders ? money(Math.round(gross / orders)) : "—"}
-          hint="par commande"
+          value={a.orders ? money(a.aovCents) : "—"}
+          hint={a.orders ? `TTC net · ${money(a.aovHtCents)} HT` : "aucune commande sur la période"}
+          change={<Delta d={a.orders && a.previous.orders ? { now: a.aovCents, before: a.previous.aovCents } : a.orders ? noPrev : { unavailable: "aucune commande sur la période" }} label={vsLabel} />}
+          spark={spark.avg}
         />
         <Kpi
           icon={Percent}
-          color="#10b981"
           label="Conversion"
-          value={started ? `${((orders / started) * 100).toFixed(1)} %` : "—"}
-          hint="checkouts → payés"
+          value={a.visitors ? formatPercent(a.cvr) : "—"}
+          hint={a.visitors ? `${formatNumber(a.paidVisitors)} acheteurs / ${formatNumber(a.visitors)} visiteurs · ${formatNumber(a.abandoned)} abandons` : "aucun checkout sur la période"}
+          change={<Delta d={a.visitors && a.previous.visitors ? { now: a.cvr, before: a.previous.cvr } : { unavailable: a.visitors ? "pas de visiteur sur la période précédente" : "aucun checkout sur la période" }} label={vsLabel} />}
+          spark={spark.conv}
         />
         <Kpi
           icon={ShoppingCart}
-          color="#f59e0b"
-          label="Abandons"
-          value={String(abandoned)}
-          hint="checkouts non payés"
+          label={hasSpend ? "Bénéfice net après pub" : "Marge nette"}
+          value={a.orders ? money(profit) : "—"}
+          estimated={a.orders > 0 && !a.profit.complete}
+          hint={hasSpend ? `pub : ${money(a.ads.spendCents)}` : a.orders ? `${formatPercent(a.profit.marginRate)} du CA HT` : "aucune commande sur la période"}
+          change={
+            <Delta
+              d={a.orders && prevProfit != null ? { now: profit, before: prevProfit, estimated: !a.profit.complete || a.previous.profitEstimated } : a.orders ? noPrev : { unavailable: "aucune commande sur la période" }}
+              label={vsLabel}
+              hideEstimatedBadge={a.orders > 0 && !a.profit.complete}
+            />
+          }
+          spark={spark.profit}
         />
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-[1.35fr_1fr]">
+      <div className="grid grid-cols-[minmax(0,1fr)] gap-6 lg:grid-cols-[1.35fr_1fr] [&>*]:min-w-0">
         {doneCount === steps.length ? (
-          <section className="rounded-2xl bg-white p-5 shadow-[var(--shadow-card)]">
-            <div className="mb-4 flex items-center justify-between">
+          <section aria-labelledby="health-title" className="rounded-2xl bg-white p-5 shadow-[var(--shadow-card)]">
+            <div className="mb-4 flex items-center justify-between gap-4">
               <div>
-                <h2 className="text-[15px] font-semibold tracking-tight">
+                <h2 id="health-title" className="text-[15px] font-semibold tracking-tight">
                   Santé du checkout
                 </h2>
-                <p className="text-sm text-zinc-500">Vérifiée en continu</p>
+                <p className="text-sm text-zinc-500">Vérifiée à chaque visite</p>
               </div>
-              <Link
-                href={`${base}/journal`}
-                className="text-sm font-medium text-indigo-600 hover:underline"
-              >
-                Journal
+              <Link href={`${base}/journal`} className="inline-flex min-h-9 items-center gap-1 rounded-lg px-2 text-sm font-medium text-indigo-600 hover:bg-indigo-50">
+                Journal <ArrowRight className="h-3.5 w-3.5" aria-hidden />
               </Link>
             </div>
             <HealthGrid items={health} />
           </section>
         ) : (
-          <section className="rounded-2xl bg-white p-5 shadow-[var(--shadow-card)]">
+          <section aria-labelledby="setup-title" className="rounded-2xl bg-white p-5 shadow-[var(--shadow-card)]">
             <div className="mb-4 flex items-center justify-between">
               <div>
-                <h2 className="text-[15px] font-semibold tracking-tight">
+                <h2 id="setup-title" className="text-[15px] font-semibold tracking-tight">
                   Mise en route
                 </h2>
                 <p className="text-sm text-zinc-500">
@@ -298,12 +255,10 @@ export default async function OverviewPage({
             <ol className="space-y-1.5">
               {steps.map((s) => {
                 const Row = (
-                  <div
-                    className={`flex items-center gap-3 rounded-xl p-2.5 transition ${s.done ? "" : "hover:bg-zinc-50"}`}
-                  >
+                  <div className={`flex items-center gap-3 rounded-xl p-2.5 transition ${s.done ? "" : "hover:bg-zinc-50"}`}>
                     {s.done ? (
                       <span className="flex h-9 w-9 items-center justify-center rounded-[28%] bg-emerald-500 text-white shadow-[inset_0_1px_0_rgba(255,255,255,.3),0_4px_10px_-4px_rgba(16,185,129,.8)]">
-                        <Check className="h-4 w-4" strokeWidth={3} />
+                        <Check className="h-4 w-4" strokeWidth={3} aria-hidden />
                       </span>
                     ) : s.brand ? (
                       <BrandTile brand={s.brand} size={36} />
@@ -311,94 +266,80 @@ export default async function OverviewPage({
                       <IconTile icon={s.icon} size={36} color="#6366f1" />
                     )}
                     <span className="min-w-0 flex-1">
-                      <span
-                        className={`block text-sm font-medium ${s.done ? "text-zinc-400 line-through" : ""}`}
-                      >
+                      <span className={`block text-sm font-medium ${s.done ? "text-zinc-500 line-through" : ""}`}>
                         {s.title}
+                        {s.done && <span className="sr-only"> (terminé)</span>}
                       </span>
-                      <span className="block text-xs text-zinc-500">
-                        {s.text}
-                      </span>
+                      <span className="block text-xs text-zinc-500">{s.text}</span>
                     </span>
-                    {!s.done && s.href && (
-                      <ArrowRight className="h-4 w-4 text-zinc-400" />
-                    )}
+                    {!s.done && s.href && <ArrowRight className="h-4 w-4 text-zinc-500" aria-hidden />}
                   </div>
                 );
-                return (
-                  <li key={s.title}>
-                    {s.href && !s.done ? <Link href={s.href}>{Row}</Link> : Row}
-                  </li>
-                );
+                return <li key={s.title}>{s.href && !s.done ? <Link href={s.href} className="block rounded-xl">{Row}</Link> : Row}</li>;
               })}
             </ol>
           </section>
         )}
 
-        <section className="relative overflow-hidden rounded-2xl p-5 text-white shadow-[var(--shadow-float)]">
-          <div
-            className={`absolute inset-0 ${live ? "bg-mesh" : "bg-gradient-to-br from-zinc-800 to-zinc-950"}`}
-          />
+        <section aria-labelledby="status-title" className="relative overflow-hidden rounded-2xl p-5 text-white shadow-[var(--shadow-float)]">
+          <div className={`absolute inset-0 ${live ? "bg-mesh" : "bg-gradient-to-br from-zinc-800 to-zinc-950"}`} />
           <div className="bg-grid absolute inset-0 opacity-40" />
           <div className="relative">
-            <div className="mb-5 flex items-center justify-between">
-              <h2 className="text-[15px] font-semibold">Statut du checkout</h2>
+            <div className="mb-5 flex items-center justify-between gap-3">
+              <h2 id="status-title" className="text-[15px] font-semibold">
+                Statut du checkout
+              </h2>
               <span
-                className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${live ? "bg-emerald-400/20 text-emerald-200" : "bg-white/10 text-zinc-300"}`}
+                className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${live ? "bg-emerald-400/20 text-emerald-100" : "bg-white/10 text-zinc-200"}`}
               >
-                <span
-                  className={`h-1.5 w-1.5 rounded-full ${live ? "animate-pulse bg-emerald-400" : "bg-zinc-400"}`}
-                />
+                <span className={`h-1.5 w-1.5 rounded-full ${live ? "animate-pulse bg-emerald-400" : "bg-zinc-400"}`} aria-hidden />
                 {live ? "En ligne" : "Hors ligne"}
               </span>
             </div>
-            <p className="text-2xl font-semibold tracking-tight">
-              {live ? "Checkout Whop actif" : "Checkout Shopify natif"}
+            <p className="text-2xl font-semibold tracking-tight">{live ? "Checkout Whop actif" : "Checkout Shopify natif"}</p>
+            <p className="mt-1.5 text-sm text-white/75">
+              {live ? "Les clics sur « Paiement » arrivent sur votre checkout Whop." : "Vos clients passent par le checkout Shopify habituel."}
             </p>
-            <p className="mt-1.5 text-sm text-white/70">
-              {live
-                ? "Les clics sur « Paiement » arrivent sur ton checkout Whop."
-                : "Tes clients passent par le checkout Shopify habituel."}
-            </p>
-            <form
-              action={setEnabledAction.bind(null, store.id, !store.enabled)}
-              className="mt-6"
-            >
-              <SubmitButton
-                variant={store.enabled ? "secondary" : "primary"}
-                className={`w-full ${store.enabled ? "" : "!bg-white !text-zinc-900 hover:!bg-zinc-100"}`}
-                disabled={!store.enabled && !ready}
-                confirm={
-                  store.enabled
-                    ? "Désactiver le checkout Whop ? Tes clients repasseront par le checkout Shopify."
-                    : undefined
-                }
-              >
-                <Power className="h-4 w-4" />
-                {store.enabled ? "Désactiver" : "Mettre en ligne"}
-              </SubmitButton>
-            </form>
-            {!ready && (
-              <p className="mt-2 text-xs text-white/60">
-                Connecte Shopify et Whop pour pouvoir mettre en ligne.
-              </p>
+            {store.enabled || ready ? (
+              <form action={setEnabledAction.bind(null, store.id, !store.enabled)} className="mt-6">
+                {store.enabled ? (
+                  <ConfirmButton
+                    variant="danger-dark"
+                    className="w-full"
+                    title="Désactiver le checkout Whop ?"
+                    description="Vos clients repasseront immédiatement par le checkout Shopify. Vous pourrez le remettre en ligne à tout moment."
+                    confirmLabel="Désactiver"
+                  >
+                    <Power className="h-4 w-4" aria-hidden />
+                    Désactiver le checkout
+                  </ConfirmButton>
+                ) : (
+                  <SubmitButton className="w-full !bg-white !text-zinc-900 hover:!bg-zinc-100">
+                    <Power className="h-4 w-4" aria-hidden />
+                    Mettre en ligne
+                  </SubmitButton>
+                )}
+              </form>
+            ) : (
+              <div className="mt-6">
+                {/* Not connectable yet: the next actionable step replaces the unavailable "Mettre en ligne". */}
+                <Link
+                  href={`${base}/${!store.shopifyConnectedAt ? "shopify" : "whop"}`}
+                  className="inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-white px-4 text-sm font-semibold text-zinc-900 transition hover:bg-zinc-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+                >
+                  {!store.shopifyConnectedAt ? "Connecter Shopify" : "Connecter Whop"}
+                  <ArrowRight className="h-4 w-4" aria-hidden />
+                </Link>
+                <p className="mt-2 text-xs text-white/85">
+                  La mise en ligne sera possible une fois {!store.shopifyConnectedAt && !store.whopConnectedAt ? "Shopify et Whop connectés" : !store.shopifyConnectedAt ? "Shopify connecté" : "Whop connecté"}.
+                </p>
+              </div>
             )}
             <div className="mt-6 space-y-2 border-t border-white/10 pt-4">
-              <Connection
-                label="Shopify"
-                detail={store.shopDomain ?? "Non connecté"}
-                ok={!!store.shopifyConnectedAt}
-                href={`${base}/shopify`}
-              />
+              <Connection label="Shopify" detail={store.shopDomain ?? "Non connecté"} ok={!!store.shopifyConnectedAt} href={`${base}/shopify`} />
               <Connection
                 label="Whop"
-                detail={
-                  store.whopConnectedAt
-                    ? store.testMode
-                      ? "Sandbox"
-                      : "Production"
-                    : "Non connecté"
-                }
+                detail={store.whopConnectedAt ? (store.testMode ? "Sandbox" : "Production") : "Non connecté"}
                 ok={!!store.whopConnectedAt}
                 href={`${base}/whop`}
               />
@@ -410,39 +351,40 @@ export default async function OverviewPage({
   );
 }
 
-function MiniStat({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-xl bg-zinc-50 p-3 ring-1 ring-zinc-900/5">
-      <p className="text-[11px] font-medium text-zinc-500">{label}</p>
-      <p className="mt-0.5 text-lg font-semibold tracking-tight tabular-nums">
-        {value}
-      </p>
-    </div>
-  );
-}
+/** One neutral color for every KPI card (icon + sparkline): the numbers carry the meaning. */
+const KPI_COLOR = "#6366f1";
 
 function Kpi({
   icon,
-  color,
   label,
   value,
   hint,
+  change,
+  spark,
+  estimated,
 }: {
   icon: LucideIcon;
-  color: string;
   label: string;
   value: string;
   hint: string;
+  change: React.ReactNode;
+  spark: number[];
+  estimated?: boolean;
 }) {
   return (
-    <div className="group rounded-2xl bg-white p-4 shadow-[var(--shadow-card)] transition hover:-translate-y-0.5 hover:shadow-[var(--shadow-float)]">
-      <IconTile icon={icon} size={34} color={color} />
-      <p className="mt-3 text-xs font-medium text-zinc-500">{label}</p>
-      <p className="mt-0.5 text-xl font-semibold tracking-tight tabular-nums">
+    <section aria-label={label} className="flex min-w-0 flex-col rounded-2xl bg-white p-3.5 shadow-[var(--shadow-card)] sm:p-4">
+      <div className="flex items-start justify-between gap-2">
+        <IconTile icon={icon} size={34} color={KPI_COLOR} />
+        <Sparkline values={spark} color={KPI_COLOR} />
+      </div>
+      <h2 className="mt-3 text-xs font-medium text-zinc-500">{label}</h2>
+      <p className="mt-0.5 text-xl font-semibold tracking-tight text-zinc-900 tabular-nums">
         {value}
+        {estimated && <EstimatedBadge />}
       </p>
-      <p className="mt-0.5 text-[11px] text-zinc-400">{hint}</p>
-    </div>
+      <p className="mt-0.5 text-xs text-zinc-500">{hint}</p>
+      {change && <div className="mt-auto pt-2.5">{change}</div>}
+    </section>
   );
 }
 
@@ -455,7 +397,7 @@ function ProgressRing({ value }: { value: number }) {
       height="48"
       viewBox="0 0 48 48"
       role="img"
-      aria-label={`${Math.round(value * 100)} % terminé`}
+      aria-label={`${formatPercent(value)} terminé`}
     >
       <circle
         cx="24"
@@ -489,7 +431,7 @@ function ProgressRing({ value }: { value: number }) {
         textAnchor="middle"
         className="fill-zinc-900 text-[11px] font-semibold"
       >
-        {Math.round(value * 100)}%
+        {formatPercent(value).replace(/\s/g, "")}
       </text>
     </svg>
   );
@@ -509,11 +451,11 @@ function Connection({
   return (
     <Link
       href={href}
-      className="flex items-center justify-between rounded-lg px-2 py-1.5 transition hover:bg-white/5"
+      className="flex min-h-11 items-center justify-between gap-3 rounded-lg px-2 py-1.5 transition hover:bg-white/5"
     >
       <span>
         <span className="block text-sm font-medium">{label}</span>
-        <span className="block max-w-[200px] truncate text-xs text-white/60">
+        <span className="block max-w-[200px] truncate text-xs text-white/70">
           {detail}
         </span>
       </span>
@@ -522,22 +464,4 @@ function Connection({
       </Badge>
     </Link>
   );
-}
-
-const parisFormat = new Intl.DateTimeFormat("en-CA", {
-  timeZone: "Europe/Paris",
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-});
-
-/** "YYYY-MM-DD" of a moment in Paris. */
-function parisDay(d: Date): string {
-  return parisFormat.format(d);
-}
-
-function addDays(key: string, n: number): string {
-  const d = new Date(`${key}T12:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + n);
-  return d.toISOString().slice(0, 10);
 }

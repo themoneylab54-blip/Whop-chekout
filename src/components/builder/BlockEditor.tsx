@@ -1,29 +1,64 @@
 "use client";
 
-import { useState, type ReactNode } from "react";
-import { ICON_KEYS, type Block, type BlockOf, type BlockStyle, type IconKey } from "@/lib/layout";
-import { X } from "lucide-react";
+import { useId, useRef, useState, type ReactNode } from "react";
+import {
+  ICON_KEYS,
+  MAX_RECOMMENDATIONS,
+  SURVEY_KEYS,
+  offerArmSchema,
+  upsellSellable,
+  variantGidOf,
+  type Block,
+  type BlockOf,
+  type BlockStyle,
+  type IconKey,
+  type OfferArmProps,
+  type SurveyKey,
+} from "@/lib/layout";
+import { AlertTriangle, Check, ImageOff, Images, Star, X } from "lucide-react";
 import { BlockIcon, ICON_LABELS, isIconKey } from "@/components/icons";
+import type { Lang } from "@/components/checkout/i18n";
+import { emptyTextDefault } from "@/components/checkout/localize";
+import { EditorAccordion, UpsellQuantity, UpsellRules } from "./UpsellRules";
+import { ProductPicker, type PickedVariant } from "@/components/dashboard/ProductPicker";
+import { centsToField, currencySymbol, parseMoney } from "@/components/dashboard/money";
+import { decimalRangeLabel, formatCount, formatDecimalField, MAX_REVIEW_COUNT, parseCount, parseDecimal, RATING_MIN_SCORE, ratingScoreWarning } from "./decimal";
 
 /* ------------------------------------------------------------------ */
 /* Small controlled inputs                                             */
 /* ------------------------------------------------------------------ */
 
 const input =
-  "w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm outline-none focus:border-zinc-900 focus:ring-2 focus:ring-zinc-900/10";
+  "w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm outline-none focus:border-zinc-900 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-indigo-500 focus-visible:outline-solid";
+const ring = "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-500 focus-visible:outline-solid";
+
+/** An image the merchant can pick instead of pasting a URL (product photos, logo…). */
+export type ImageSource = { url: string; label: string };
 
 export function F({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
     <label className="block">
       <span className="mb-1 block text-xs font-medium text-zinc-700">{label}</span>
       {children}
-      {hint && <span className="mt-1 block text-[11px] text-zinc-500">{hint}</span>}
+      {hint && <span className="mt-1 block text-[11px] text-zinc-600">{hint}</span>}
     </label>
   );
 }
 
-export function Text({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder?: string }) {
-  return <input className={input} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />;
+/** Like F, for composite controls (a <label> must wrap a single control). */
+export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+  return (
+    <div role="group" aria-label={label}>
+      <span className="mb-1 block text-xs font-medium text-zinc-700">{label}</span>
+      {children}
+      {hint && <span className="mt-1 block text-[11px] text-zinc-600">{hint}</span>}
+    </div>
+  );
+}
+
+/** `label`: accessible name when the field has no visible <label> (list items). */
+export function Text({ value, onChange, placeholder, label }: { value: string; onChange: (v: string) => void; placeholder?: string; label?: string }) {
+  return <input className={input} value={value} placeholder={placeholder} aria-label={label} onChange={(e) => onChange(e.target.value)} />;
 }
 
 const isHttpUrl = (v: string) => /^https?:\/\/[^\s]+\.[^\s]+/i.test(v) && URL.canParse(v);
@@ -82,6 +117,145 @@ export function Num({ value, onChange, min, max, step = 1 }: { value: number; on
   );
 }
 
+/**
+ * Decimal field typed as text ("4,7" or "4.7"): a French comma is never lost to
+ * <input type="number">, valid values reach the preview while typing, and a value outside
+ * [min, max] shows an inline error instead of being silently capped. On blur the field is
+ * normalised to the committed value ("4.70" → "4,7").
+ */
+export function DecimalInput({
+  value,
+  onChange,
+  min,
+  max,
+  placeholder,
+  suffix,
+  optional = false,
+  describedBy,
+}: {
+  value: number | null;
+  onChange: (v: number | null) => void;
+  min?: number;
+  max?: number;
+  placeholder?: string;
+  suffix?: string;
+  /** Empty commits null; otherwise an emptied field falls back to the last value on blur. */
+  optional?: boolean;
+  describedBy?: string;
+}) {
+  const errId = useId();
+  const [draft, setDraft] = useState(() => formatDecimalField(value));
+  const [seen, setSeen] = useState(value);
+  const [touched, setTouched] = useState(false);
+  if (value !== seen) {
+    setSeen(value);
+    setDraft(formatDecimalField(value));
+  }
+  const parsed = parseDecimal(draft, { min, max });
+  const error =
+    parsed.kind === "range"
+      ? `Valeur ${decimalRangeLabel(min, max)} attendue.`
+      : parsed.kind === "invalid" && touched
+        ? "Nombre attendu, par ex. 4,7."
+        : parsed.kind === "empty" && !optional && touched
+          ? "Valeur requise."
+          : null;
+  const commit = (next: number | null) => {
+    setSeen(next);
+    onChange(next);
+  };
+  return (
+    <span className="block">
+      <span className="relative block">
+        <input
+          type="text"
+          inputMode="decimal"
+          autoComplete="off"
+          className={`${input} tabular-nums ${suffix ? "pr-7" : ""} ${error ? "border-amber-400 focus:border-amber-500" : ""}`}
+          value={draft}
+          placeholder={placeholder}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={[error ? errId : null, describedBy].filter(Boolean).join(" ") || undefined}
+          onChange={(e) => {
+            const raw = e.target.value;
+            setDraft(raw);
+            const p = parseDecimal(raw, { min, max });
+            if (p.kind === "ok") commit(p.value);
+            else if (p.kind === "empty" && optional) commit(null);
+          }}
+          onBlur={() => {
+            setTouched(true);
+            const p = parseDecimal(draft, { min, max });
+            if (p.kind === "ok") setDraft(formatDecimalField(p.value));
+            else if (p.kind === "empty" && !optional) setDraft(formatDecimalField(value));
+          }}
+        />
+        {suffix && (
+          <span className="pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 text-sm text-zinc-500" aria-hidden>
+            {suffix}
+          </span>
+        )}
+      </span>
+      {error && (
+        <span id={errId} role="alert" className="mt-1 block text-[11px] text-amber-700">
+          {error}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/**
+ * Whole number typed as text so "1 250" (grouped by spaces, as French merchants write it) is
+ * accepted; letters, decimals and signs show an inline error instead of being dropped.
+ * Normalised on blur ("1250" → "1 250").
+ */
+export function CountInput({ value, onChange, max, placeholder, label }: { value: number; onChange: (v: number) => void; max?: number; placeholder?: string; label?: string }) {
+  const errId = useId();
+  const [draft, setDraft] = useState(() => formatCount(value));
+  const [seen, setSeen] = useState(value);
+  if (value !== seen) {
+    setSeen(value);
+    setDraft(formatCount(value));
+  }
+  const parsed = parseCount(draft, { max });
+  const error = parsed.kind === "invalid" ? "Chiffres uniquement, par ex. 1 250." : parsed.kind === "range" ? `${formatCount(max)} au maximum.` : null;
+  return (
+    <span className="block">
+      <input
+        type="text"
+        inputMode="numeric"
+        autoComplete="off"
+        aria-label={label}
+        className={`${input} tabular-nums ${error ? "border-amber-400 focus:border-amber-500" : ""}`}
+        value={draft}
+        placeholder={placeholder}
+        aria-invalid={error ? true : undefined}
+        aria-describedby={error ? errId : undefined}
+        onChange={(e) => {
+          const raw = e.target.value;
+          setDraft(raw);
+          const p = parseCount(raw, { max });
+          const next = p.kind === "ok" ? p.value : p.kind === "empty" ? 0 : null;
+          if (next != null) {
+            setSeen(next);
+            onChange(next);
+          }
+        }}
+        onBlur={() => {
+          const p = parseCount(draft, { max });
+          if (p.kind === "ok" || p.kind === "empty") setDraft(formatCount(p.kind === "ok" ? p.value : 0));
+        }}
+      />
+      {error && (
+        <span id={errId} role="alert" className="mt-1 block text-[11px] text-amber-700">
+          {error}
+        </span>
+      )}
+    </span>
+  );
+}
+
 export function Pick<T extends string>({ value, options, onChange }: { value: T; options: [T, string][]; onChange: (v: T) => void }) {
   return (
     <select className={input} value={value} onChange={(e) => onChange(e.target.value as T)}>
@@ -96,13 +270,14 @@ export function Pick<T extends string>({ value, options, onChange }: { value: T;
 
 export function Segmented<T extends string>({ value, options, onChange }: { value: T; options: [T, string][]; onChange: (v: T) => void }) {
   return (
-    <div className="flex rounded-md border border-zinc-300 bg-white p-0.5">
+    <div className="flex rounded-md border border-zinc-300 bg-white p-0.5" role="group">
       {options.map(([v, l]) => (
         <button
           key={v}
           type="button"
+          aria-pressed={value === v}
           onClick={() => onChange(v)}
-          className={`flex-1 rounded px-2 py-1 text-xs ${value === v ? "bg-zinc-900 text-white" : "text-zinc-600 hover:bg-zinc-100"}`}
+          className={`flex-1 rounded px-2 py-1 text-xs ${ring} ${value === v ? "bg-zinc-900 font-medium text-white" : "text-zinc-700 hover:bg-zinc-100"}`}
         >
           {l}
         </button>
@@ -155,9 +330,146 @@ export function ColorInput({ value, onChange, allowEmpty = true }: { value: stri
         }}
       />
       {allowEmpty && value && (
-        <button type="button" onClick={() => onChange("")} className="text-xs text-zinc-500 underline">
+        <button type="button" onClick={() => onChange("")} className={`rounded text-xs text-zinc-600 underline ${ring}`}>
           effacer
         </button>
+      )}
+    </div>
+  );
+}
+
+/** 1–5 star picker: a radiogroup (arrow keys move, Home/End jump). */
+export function StarPicker({ value, onChange, label = "Note" }: { value: number; onChange: (v: number) => void; label?: string }) {
+  const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  const [hover, setHover] = useState<number | null>(null);
+  const current = Math.min(5, Math.max(1, Math.round(value) || 5));
+  const shown = hover ?? current;
+  function pick(n: number, focus = false) {
+    const v = Math.min(5, Math.max(1, n));
+    onChange(v);
+    if (focus) refs.current[v - 1]?.focus();
+  }
+  return (
+    <div role="radiogroup" aria-label={label} className="inline-flex items-center gap-0.5" onMouseLeave={() => setHover(null)}>
+      {[1, 2, 3, 4, 5].map((n) => (
+        <button
+          key={n}
+          ref={(el) => {
+            refs.current[n - 1] = el;
+          }}
+          type="button"
+          role="radio"
+          aria-checked={current === n}
+          aria-label={`${n} étoile${n > 1 ? "s" : ""}`}
+          tabIndex={current === n ? 0 : -1}
+          onMouseEnter={() => setHover(n)}
+          onClick={() => pick(n)}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowRight" || e.key === "ArrowUp") {
+              e.preventDefault();
+              pick(current + 1, true);
+            } else if (e.key === "ArrowLeft" || e.key === "ArrowDown") {
+              e.preventDefault();
+              pick(current - 1, true);
+            } else if (e.key === "Home") {
+              e.preventDefault();
+              pick(1, true);
+            } else if (e.key === "End") {
+              e.preventDefault();
+              pick(5, true);
+            }
+          }}
+          className={`rounded p-0.5 transition ${ring}`}
+        >
+          <Star className={`h-5 w-5 ${n <= shown ? "fill-amber-400 text-amber-400" : "fill-transparent text-zinc-300"}`} />
+        </button>
+      ))}
+      <span className="ml-1.5 text-xs text-zinc-600 tabular-nums">{current}/5</span>
+    </div>
+  );
+}
+
+/**
+ * Image URL field with a live thumbnail, a load-error state and, when the store has
+ * images (product photos, logo, options), a one-click picker.
+ */
+export function ImageField({
+  value,
+  onChange,
+  images = [],
+  placeholder,
+  compact = false,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  images?: ImageSource[];
+  placeholder?: string;
+  compact?: boolean;
+}) {
+  const [failed, setFailed] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+  const pickerId = useId();
+  const broken = !!value && failed === value;
+  const size = compact ? "h-9 w-9" : "h-14 w-14";
+  const choices = images.filter((im, i, all) => im.url && all.findIndex((x) => x.url === im.url) === i);
+  return (
+    <div className="space-y-2">
+      <div className="flex items-start gap-2">
+        <span className={`flex ${size} shrink-0 items-center justify-center overflow-hidden rounded-md border border-zinc-200 bg-[repeating-conic-gradient(#f4f4f5_0_25%,#fff_0_50%)] bg-[length:12px_12px]`}>
+          {value && !broken ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={value} alt="" className="h-full w-full object-contain" onError={() => setFailed(value)} onLoad={() => {
+                if (failed === value) setFailed(null);
+              }} />
+          ) : value ? (
+            <ImageOff className="h-4 w-4 text-amber-600" aria-hidden />
+          ) : (
+            <Images className="h-4 w-4 text-zinc-400" aria-hidden />
+          )}
+        </span>
+        <div className="min-w-0 flex-1">
+          <UrlText value={value} placeholder={placeholder ?? "https://…/image.jpg"} onChange={onChange} />
+          {broken && <p className="mt-1 text-[11px] text-amber-700">Image introuvable à cette adresse : vérifiez le lien.</p>}
+        </div>
+      </div>
+      {choices.length > 0 && (
+        <div>
+          <button
+            type="button"
+            aria-expanded={open}
+            aria-controls={pickerId}
+            onClick={() => setOpen((o) => !o)}
+            className={`inline-flex items-center gap-1 rounded text-xs font-medium text-indigo-700 hover:underline ${ring}`}
+          >
+            <Images className="h-3.5 w-3.5" /> Choisir parmi les images de la boutique
+          </button>
+          {open && (
+            <div id={pickerId} className="mt-2 grid grid-cols-5 gap-1.5">
+              {choices.slice(0, 15).map((im) => (
+                <button
+                  key={im.url}
+                  type="button"
+                  title={im.label}
+                  aria-label={im.label}
+                  aria-pressed={value === im.url}
+                  onClick={() => {
+                    onChange(im.url);
+                    setOpen(false);
+                  }}
+                  className={`relative aspect-square overflow-hidden rounded-md border bg-white ${ring} ${value === im.url ? "border-indigo-500 ring-2 ring-indigo-500/30" : "border-zinc-200 hover:border-zinc-400"}`}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={im.url} alt="" className="h-full w-full object-cover" />
+                  {value === im.url && (
+                    <span className="absolute top-0.5 right-0.5 rounded-full bg-indigo-600 p-0.5 text-white">
+                      <Check className="h-2.5 w-2.5" />
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
@@ -175,7 +487,7 @@ export function IconPicker({ value, onChange }: { value: string; onChange: (v: I
           aria-label={ICON_LABELS[k]}
           aria-pressed={value === k}
           onClick={() => onChange(k)}
-          className={`flex aspect-square items-center justify-center rounded-md border transition ${
+          className={`flex aspect-square items-center justify-center rounded-md border transition ${ring} ${
             value === k ? "border-indigo-400 bg-indigo-50 text-indigo-600" : "border-zinc-200 bg-white text-zinc-500 hover:border-zinc-300 hover:text-zinc-800"
           }`}
         >
@@ -219,14 +531,14 @@ function ListEditor<T>({
             type="button"
             aria-label="Retirer"
             onClick={() => onChange(items.filter((_, j) => j !== i))}
-            className="absolute top-2 right-2 text-zinc-400 hover:text-red-600"
+            className={`absolute top-2 right-2 rounded text-zinc-500 hover:text-red-600 ${ring}`}
           >
             <X className="h-3.5 w-3.5" />
           </button>
         </div>
       ))}
       {items.length < max && (
-        <button type="button" onClick={() => onChange([...items, create()])} className="text-xs font-medium text-zinc-900 underline">
+        <button type="button" onClick={() => onChange([...items, create()])} className={`rounded text-xs font-medium text-zinc-900 underline ${ring}`}>
           + {addLabel}
         </button>
       )}
@@ -238,25 +550,137 @@ function ListEditor<T>({
 /* Content fields per block type                                       */
 /* ------------------------------------------------------------------ */
 
-export function BlockContentEditor({ block, onChange }: { block: Block; onChange: (b: Block) => void }) {
+/** Page context some editors need (other blocks, store, known product names). */
+/**
+ * Amount field (same behaviour as the dashboard's MoneyInput, for controlled builder state):
+ * "12,5" or "12.50" accepted, tidied to "12,50" on blur, currency sign inside the field.
+ * The value is in currency units (19.9 = 19,90 €); `optional` allows an empty field.
+ */
+export function PriceInput({
+  value,
+  onChange,
+  optional = false,
+  placeholder,
+  invalid = false,
+  currency = "EUR",
+  max = 1_000_000,
+  id,
+}: {
+  value: number | undefined;
+  onChange: (v: number | undefined) => void;
+  optional?: boolean;
+  placeholder?: string;
+  invalid?: boolean;
+  currency?: string;
+  max?: number;
+  id?: string;
+}) {
+  const show = (v: number | undefined) => (v == null || !Number.isFinite(v) ? "" : centsToField(Math.round(v * 100)));
+  const [draft, setDraft] = useState(() => show(value));
+  // Last value this field sent: its own echo must not reformat what is being typed.
+  const [seen, setSeen] = useState(value);
+  if (value !== seen) {
+    setSeen(value);
+    setDraft(show(value));
+  }
+  const cents = parseMoney(draft);
+  const bad = invalid || (draft.trim() !== "" && (cents == null || cents / 100 > max));
+  return (
+    <div className="relative">
+      <input
+        id={id}
+        type="text"
+        inputMode="decimal"
+        autoComplete="off"
+        className={`${input} pr-8 tabular-nums ${bad ? "border-amber-400 focus:border-amber-500" : ""}`}
+        value={draft}
+        placeholder={placeholder ?? (optional ? "Aucun" : "0,00")}
+        aria-invalid={bad || undefined}
+        onChange={(e) => {
+          const raw = e.target.value;
+          setDraft(raw);
+          const c = parseMoney(raw);
+          const next = raw.trim() === "" ? (optional ? undefined : 0) : c != null && c / 100 <= max ? c / 100 : null;
+          if (next === null) return;
+          setSeen(next);
+          onChange(next);
+        }}
+        onBlur={() => setDraft(show(value))}
+      />
+      <span className="pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 text-sm text-zinc-500" aria-hidden>
+        {currencySymbol(currency)}
+      </span>
+    </div>
+  );
+}
+
+/** A checkout A/B test runs on this element: a price edited now reaches no visitor before it ends. */
+export function RunningTestNotice({ name }: { name: string }) {
+  return (
+    <p role="note" className="rounded-lg bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-900 ring-1 ring-amber-200">
+      Test A/B « {name} » en cours sur ce prix : les visiteurs du test gardent le prix A de son lancement ou le prix B. Une modification ici ne
+      s&apos;applique qu&apos;après la fin du test (Analytics › Tests A/B).
+    </p>
+  );
+}
+
+export type EditorContext = {
+  blocks: Block[];
+  storeId: string | null;
+  productTitles?: Record<string, string>;
+  currency?: string;
+  /** Store language: empty-field placeholders show the built-in wording in it. */
+  lang?: Lang;
+  /** A checkout A/B test runs on the shipping protection price (its name). */
+  protectionTest?: string | null;
+};
+
+export function BlockContentEditor({
+  block,
+  onChange,
+  images = [],
+  context,
+}: {
+  block: Block;
+  onChange: (b: Block) => void;
+  images?: ImageSource[];
+  context?: EditorContext;
+}) {
   function props<T extends Block["type"]>(b: BlockOf<T>, patch: Partial<BlockOf<T>["props"]>) {
     onChange({ ...b, props: { ...b.props, ...patch } } as Block);
   }
 
   switch (block.type) {
+    case "express":
+      // Edited in the builder's block panel (its switch also drives theme.expressCheckout).
+      return null;
     case "contact":
     case "delivery":
     case "shipping_method":
     case "payment":
     case "order_addons":
+    case "ty_confirmation":
+    case "ty_details":
+    case "ty_summary":
       return (
         <div className="space-y-3">
-          <F label="Titre" hint="Vide = titre traduit par défaut">
-            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+          <F
+            label="Titre"
+            hint={
+              block.type === "ty_confirmation"
+                ? "Vide = « Merci, {prénom} ! » traduit. {name} insère le prénom du client."
+                : "Vide = titre traduit par défaut. Astuce : double-cliquez le titre dans l'aperçu."
+            }
+          >
+            <Text
+              value={block.props.title}
+              placeholder={emptyTextDefault(block.type, "title", context?.lang ?? "fr") ?? undefined}
+              onChange={(title) => props(block, { title })}
+            />
           </F>
-          {block.type === "shipping_method" && <p className="text-[11px] text-zinc-500">Les tarifs viennent de la page Livraison.</p>}
-          {block.type === "order_addons" && <p className="text-[11px] text-zinc-500">Les options viennent de la page Promos &amp; options.</p>}
-          {block.type === "payment" && <p className="text-[11px] text-zinc-500">Le formulaire de paiement Whop (carte, Apple Pay, etc.) s&apos;affiche ici.</p>}
+          {block.type === "shipping_method" && <p className="text-[11px] text-zinc-600">Les tarifs viennent de la page Livraison.</p>}
+          {block.type === "payment" && <p className="text-[11px] text-zinc-600">Le formulaire de paiement Whop (carte, PayPal, etc.) s&apos;affiche ici.</p>}
+          {block.type === "ty_details" && <p className="text-[11px] text-zinc-600">Remplace l&apos;intitulé « Livraison à ». La livraison estimée et le moyen de paiement suivent.</p>}
         </div>
       );
     case "text":
@@ -273,9 +697,9 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
     case "image":
       return (
         <div className="space-y-3">
-          <F label="URL de l'image">
-            <UrlText value={block.props.url} placeholder="https://…" onChange={(url) => props(block, { url })} />
-          </F>
+          <Field label="Image">
+            <ImageField value={block.props.url} images={images} onChange={(url) => props(block, { url })} />
+          </Field>
           <F label="Texte alternatif">
             <Text value={block.props.alt} onChange={(alt) => props(block, { alt })} />
           </F>
@@ -302,23 +726,46 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           <F label="Auteur" hint="Utilisez de vrais avis clients : les faux avis sont interdits (directive Omnibus).">
             <Text value={block.props.author} onChange={(author) => props(block, { author })} />
           </F>
-          <F label="Photo (URL, facultatif)">
-            <UrlText value={block.props.photoUrl} onChange={(photoUrl) => props(block, { photoUrl })} />
-          </F>
-          <F label="Étoiles">
-            <Num value={block.props.stars} min={1} max={5} onChange={(stars) => props(block, { stars })} />
-          </F>
+          <Field label="Photo (facultatif)">
+            <ImageField value={block.props.photoUrl} compact onChange={(photoUrl) => props(block, { photoUrl })} />
+          </Field>
+          <Field label="Étoiles">
+            <StarPicker value={block.props.stars} label="Étoiles du témoignage" onChange={(stars) => props(block, { stars })} />
+          </Field>
         </div>
       );
-    case "rating":
+    case "rating": {
+      const hintId = `rating-hint-${block.id}`;
+      const warnId = `rating-warn-${block.id}`;
       return (
         <div className="grid grid-cols-2 gap-3">
           <F label="Note /5">
-            <Num value={block.props.score} min={0} max={5} step={0.1} onChange={(score) => props(block, { score })} />
+            {/* Empty until the merchant types their real score (no invented default). */}
+            <DecimalInput
+              value={block.props.score ?? null}
+              min={RATING_MIN_SCORE}
+              max={5}
+              optional
+              placeholder="ex. 4,7"
+              suffix="/5"
+              describedBy={block.props.score == null ? hintId : ratingScoreWarning(block.props.score) ? warnId : undefined}
+              onChange={(score) => props(block, score == null ? { score: null, scoreSet: false } : { score, scoreSet: true })}
+            />
           </F>
           <F label="Nombre d'avis">
-            <Num value={block.props.count} min={0} onChange={(count) => props(block, { count })} />
+            <CountInput value={block.props.count} max={MAX_REVIEW_COUNT} placeholder="ex. 1 250" onChange={(count) => props(block, { count })} />
           </F>
+          {block.props.score == null && (
+            <p id={hintId} className="col-span-2 -mt-1 text-[11px] text-zinc-600">
+              À compléter : le bloc reste masqué en ligne tant qu&apos;aucune note n&apos;est saisie.
+            </p>
+          )}
+          {ratingScoreWarning(block.props.score) && (
+            <p id={warnId} className="col-span-2 -mt-1 flex items-start gap-1.5 rounded-md bg-amber-50 px-2 py-1.5 text-[11px] leading-snug text-amber-900 ring-1 ring-amber-600/15">
+              <AlertTriangle className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden />
+              {ratingScoreWarning(block.props.score)}
+            </p>
+          )}
           <div className="col-span-2">
             <F label="Libellé" hint="Reprenez la note réelle de votre outil d'avis (Judge.me, Loox, Trustpilot…).">
               <Text value={block.props.label} onChange={(label) => props(block, { label })} />
@@ -326,6 +773,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           </div>
         </div>
       );
+    }
     case "trust_badges":
       return (
         <ListEditor
@@ -336,8 +784,8 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           onChange={(badges) => props(block, { badges })}
           render={(b, set) => (
             <>
-              <Text value={b.label} onChange={(label) => set({ ...b, label })} />
-              <UrlText value={b.iconUrl} placeholder="Icône (URL, facultatif)" onChange={(iconUrl) => set({ ...b, iconUrl })} />
+              <Text value={b.label} label="Libellé du badge" onChange={(label) => set({ ...b, label })} />
+              <ImageField value={b.iconUrl} compact placeholder="Icône (URL, facultatif)" onChange={(iconUrl) => set({ ...b, iconUrl })} />
             </>
           )}
         />
@@ -363,7 +811,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           onChange={(items) => props(block, { items })}
           render={(it, set) => (
             <>
-              <Text value={it.q} onChange={(q) => set({ ...it, q })} />
+              <Text label="Question" value={it.q} onChange={(q) => set({ ...it, q })} />
               <Area value={it.a} rows={2} onChange={(a) => set({ ...it, a })} />
             </>
           )}
@@ -379,7 +827,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           onChange={(items) => props(block, { items })}
           render={(it, set) => (
             <>
-              <Text value={it.label} onChange={(label) => set({ ...it, label })} />
+              <Text label="Libellé" value={it.label} onChange={(label) => set({ ...it, label })} />
               <IconPicker value={isIconKey(it.icon) ? it.icon : ""} onChange={(icon) => set({ ...it, icon })} />
             </>
           )}
@@ -400,7 +848,8 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
                   key={m}
                   type="button"
                   onClick={() => props(block, { methods: on ? block.props.methods.filter((x) => x !== m) : [...block.props.methods, m] })}
-                  className={`rounded-full border px-2.5 py-1 text-xs ${on ? "border-zinc-900 bg-zinc-900 text-white" : "border-zinc-300 text-zinc-600"}`}
+                  aria-pressed={on}
+                  className={`rounded-full border px-2.5 py-1 text-xs ${ring} ${on ? "border-zinc-900 bg-zinc-900 text-white" : "border-zinc-300 text-zinc-600"}`}
                 >
                   {m}
                 </button>
@@ -422,14 +871,9 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           <F label="Libellé">
             <Text value={block.props.label} onChange={(label) => props(block, { label })} />
           </F>
-          <F label="Fin de l'offre" hint="Une vraie date de fin : le minuteur disparaît ensuite (pas de faux compte à rebours qui se relance).">
-            <input
-              type="datetime-local"
-              className={input}
-              value={toLocalInput(block.props.endsAt)}
-              onChange={(e) => props(block, { endsAt: e.target.value ? new Date(e.target.value).toISOString() : "" })}
-            />
-          </F>
+          <Field label="Fin de l'offre" hint="Une vraie date de fin : le minuteur disparaît ensuite (pas de faux compte à rebours qui se relance).">
+            <EndDateInput value={block.props.endsAt} onChange={(endsAt) => props(block, { endsAt })} />
+          </Field>
         </div>
       );
     case "low_stock":
@@ -458,7 +902,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
             render={(r, set) => (
               <>
                 <IconPicker value={r.icon} onChange={(icon) => set({ ...r, icon })} />
-                <Text value={r.title} onChange={(title) => set({ ...r, title })} />
+                <Text label="Titre" value={r.title} onChange={(title) => set({ ...r, title })} />
                 <Text value={r.text} onChange={(text) => set({ ...r, text })} />
               </>
             )}
@@ -474,8 +918,8 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           <F label="Message une fois atteint">
             <Text value={block.props.success} onChange={(success) => props(block, { success })} />
           </F>
-          <F label="Seuil (€)" hint="0 = le seuil « Offert dès » de vos tarifs de livraison">
-            <Num value={block.props.threshold} min={0} max={100000} onChange={(threshold) => props(block, { threshold })} />
+          <F label="Seuil" hint="0 = le seuil « Offert dès » de vos tarifs de livraison">
+            <PriceInput value={block.props.threshold} max={100000} currency={context?.currency} onChange={(threshold) => props(block, { threshold: threshold ?? 0 })} />
           </F>
         </div>
       );
@@ -506,7 +950,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           <F label="Affichage">
             <Segmented value={block.props.layout} options={[["carousel", "Carrousel"], ["stack", "Liste"]]} onChange={(layout) => props(block, { layout })} />
           </F>
-          <p className="text-[11px] text-zinc-500">Utilisez de vrais avis clients : les faux avis sont interdits (directive Omnibus).</p>
+          <p className="text-[11px] text-zinc-600">Utilisez de vrais avis clients : les faux avis sont interdits (directive Omnibus).</p>
           <ListEditor
             items={block.props.items}
             max={20}
@@ -515,12 +959,10 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
             onChange={(items) => props(block, { items })}
             render={(r, set) => (
               <>
-                <Text value={r.name} onChange={(name) => set({ ...r, name })} />
+                <Text label="Nom du client" value={r.name} onChange={(name) => set({ ...r, name })} />
                 <Area value={r.text} rows={2} onChange={(text) => set({ ...r, text })} />
-                <div className="flex items-center gap-3">
-                  <div className="w-20">
-                    <Num value={r.stars} min={1} max={5} onChange={(stars) => set({ ...r, stars })} />
-                  </div>
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                  <StarPicker value={r.stars} label={`Étoiles de l'avis de ${r.name || "ce client"}`} onChange={(stars) => set({ ...r, stars })} />
                   <Toggle label="Achat vérifié" checked={r.verified} onChange={(verified) => set({ ...r, verified })} />
                 </div>
               </>
@@ -550,7 +992,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
             onChange={(rows) => props(block, { rows })}
             render={(r, set) => (
               <>
-                <Text value={r.label} onChange={(label) => set({ ...r, label })} />
+                <Text label="Critère comparé" value={r.label} onChange={(label) => set({ ...r, label })} />
                 <div className="flex gap-4">
                   <Toggle label={block.props.usLabel || "Nous"} checked={r.us} onChange={(us) => set({ ...r, us })} />
                   <Toggle label={block.props.themLabel || "Eux"} checked={r.them} onChange={(them) => set({ ...r, them })} />
@@ -585,7 +1027,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
             onChange={(logos) => props(block, { logos })}
             render={(l, set) => (
               <>
-                <UrlText value={l.imageUrl} placeholder="URL du logo (PNG/SVG)" onChange={(imageUrl) => set({ ...l, imageUrl })} />
+                <ImageField value={l.imageUrl} compact placeholder="URL du logo (PNG/SVG)" onChange={(imageUrl) => set({ ...l, imageUrl })} />
                 <Text value={l.alt} placeholder="Nom du média" onChange={(alt) => set({ ...l, alt })} />
               </>
             )}
@@ -602,8 +1044,8 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           onChange={(items) => props(block, { items })}
           render={(it, set) => (
             <div className="grid grid-cols-[90px_1fr] gap-2">
-              <Text value={it.value} onChange={(value) => set({ ...it, value })} />
-              <Text value={it.label} onChange={(label) => set({ ...it, label })} />
+              <Text label="Valeur" value={it.value} onChange={(value) => set({ ...it, value })} />
+              <Text label="Libellé" value={it.label} onChange={(label) => set({ ...it, label })} />
             </div>
           )}
         />
@@ -625,7 +1067,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
             onChange={(items) => props(block, { items })}
             render={(it, set) => (
               <>
-                <Text value={it.title} onChange={(title) => set({ ...it, title })} />
+                <Text label="Titre" value={it.title} onChange={(title) => set({ ...it, title })} />
                 <Text value={it.text} placeholder="Sous-texte (facultatif)" onChange={(text) => set({ ...it, text })} />
                 <IconPicker value={it.icon} onChange={(icon) => set({ ...it, icon })} />
               </>
@@ -653,7 +1095,7 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
           <F label="Texte d'exemple">
             <Text value={block.props.placeholder} onChange={(placeholder) => props(block, { placeholder })} />
           </F>
-          <p className="text-[11px] text-zinc-500">La note du client est ajoutée à la commande Shopify.</p>
+          <p className="text-[11px] text-zinc-600">La note du client est ajoutée à la commande Shopify.</p>
         </div>
       );
     case "support":
@@ -703,47 +1145,153 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
       );
     case "upsell":
       return (
-        <div className="space-y-3">
+        <div className="space-y-4">
+          {/* What the merchant must set first: the product and its price. */}
+          <section aria-labelledby={`upsell-product-${block.id}`} className="space-y-3">
+            <h3 id={`upsell-product-${block.id}`} className="text-xs font-semibold text-zinc-900">
+              Produit &amp; prix
+            </h3>
+            <F label="Produit proposé">
+              <Segmented
+                value={block.props.productSource ?? "manual"}
+                options={[
+                  ["manual", "Choisi"],
+                  ["auto", "Automatique"],
+                ]}
+                onChange={(productSource) =>
+                  // An automatic product has no fixed price: a percent off its live Shopify price.
+                  props(block, productSource === "auto" ? { productSource, priceMode: "percent" } : { productSource })
+                }
+              />
+            </F>
+            {block.props.productSource === "auto" ? (
+              <p className="rounded-lg bg-zinc-50 px-3 py-2 text-[11px] leading-relaxed text-zinc-700 ring-1 ring-zinc-900/5">
+                Pour chaque commande, le produit le plus souvent acheté avec ceux du panier (vos commandes payées des 180 derniers jours, au moins 2 commandes en commun),
+                hors produits déjà dans la commande et seulement s&apos;il est en stock. Sans produit trouvé, l&apos;offre n&apos;est pas affichée. Prix : le % de remise
+                ci-dessous sur son prix Shopify.
+              </p>
+            ) : (
+              <OfferProduct block={block} context={context} onChange={onChange} />
+            )}
+            <OfferPriceFields value={block.props} currency={context?.currency} onChange={(patch) => props(block, block.props.productSource === "auto" ? { ...patch, priceMode: "percent" } : patch)} />
+            <UpsellQuantity block={block} onChange={onChange} />
+          </section>
+          <EditorAccordion title="Textes" summary={block.props.title || "Titre, texte, image, boutons"}>
+            <F label="Bandeau">
+              <Text value={block.props.badge} onChange={(badge) => props(block, { badge })} />
+            </F>
+            <F label="Titre">
+              <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+            </F>
+            <F label="Texte">
+              <Area value={block.props.text} rows={3} onChange={(text) => props(block, { text })} />
+            </F>
+            <Field label="Image" hint="Vide = la photo du produit dans la commande, sinon une vignette neutre.">
+              <ImageField value={block.props.imageUrl} images={images} onChange={(imageUrl) => props(block, { imageUrl })} />
+            </Field>
+            <div className="grid grid-cols-2 gap-2">
+              <F label="Bouton">
+                <Text value={block.props.buttonText} onChange={(buttonText) => props(block, { buttonText })} />
+              </F>
+              <F label="Refus">
+                <Text value={block.props.declineText} onChange={(declineText) => props(block, { declineText })} />
+              </F>
+            </div>
+          </EditorAccordion>
+          {context && (
+            <UpsellRules block={block} blocks={context.blocks} storeId={context.storeId} productTitles={context.productTitles} onChange={onChange} />
+          )}
+          <OfferVariantB block={block} context={context} images={images} onChange={onChange} />
           <p className="rounded-lg bg-indigo-50 px-3 py-2 text-[11px] leading-relaxed text-indigo-900">
             Affichée juste après l&apos;achat. Le client accepte en un clic : Whop débite la carte enregistrée pendant le checkout et une commande Shopify
             liée est créée. Valable 1 h après le paiement. Quand une offre est active, le checkout enregistre la carte (certains moyens comme PayPal peuvent
             alors être masqués).
           </p>
-          <F label="ID de variante Shopify" hint="Le numéro de la variante (ou l'URL admin …/variants/123).">
-            <Text
-              value={block.props.variantId}
-              placeholder="44871234567890"
-              onChange={(v) => props(block, { variantId: v.startsWith("gid://") ? v : (v.match(/(\d+)\D*$/)?.[1] ?? v.trim()) })}
-            />
+        </div>
+      );
+    case "shipping_protection": {
+      const p = block.props;
+      return (
+        <div className="space-y-3">
+          <p className="rounded-lg bg-indigo-50 px-3 py-2 text-[11px] leading-relaxed text-indigo-900">
+            Case à cocher au checkout. Le prix est calculé par le serveur et ajouté au total ; la commande Shopify reçoit une ligne « Protection colis ». La page
+            de remerciement affiche « Colis protégé » et vos instructions de réclamation.
+          </p>
+          {context?.protectionTest && <RunningTestNotice name={context.protectionTest} />}
+          <F label="Titre" hint="Vide = « Protection colis (perte, vol, casse) », traduit.">
+            <Text value={p.title} placeholder={emptyTextDefault("shipping_protection", "title", context?.lang ?? "fr") ?? undefined} onChange={(title) => props(block, { title })} />
           </F>
-          <div className="grid grid-cols-2 gap-2">
-            <F label="Prix de l'offre">
-              <Num value={block.props.price} min={0} step={0.1} onChange={(price) => props(block, { price })} />
+          <F label="Description" hint="Vide = texte traduit par défaut.">
+            <Text value={p.text} placeholder={emptyTextDefault("shipping_protection", "text", context?.lang ?? "fr") ?? undefined} onChange={(text) => props(block, { text })} />
+          </F>
+          <F label="Prix">
+            <Segmented value={p.priceMode} options={[["fixed", "Montant fixe"], ["percent", "% du panier"]]} onChange={(priceMode) => props(block, { priceMode })} />
+          </F>
+          {p.priceMode === "fixed" ? (
+            <F label="Montant">
+              <PriceInput value={p.price} currency={context?.currency} max={1000} onChange={(price) => props(block, { price: price ?? 0 })} />
             </F>
-            <F label="Prix barré">
-              <Num value={block.props.compareAt} min={0} step={0.1} onChange={(compareAt) => props(block, { compareAt })} />
-            </F>
-          </div>
-          <F label="Bandeau">
-            <Text value={block.props.badge} onChange={(badge) => props(block, { badge })} />
+          ) : (
+            <div className="grid grid-cols-3 gap-2">
+              <F label="% du panier">
+                <DecimalInput value={p.percent} min={0} max={50} suffix="%" placeholder="ex. 2,5" onChange={(percent) => props(block, { percent: percent ?? 0 })} />
+              </F>
+              <F label="Minimum">
+                <PriceInput value={p.minPrice} currency={context?.currency} max={1000} onChange={(minPrice) => props(block, { minPrice: minPrice ?? 0 })} />
+              </F>
+              <F label="Maximum" hint="0 = aucun">
+                <PriceInput value={p.maxPrice} currency={context?.currency} max={1000} onChange={(maxPrice) => props(block, { maxPrice: maxPrice ?? 0 })} />
+              </F>
+            </div>
+          )}
+          <Toggle label="Cochée par défaut" checked={p.defaultOn} onChange={(defaultOn) => props(block, { defaultOn })} />
+          {p.defaultOn && (
+            <p role="alert" className="rounded-lg bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-900 ring-1 ring-amber-200">
+              Déconseillé en Europe : le droit de la consommation (directive 2011/83/UE, art. 22) interdit de faire payer une option cochée d&apos;avance.
+              Le client doit la cocher lui-même, sinon il peut en demander le remboursement.
+            </p>
+          )}
+          <F label="Instructions de réclamation" hint="Affichées sur la page de remerciement quand le colis est protégé.">
+            <Area value={p.claimText} rows={4} onChange={(claimText) => props(block, { claimText })} />
           </F>
-          <F label="Titre">
-            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+        </div>
+      );
+    }
+    case "survey": {
+      const p = block.props;
+      const toggle = (key: SurveyKey, on: boolean) =>
+        props(block, { options: SURVEY_KEYS.filter((k) => (k === key ? on : p.options.includes(k))) });
+      return (
+        <div className="space-y-3">
+          <p className="rounded-lg bg-indigo-50 px-3 py-2 text-[11px] leading-relaxed text-indigo-900">
+            Une question en un clic après l&apos;achat. La réponse est enregistrée sur la commande (une seule fois) : utile pour attribuer vos ventes au bon canal.
+          </p>
+          <F label="Question" hint="Vide = « Comment nous avez-vous connu ? », traduit dans la langue du client.">
+            <Text value={p.question} placeholder={emptyTextDefault("survey", "question", context?.lang ?? "fr") ?? undefined} onChange={(question) => props(block, { question })} />
           </F>
-          <F label="Texte">
-            <Area value={block.props.text} rows={3} onChange={(text) => props(block, { text })} />
+          <fieldset className="space-y-1.5">
+            <legend className="mb-1 text-xs font-medium text-zinc-700">Réponses proposées</legend>
+            {SURVEY_KEYS.map((k) => (
+              <Toggle key={k} label={SURVEY_LABELS[k]} checked={p.options.includes(k)} onChange={(on) => toggle(k, on)} />
+            ))}
+          </fieldset>
+          {p.options.length === 0 && <p className="text-[11px] text-amber-700">Cochez au moins une réponse : sans réponse, le bloc ne s&apos;affiche pas.</p>}
+          <p className="text-[11px] text-zinc-600">Les libellés sont traduits automatiquement. « Autre » permet au client de préciser (80 caractères).</p>
+        </div>
+      );
+    }
+    case "recommendations":
+      return (
+        <div className="space-y-3">
+          <p className="rounded-lg bg-indigo-50 px-3 py-2 text-[11px] leading-relaxed text-indigo-900">
+            Le client ajoute le produit au panier en un clic, sans quitter le checkout. Prix, photo et disponibilité viennent de Shopify au moment de
+            l&apos;affichage ; un produit épuisé ou brouillon n&apos;est pas proposé.
+          </p>
+          <F label="Titre" hint="Vide = « Complétez votre commande », traduit dans la langue du checkout.">
+            <Text value={block.props.title} placeholder={emptyTextDefault("recommendations", "title", context?.lang ?? "fr") ?? undefined} onChange={(title) => props(block, { title })} />
           </F>
-          <F label="Image">
-            <UrlText value={block.props.imageUrl} onChange={(imageUrl) => props(block, { imageUrl })} />
-          </F>
-          <div className="grid grid-cols-2 gap-2">
-            <F label="Bouton">
-              <Text value={block.props.buttonText} onChange={(buttonText) => props(block, { buttonText })} />
-            </F>
-            <F label="Refus">
-              <Text value={block.props.declineText} onChange={(declineText) => props(block, { declineText })} />
-            </F>
-          </div>
+          <RecommendationItems block={block} context={context} onChange={onChange} />
+          <Toggle label="Masquer les produits déjà dans le panier" checked={block.props.hideIfInCart} onChange={(hideIfInCart) => props(block, { hideIfInCart })} />
         </div>
       );
     case "coupon":
@@ -776,6 +1324,63 @@ export function BlockContentEditor({ block, onChange }: { block: Block; onChange
   }
 }
 
+/**
+ * Offer end: separate date + time fields (the browser's native pickers), with the result
+ * spelled out in French ("mardi 14 octobre 2026 à 23:59") so the day/month order is never
+ * ambiguous, whatever the browser's locale displays.
+ */
+function EndDateInput({ value, onChange }: { value: string; onChange: (iso: string) => void }) {
+  const local = toLocalInput(value);
+  const [date, time] = local ? local.split("T") : ["", ""];
+  const commit = (d: string, t: string) => {
+    if (!d) return onChange("");
+    const at = new Date(`${d}T${t || "23:59"}`);
+    onChange(Number.isNaN(at.getTime()) ? "" : at.toISOString());
+  };
+  const at = value ? new Date(value) : null;
+  const valid = at && !Number.isNaN(at.getTime());
+  // Checked against the time the panel opened (render stays pure).
+  const [openedAt] = useState(() => Date.now());
+  const past = valid && at.getTime() <= openedAt;
+  const preset = (days: number) => {
+    const d = new Date();
+    d.setDate(d.getDate() + days);
+    d.setHours(23, 59, 0, 0);
+    onChange(d.toISOString());
+  };
+  const chip = `rounded-md bg-zinc-100 px-2 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-200 ${ring}`;
+  return (
+    <div className="space-y-1.5">
+      <div className="grid grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)] gap-2">
+        <label className="block">
+          <span className="mb-0.5 block text-[11px] text-zinc-600">Date</span>
+          <input type="date" lang="fr" className={input} value={date} onChange={(e) => commit(e.target.value, time)} />
+        </label>
+        <label className="block">
+          <span className="mb-0.5 block text-[11px] text-zinc-600">Heure</span>
+          <input type="time" lang="fr" step={60} className={input} value={time} disabled={!date} onChange={(e) => commit(date, e.target.value)} />
+        </label>
+      </div>
+      <p aria-live="polite" className={`text-[11px] ${past ? "font-medium text-amber-800" : "text-zinc-700"}`}>
+        {valid
+          ? `${past ? "Terminée depuis le" : "Se termine le"} ${at.toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long", year: "numeric" })} à ${at.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}${past ? " : le minuteur est masqué" : ""}`
+          : "Aucune date de fin : le minuteur n'est pas affiché."}
+      </p>
+      <div className="flex flex-wrap gap-1.5">
+        <button type="button" className={chip} onClick={() => preset(0)}>
+          Ce soir 23:59
+        </button>
+        <button type="button" className={chip} onClick={() => preset(3)}>
+          Dans 3 jours
+        </button>
+        <button type="button" className={chip} onClick={() => preset(7)}>
+          Dans 7 jours
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function toLocalInput(iso: string) {
   if (!iso) return "";
   const d = new Date(iso);
@@ -787,6 +1392,321 @@ function toLocalInput(iso: string) {
 /* ------------------------------------------------------------------ */
 /* Style panel                                                         */
 /* ------------------------------------------------------------------ */
+
+/** Suggested one-click price: 20 % off the product's price, ending in ,90 when it can. */
+function suggestedPrice(regular: number) {
+  const p = regular * 0.8;
+  const nice = Math.floor(p) + 0.9;
+  return Math.round((nice <= p + 0.001 && nice < regular ? nice : Math.round(p * 100) / 100) * 100) / 100;
+}
+
+/** Survey options as the merchant reads them (buyers see them translated). */
+const SURVEY_LABELS: Record<SurveyKey, string> = {
+  facebook: "Facebook",
+  instagram: "Instagram",
+  tiktok: "TikTok",
+  google: "Google",
+  youtube: "YouTube",
+  friend: "Un proche",
+  other: "Autre (+ précision libre)",
+};
+
+type OfferProductFields = { variantId: string; productId?: string; imageUrl: string; title: string; price: number; compareAt: number };
+
+/**
+ * Product of a one-click offer: catalog search (the dashboard's product picker), which fills
+ * the variant, product, photo, title and prices; pasting a variant id stays possible.
+ */
+function OfferProductPicker({
+  pickerId,
+  value,
+  context,
+  label = "Produit offert",
+  onChange,
+}: {
+  pickerId: string;
+  value: OfferProductFields;
+  context?: EditorContext;
+  label?: string;
+  onChange: (patch: Partial<OfferProductFields>) => void;
+}) {
+  const uid = useId();
+  const [manual, setManual] = useState(false);
+  // Remounts the picker when the id is typed by hand (it reads its value once).
+  const [pickerKey, setPickerKey] = useState(0);
+  const variantId = value.variantId;
+  const numeric = (v: string) => (v.startsWith("gid://") ? (v.match(/(\d+)\D*$/)?.[1] ?? v) : v);
+  const typed = (v: string) => (v.startsWith("gid://") ? v : (v.match(/(\d+)\D*$/)?.[1] ?? v.trim()));
+  function onPick(picked: PickedVariant | null) {
+    if (!picked) {
+      onChange({ variantId: "", productId: undefined });
+      return;
+    }
+    // The picker also reports the saved variant when it loads: only the product id may be missing then.
+    if (picked.id === numeric(variantId)) {
+      if (picked.product && !value.productId) onChange({ productId: picked.product.id });
+      return;
+    }
+    const regular = picked.variant ? Number(picked.variant.price) : NaN;
+    const next: Partial<OfferProductFields> = { variantId: picked.id, productId: picked.product?.id };
+    if (picked.product && picked.variant) {
+      next.imageUrl = picked.variant.imageUrl ?? picked.product.imageUrl ?? value.imageUrl;
+      next.title = pickedTitle(picked);
+      if (Number.isFinite(regular) && regular > 0) {
+        next.compareAt = regular;
+        next.price = suggestedPrice(regular);
+      }
+    }
+    onChange(next);
+  }
+  if (!context?.storeId) {
+    return (
+      <F label="ID de variante Shopify" hint="Le numéro de la variante (ou l'URL admin …/variants/123).">
+        <Text value={variantId} placeholder="44871234567890" onChange={(v) => onChange({ variantId: typed(v), productId: undefined })} />
+      </F>
+    );
+  }
+  return (
+    <div>
+      <label htmlFor={`${uid}-product`} className="mb-1 block text-xs font-medium text-zinc-700">
+        {label}
+      </label>
+      <ProductPicker
+        key={`${pickerId}:${pickerKey}`}
+        storeId={context.storeId}
+        name={`upsell-${pickerId}`}
+        defaultValue={variantId || null}
+        currency={context.currency ?? "EUR"}
+        inputId={`${uid}-product`}
+        describedBy={`${uid}-product-hint`}
+        onPick={onPick}
+      />
+      <p id={`${uid}-product-hint`} className="mt-1 text-[11px] text-zinc-600">
+        Remplit la photo, le titre et les prix (−20 % suggéré, modifiable ci-dessous).{" "}
+        <button type="button" onClick={() => setManual((v) => !v)} aria-expanded={manual} className={`rounded font-medium text-indigo-700 hover:underline ${ring}`}>
+          {manual ? "Masquer" : "Coller un ID"}
+        </button>
+      </p>
+      {manual && (
+        <div className="mt-2">
+          <F label="ID de variante Shopify" hint="Le numéro de la variante (ou l'URL admin …/variants/123).">
+            <Text
+              value={variantId}
+              placeholder="44871234567890"
+              onChange={(v) => {
+                onChange({ variantId: typed(v), productId: undefined });
+                setPickerKey((k) => k + 1);
+              }}
+            />
+          </F>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OfferProduct({ block, context, onChange }: { block: BlockOf<"upsell">; context?: EditorContext; onChange: (b: Block) => void }) {
+  return <OfferProductPicker pickerId={block.id} value={block.props} context={context} onChange={(patch) => onChange({ ...block, props: { ...block.props, ...patch } })} />;
+}
+
+type OfferPriceValue = { priceMode: "fixed" | "percent"; price: number; discountPercent: number; compareAt: number };
+
+/** Fixed price, or "% off the Shopify price" (charged on Shopify's price at the time of the "Yes"). */
+function OfferPriceFields({ value, currency, onChange }: { value: OfferPriceValue; currency?: string; onChange: (patch: Partial<OfferPriceValue>) => void }) {
+  return (
+    <div className="space-y-2">
+      <F label="Prix de l'offre">
+        <Segmented
+          value={value.priceMode}
+          options={[
+            ["fixed", "Prix fixe"],
+            ["percent", "% de remise sur le prix Shopify"],
+          ]}
+          onChange={(priceMode) => onChange({ priceMode })}
+        />
+      </F>
+      {value.priceMode === "fixed" ? (
+        <div className="grid grid-cols-2 gap-2">
+          <F label="Prix">
+            <PriceInput value={value.price} currency={currency} onChange={(price) => onChange({ price: price ?? 0 })} />
+          </F>
+          <F label="Prix barré" hint="Prix habituel du produit">
+            <PriceInput value={value.compareAt} currency={currency} onChange={(compareAt) => onChange({ compareAt: compareAt ?? 0 })} />
+          </F>
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 gap-2">
+          <F label="Remise (%)" hint="1 à 90 %">
+            <Num value={value.discountPercent} min={1} max={90} onChange={(discountPercent) => onChange({ discountPercent: Math.min(90, Math.max(1, Math.round(discountPercent || 1))) })} />
+          </F>
+          <F label="Prix habituel (aperçu)" hint="Sert seulement à l'aperçu">
+            <PriceInput value={value.compareAt} currency={currency} onChange={(compareAt) => onChange({ compareAt: compareAt ?? 0 })} />
+          </F>
+          <p className="col-span-2 text-[11px] leading-relaxed text-zinc-600">
+            Le prix affiché et débité est calculé sur le prix Shopify au moment de l&apos;achat (le prix barré est ce prix Shopify). Si Shopify ne répond pas,
+            l&apos;offre n&apos;est pas affichée.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Offer-level A/B test: arm B (product, price, texts) seen by `split` % of visitors. */
+function OfferVariantB({ block, context, images, onChange }: { block: BlockOf<"upsell">; context?: EditorContext; images: ImageSource[]; onChange: (b: Block) => void }) {
+  const b = offerArmSchema.parse(block.props.variantB ?? {});
+  const set = (patch: Partial<OfferArmProps>) => onChange({ ...block, props: { ...block.props, variantB: { ...b, ...patch } } });
+  const incomplete = b.enabled && !upsellSellable(b);
+  return (
+    <EditorAccordion
+      title="Tester une variante B"
+      summary={b.enabled ? (incomplete ? "Incomplète" : `A ${100 - b.split} % · B ${b.split} %`) : "Désactivé"}
+      defaultOpen={incomplete}
+    >
+      <p className="text-[11px] leading-relaxed text-zinc-600">
+        Chaque client voit toujours la même version (tirage par visiteur). Les affichages et les achats sont comptés par version : comparez le taux
+        d&apos;acceptation dans Analyses.
+      </p>
+      <Toggle label="Activer la variante B" checked={b.enabled} onChange={(enabled) => set({ enabled })} />
+      {b.enabled && (
+        <>
+          <F label={`Part des clients qui voient B : ${b.split} %`}>
+            <input
+              type="range"
+              min={1}
+              max={99}
+              value={b.split}
+              aria-valuetext={`${b.split} %`}
+              onChange={(e) => set({ split: Number(e.target.value) })}
+              className="w-full accent-zinc-900"
+            />
+          </F>
+          <Toggle label="Garder automatiquement la gagnante" checked={!!b.autoPromote} onChange={(autoPromote) => set({ autoPromote })} />
+          <p className="-mt-1 text-[11px] leading-relaxed text-zinc-600">
+            Dès que l&apos;écart de CA HT par affichage est significatif (7 jours et 200 affichages par version au moins, même règle que les tests de design), la
+            version gagnante devient l&apos;offre et le test s&apos;arrête. Sinon, décidez depuis Analyses › Offres (« Promouvoir B »).
+          </p>
+          <OfferProductPicker pickerId={`${block.id}-b`} label="Produit de la variante B" value={b} context={context} onChange={(patch) => set(patch)} />
+          <OfferPriceFields value={b} currency={context?.currency} onChange={(patch) => set(patch)} />
+          <F label="Bandeau" hint="Vide = celui de la version A">
+            <Text value={b.badge} placeholder={block.props.badge} onChange={(badge) => set({ badge })} />
+          </F>
+          <F label="Titre" hint="Vide = celui de la version A">
+            <Text value={b.title} placeholder={block.props.title} onChange={(title) => set({ title })} />
+          </F>
+          <F label="Texte" hint="Vide = celui de la version A">
+            <Area value={b.text} rows={2} onChange={(text) => set({ text })} />
+          </F>
+          <F label="Bouton" hint="Vide = celui de la version A">
+            <Text value={b.buttonText} placeholder={block.props.buttonText} onChange={(buttonText) => set({ buttonText })} />
+          </F>
+          <Field label="Image" hint="Vide = la photo du produit dans la commande, sinon une vignette neutre.">
+            <ImageField value={b.imageUrl} images={images} onChange={(imageUrl) => set({ imageUrl })} />
+          </Field>
+          {incomplete && <p className="text-[11px] text-amber-700">Choisissez un produit et un prix : sans eux, tous les clients voient la version A.</p>}
+        </>
+      )}
+    </EditorAccordion>
+  );
+}
+
+/** Title shown for a picked variant ("Produit — Variante"). */
+function pickedTitle(picked: PickedVariant) {
+  if (!picked.product) return "";
+  const variant = picked.variant?.title && picked.variant.title !== "Default Title" ? ` — ${picked.variant.title}` : "";
+  return `${picked.product.title}${variant}`.slice(0, 120);
+}
+
+/**
+ * Products of "Complétez votre commande" (1 to 4): the dashboard's catalog search, as for the
+ * one-click offer, with pasting a variant id as a fallback. Stored as variant GIDs.
+ */
+function RecommendationItems({ block, context, onChange }: { block: BlockOf<"recommendations">; context?: EditorContext; onChange: (b: Block) => void }) {
+  const uid = useId();
+  const [manual, setManual] = useState(false);
+  // Remounts the pickers when the list shifts or an id is typed (a picker reads its value once).
+  const [nonce, setNonce] = useState(0);
+  const items = block.props.items;
+  const setItems = (next: typeof items) => onChange({ ...block, props: { ...block.props, items: next } });
+  const setItem = (i: number, patch: Partial<(typeof items)[number]>) => setItems(items.map((it, j) => (j === i ? { ...it, ...patch } : it)));
+  const numeric = (v: string) => v.match(/(\d+)\D*$/)?.[1] ?? v;
+  const toGid = (v: string) => variantGidOf(v) ?? v.trim();
+  return (
+    <div className="space-y-2">
+      <p className="text-xs font-medium text-zinc-700">
+        Produits proposés <span className="font-normal text-zinc-600">({items.length}/{MAX_RECOMMENDATIONS})</span>
+      </p>
+      {items.length === 0 && <p className="text-[11px] text-amber-700">Ajoutez au moins un produit : sans produit, le bloc ne s&apos;affiche pas.</p>}
+      {items.map((it, i) => (
+        <div key={i} className="relative space-y-2 rounded-md border border-zinc-200 bg-zinc-50 p-2.5 pr-8">
+          {context?.storeId ? (
+            <div>
+              <label htmlFor={`${uid}-${i}`} className="mb-1 block text-xs font-medium text-zinc-700">
+                Produit {i + 1}
+              </label>
+              <ProductPicker
+                key={nonce}
+                storeId={context.storeId}
+                name={`reco-${block.id}-${i}`}
+                defaultValue={it.variantId || null}
+                currency={context.currency ?? "EUR"}
+                inputId={`${uid}-${i}`}
+                onPick={(picked) => {
+                  if (!picked) return setItem(i, { variantId: "", title: "", imageUrl: "" });
+                  // The picker also reports the saved variant when it loads: nothing to fill then.
+                  if (picked.id === numeric(it.variantId)) return;
+                  setItem(i, {
+                    variantId: toGid(picked.id),
+                    title: pickedTitle(picked),
+                    imageUrl: picked.variant?.imageUrl ?? picked.product?.imageUrl ?? "",
+                  });
+                }}
+              />
+            </div>
+          ) : null}
+          {(manual || !context?.storeId) && (
+            <F label="ID de variante Shopify" hint="Le numéro de la variante (ou l'URL admin …/variants/123).">
+              <Text
+                value={it.variantId}
+                placeholder="44871234567890"
+                onChange={(v) => {
+                  setItem(i, { variantId: toGid(v) });
+                  setNonce((n) => n + 1);
+                }}
+              />
+            </F>
+          )}
+          <F label="Titre affiché" hint="Vide = titre Shopify.">
+            <Text value={it.title} onChange={(title) => setItem(i, { title })} />
+          </F>
+          <button
+            type="button"
+            aria-label={`Retirer le produit ${i + 1}`}
+            onClick={() => {
+              setItems(items.filter((_, j) => j !== i));
+              setNonce((n) => n + 1);
+            }}
+            className={`absolute top-2 right-2 rounded text-zinc-500 hover:text-red-600 ${ring}`}
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      ))}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        {items.length < MAX_RECOMMENDATIONS && (
+          <button type="button" onClick={() => setItems([...items, { variantId: "", title: "", imageUrl: "" }])} className={`rounded text-xs font-medium text-zinc-900 underline ${ring}`}>
+            + Ajouter un produit
+          </button>
+        )}
+        {context?.storeId && items.length > 0 && (
+          <button type="button" onClick={() => setManual((v) => !v)} aria-expanded={manual} className={`rounded text-xs font-medium text-indigo-700 hover:underline ${ring}`}>
+            {manual ? "Masquer les ID" : "Coller un ID"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
 
 export function StyleEditor({ style, onChange }: { style: BlockStyle; onChange: (s: BlockStyle) => void }) {
   const set = <K extends keyof BlockStyle>(k: K, v: BlockStyle[K]) => onChange({ ...style, [k]: v });
@@ -811,7 +1731,7 @@ export function StyleEditor({ style, onChange }: { style: BlockStyle; onChange: 
         <Pick value={style.divider} options={[["none", "Aucun"], ["top", "Haut"], ["bottom", "Bas"], ["both", "Haut et bas"]]} onChange={(v) => set("divider", v)} />
       </F>
       <label className="col-span-2 flex items-center gap-2 text-xs font-medium text-zinc-700">
-        <input type="checkbox" checked={style.card} onChange={(e) => set("card", e.target.checked)} /> Encadré (carte)
+        <input type="checkbox" checked={style.card} onChange={(e) => set("card", e.target.checked)} className="h-3.5 w-3.5 accent-zinc-900" /> Encadré (carte)
       </label>
       <div className="col-span-2">
         <F label="Fond personnalisé">

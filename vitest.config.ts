@@ -11,6 +11,8 @@ export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
     environment: "node",
+    // Integration files share one database and the background tick's lock: run files one at a time.
+    fileParallelism: false,
     env: { ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"), APP_URL: "https://checkout.example.com", SESSION_SECRET: "test" },
   },
 });

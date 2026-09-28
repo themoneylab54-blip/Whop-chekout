@@ -29,6 +29,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx prisma migrate deploy
+      # The migrations must produce exactly schema.prisma (no drift that a later migrate would "fix" by dropping indexes).
+      - run: npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code
       - run: npx tsc --noEmit
       - run: npx eslint .
       - run: npx vitest run

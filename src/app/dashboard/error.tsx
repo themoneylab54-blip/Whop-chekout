@@ -15,7 +15,7 @@ export default function DashboardError({ error, reset }: { error: Error & { dige
           Souvent, c&apos;est qu&apos;une nouvelle version de l&apos;app vient d&apos;être déployée. Recharger la page règle le problème ; vos réglages
           déjà enregistrés sont conservés.
         </p>
-        {error.digest && <p className="mt-3 font-mono text-xs text-zinc-400">Code : {error.digest}</p>}
+        {error.digest && <p className="mt-3 font-mono text-xs text-zinc-500">Code : {error.digest}</p>}
         <div className="mt-6 flex justify-center gap-2">
           <button onClick={() => window.location.reload()} className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white">
             Recharger la page

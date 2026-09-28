@@ -70,3 +70,45 @@ describe("reviewReasons", () => {
     expect(reviewReasons({ ...snap, shippingCountries: [] }, { totalCents: 5490, currency: "EUR" }, { ...fr, countryCode: "US" })).toEqual([]);
   });
 });
+
+describe("quantity breaks and bump rules", async () => {
+  const { computeTotals, parseQuantityBreaks, quantityBreakFor } = await import("@/lib/pricing");
+  const { addOnEligible } = await import("@/lib/checkout");
+  const line = { variantId: "v", productId: "p1", productHandle: "h", title: "T", variantTitle: null, sku: null, imageUrl: null, quantity: 2, unitPriceCents: 2500, compareAtCents: null, inventory: null, requiresShipping: true };
+  const breaks = parseQuantityBreaks([{ minQty: 2, percent: 10 }, { minQty: 3, percent: 15 }, { minQty: 1, percent: 90 }]);
+  it("keeps only sane tiers and finds the current and next one", () => {
+    expect(breaks).toEqual([{ minQty: 2, percent: 10 }, { minQty: 3, percent: 15 }]);
+    expect(quantityBreakFor(breaks, 2)).toEqual({ current: { minQty: 2, percent: 10 }, next: { minQty: 3, percent: 15 } });
+    expect(quantityBreakFor(breaks, 1)).toEqual({ current: null, next: { minQty: 2, percent: 10 } });
+  });
+  it("applies the tier before the code, and counts it in the discount", () => {
+    const t = computeTotals({
+      lines: [line],
+      rate: null,
+      addOns: [],
+      quantityBreaks: breaks,
+      discount: { code: "X", type: "PERCENT", value: 10, minSubtotalCents: null, startsAt: null, endsAt: null, usageLimit: null, usageCount: 0, active: true },
+    });
+    expect(t.volumeDiscountCents).toBe(500);
+    expect(t.discountCents).toBe(500 + 450);
+    expect(t.totalCents).toBe(5000 - 950);
+  });
+  it("shows an order bump only when its rules match", () => {
+    const ctx = { subtotalCents: 5000, productIds: ["p1"], country: "FR" };
+    expect(addOnEligible(null, ctx)).toBe(true);
+    expect(addOnEligible({ minSubtotalCents: 6000 }, ctx)).toBe(false);
+    expect(addOnEligible({ productIds: ["p2"] }, ctx)).toBe(false);
+    expect(addOnEligible({ productIds: ["p1"], countries: ["fr"] }, ctx)).toBe(true);
+    expect(addOnEligible({ countries: ["BE"] }, ctx)).toBe(false);
+  });
+});
+
+describe("deadline guard", async () => {
+  const { assertTime, DeadlineError } = await import("@/lib/deadline");
+  const { withLogContext } = await import("@/lib/log");
+  it("refuses to start a call that can't finish before the run's hard deadline", () => {
+    expect(() => withLogContext({ hardDeadline: Date.now() + 5_000 }, () => assertTime(12_000, "Shopify"))).toThrow(DeadlineError);
+    expect(() => withLogContext({ hardDeadline: Date.now() + 60_000 }, () => assertTime(12_000, "Shopify"))).not.toThrow();
+    expect(() => assertTime(12_000, "Shopify")).not.toThrow(); // outside a bounded run
+  });
+});

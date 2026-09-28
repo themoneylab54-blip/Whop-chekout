@@ -8,10 +8,12 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 const shopify = vi.hoisted(() => ({
   createPaidOrder: vi.fn(),
   findOrderForSession: vi.fn(),
+  findOrderByPayment: vi.fn(),
   createRefund: vi.fn(),
   tagOrder: vi.fn(),
   priceCart: vi.fn(),
   orderTracking: vi.fn(),
+  orderRefundedCents: vi.fn(),
 }));
 const whop = vi.hoisted(() => ({
   list: vi.fn(),
@@ -20,6 +22,7 @@ const whop = vi.hoisted(() => ({
   disputeUpdate: vi.fn(),
   disputeSubmit: vi.fn(),
   refund: vi.fn(),
+  refunds: vi.fn(),
 }));
 const notify = vi.hoisted(() => ({ sendAlert: vi.fn(), sendEmail: vi.fn() }));
 
@@ -29,15 +32,20 @@ vi.mock("@/lib/whop", async (orig) => ({
   refundPayment: whop.refund,
   storeClient: () => ({
     payments: {
-      list: async () => ({
-        async *[Symbol.asyncIterator]() {
-          for (const p of await whop.list()) yield p;
-        },
-      }),
+      // Cursor pages like Whop's: `after` is the index where the next page starts.
+      list: async (params: { first?: number; after?: string; product_id?: string }) => {
+        const all = (await whop.list(params)) as unknown[];
+        const start = params.after ? Number(params.after) : 0;
+        const size = params.first ?? 50;
+        const data = all.slice(start, start + size);
+        const more = start + size < all.length;
+        return { data, response: { page_info: { has_next_page: more, end_cursor: more ? String(start + size) : null } } };
+      },
       create: whop.create,
     },
+    refunds: { list: async () => ({ data: await whop.refunds(), response: { page_info: { has_next_page: false, end_cursor: null } } }) },
     shipments: { create: whop.shipments },
-    disputes: { update: whop.disputeUpdate, submit: whop.disputeSubmit },
+    disputes: { update: whop.disputeUpdate, submit: whop.disputeSubmit, list: async () => ({ data: [], response: { page_info: { has_next_page: false, end_cursor: null } } }) },
   }),
 }));
 vi.mock("@/lib/notify", async (orig) => ({ ...(await orig<typeof import("@/lib/notify")>()), ...notify }));
@@ -110,9 +118,16 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
   beforeEach(() => {
     vi.clearAllMocks();
     shopify.findOrderForSession.mockResolvedValue(null);
+    shopify.findOrderByPayment.mockResolvedValue(null);
     shopify.orderTracking.mockResolvedValue([]);
+    shopify.tagOrder.mockResolvedValue(undefined);
+    // Shopify's refunded total = what createRefund has applied to that order so far.
+    shopify.orderRefundedCents.mockImplementation(async (_st: unknown, orderId: string) =>
+      shopify.createRefund.mock.calls.filter((c) => c[1] === orderId).reduce((sum, c) => sum + Number(c[2]), 0),
+    );
     shopify.createPaidOrder.mockRejectedValue(new Error("unexpected order"));
     whop.list.mockResolvedValue([]);
+    whop.refunds.mockResolvedValue([]);
   });
 
   afterAll(async () => {
@@ -132,8 +147,15 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
     expect(row.nextSyncAt!.getTime() - Date.now()).toBeGreaterThan((SYNC_BACKOFF_MINUTES[0] - 0.2) * 60_000);
     expect(notify.sendAlert).toHaveBeenCalledTimes(1);
 
-    // Backoff elapsed: the background tick retries and succeeds.
+    // A 503 on orderCreate is ambiguous (Shopify may have created it): no retry before its search is consistent.
+    expect(row.syncAmbiguousAt).not.toBeNull();
+    expect(row.nextSyncAt!.getTime() - Date.now()).toBeGreaterThan(4.8 * 60_000);
     await db.checkoutSession.update({ where: { id: s.id }, data: { nextSyncAt: new Date(Date.now() - 1000) } });
+    await runTick();
+    expect((await db.checkoutSession.findUniqueOrThrow({ where: { id: s.id } })).shopifyOrderId).toBeNull();
+
+    // Backoff and consistency window elapsed: the background tick retries and succeeds.
+    await db.checkoutSession.update({ where: { id: s.id }, data: { nextSyncAt: new Date(Date.now() - 1000), syncAmbiguousAt: new Date(Date.now() - 6 * 60_000) } });
     // The tick scans every store: answer only for this test's session.
     shopify.createPaidOrder.mockImplementation(async (_store: unknown, input: { sessionId: string }) => {
       if (input.sessionId !== s.id) throw new Error("not this test");
@@ -225,9 +247,13 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
     expect(whop.disputeSubmit).not.toHaveBeenCalled();
     shopify.orderTracking.mockResolvedValue([{ number: "6A1", company: "Colissimo", url: null }]);
     await runTick();
-    expect(whop.disputeUpdate).toHaveBeenCalledWith(expect.objectContaining({ id: "dsp_1" }));
-    expect(whop.disputeSubmit).toHaveBeenCalledWith({ id: "dsp_1" });
-    expect(whop.shipments).toHaveBeenCalledWith(expect.objectContaining({ payment_id: expect.stringMatching(/^pay_dis_/), tracking_number: "6A1" }));
+    // Each Whop call carries its own request options (timeout from the time left when it starts).
+    expect(whop.disputeUpdate).toHaveBeenCalledWith(expect.objectContaining({ id: "dsp_1" }), expect.objectContaining({ timeoutInSeconds: expect.any(Number) }));
+    expect(whop.disputeSubmit).toHaveBeenCalledWith({ id: "dsp_1" }, expect.objectContaining({ timeoutInSeconds: expect.any(Number) }));
+    expect(whop.shipments).toHaveBeenCalledWith(
+      expect.objectContaining({ payment_id: expect.stringMatching(/^pay_dis_/), tracking_number: "6A1" }),
+      expect.objectContaining({ idempotencyKey: expect.stringMatching(/^ship_/) }),
+    );
     const row = await db.checkoutSession.findUniqueOrThrow({ where: { id: s.id } });
     expect(row.disputed).toBe(true);
     expect(row.disputeEvidenceAt).not.toBeNull();
@@ -259,7 +285,7 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
     expect(row.extraPaymentIds).toEqual([`payB_${s.id}`]);
     expect(row.reviewNote).toBeNull();
 
-    await db.checkoutSession.update({ where: { id: s.id }, data: { nextSyncAt: new Date(Date.now() - 1000) } });
+    await db.checkoutSession.update({ where: { id: s.id }, data: { nextSyncAt: new Date(Date.now() - 1000), syncAmbiguousAt: new Date(Date.now() - 6 * 60_000) } });
     shopify.createPaidOrder.mockImplementation(async (_s: unknown, input: { sessionId: string }) => {
       if (input.sessionId !== s.id) throw new Error("not this test");
       return { id: "gid://shopify/Order/67", name: "#1067" };
@@ -324,7 +350,9 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
     let row = await db.checkoutSession.findUniqueOrThrow({ where: { id: s.id } });
     expect(row.pixelSentAt).toBeNull();
     expect(row.pixelStatus).toEqual({ meta: "failed" });
-    await db.$executeRaw`UPDATE "CheckoutSession" SET "updatedAt" = now() - interval '10 minutes' WHERE id = ${s.id}`;
+    // The failed try scheduled its own retry (backoff on pixelNextAttemptAt, never the updatedAt clock): elapsed.
+    expect(row.pixelNextAttemptAt!.getTime()).toBeGreaterThan(Date.now() + 4 * 60_000);
+    await db.checkoutSession.update({ where: { id: s.id }, data: { pixelNextAttemptAt: new Date(Date.now() - 60_000) } });
     fetchSpy.mockImplementation(async (url) =>
       String(url).includes("graph.facebook.com") ? new Response('{"events_received":1}', { status: 200 }) : new Response("{}", { status: 200 }),
     );
@@ -341,12 +369,12 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
     // The refund lands while orderCreate is in flight.
     shopify.createPaidOrder.mockImplementation(async (_st: unknown, input: { sessionId: string }) => {
       if (input.sessionId !== s.id) throw new Error("not this test");
-      await recordRefund(s.id, 1000);
+      await recordRefund(s.id, 1000, `re_a_${s.id}`);
       return { id: "gid://shopify/Order/70", name: "#1070" };
     });
     shopify.createRefund.mockResolvedValue(undefined);
     await markPaid(s.id, { id: `pay_rf_${s.id}`, totalCents: 5490, currency: "eur", checkoutConfigurationId: `ch_${s.id}` });
-    await recordRefund(s.id, 500);
+    await recordRefund(s.id, 500, `re_b_${s.id}`);
     await runTick();
     const row = await db.checkoutSession.findUniqueOrThrow({ where: { id: s.id } });
     expect(row.refundedCents).toBe(1500);
@@ -400,12 +428,32 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
     expect(key).toMatch(/^upsell_/);
     // The sweep replays the same key and learns it was paid.
     const charge = await db.upsellCharge.findFirstOrThrow({ where: { sessionId: s.id } });
-    await db.upsellCharge.update({ where: { id: charge.id }, data: { createdAt: new Date(Date.now() - 10 * 60_000) } });
+    await db.upsellCharge.update({ where: { id: charge.id }, data: { chargeStartedAt: new Date(Date.now() - 10 * 60_000) } });
     whop.create.mockResolvedValueOnce({ id: `pay_up3b_${s.id}`, status: "paid", recovery_url: null });
     shopify.createPaidOrder.mockResolvedValue({ id: "gid://shopify/Order/73", name: "#1073" });
     await runTick();
     expect(whop.create.mock.calls[1][1].idempotencyKey).toBe(key);
     expect((await db.upsellCharge.findUniqueOrThrow({ where: { id: charge.id } })).status).toBe("PAID");
+  });
+
+  it("never replays an offer charge after the acceptance window", async () => {
+    const store = await makeStore({
+      thankYouLayout: {
+        blocks: [{ id: "up4", type: "upsell", props: { badge: "", title: "Gants", text: "", variantId: "98", imageUrl: "", price: 9, compareAt: 0, buttonText: "Oui", declineText: "Non" } }],
+      },
+    });
+    const s = await makePaidReadySession(store.id, { status: "PAID", paidAt: new Date(), whopPaymentId: `pay_up4_${Date.now()}`, whopMemberId: "m", whopPaymentMethodId: "pm" });
+    shopify.priceCart.mockResolvedValue([{ ...line, variantId: "gid://shopify/ProductVariant/98", title: "Gants", unitCostCents: 300 }]);
+    whop.create.mockRejectedValueOnce(Object.assign(new Error("timeout"), { statusCode: undefined }));
+    const full = await db.checkoutSession.findUniqueOrThrow({ where: { id: s.id }, include: { store: true } });
+    expect(await acceptUpsell(full, "up4")).toEqual({ status: "pending" });
+    const charge = await db.upsellCharge.findFirstOrThrow({ where: { sessionId: s.id } });
+    expect(charge.costCents).toBe(300);
+    await db.upsellCharge.update({ where: { id: charge.id }, data: { chargeStartedAt: new Date(Date.now() - 3 * 3600_000) } });
+    await runTick();
+    expect(whop.create).toHaveBeenCalledTimes(1);
+    expect((await db.upsellCharge.findUniqueOrThrow({ where: { id: charge.id } })).status).toBe("FAILED");
+    expect(await db.eventLog.count({ where: { sessionId: s.id, kind: "upsell.gave_up" } })).toBe(1);
   });
 
   it("keeps reconciling other stores when one store's Whop call fails", async () => {
@@ -428,6 +476,30 @@ describe.skipIf(!hasDb)("payments (integration)", async () => {
     await runTick();
     expect((await db.checkoutSession.findUniqueOrThrow({ where: { id: s.id } })).status).toBe("PAID");
     expect(await db.eventLog.count({ where: { kind: "reconcile.failed" } })).toBeGreaterThan(0);
+  });
+
+  it("resumes a long reconciliation from Whop's cursor instead of restarting", async () => {
+    const store = await makeStore({ whopProductId: `prod_many_${Date.now()}` });
+    const now = Date.now();
+    const payments = Array.from({ length: 520 }, (_, i) => ({ id: `pay_many_${store.id}_${i}`, paid_at: new Date(now - i * 1000).toISOString(), metadata: {} }));
+    const pages: (string | undefined)[] = [];
+    whop.list.mockImplementation(async (params: { product_id?: string; after?: string }) => {
+      if (params.product_id !== store.whopProductId) return [];
+      pages.push(params.after);
+      return payments;
+    });
+    await runTick();
+    const run = await db.appSetting.findUnique({ where: { key: `reconcile-run:${store.id}` } });
+    expect(run).not.toBeNull();
+    expect(await db.appSetting.findUnique({ where: { key: `reconcile:${store.id}` } })).toBeNull();
+    await db.appSetting.update({ where: { key: "tick:last" }, data: { value: new Date(0).toISOString() } }).catch(() => undefined);
+    pages.length = 0;
+    await runTick();
+    // Second run starts where the first stopped, then finishes and sets the mark.
+    expect(pages[0]).toBe(JSON.parse(run!.value).cursor);
+    expect(await db.appSetting.findUnique({ where: { key: `reconcile-run:${store.id}` } })).toBeNull();
+    expect(await db.appSetting.findUnique({ where: { key: `reconcile:${store.id}` } })).not.toBeNull();
+    await db.appSetting.deleteMany({ where: { key: { in: [`reconcile:${store.id}`, `reconcile-run:${store.id}`] } } });
   });
 
   it("shares the rate limit through the database", async () => {

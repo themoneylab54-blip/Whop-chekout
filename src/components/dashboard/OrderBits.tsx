@@ -15,8 +15,14 @@ export function StatusBadge({ status, disputed }: { status: SessionStatus; dispu
 }
 
 export function SyncBadge({ s }: { s: { status: SessionStatus; shopifyOrderName: string | null; reviewNote: string | null; syncError: string | null } }) {
-  if (s.status !== "PAID") return <span className="text-zinc-400">—</span>;
+  if (s.status !== "PAID")
+    return (
+      <span className="text-zinc-500" title="Pas de commande Shopify tant que le paiement n'est pas reçu">
+        <span aria-hidden>—</span>
+        <span className="sr-only">Pas de commande Shopify (non payé)</span>
+      </span>
+    );
   if (s.shopifyOrderName) return <span className="font-medium">{s.shopifyOrderName}</span>;
   if (s.reviewNote) return <Badge color="amber">À vérifier</Badge>;
-  return <Badge color="red">{s.syncError ? "Échec — nouvel essai auto" : "En cours"}</Badge>;
+  return <Badge color={s.syncError ? "red" : "blue"}>{s.syncError ? "Échec — nouvel essai auto" : "Création en cours"}</Badge>;
 }

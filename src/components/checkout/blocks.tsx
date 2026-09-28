@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   BadgeCheck,
   Check,
@@ -21,9 +21,26 @@ import {
   Truck,
   X,
 } from "lucide-react";
-import type { Block, BlockOf, BlockStyle } from "@/lib/layout";
+import {
+  armKey,
+  downsellTargets,
+  offerArmProps,
+  offerTrail,
+  offerUnitCents,
+  variantGidOf,
+  MAX_OFFER_QUANTITY,
+  SURVEY_OTHER_MAX,
+  type Block,
+  type BlockOf,
+  type BlockStyle,
+  type OfferArm,
+  formatRatingScore,
+  ratingIsSet,
+} from "@/lib/layout";
 import { BlockIcon, ICONS, IconTile } from "@/components/icons";
-import type { Labels } from "./i18n";
+import { errorText, localeOf, type Labels, type Lang } from "./i18n";
+import { SafeImg } from "./SafeImg";
+import type { CartLine } from "@/lib/pricing";
 
 /* ------------------------------------------------------------------ */
 /* Style wrapper                                                       */
@@ -161,7 +178,7 @@ function Countdown({ label, endsAt, labels, preview }: BlockOf<"countdown">["pro
   if (left === 0) return null; // offer over: hide, never restart
   const s = Math.floor(left / 1000);
   const parts = [Math.floor(s / 86400), Math.floor((s % 86400) / 3600), Math.floor((s % 3600) / 60), s % 60];
-  const text = (parts[0] ? `${parts[0]}j ` : "") + parts.slice(1).map((p) => String(p).padStart(2, "0")).join(":");
+  const text = (parts[0] ? `${parts[0]}${labels.daysShort} ` : "") + parts.slice(1).map((p) => String(p).padStart(2, "0")).join(":");
   return (
     <div className="flex items-center justify-between gap-3 rounded-[var(--radius)] border border-red-200/70 bg-gradient-to-r from-red-50 to-orange-50 px-4 py-3 text-red-700">
       <span className="flex items-center gap-2 text-sm font-medium">
@@ -213,14 +230,14 @@ function DeliveryEstimate({ label, minDays, maxDays, businessDays, showTimeline,
   const now = useNow();
   if (now === null) return <div className="h-16" />;
   const today = new Date(now);
-  const fmt = (d: Date) => d.toLocaleDateString(ctx.lang === "fr" ? "fr-FR" : "en-US", { weekday: "short", day: "numeric", month: "short" });
+  const fmt = (d: Date) => d.toLocaleDateString(localeOf(ctx.lang), { weekday: "short", day: "numeric", month: "short" });
   const shipped = addDays(today, Math.min(1, minDays), businessDays);
   const from = addDays(today, minDays, businessDays);
   const to = addDays(today, Math.max(minDays, maxDays), businessDays);
   const steps = [
-    { icon: Check, title: ctx.lang === "fr" ? "Commande" : "Ordered", date: fmt(today) },
-    { icon: Package, title: ctx.lang === "fr" ? "Expédition" : "Shipped", date: fmt(shipped) },
-    { icon: Home, title: ctx.lang === "fr" ? "Livraison" : "Delivered", date: `${fmt(from)} – ${fmt(to)}` },
+    { icon: Check, title: ctx.labels.stepOrdered, date: fmt(today) },
+    { icon: Package, title: ctx.labels.stepShipped, date: fmt(shipped) },
+    { icon: Home, title: ctx.labels.stepDelivered, date: `${fmt(from)} – ${fmt(to)}` },
   ];
   return (
     <div className="rounded-[var(--radius)] border border-[var(--border)] bg-white p-4">
@@ -249,7 +266,7 @@ function DeliveryEstimate({ label, minDays, maxDays, businessDays, showTimeline,
   );
 }
 
-function Reviews({ title, layout, items }: BlockOf<"reviews">["props"]) {
+function Reviews({ title, layout, items, labels }: BlockOf<"reviews">["props"] & { labels: Labels }) {
   const [i, setI] = useState(0);
   if (items.length === 0) return null;
   const review = (r: (typeof items)[number], key?: number) => (
@@ -258,7 +275,7 @@ function Reviews({ title, layout, items }: BlockOf<"reviews">["props"]) {
         <Stars n={r.stars} />
         {r.verified && (
           <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700">
-            <BadgeCheck className="h-3.5 w-3.5" /> Achat vérifié
+            <BadgeCheck className="h-3.5 w-3.5" aria-hidden /> {labels.verifiedPurchase}
           </span>
         )}
       </div>
@@ -276,23 +293,26 @@ function Reviews({ title, layout, items }: BlockOf<"reviews">["props"]) {
           {review(items[i % items.length])}
           {items.length > 1 && (
             <div className="mt-2.5 flex items-center justify-between">
-              <div className="flex gap-1.5">
+              <div className="-ml-2 flex">
                 {items.map((_, k) => (
                   <button
                     key={k}
                     type="button"
-                    aria-label={`Avis ${k + 1}`}
+                    aria-label={labels.reviewN(k + 1)}
+                    aria-current={k === i % items.length ? "true" : undefined}
                     onClick={() => setI(k)}
-                    className={`h-1.5 rounded-full transition-all ${k === i % items.length ? "w-5 bg-[var(--accent)]" : "w-1.5 bg-black/15"}`}
-                  />
+                    className="flex h-11 min-w-6 items-center justify-center px-1"
+                  >
+                    <span className={`block h-1.5 rounded-full transition-all ${k === i % items.length ? "w-5 bg-[var(--accent)]" : "w-1.5 bg-black/30"}`} />
+                  </button>
                 ))}
               </div>
               <div className="flex gap-1">
-                <button type="button" aria-label="Avis précédent" onClick={() => setI((i - 1 + items.length) % items.length)} className="rounded-full border border-[var(--border)] bg-white p-1.5 hover:bg-black/[.03]">
-                  <ChevronLeft className="h-3.5 w-3.5" />
+                <button type="button" aria-label={labels.prevReview} onClick={() => setI((i - 1 + items.length) % items.length)} className="flex h-11 w-11 items-center justify-center rounded-full border border-[var(--border)] bg-white hover:bg-black/[.03]">
+                  <ChevronLeft className="h-4 w-4" aria-hidden />
                 </button>
-                <button type="button" aria-label="Avis suivant" onClick={() => setI((i + 1) % items.length)} className="rounded-full border border-[var(--border)] bg-white p-1.5 hover:bg-black/[.03]">
-                  <ChevronRight className="h-3.5 w-3.5" />
+                <button type="button" aria-label={labels.nextReview} onClick={() => setI((i + 1) % items.length)} className="flex h-11 w-11 items-center justify-center rounded-full border border-[var(--border)] bg-white hover:bg-black/[.03]">
+                  <ChevronRight className="h-4 w-4" aria-hidden />
                 </button>
               </div>
             </div>
@@ -329,6 +349,20 @@ function Coupon({ title, text, code }: BlockOf<"coupon">["props"]) {
 }
 
 function OrderNote({ title, placeholder, ctx }: BlockOf<"order_note">["props"] & { ctx: ContentContext }) {
+  // Collapsed behind a link until the buyer wants it: keeps the payment step higher.
+  const [open, setOpen] = useState(ctx.preview || !!ctx.note);
+  if (!open) {
+    return (
+      <button
+        type="button"
+        aria-expanded={false}
+        onClick={() => setOpen(true)}
+        className="inline-flex min-h-11 items-center gap-1.5 text-sm font-medium underline underline-offset-2"
+      >
+        <Plus className="h-4 w-4" aria-hidden /> {title}
+      </button>
+    );
+  }
   return (
     <label className="block">
       <span className="mb-1.5 block text-sm font-semibold">{title}</span>
@@ -336,9 +370,10 @@ function OrderNote({ title, placeholder, ctx }: BlockOf<"order_note">["props"] &
         rows={3}
         maxLength={1000}
         value={ctx.note}
+        autoFocus={!ctx.preview && !ctx.note}
         onChange={(e) => ctx.setNote(e.target.value)}
         placeholder={placeholder}
-        className="w-full resize-y rounded-[var(--radius)] border border-[var(--border)] bg-white px-3.5 py-3 text-[15px] outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--accent)_20%,transparent)]"
+        className="w-full resize-y rounded-[var(--radius)] border border-[var(--border)] bg-white px-3.5 py-3 text-base outline-none focus:border-[var(--accent)]"
       />
     </label>
   );
@@ -367,7 +402,7 @@ function videoEmbed(url: string): { kind: "iframe" | "video"; src: string } | nu
 
 export type ContentContext = {
   labels: Labels;
-  lang: "fr" | "en";
+  lang: Lang;
   /** lowest tracked inventory among cart items (null in the builder without data) */
   lowestInventory: number | null;
   preview: boolean;
@@ -377,8 +412,70 @@ export type ContentContext = {
   note: string;
   setNote: (v: string) => void;
   /** Thank-you page, live: one-click post-purchase offers. */
-  upsell?: { sessionId: string; eligible: boolean; states: Record<string, string> };
+  upsell?: UpsellContext;
+  /** Thank-you page: end of the one-click offer window (ms), for the "valid N more min" line. */
+  offerEndsAt?: number | null;
+  /** Full-screen preview: offers are shown as buyers see them, answering does nothing. */
+  demoOffers?: boolean;
+  /** Photos of the order's lines by variant GID: an offer without its own image uses its line's. */
+  lineImages?: Record<string, string>;
+  /** Thank-you page survey: live answer state (null = preview / not paid). */
+  survey?: { sessionId: string; answered: boolean } | null;
+  /**
+   * The checkout was paid in another currency than the shop's (local currency option): one-click
+   * offers are charged in the shop's, so the offer says so. { shop, paid } currency codes.
+   */
+  offerCurrency?: { shop: string; paid: string } | null;
 };
+
+/** Thank-you page state of the one-click offers (live only). */
+export type UpsellContext = {
+  sessionId: string;
+  /** Payment method saved, within the offer window, order not held… */
+  eligible: boolean;
+  /** Answer per offer block id: PAID | PENDING | FAILED | DECLINED. */
+  states: Record<string, string>;
+  /** Confirmation text of accepted offers (kept when the funnel moves on). */
+  messages?: Record<string, string>;
+  /** Offers whose targeting matches this order (server-side). */
+  offerIds: string[];
+  /** Every offer block of the page, for the funnels (accept / decline chains). */
+  blocks: BlockOf<"upsell">[];
+  /** A/B arm this visitor sees, per offer block (server-side, sticky). Missing = A. */
+  arms?: Record<string, OfferArm>;
+  /** Live Shopify unit prices (cents) by variant GID, for "% off" offers. */
+  livePrices?: Record<string, number>;
+  setState: (blockId: string, status: string, message?: string) => void;
+  /**
+   * "No thanks" answered in this page view. `index`: position of the declined offer's heading
+   * among the page's offer headings, so the page can move focus to the next offer (or the order
+   * heading) and announce it, even when the declined slot disappears.
+   */
+  declined?: (index: number) => void;
+};
+
+/**
+ * The slot opened by `root`: offers already accepted in its funnel (confirmations) and the
+ * one waiting for an answer (null when the buyer can no longer be offered anything).
+ */
+function slotTrail(root: BlockOf<"upsell">, u: UpsellContext): { accepted: BlockOf<"upsell">[]; current: BlockOf<"upsell"> | null } {
+  if (downsellTargets(u.blocks).has(root.id)) return { accepted: [], current: null }; // shown in its parent's slot
+  const trail = offerTrail(u.blocks, root.id, u.states, (x) => u.offerIds.includes(x));
+  const byId = (id: string) => u.blocks.find((b) => b.id === id) ?? null;
+  const accepted = trail.accepted.map(byId).filter((b): b is BlockOf<"upsell"> => !!b);
+  const current = trail.current && u.eligible ? byId(trail.current) : null;
+  return { accepted, current };
+}
+
+/**
+ * True while the offer shown in this slot still waits for the buyer's answer
+ * (the thank-you page then styles "Continue shopping" as a secondary button).
+ */
+export function offerAwaitingAnswer(root: BlockOf<"upsell">, u: UpsellContext): boolean {
+  const offer = slotTrail(root, u).current;
+  const state = offer ? u.states[offer.id] : undefined;
+  return !!offer && state !== "PAID" && state !== "PENDING" && state !== "DECLINED";
+}
 
 /** Renders every non-section block. Returns null for fixed sections / add-ons. */
 /**
@@ -395,6 +492,20 @@ export function isEmptyInLive(block: Block, ctx: ContentContext, now: number): b
       return !block.props.url || !videoEmbed(block.props.url);
     case "logos":
       return block.props.logos.length === 0;
+    case "reviews":
+      return block.props.items.length === 0;
+    case "rating":
+      return !ratingIsSet(block.props);
+    case "social": {
+      const p = block.props;
+      return !p.instagram && !p.tiktok && !p.facebook && !p.youtube;
+    }
+    case "support": {
+      const p = block.props;
+      return !p.email && !p.phone && !p.whatsapp.replace(/[^\d]/g, "") && !p.text;
+    }
+    case "button_link":
+      return !block.props.url;
     case "countdown": {
       const end = Date.parse(block.props.endsAt);
       return !block.props.endsAt || Number.isNaN(end) || end <= now;
@@ -404,9 +515,16 @@ export function isEmptyInLive(block: Block, ctx: ContentContext, now: number): b
     case "free_shipping_bar":
       return !(block.props.threshold > 0 || ctx.freeShippingThresholdCents);
     case "upsell": {
-      const state = ctx.upsell?.states[block.id];
-      return !block.props.variantId || !(ctx.upsell?.eligible || state === "PAID") || state === "DECLINED";
+      if (ctx.demoOffers) return false;
+      if (!block.props.variantId || !ctx.upsell) return true;
+      const slot = slotTrail(block, ctx.upsell);
+      // Accepted offers keep their confirmation; the open one goes when the window is over.
+      if (slot.accepted.length) return false;
+      if (!slot.current) return true;
+      return !!ctx.offerEndsAt && now >= ctx.offerEndsAt;
     }
+    case "survey":
+      return (!ctx.survey && !ctx.demoOffers) || block.props.options.length === 0;
     default:
       return false;
   }
@@ -417,58 +535,77 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
     case "text":
       return (
         <div className="space-y-1">
-          {block.props.heading && <h3 className="font-[family-name:var(--heading-font)] text-base font-semibold tracking-tight">{block.props.heading}</h3>}
-          {block.props.body && <p className="whitespace-pre-line opacity-80">{block.props.body}</p>}
+          {block.props.heading && (
+            <h3 data-inline-field="heading" className="font-[family-name:var(--heading-font)] text-base font-semibold tracking-tight">
+              {block.props.heading}
+            </h3>
+          )}
+          {block.props.body && (
+            <p data-inline-field="body" className="whitespace-pre-line opacity-80">
+              {block.props.body}
+            </p>
+          )}
         </div>
       );
     case "image": {
       if (!block.props.url) return ctx.preview ? <Placeholder>Bloc image — ajoutez une URL</Placeholder> : null;
       const width = { sm: "max-w-[160px]", md: "max-w-[280px]", lg: "max-w-[420px]", full: "w-full" }[block.props.size];
       return (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img src={block.props.url} alt={block.props.alt} className={`${width} mx-auto rounded-[var(--radius)]`} />
+        <SafeImg
+          src={block.props.url}
+          alt={block.props.alt}
+          className={`${width} mx-auto rounded-[var(--radius)]`}
+          fallback={ctx.preview ? <Placeholder>Image introuvable : vérifiez l&apos;adresse de l&apos;image</Placeholder> : null}
+        />
       );
     }
     case "testimonial":
       return (
         <figure className="flex gap-3 text-left">
           {block.props.photoUrl && (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={block.props.photoUrl} alt="" className="h-10 w-10 shrink-0 rounded-full object-cover ring-2 ring-white" />
+            <SafeImg src={block.props.photoUrl} alt="" className="h-10 w-10 shrink-0 rounded-full object-cover ring-2 ring-white" fallback={null} />
           )}
           <div className="space-y-1">
             <Stars n={block.props.stars} />
             <blockquote className="text-sm">« {block.props.quote} »</blockquote>
-            <figcaption className="text-xs font-semibold opacity-60">{block.props.author}</figcaption>
+            <figcaption className="text-xs font-semibold text-[var(--muted)]">{block.props.author}</figcaption>
           </div>
         </figure>
       );
-    case "rating":
+    case "rating": {
+      // No invented score: until the merchant enters theirs, only the builder shows the block.
+      if (!ratingIsSet(block.props)) return ctx.preview ? <Placeholder>Note globale · À compléter : saisissez votre note réelle</Placeholder> : null;
       return (
         <div className="flex flex-wrap items-center gap-2">
           <Stars n={block.props.score} size={18} />
-          <span className="font-semibold">{block.props.score.toFixed(1)}/5</span>
-          <span className="text-sm opacity-70">
-            {block.props.count > 0 && `${block.props.count.toLocaleString("fr-FR")} avis · `}
+          <span className="font-semibold">{formatRatingScore(block.props.score, localeOf(ctx.lang))}/5</span>
+          <span className="text-sm text-[var(--muted)]">
+            {block.props.count > 0 && `${ctx.labels.reviewsCount(block.props.count.toLocaleString(localeOf(ctx.lang)))} · `}
             {block.props.label}
           </span>
         </div>
       );
+    }
     case "trust_badges":
       return (
-        <ul className="flex flex-wrap justify-center gap-x-5 gap-y-2 text-sm">
-          {block.props.badges.map((b, i) => (
-            <li key={i} className="flex items-center gap-1.5">
-              {b.iconUrl ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img src={b.iconUrl} alt="" className="h-5 w-5 object-contain" />
-              ) : (
-                <Check className="h-4 w-4 text-[var(--accent)]" strokeWidth={2.5} />
-              )}
-              {b.label}
-            </li>
-          ))}
-        </ul>
+        // A tidy left-aligned stack in narrow columns (summary), a row of equal cells when wide.
+        <div className="@container">
+          <ul className="grid grid-cols-1 gap-x-4 gap-y-2.5 text-left text-sm @lg:grid-cols-3">
+            {block.props.badges.map((b, i) => {
+              const check = (
+                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[color-mix(in_srgb,var(--accent)_10%,white)] text-[var(--accent)]">
+                  <Check className="h-3.5 w-3.5" strokeWidth={2.75} aria-hidden />
+                </span>
+              );
+              return (
+                <li key={i} className="flex items-center gap-2.5 leading-snug">
+                  {b.iconUrl ? <SafeImg src={b.iconUrl} alt="" className="h-6 w-6 shrink-0 object-contain" fallback={check} /> : check}
+                  <span className="min-w-0">{b.label}</span>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
       );
     case "guarantee":
       return (
@@ -498,7 +635,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
     case "payment_icons":
       return (
         <div className="space-y-2">
-          {block.props.label && <p className="text-xs opacity-70">{block.props.label}</p>}
+          {block.props.label && <p className="text-xs text-[var(--muted)]">{block.props.label}</p>}
           <div className="flex flex-wrap justify-center gap-1.5">
             {block.props.methods.map((m) => (
               <span key={m} className="rounded-md border border-[var(--border)] bg-white px-2 py-1 text-[11px] font-bold text-neutral-700 shadow-[0_1px_1px_rgba(0,0,0,.04)]">
@@ -510,7 +647,10 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
       );
     case "announcement":
       return (
-        <div className="rounded-[var(--radius)] bg-[image:var(--accent-bg)] px-4 py-2.5 text-center text-sm font-medium text-[var(--accent-fg)] shadow-sm">
+        <div
+          data-inline-field="text"
+          className="rounded-[var(--radius)] bg-[image:var(--accent-bg)] px-4 py-2.5 text-center text-sm font-medium text-[var(--accent-fg)] shadow-sm"
+        >
           {block.props.text}
         </div>
       );
@@ -527,7 +667,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
               <IconTile icon={ICONS[r.icon]} size={36} />
               <div>
                 <p className="text-sm font-semibold">{r.title}</p>
-                <p className="text-sm opacity-70">{r.text}</p>
+                <p className="text-sm text-[var(--muted)]">{r.text}</p>
               </div>
             </div>
           ))}
@@ -538,7 +678,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
     case "delivery_estimate":
       return <DeliveryEstimate {...block.props} ctx={ctx} />;
     case "reviews":
-      return <Reviews {...block.props} />;
+      return <Reviews {...block.props} labels={ctx.labels} />;
     case "comparison":
       return (
         <div>
@@ -547,16 +687,16 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
             <div className="grid grid-cols-[1fr_72px_72px] border-b border-[var(--border)] bg-black/[.02] text-xs font-semibold">
               <span className="px-3 py-2.5" />
               <span className="bg-[color-mix(in_srgb,var(--accent)_10%,white)] px-2 py-2.5 text-center text-[var(--accent)]">{block.props.usLabel}</span>
-              <span className="px-2 py-2.5 text-center text-[var(--muted)]">{block.props.themLabel}</span>
+              <span className="px-2 py-2.5 text-center text-neutral-700">{block.props.themLabel}</span>
             </div>
             {block.props.rows.map((r, i) => (
               <div key={i} className="grid grid-cols-[1fr_72px_72px] border-b border-[var(--border)] last:border-0">
                 <span className="px-3 py-2.5">{r.label}</span>
                 <span className="flex items-center justify-center bg-[color-mix(in_srgb,var(--accent)_5%,white)]">
-                  {r.us ? <Check className="h-4 w-4 text-emerald-600" strokeWidth={3} /> : <X className="h-4 w-4 text-neutral-300" />}
+                  {r.us ? <Check className="h-4 w-4 text-emerald-700" strokeWidth={3} role="img" aria-label="✓" /> : <X className="h-4 w-4 text-neutral-600" role="img" aria-label="✗" />}
                 </span>
                 <span className="flex items-center justify-center">
-                  {r.them ? <Check className="h-4 w-4 text-neutral-400" strokeWidth={3} /> : <X className="h-4 w-4 text-red-400" />}
+                  {r.them ? <Check className="h-4 w-4 text-neutral-600" strokeWidth={3} role="img" aria-label="✓" /> : <X className="h-4 w-4 text-red-600" role="img" aria-label="✗" />}
                 </span>
               </div>
             ))}
@@ -572,7 +712,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
             {embed.kind === "iframe" ? (
               <iframe
                 src={embed.src}
-                title={block.props.caption || "Vidéo"}
+                title={block.props.caption || ctx.labels.video}
                 className="h-full w-full"
                 allow="accelerometer; encrypted-media; gyroscope; picture-in-picture"
                 allowFullScreen
@@ -594,8 +734,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
           <div className="flex flex-wrap items-center justify-center gap-x-7 gap-y-3">
             {block.props.logos.map((l, i) =>
               l.imageUrl ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img key={i} src={l.imageUrl} alt={l.alt} className="h-6 w-auto object-contain opacity-60 grayscale" />
+                <SafeImg key={i} src={l.imageUrl} alt={l.alt} className="h-6 w-auto object-contain opacity-60 grayscale" fallback={null} />
               ) : null,
             )}
           </div>
@@ -648,21 +787,21 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
           {p.text && <p className="-mt-2 mb-3 text-sm text-[var(--muted)]">{p.text}</p>}
           <div className="flex flex-wrap gap-2 text-sm">
             {p.email && (
-              <a href={`mailto:${p.email}`} className="inline-flex items-center gap-1.5 rounded-full border border-[var(--border)] px-3 py-1.5 hover:bg-black/[.03]">
+              <a href={`mailto:${p.email}`} className="inline-flex min-h-11 items-center gap-1.5 rounded-full border border-[var(--border)] px-3.5 py-2 hover:bg-black/[.03]">
                 <Mail className="h-3.5 w-3.5" /> {p.email}
               </a>
             )}
             {p.phone && (
-              <a href={`tel:${p.phone.replace(/\s/g, "")}`} className="inline-flex items-center gap-1.5 rounded-full border border-[var(--border)] px-3 py-1.5 hover:bg-black/[.03]">
+              <a href={`tel:${p.phone.replace(/\s/g, "")}`} className="inline-flex min-h-11 items-center gap-1.5 rounded-full border border-[var(--border)] px-3.5 py-2 hover:bg-black/[.03]">
                 <Phone className="h-3.5 w-3.5" /> {p.phone}
               </a>
             )}
             {wa && (
-              <a href={`https://wa.me/${wa}`} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 rounded-full bg-[#25D366] px-3 py-1.5 font-medium text-white">
+              <a href={`https://wa.me/${wa}`} target="_blank" rel="noreferrer" className="inline-flex min-h-11 items-center gap-1.5 rounded-full bg-[#1f7a43] px-3.5 py-2 font-medium text-white">
                 <MessageCircle className="h-3.5 w-3.5" /> WhatsApp
               </a>
             )}
-            {!p.email && !p.phone && !wa && ctx.preview && <span className="text-xs text-neutral-400 italic">Ajoutez un e-mail, un téléphone ou WhatsApp</span>}
+            {!p.email && !p.phone && !wa && ctx.preview && <span className="text-xs text-neutral-500 italic">Ajoutez un e-mail, un téléphone ou WhatsApp</span>}
           </div>
         </div>
       );
@@ -689,6 +828,8 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
       return <Coupon {...block.props} />;
     case "upsell":
       return <UpsellOffer block={block} ctx={ctx} />;
+    case "survey":
+      return <Survey block={block} ctx={ctx} />;
     case "social": {
       const links = [
         { url: block.props.instagram, icon: InstagramIcon, label: "Instagram" },
@@ -756,50 +897,284 @@ function TikTokIcon({ className }: { className?: string }) {
   );
 }
 
-export function Placeholder({ children }: { children: ReactNode }) {
+/**
+ * "Complétez votre commande" (checkout): compact product cards with a one-tap "Ajouter".
+ * Without `onAdd` (builder preview) the button does nothing.
+ */
+export function Recommendations({
+  title,
+  items,
+  labels: L,
+  money,
+  showImages,
+  idPrefix,
+  onAdd,
+}: {
+  title: string;
+  items: CartLine[];
+  labels: Labels;
+  money: (cents: number) => string;
+  showImages: boolean;
+  idPrefix: string;
+  onAdd?: (item: CartLine) => void;
+}) {
+  if (items.length === 0) return null;
+  const headingId = `${idPrefix}reco-title`;
   return (
-    <div className="rounded-[var(--radius)] border-2 border-dashed border-neutral-300 px-4 py-6 text-center text-sm text-neutral-400">{children}</div>
+    <section aria-labelledby={headingId} className="text-left">
+      <h2 id={headingId} className="mb-2.5 font-[family-name:var(--heading-font)] text-base font-semibold tracking-tight">
+        {title}
+      </h2>
+      <ul className="space-y-2">
+        {items.map((r) => {
+          const price = money(r.unitPriceCents);
+          const compare = r.compareAtCents != null && r.compareAtCents > r.unitPriceCents ? money(r.compareAtCents) : null;
+          return (
+            <li key={r.variantId} className="flex items-center gap-3 rounded-[var(--radius)] border border-[var(--border)] bg-white p-2.5">
+              {showImages && (
+                <SafeImg
+                  src={r.imageUrl ?? ""}
+                  alt=""
+                  width={48}
+                  height={48}
+                  className="h-12 w-12 shrink-0 rounded-[calc(var(--radius)*0.8)] border border-neutral-200 bg-white object-cover"
+                  fallback={
+                    <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-[calc(var(--radius)*0.8)] bg-neutral-100 text-neutral-400">
+                      <Package className="h-5 w-5" aria-hidden />
+                    </span>
+                  }
+                />
+              )}
+              <div className="min-w-0 flex-1">
+                <p className="line-clamp-2 text-sm leading-snug font-medium break-words">{r.title}</p>
+                {r.variantTitle && <p className="truncate text-xs text-neutral-600">{r.variantTitle}</p>}
+                <p className="mt-0.5 flex flex-wrap items-baseline gap-x-1.5 text-sm">
+                  <span className="font-semibold">{price}</span>
+                  {compare && (
+                    <s className="text-xs text-neutral-600">
+                      <span className="sr-only">{L.recoWas} </span>
+                      {compare}
+                    </s>
+                  )}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onAdd ? () => onAdd(r) : undefined}
+                aria-label={L.recoAddLabel(r.title, price)}
+                className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center gap-1 rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-3.5 text-sm font-semibold text-[var(--accent-fg)] transition hover:brightness-110 motion-reduce:transition-none"
+              >
+                <Plus className="h-4 w-4" aria-hidden />
+                {L.recoAdd}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
   );
 }
 
-/** One-click post-purchase offer (thank-you page). */
+export function Placeholder({ children }: { children: ReactNode }) {
+  return (
+    <div className="rounded-[var(--radius)] border-2 border-dashed border-neutral-300 px-4 py-6 text-center text-sm text-neutral-500">{children}</div>
+  );
+}
+
+/**
+ * After "No thanks", focus goes to the offer heading now at the declined one's place (the next
+ * step of its funnel, else the next offer down the page), else the last offer left above, else
+ * the order heading — keyboard and screen-reader users are never dropped on <body>.
+ */
+export function focusAfterDecline(index: number) {
+  const headings = Array.from(document.querySelectorAll<HTMLElement>("[data-offer-heading]"));
+  const target = headings[Math.min(Math.max(0, index), headings.length - 1)] ?? document.querySelector<HTMLElement>("[data-order-heading]");
+  if (!target || target === document.activeElement) return;
+  target.focus({ preventScroll: true });
+  const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  target.scrollIntoView?.({ block: "center", behavior: reduce ? "auto" : "smooth" });
+}
+
+/** One-click post-purchase offer slot (thank-you page): the offer, then the next step of its funnel after "Yes" or "No thanks". */
 function UpsellOffer({ block, ctx }: { block: BlockOf<"upsell">; ctx: ContentContext }) {
-  const p = block.props;
-  const [state, setState] = useState<string | null>(ctx.upsell?.states[block.id] ?? null);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const L = ctx.labels;
-  const price = ctx.money(Math.round(p.price * 100));
-  const compare = p.compareAt > p.price ? ctx.money(Math.round(p.compareAt * 100)) : null;
-  const live = !!ctx.upsell && !ctx.preview;
-  const viewSession = live && state == null ? ctx.upsell?.sessionId : undefined;
+  const u = ctx.upsell && !ctx.preview ? ctx.upsell : null;
+  const trail = u ? slotTrail(block, u) : null;
+  // Offers already accepted when the page loaded: their confirmation never grabs focus.
+  const [initial] = useState(() => new Set(trail?.accepted.map((b) => b.id) ?? []));
+  if (!u || !trail) return <OfferCard block={block} ctx={ctx} upsell={null} swapped={false} />;
+  const { accepted, current } = trail;
+  if (!accepted.length && !current) return null;
+  return (
+    <div className="space-y-3">
+      {/* Accepted steps keep their confirmation while the funnel offers the next one. */}
+      {accepted.map((b) => (
+        <OfferConfirmation
+          key={`ok-${b.id}`}
+          // Accepted just now and no next step: the confirmation takes focus (the buttons are gone).
+          autoFocus={!current && !initial.has(b.id)}
+          text={u.messages?.[b.id] ?? (u.states[b.id] === "PAID" ? ctx.labels.upsellAdded("") : ctx.labels.upsellAddedPending)} />
+      ))}
+      {/* Keyed by offer: the next step mounts fresh (its own quantity, impression and entrance). */}
+      {current && <OfferCard key={current.id} block={current} ctx={ctx} upsell={u} swapped={current.id !== block.id} />}
+    </div>
+  );
+}
+
+function OfferConfirmation({ text, autoFocus }: { text: string; /** Answered just now: focus moves here (the buttons are gone). */ autoFocus?: boolean }) {
+  const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    // Impression, for the acceptance rate in Analytics (once per session, server-side).
-    if (viewSession) void fetch(`/api/public/sessions/${viewSession}/upsell`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ view: true }) }).catch(() => undefined);
-  }, [viewSession]);
+    if (autoFocus) ref.current?.focus({ preventScroll: false });
+  }, [autoFocus]);
+  return (
+    <div ref={ref} tabIndex={-1} role="status" className="flex items-center gap-3 rounded-[var(--radius)] border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600">
+      <Check className="h-5 w-5 shrink-0" strokeWidth={2.5} aria-hidden />
+      {text}
+    </div>
+  );
+}
+
+function OfferCard({ block, ctx, upsell, swapped }: { block: BlockOf<"upsell">; ctx: ContentContext; upsell: UpsellContext | null; swapped: boolean }) {
+  // The arm this visitor sees (server-decided); the builder canvas shows arm A.
+  const arm: OfferArm = upsell?.arms?.[block.id] ?? "A";
+  const p = offerArmProps(block, arm);
+  const state = upsell?.states[block.id] ?? null;
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<{ text: string; uncertain: boolean } | null>(null);
+  // Accepted offer whose outcome is unknown (5xx, lost connection): both buttons are hidden
+  // and the session's status is polled until the charge settles ("slow": still unsettled).
+  const [pending, setPending] = useState<null | "polling" | "slow">(null);
+  const [quantity, setQuantity] = useState(1);
+  const root = useRef<HTMLDivElement>(null);
+  const pendingRef = useRef<HTMLDivElement>(null);
+  const errorRef = useRef<HTMLParagraphElement>(null);
+  // The buyer answered in this page view: the outcome (notice, error, confirmation) takes focus.
+  const [answered, setAnswered] = useState(false);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+  useEffect(() => {
+    // The notice replaces the buttons at the top of the card: keep it on screen (small phones).
+    // The buttons are gone: focus moves to the notice (keyboard / screen-reader users).
+    if (!pending) return;
+    pendingRef.current?.focus({ preventScroll: true });
+    pendingRef.current?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+  }, [pending]);
+  useEffect(() => {
+    if (error && answered) errorRef.current?.focus({ preventScroll: false });
+  }, [error, answered]);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const L = ctx.labels;
+  const maxQty = Math.min(MAX_OFFER_QUANTITY, Math.max(1, p.maxQuantity ?? 1));
+  // "% off" offers: Shopify's live price (thank-you page); the builder uses the regular price entered.
+  const percent = p.priceMode === "percent";
+  const liveCents = percent ? (upsell ? upsell.livePrices?.[variantGidOf(p.variantId) ?? ""] : p.compareAt > 0 ? Math.round(p.compareAt * 100) : null) : null;
+  const unitCents = offerUnitCents(p, liveCents) ?? 0;
+  const price = ctx.money(unitCents);
+  const total = ctx.money(unitCents * quantity);
+  const compareUnit = percent ? (liveCents ?? 0) : Math.round(p.compareAt * 100);
+  const compare = compareUnit > unitCents ? ctx.money(compareUnit * quantity) : null;
+  const pctOff = percent ? new Intl.NumberFormat(localeOf(ctx.lang), { maximumFractionDigits: 0 }).format(p.discountPercent) : null;
+  const live = !!upsell;
+  const viewSession = live && state == null ? upsell.sessionId : undefined;
+  const viewKey = armKey(block.id, arm);
+  const now = useNow(30_000);
+  const minutesLeft = ctx.offerEndsAt && now != null ? Math.max(1, Math.ceil((ctx.offerEndsAt - now) / 60_000)) : null;
+  useEffect(() => {
+    // Impression of the arm actually displayed (the next steps too), for the acceptance rate per arm.
+    if (viewSession) void fetch(`/api/public/sessions/${viewSession}/upsell`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ view: true, blockIds: [viewKey] }) }).catch(() => undefined);
+  }, [viewSession, viewKey]);
+
+  useEffect(() => {
+    // The next step replaces the answered offer: a short entrance, and focus moves to it.
+    if (!swapped) return;
+    heading.current?.focus({ preventScroll: true });
+    if (!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      root.current?.animate?.(
+        [
+          { opacity: 0, transform: "translateY(10px) scale(.98)" },
+          { opacity: 1, transform: "none" },
+        ],
+        { duration: 320, easing: "cubic-bezier(.2,.8,.2,1)" },
+      );
+    }
+  }, [swapped]);
+
+  async function settle() {
+    if (!upsell) return;
+    setPending("polling");
+    setError(null);
+    const started = Date.now();
+    for (let attempt = 1; alive.current; attempt++) {
+      const elapsed = Date.now() - started;
+      await new Promise((r) => setTimeout(r, elapsed < 90_000 ? 2500 : 10_000));
+      if (!alive.current) return;
+      const body = await fetch(`/api/public/sessions/${upsell.sessionId}/status`, { cache: "no-store" })
+        .then((r) => (r.ok ? r.json() : null))
+        .catch(() => null);
+      const offer = (body?.upsells as Record<string, { status: string; orderName: string | null }> | undefined)?.[block.id];
+      if (offer?.status === "PAID") {
+        upsell.setState(block.id, "PAID", L.upsellAdded(offer.orderName ?? ""));
+        return;
+      }
+      if (offer?.status === "DECLINED") {
+        upsell.setState(block.id, "DECLINED");
+        return;
+      }
+      // FAILED, or still no charge after a few checks (the request never reached the payment):
+      // nothing was charged, and a new attempt is idempotent server-side.
+      if (offer?.status === "FAILED" || (body && !offer && attempt >= 4)) {
+        setPending(null);
+        setError({ text: L.upsellFailedRetry, uncertain: false });
+        return;
+      }
+      if (Date.now() - started >= 90_000) setPending("slow");
+      if (Date.now() - started >= 10 * 60_000) return; // the background check settles it; the notice stays
+    }
+  }
 
   async function answer(accept: boolean) {
-    if (!live || !ctx.upsell) return;
+    if (!upsell) return;
+    setAnswered(true);
     setBusy(true);
     setError(null);
+    // Unknown outcome of an accepted offer (lost connection, server error after the charge
+    // was sent): never claim nothing was charged; settle() waits for the real outcome.
     try {
-      const res = await fetch(`/api/public/sessions/${ctx.upsell.sessionId}/upsell`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ blockId: block.id, accept }),
-      });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error ?? "Erreur");
+      let res: Response;
+      try {
+        res = await fetch(`/api/public/sessions/${upsell.sessionId}/upsell`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          // variantId: the product shown (an automatic offer is only charged if it is still that one).
+          body: JSON.stringify(accept ? { blockId: block.id, accept, quantity, variantId: offerArmProps(block, upsell.arms?.[block.id] ?? "A").variantId } : { blockId: block.id, accept }),
+        });
+      } catch {
+        if (accept) void settle();
+        else setError({ text: L.error, uncertain: false });
+        return;
+      }
+      const body = await res.json().catch(() => null);
+      if (!res.ok || !body) {
+        if (body?.code === "upsell_uncertain" || (accept && (res.status >= 500 || !body))) void settle();
+        else setError({ text: errorText(L, body), uncertain: false });
+        return;
+      }
       if (body.status === "action" && body.url) {
         window.location.href = body.url; // 3-D Secure confirmation, back to this page after
         return;
       }
-      setState(body.status === "paid" ? "PAID" : body.status === "declined" ? "DECLINED" : "PENDING");
-      if (body.status === "paid") setMessage(L.upsellAdded(body.orderName ?? ""));
-      if (body.status === "pending") setMessage(L.upsellAddedPending);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Erreur");
+      const message = body.status === "paid" ? L.upsellAdded(body.orderName ?? "") : body.status === "pending" ? L.upsellAddedPending : undefined;
+      if (body.status === "declined" && heading.current) {
+        upsell.declined?.(Array.from(document.querySelectorAll("[data-offer-heading]")).indexOf(heading.current));
+      }
+      upsell.setState(block.id, body.status === "paid" ? "PAID" : body.status === "declined" ? "DECLINED" : "PENDING", message);
+    } catch {
+      if (accept) void settle();
+      else setError({ text: L.error, uncertain: false });
     } finally {
       setBusy(false);
     }
@@ -807,53 +1182,208 @@ function UpsellOffer({ block, ctx }: { block: BlockOf<"upsell">; ctx: ContentCon
 
   if (state === "DECLINED") return null;
   if (state === "PAID" || state === "PENDING") {
-    return (
-      <div className="flex items-center gap-3 rounded-[var(--radius)] border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800">
-        <Check className="h-5 w-5 shrink-0" strokeWidth={2.5} />
-        {message ?? (state === "PAID" ? L.upsellAdded("") : L.upsellAddedPending)}
+    return <OfferConfirmation autoFocus={answered} text={upsell?.messages?.[block.id] ?? (state === "PAID" ? L.upsellAdded("") : L.upsellAddedPending)} />;
+  }
+  // "% off" without a live price (Shopify unreachable): the server hides it; never a made-up price.
+  if (live && percent && liveCents == null) return null;
+  const image = p.imageUrl || ctx.lineImages?.[variantGidOf(p.variantId) ?? ""] || null;
+  const tile = (
+    <span className="flex h-24 w-24 shrink-0 items-center justify-center rounded-[calc(var(--radius)*0.8)] bg-neutral-100 text-neutral-400" aria-hidden>
+      <Package className="h-8 w-8" />
+    </span>
+  );
+  const stepBtn =
+    "relative flex h-9 w-9 items-center justify-center rounded-full text-neutral-800 after:absolute after:-inset-1 after:content-[''] hover:bg-neutral-100 disabled:cursor-not-allowed disabled:text-neutral-400 disabled:hover:bg-transparent";
+  return (
+    <div ref={root} className="overflow-hidden rounded-[var(--radius)] border-2 border-[var(--accent)] bg-white shadow-[0_12px_32px_-16px_rgba(0,0,0,.25)]">
+      {swapped && <p className="sr-only">{L.upsellNextOffer}</p>}
+      {p.badge && <p className="bg-[image:var(--accent-bg)] px-4 py-2 text-center text-xs font-semibold tracking-wide text-[var(--accent-fg)] uppercase">{p.badge}</p>}
+      {/* Unknown outcome: the notice leads the card, the buttons are hidden until it settles. */}
+      {pending && (
+        // The focus ring is drawn around the notice itself, inside the card's padding: never clipped by the card's edge.
+        <div ref={pendingRef} tabIndex={-1} className="group scroll-mt-4 px-4 pt-4 focus:outline-none">
+          <div role="alert" className="flex items-start gap-3 rounded-[calc(var(--radius)*0.8)] border border-neutral-200 bg-neutral-50 p-3 text-sm text-neutral-800 group-focus-visible:ring-2 group-focus-visible:ring-[var(--focus,#111827)] group-focus-visible:ring-offset-2">
+            <span className="mt-0.5 h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-neutral-500 border-r-transparent motion-reduce:animate-none" aria-hidden />
+            <span>
+              <strong className="block font-semibold">{L.upsellPendingTitle}</strong>
+              {pending === "slow" ? L.upsellStillPending : L.upsellPendingText}
+            </span>
+          </div>
+        </div>
+      )}
+      {ctx.preview && arm === "A" && block.props.variantB?.enabled && (
+        <p className="bg-indigo-50 px-4 py-1 text-center text-[11px] text-indigo-900">Aperçu de la version A · la version B est vue par {block.props.variantB.split} % des clients</p>
+      )}
+      <div className="flex gap-4 p-4">
+        {/* No photo of its own: the matching order line's photo, else a neutral tile (never an empty slot). */}
+        {image ? (
+          <SafeImg src={image} alt="" width={96} height={96} className="h-24 w-24 shrink-0 rounded-[calc(var(--radius)*0.8)] object-cover" fallback={tile} />
+        ) : (
+          tile
+        )}
+        <div className="min-w-0 flex-1">
+          <h2 ref={heading} tabIndex={live ? -1 : undefined} data-offer-heading={live ? "" : undefined} className="rounded-sm font-[family-name:var(--heading-font)] text-base font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus,#111827)] focus-visible:ring-offset-2">
+            {p.title}
+          </h2>
+          <p className="mt-1 text-sm text-[var(--muted)]">{p.text}</p>
+          <p className="mt-2 flex flex-wrap items-baseline gap-x-2">
+            <span className="text-lg font-semibold">{total}</span>
+            {compare && <span className="text-sm text-neutral-600 line-through">{compare}</span>}
+            {pctOff && compare && <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-800">{L.upsellOff(pctOff)}</span>}
+            {quantity > 1 && <span className="text-xs text-neutral-600">{`${quantity} × ${price}`}</span>}
+          </p>
+          {ctx.offerCurrency && <p className="mt-1 text-xs text-neutral-700">{L.upsellShopCurrency(ctx.offerCurrency.shop, ctx.offerCurrency.paid)}</p>}
+        </div>
       </div>
+      {!pending && (
+        <div className="space-y-2 px-4 pb-4">
+          {error && (
+            <p ref={errorRef} tabIndex={-1} role="alert" className={`rounded-[calc(var(--radius)*0.8)] px-3 py-2 text-center text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus,#111827)] ${error.uncertain ? "bg-neutral-50 text-neutral-800" : "bg-red-50 text-red-800"}`}>
+              {error.text}
+            </p>
+          )}
+          {maxQty > 1 && (
+            <div className="flex items-center justify-between gap-3">
+              <span id={`upsell-qty-${block.id}`} className="text-sm font-medium">
+                {L.upsellQty}
+              </span>
+              <div role="group" aria-labelledby={`upsell-qty-${block.id}`} className="inline-flex items-center rounded-full border border-neutral-300 bg-white">
+                <button type="button" className={stepBtn} aria-label={L.upsellQtyDecrease} disabled={busy || quantity <= 1} onClick={() => setQuantity((n) => Math.max(1, n - 1))}>
+                  <Minus className="h-3.5 w-3.5" aria-hidden />
+                </button>
+                <output aria-live="polite" className="min-w-7 text-center text-sm font-medium tabular-nums">
+                  {quantity}
+                </output>
+                <button type="button" className={stepBtn} aria-label={L.upsellQtyIncrease} disabled={busy || quantity >= maxQty} onClick={() => setQuantity((n) => Math.min(maxQty, n + 1))}>
+                  <Plus className="h-3.5 w-3.5" aria-hidden />
+                </button>
+              </div>
+            </div>
+          )}
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => answer(true)}
+            className="flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-5 py-3.5 font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)] transition hover:brightness-110 disabled:opacity-60"
+          >
+            {busy && <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-r-transparent motion-reduce:animate-none" aria-hidden />}
+            {p.buttonText} · {total}
+          </button>
+          <button type="button" disabled={busy} onClick={() => answer(false)} className="min-h-11 w-full py-2 text-sm text-[var(--muted)] underline underline-offset-2">
+            {p.declineText}
+          </button>
+          <p className="text-center text-[11px] text-neutral-600">{L.upsellNoCard}</p>
+          {minutesLeft != null && (
+            <p className="flex items-center justify-center gap-1 text-center text-[11px] text-neutral-600">
+              <Timer className="h-3 w-3 shrink-0" aria-hidden />
+              {L.offerValidFor(minutesLeft)}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Post-purchase survey (thank-you page): "How did you hear about us?", one tap, stored on the order. */
+function Survey({ block, ctx }: { block: BlockOf<"survey">; ctx: ContentContext }) {
+  const L = ctx.labels;
+  const live = ctx.survey && !ctx.preview ? ctx.survey : null;
+  const [done, setDone] = useState(!!live?.answered);
+  const [other, setOther] = useState(false);
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const uid = `survey-${block.id}`;
+  const options = block.props.options;
+
+  async function send(answer: string) {
+    setError(null);
+    if (!live) {
+      setDone(true); // builder / preview: nothing is stored
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await fetch(`/api/public/sessions/${live.sessionId}/survey`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer }),
+      });
+      const body = await res.json().catch(() => null);
+      // Already answered (another tab): the thanks are just as true.
+      if (res.ok || body?.code === "survey_answered") setDone(true);
+      else setError(body?.code === "survey_invalid" ? errorText(L, body) : L.surveyError);
+    } catch {
+      setError(L.surveyError);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (done) {
+    return (
+      <p role="status" className="flex items-center justify-center gap-2 rounded-[var(--radius)] border border-neutral-200 bg-white p-4 text-sm font-medium">
+        <Check className="h-4 w-4 text-emerald-700" strokeWidth={2.5} aria-hidden />
+        {L.surveyThanks}
+      </p>
     );
   }
   return (
-    <div className="overflow-hidden rounded-[var(--radius)] border-2 border-[var(--accent)] bg-white shadow-[0_12px_32px_-16px_rgba(0,0,0,.25)]">
-      {p.badge && <p className="bg-[image:var(--accent-bg)] px-4 py-2 text-center text-xs font-semibold tracking-wide text-[var(--accent-fg)] uppercase">{p.badge}</p>}
-      <div className="flex gap-4 p-4">
-        {p.imageUrl ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img src={p.imageUrl} alt="" className="h-24 w-24 shrink-0 rounded-[calc(var(--radius)*0.8)] object-cover" />
-        ) : ctx.preview ? (
-          <div className="h-24 w-24 shrink-0 rounded-[calc(var(--radius)*0.8)] bg-neutral-100" />
-        ) : null}
-        <div className="min-w-0 flex-1">
-          <h3 className="font-[family-name:var(--heading-font)] text-base font-semibold">{p.title}</h3>
-          <p className="mt-1 text-sm text-[var(--muted)]">{p.text}</p>
-          <p className="mt-2 flex items-baseline gap-2">
-            <span className="text-lg font-semibold">{price}</span>
-            {compare && <span className="text-sm text-neutral-400 line-through">{compare}</span>}
-          </p>
-        </div>
+    <section aria-labelledby={`${uid}-q`} className="rounded-[var(--radius)] border border-neutral-200 bg-white p-4">
+      <h2 id={`${uid}-q`} className="mb-3 font-[family-name:var(--heading-font)] text-base font-semibold">
+        {block.props.question || L.surveyQuestion}
+      </h2>
+      <div className="flex flex-wrap gap-2" role="group" aria-labelledby={`${uid}-q`}>
+        {options.map((key) => (
+          <button
+            key={key}
+            type="button"
+            disabled={busy}
+            aria-expanded={key === "other" ? other : undefined}
+            aria-controls={key === "other" ? `${uid}-other` : undefined}
+            onClick={() => (key === "other" ? setOther((v) => !v) : send(key))}
+            className={`min-h-11 rounded-full border px-4 py-2 text-sm font-medium transition hover:border-[var(--accent)] disabled:opacity-60 ${key === "other" && other ? "border-[var(--accent)] bg-[color-mix(in_srgb,var(--accent)_8%,white)]" : "border-neutral-300 bg-white"}`}
+          >
+            {L.surveyOptions[key] ?? key}
+          </button>
+        ))}
       </div>
-      <div className="space-y-2 px-4 pb-4">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => answer(true)}
-          className="flex w-full items-center justify-center gap-2 rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-5 py-3.5 font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)] transition hover:brightness-110 disabled:opacity-60"
+      {other && (
+        <form
+          id={`${uid}-other`}
+          className="mt-3 flex gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const t = text.trim();
+            void send(t ? `other:${t}` : "other");
+          }}
         >
-          {busy && <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-r-transparent" />}
-          {p.buttonText} · {price}
-        </button>
-        <button type="button" disabled={busy} onClick={() => answer(false)} className="w-full py-1.5 text-sm text-[var(--muted)] underline underline-offset-2">
-          {p.declineText}
-        </button>
-        <p className="text-center text-[11px] text-neutral-400">{L.upsellNoCard}</p>
-        {error && (
-          <p role="alert" className="text-center text-xs text-red-600">
-            {error}
-          </p>
-        )}
-        {ctx.preview && !p.variantId && <Placeholder>Offre post-achat : renseignez l&apos;ID de variante Shopify</Placeholder>}
-      </div>
-    </div>
+          <label htmlFor={`${uid}-text`} className="sr-only">
+            {L.surveyOtherLabel}
+          </label>
+          <input
+            id={`${uid}-text`}
+            value={text}
+            maxLength={SURVEY_OTHER_MAX}
+            placeholder={L.surveyOtherLabel}
+            onChange={(e) => setText(e.target.value)}
+            className="min-h-11 min-w-0 flex-1 rounded-[var(--radius)] border border-neutral-300 bg-white px-3 text-sm"
+          />
+          <button
+            type="submit"
+            disabled={busy}
+            className="min-h-11 shrink-0 rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-4 text-sm font-semibold text-[var(--accent-fg)] disabled:opacity-60"
+          >
+            {L.surveySend}
+          </button>
+        </form>
+      )}
+      {error && (
+        <p role="alert" className="mt-2 text-xs text-red-700">
+          {error}
+        </p>
+      )}
+    </section>
   );
 }
