@@ -5,6 +5,7 @@ import type { Store } from "@prisma/client";
 import { decrypt } from "./crypto";
 import { env } from "./env";
 import { centsToDecimal } from "./pricing";
+import { recordEvent } from "./log";
 
 /** Events the app subscribes to when it creates the Whop webhook itself. */
 export const WHOP_WEBHOOK_EVENTS = [
@@ -48,19 +49,23 @@ export async function setupWhop(opts: {
 
   // Idempotent: reuse this store's product and replace its webhook if a previous
   // attempt (or an older connection) already created them.
+  const productInput = {
+    account_id: account.id,
+    title: `${opts.storeName || "Boutique"} — Checkout`,
+    description: "Commandes de la boutique Shopify (créé automatiquement par Whop Checkout).",
+    visibility: "hidden" as const,
+    collect_shipping_address: false,
+    send_welcome_message: false,
+    metadata: { source: "whop-checkout", store_id: opts.storeId },
+  };
+  const descriptor = statementDescriptor(opts.statementDescriptor || opts.storeName);
   const product =
     (await findStoreProduct(client, account.id, opts.storeId)) ??
-    (await client.products.create({
-      account_id: account.id,
-      title: `${opts.storeName || "Boutique"} — Checkout`,
-      description: "Commandes de la boutique Shopify (créé automatiquement par Whop Checkout).",
-      visibility: "hidden",
-      collect_shipping_address: false,
-      send_welcome_message: false,
-      // What buyers see on their bank statement: a recognisable name prevents "unknown charge" disputes.
-      custom_statement_descriptor: statementDescriptor(opts.statementDescriptor || opts.storeName) ?? undefined,
-      metadata: { source: "whop-checkout", store_id: opts.storeId },
-    }));
+    // What buyers see on their bank statement: a recognisable name prevents "unknown charge"
+    // disputes. A rejected descriptor must never block the connection.
+    (await (descriptor
+      ? client.products.create({ ...productInput, custom_statement_descriptor: descriptor }).catch(() => client.products.create(productInput))
+      : client.products.create(productInput)));
 
   const url = whopWebhookUrl(opts.storeId);
   await deleteWebhooksForUrl(client, account.id, url);
@@ -183,7 +188,13 @@ export async function createCheckoutConfiguration(
   } catch (err) {
     // A method the account isn't eligible for (e.g. PayPal) must never block the sale:
     // fall back to the account's default methods.
-    console.warn("Whop rejected the payment method configuration, using account defaults", err);
+    await recordEvent({
+      storeId: opts.storeId,
+      sessionId: opts.sessionId,
+      level: "warn",
+      kind: "payment_methods.rejected",
+      message: `Whop a refusé la liste des moyens de paiement (${err instanceof Error ? err.message : String(err)}) : moyens par défaut du compte utilisés. Activez-les dans Whop ou retirez-les.`,
+    });
     config = await client.checkoutConfigurations.create(base);
   }
   return { id: config.id, purchaseUrl: config.purchase_url ?? null };
@@ -272,6 +283,7 @@ export function paymentInfoFromWhop(data: Record<string, unknown>) {
     checkoutConfigurationId: str(data.checkout_configuration_id),
     memberId: str(data.member_id),
     paymentMethodId: str(data.payment_method_id),
+    paymentMethodType: str(data.payment_method_type),
     buyer: {
       email: str(data.customer_email) ?? user?.email ?? null,
       shippingAddress: (data.shipping_address ?? null) as Addr | null,
@@ -281,16 +293,20 @@ export function paymentInfoFromWhop(data: Record<string, unknown>) {
   };
 }
 
-/** Bank statement descriptors: 5–22 characters, letters/digits/spaces only. */
+/**
+ * Card statement descriptor for Whop: must start with "WHOP*", 5–22 characters, Latin
+ * letters/digits/spaces/_/-, at least one letter. "Ma Boutique" → "WHOP*MA BOUTIQUE".
+ */
 export function statementDescriptor(name: string | null | undefined): string | null {
   const clean = (name ?? "")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^A-Za-z0-9 ]/g, "")
+    .replace(/^\s*WHOP\*/i, "")
+    .replace(/[^A-Za-z0-9 _-]/g, "")
     .replace(/\s+/g, " ")
     .trim()
     .toUpperCase()
-    .slice(0, 22)
+    .slice(0, 17)
     .trim();
-  return clean.length >= 5 ? clean : null;
+  return /[A-Z]/.test(clean) ? `WHOP*${clean}` : null;
 }

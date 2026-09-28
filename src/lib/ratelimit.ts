@@ -27,9 +27,11 @@ function memoryHit(key: string, limit: number, windowMs: number): boolean {
 export async function rateLimit(key: string, limit: number, windowMs = 60_000): Promise<boolean> {
   if (!memoryHit(key, limit, windowMs)) return false;
   try {
+    // The window is computed by Postgres itself, in UTC, whatever the session time zone.
+    const seconds = Math.ceil(windowMs / 1000);
     const rows = await db.$queryRaw<{ count: number }[]>`
       INSERT INTO "RateLimit" ("key", "count", "resetAt")
-      VALUES (${key}, 1, ${new Date(Date.now() + windowMs)})
+      VALUES (${key}, 1, (now() AT TIME ZONE 'UTC') + make_interval(secs => ${seconds}))
       ON CONFLICT ("key") DO UPDATE SET
         "count" = CASE WHEN "RateLimit"."resetAt" <= (now() AT TIME ZONE 'UTC') THEN 1 ELSE "RateLimit"."count" + 1 END,
         "resetAt" = CASE WHEN "RateLimit"."resetAt" <= (now() AT TIME ZONE 'UTC') THEN EXCLUDED."resetAt" ELSE "RateLimit"."resetAt" END

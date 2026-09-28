@@ -773,6 +773,11 @@ function UpsellOffer({ block, ctx }: { block: BlockOf<"upsell">; ctx: ContentCon
   const price = ctx.money(Math.round(p.price * 100));
   const compare = p.compareAt > p.price ? ctx.money(Math.round(p.compareAt * 100)) : null;
   const live = !!ctx.upsell && !ctx.preview;
+  const viewSession = live && state == null ? ctx.upsell?.sessionId : undefined;
+  useEffect(() => {
+    // Impression, for the acceptance rate in Analytics (once per session, server-side).
+    if (viewSession) void fetch(`/api/public/sessions/${viewSession}/upsell`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ view: true }) }).catch(() => undefined);
+  }, [viewSession]);
 
   async function answer(accept: boolean) {
     if (!live || !ctx.upsell) return;

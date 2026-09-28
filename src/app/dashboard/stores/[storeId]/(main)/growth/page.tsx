@@ -2,7 +2,7 @@ import { notFound } from "next/navigation";
 import { Megaphone, Radar } from "lucide-react";
 import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { Card, Flash, Input, Label, PageHeader, SubmitButton } from "@/components/ui";
+import { Card, Flash, Input, Label, PageHeader, Select, SubmitButton, Toggle } from "@/components/ui";
 import { SecretInput } from "@/components/dashboard/SecretInput";
 import { saveTrackingAction, testTrackingAction } from "../../../../actions";
 
@@ -33,7 +33,7 @@ export default async function GrowthPage({
           icon={Radar}
           iconColor="#2563eb"
           title="Pixels côté serveur (Meta & TikTok)"
-          description="Vos clients ne passent plus par la page de remerciement Shopify : sans ceci, Meta et TikTok ne voient aucun achat et optimisent à l'aveugle. Chaque achat est envoyé depuis le serveur (e-mail/téléphone hachés, identifiants _fbp/_fbc/_ttp), dédoublonné avec votre pixel navigateur. Un refus sur la bannière cookies Shopify est respecté."
+          description="Vos clients ne passent plus par la page de remerciement Shopify : sans ceci, Meta et TikTok ne voient aucun achat et optimisent à l'aveugle. Chaque achat est envoyé depuis le serveur (e-mail/téléphone hachés, identifiants _fbp/_fbc/_ttp), dédoublonné avec votre pixel navigateur. Le même événement est aussi envoyé par le pixel navigateur sur la page de paiement (dédoublonné), et renvoyé automatiquement en cas d'échec."
         >
           <form action={saveTrackingAction.bind(null, store.id)} className="space-y-4">
             <div className="grid gap-4 sm:grid-cols-2">
@@ -68,6 +68,25 @@ export default async function GrowthPage({
                 </Label>
                 <SecretInput name="tiktokAccessToken" stored={!!store.tiktokAccessToken} />
               </div>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div>
+                <Label htmlFor="metaContentIdFormat" hint="« Catalogue Shopify » si vos pubs dynamiques utilisent le catalogue synchronisé par l'app Facebook de Shopify.">
+                  Identifiants produits Meta
+                </Label>
+                <Select id="metaContentIdFormat" name="metaContentIdFormat" defaultValue={store.metaContentIdFormat}>
+                  <option value="variant">ID de variante</option>
+                  <option value="shopify">Catalogue Shopify (shopify_FR_produit_variante)</option>
+                </Select>
+              </div>
+            </div>
+            <div className="border-y border-zinc-100">
+              <Toggle
+                name="pixelRequireConsent"
+                defaultChecked={store.pixelRequireConsent}
+                label="Exiger un consentement explicite"
+                hint="Recommandé si votre bannière cookies Shopify est active : aucun envoi tant que le client n'a pas accepté le marketing. Un refus est toujours respecté."
+              />
             </div>
             <div className="flex flex-wrap gap-2">
               <SubmitButton>Enregistrer</SubmitButton>

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
-import { significance, summarize } from "@/lib/experiments";
+import { analyze, bucketOf, summarize } from "@/lib/experiments";
 import { statementDescriptor } from "@/lib/whop";
 import { buildEvidence } from "@/lib/disputes";
-import { metaPayload, tiktokPayload } from "@/lib/conversions";
+import { e164, metaPayload, sessionEvent, tiktokPayload } from "@/lib/conversions";
 import { reviewReasons } from "@/lib/checkout";
 
 const sha = (v: string) => createHash("sha256").update(v).digest("hex");
@@ -14,6 +14,7 @@ const store = {
   metaPixelId: "123",
   metaTestEventCode: null,
   tiktokPixelId: "TT1",
+  metaContentIdFormat: "variant",
   theme: null,
 } as never;
 
@@ -30,61 +31,90 @@ const session = {
   userAgent: "Mozilla/5.0",
   tracking: { fbp: "fb.1.1.1", fbc: "fb.1.1.abc", ttp: "ttp1", ttclid: "cl1" },
   shippingAddress: { firstName: "Alex", lastName: "Martin", address1: "1 rue X", city: "Paris", zip: "75001", countryCode: "FR", phone: "+33 6 00 00 00 00" },
-  lines: [{ variantId: "gid://shopify/ProductVariant/42", title: "Sweat", variantTitle: "M", quantity: 2, unitPriceCents: 2500, imageUrl: null }],
+  lines: [{ variantId: "gid://shopify/ProductVariant/42", productId: "gid://shopify/Product/7", title: "Sweat", variantTitle: "M", quantity: 2, unitPriceCents: 2500, imageUrl: null }],
   termsAcceptedAt: new Date("2026-09-01T09:59:00Z"),
   store,
 } as never;
 
 describe("server-side conversions", () => {
-  it("Meta: hashed normalized identity, dedupe id, value and contents", () => {
-    const p = metaPayload(session, "Purchase");
+  it("Meta: hashed normalized identity, E.164 phone, dedupe id, value and contents", () => {
+    const p = metaPayload(session, sessionEvent(session, "purchase"));
     const e = p.data[0];
     expect(e.event_id).toBe("purchase-sess1");
     expect(e.user_data.em).toEqual([sha("alex@example.com")]);
     expect(e.user_data.ph).toEqual([sha("33600000000")]);
     expect(e.user_data.fbp).toBe("fb.1.1.1");
     expect(e.user_data.client_ip_address).toBe("1.2.3.4");
-    expect(e.custom_data).toMatchObject({ currency: "EUR", value: 54.9, num_items: 2, content_ids: ["42"], order_id: "#1001" });
+    expect(e.custom_data).toMatchObject({ currency: "EUR", value: 54.9, num_items: 2, content_ids: ["42"], order_id: "purchase-sess1" });
     expect(e.event_time).toBe(Math.floor(new Date("2026-09-01T10:00:00Z").getTime() / 1000));
   });
-  it("TikTok: CompletePayment with the same dedupe id", () => {
-    const p = tiktokPayload(session, "CompletePayment");
+  it("Meta: Shopify catalog content ids when configured", () => {
+    const shopifyFormat = { ...(session as object), store: { ...(store as object), metaContentIdFormat: "shopify" } } as never;
+    expect(metaPayload(shopifyFormat, sessionEvent(shopifyFormat, "purchase")).data[0].custom_data.content_ids).toEqual(["shopify_FR_7_42"]);
+  });
+  it("TikTok: CompletePayment with the same dedupe id and order id", () => {
+    const p = tiktokPayload(session, sessionEvent(session, "purchase"));
     expect(p.event_source_id).toBe("TT1");
     expect(p.data[0].event_id).toBe("purchase-sess1");
+    expect(p.data[0].properties.order_id).toBe("purchase-sess1");
     expect(p.data[0].user.ttclid).toBe("cl1");
+    expect(p.data[0].user.phone).toBe(sha("+33600000000"));
     expect(p.data[0].properties.value).toBe(54.9);
+  });
+  it("normalizes national phone numbers to E.164", () => {
+    expect(e164("06 12 34 56 78", "FR")).toBe("33612345678");
+    expect(e164("+32 470 12 34 56", "FR")).toBe("32470123456");
+    expect(e164("0032470123456", "BE")).toBe("32470123456");
+    expect(e164("0470 12 34 56", "BE")).toBe("32470123456");
+    expect(e164("0551 23 45 67", "DZ")).toBe("213551234567");
+    expect(e164("", "FR")).toBeUndefined();
   });
 });
 
 describe("statementDescriptor", () => {
-  it("normalizes to 5–22 plain uppercase characters", () => {
-    expect(statementDescriptor("Boutique Élégance & Co!")).toBe("BOUTIQUE ELEGANCE CO");
+  it("builds Whop's WHOP* descriptor, 22 characters max", () => {
+    expect(statementDescriptor("Boutique Élégance & Co!")).toBe("WHOP*BOUTIQUE ELEGANCE");
     expect(statementDescriptor("A very long store name that goes on")).toHaveLength(22);
-    expect(statementDescriptor("abc")).toBeNull();
+    expect(statementDescriptor("WHOP*seyuna")).toBe("WHOP*SEYUNA");
+    expect(statementDescriptor("123")).toBeNull();
+    expect(statementDescriptor("")).toBeNull();
   });
 });
 
-describe("A/B significance", () => {
-  it("summarizes variants and gives high confidence for a large, clear lift", () => {
+describe("A/B tests", () => {
+  const row = (variant: string, visitorId: string, status: string, totalCents = 5000) => ({ id: `${variant}${visitorId}${Math.random()}`, variant, visitorId, status, totalCents });
+  it("assigns a visitor to the same bucket every time, and splits evenly", () => {
+    expect(bucketOf("visitor-1", "exp1")).toBe(bucketOf("visitor-1", "exp1"));
+    const inB = Array.from({ length: 10_000 }, (_, i) => bucketOf(`v${i}`, "exp1") < 30).filter(Boolean).length;
+    expect(inB / 10_000).toBeGreaterThan(0.28);
+    expect(inB / 10_000).toBeLessThan(0.32);
+  });
+  it("counts unique visitors, not checkout clicks", () => {
+    const [a] = summarize([row("A", "v1", "OPEN"), row("A", "v1", "OPEN"), row("A", "v1", "PAID"), row("A", "v2", "OPEN")]);
+    expect(a.visitors).toBe(2);
+    expect(a.cvr).toBe(0.5);
+    expect(a.rpv).toBe(2500);
+  });
+  it("finds a clear lift significant, with enough data and no sample-ratio mismatch", () => {
     const rows = [
-      ...Array.from({ length: 1000 }, (_, i) => ({ variant: "A", status: i < 30 ? "PAID" : "OPEN", totalCents: 5000 })),
-      ...Array.from({ length: 1000 }, (_, i) => ({ variant: "B", status: i < 60 ? "PAID" : "OPEN", totalCents: 5000 })),
+      ...Array.from({ length: 1000 }, (_, i) => row("A", `a${i}`, i < 30 ? "PAID" : "OPEN")),
+      ...Array.from({ length: 1000 }, (_, i) => row("B", `b${i}`, i < 60 ? "PAID" : "OPEN")),
     ];
     const [a, b] = summarize(rows);
-    expect(a.cvr).toBeCloseTo(0.03);
-    expect(b.rpv).toBe(300);
-    const s = significance(a, b);
-    expect(s.lift).toBeCloseTo(1);
-    expect(s.confidence).toBeGreaterThan(0.99);
+    const v = analyze(a, b, 50);
+    expect(v.cvrLift).toBeCloseTo(1);
+    expect(v.cvrPValue).toBeLessThan(0.01);
+    expect(v.rpvPValue).toBeLessThan(0.01);
+    expect(v.enoughData).toBe(true);
+    expect(v.sampleRatioMismatch).toBe(false);
   });
-  it("gives low confidence on tiny samples", () => {
-    const [a, b] = summarize([
-      { variant: "A", status: "PAID", totalCents: 1 },
-      { variant: "A", status: "OPEN", totalCents: 1 },
-      { variant: "B", status: "OPEN", totalCents: 1 },
-      { variant: "B", status: "OPEN", totalCents: 1 },
-    ]);
-    expect(significance(a, b).confidence).toBeLessThan(0.8);
+  it("flags a broken split and small samples", () => {
+    const rows = [...Array.from({ length: 300 }, (_, i) => row("A", `a${i}`, "OPEN")), ...Array.from({ length: 100 }, (_, i) => row("B", `b${i}`, "OPEN"))];
+    const [a, b] = summarize(rows);
+    const v = analyze(a, b, 50);
+    expect(v.sampleRatioMismatch).toBe(true);
+    expect(v.enoughData).toBe(false);
+    expect(v.cvrPValue).toBe(1);
   });
 });
 

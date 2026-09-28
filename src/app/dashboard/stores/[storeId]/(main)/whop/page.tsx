@@ -1,6 +1,7 @@
 import { Globe2, KeyRound, Smartphone, Wallet } from "lucide-react";
 import { notFound } from "next/navigation";
 import { requireAdmin } from "@/lib/auth";
+import { daysAgo } from "@/lib/time";
 import { db } from "@/lib/db";
 import { OPTIONAL_PAYMENT_METHODS, whopWebhookUrl, WHOP_WEBHOOK_EVENTS } from "@/lib/whop";
 import { Badge, Card, CopyField, Flash, Input, Label, PageHeader, SubmitButton, Textarea, buttonClass } from "@/components/ui";
@@ -17,9 +18,11 @@ export default async function WhopPage({
   await requireAdmin();
   const { storeId } = await params;
   const sp = await searchParams;
-  const [store, applePayFile] = await Promise.all([
+  const [store, applePayFile, methodsRejected] = await Promise.all([
     db.store.findUnique({ where: { id: storeId } }),
     db.appSetting.findUnique({ where: { key: "apple_pay_domain_association" } }),
+    // Recent rejection of the optional methods (last 7 days).
+    db.eventLog.findFirst({ where: { storeId, kind: "payment_methods.rejected", createdAt: { gt: daysAgo(7) } }, orderBy: { createdAt: "desc" }, select: { createdAt: true } }),
   ]);
   if (!store) notFound();
   const connected = !!store.whopConnectedAt;
@@ -114,6 +117,13 @@ export default async function WhopPage({
           description="Ajoutez les moyens préférés de chaque pays. Whop ne montre chacun qu'aux clients des pays concernés, et seulement s'il est activé sur votre compte (sinon il est ignoré sans bloquer le paiement)."
           className="mb-6"
         >
+          {methodsRejected && (
+            <p className="mb-4 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900 ring-1 ring-amber-600/20">
+              Le {methodsRejected.createdAt.toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: "Europe/Paris" })}, Whop a refusé un
+              moyen de la liste : les moyens par défaut du compte ont été utilisés. Activez les moyens cochés dans Whop → Paramètres → Moyens de paiement, ou
+              décochez ceux qui ne sont pas disponibles.
+            </p>
+          )}
           <form action={savePaymentMethodsAction.bind(null, store.id)}>
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
               {OPTIONAL_PAYMENT_METHODS.map((m) => (

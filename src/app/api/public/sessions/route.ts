@@ -9,7 +9,6 @@ import { loadInterception } from "@/lib/layout";
 import { after } from "next/server";
 import { sendCheckoutConversions } from "@/lib/conversions";
 import { assignVariant } from "@/lib/experiments";
-import { maybeTick } from "@/lib/tick";
 
 export const OPTIONS = preflight;
 
@@ -33,6 +32,7 @@ const bodySchema = z.object({
       marketing: z.boolean().nullable().optional(),
     })
     .optional(),
+  visitorId: z.string().regex(/^[A-Za-z0-9]{8,64}$/).optional(),
 });
 
 /** Called by the storefront loader with the contents of /cart.js. */
@@ -42,7 +42,7 @@ export async function POST(req: Request) {
   }
   const parsed = bodySchema.safeParse(await readJson(req));
   if (!parsed.success) return json({ error: "Panier invalide" }, { status: 400, cors: true });
-  const { store: publicId, items, returnUrl, utm, tracking } = parsed.data;
+  const { store: publicId, items, returnUrl, utm, tracking, visitorId } = parsed.data;
 
   const store = await db.store.findUnique({ where: { publicId } });
   if (!store?.enabled || !store.shopifyConnectedAt || !store.whopConnectedAt) {
@@ -78,14 +78,13 @@ export async function POST(req: Request) {
       tracking: tracking ? (tracking as Prisma.InputJsonValue) : undefined,
       clientIp: clientIp(req),
       userAgent: req.headers.get("user-agent")?.slice(0, 400) ?? null,
-      ...(await assignVariant(store.id)),
+      test: store.testMode,
+      visitorId: visitorId ?? null,
+      ...(await assignVariant(store.id, visitorId ?? null)),
     },
   });
-  // After the response: ad "InitiateCheckout" event + background maintenance.
-  after(async () => {
-    await sendCheckoutConversions(session.id).catch(() => undefined);
-    await maybeTick().catch(() => undefined);
-  });
+  // After the response: ad "InitiateCheckout" event (never slows the buyer down).
+  after(() => sendCheckoutConversions(session.id).catch(() => undefined));
   return json({ id: session.id, url: `${env.appUrl}/c/${session.id}` }, { cors: true });
 }
 

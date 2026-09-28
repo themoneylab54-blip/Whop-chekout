@@ -58,6 +58,16 @@ export default async function OrderDetailPage({
       </div>
       <Flash ok={sp.ok} error={sp.error} />
 
+      {s.extraPaymentIds.length > 0 && (
+        <div className="mb-6 flex items-start gap-3 rounded-xl bg-red-50 p-4 text-sm text-red-900 ring-1 ring-red-600/15">
+          <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0" />
+          <p>
+            <strong>Paiement(s) en double</strong> reçu(s) pour ce panier : {s.extraPaymentIds.join(", ")}. La commande n&apos;est créée qu&apos;une fois ;
+            remboursez le(s) doublon(s) dans Whop.
+          </p>
+        </div>
+      )}
+
       {s.reviewNote && (
         <div className="mb-6 flex items-start gap-3 rounded-xl bg-amber-50 p-4 text-sm text-amber-900 ring-1 ring-amber-600/20">
           <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0" />
@@ -180,13 +190,23 @@ export default async function OrderDetailPage({
             <dl className="space-y-1.5 text-sm">
               <Row k="Shopify" v={<SyncBadge s={s} />} />
               {s.whopPaymentId && <Row k="Paiement Whop" v={<code className="text-xs">{s.whopPaymentId}</code>} />}
+              {s.paymentMethodType && <Row k="Moyen de paiement" v={s.paymentMethodType} />}
               {s.trackingNumber && <Row k="Suivi transmis à Whop" v={s.trackingNumber} />}
               <Row k="Source" v={utm.utm_source || (utm.fbclid ? "facebook (pub)" : utm.ttclid ? "tiktok (pub)" : "—")} />
               {utm.utm_campaign && <Row k="Campagne" v={utm.utm_campaign} />}
               {s.variant && <Row k="Test A/B" v={`Variante ${s.variant}`} />}
               {s.pixelSentAt && <Row k="Pixels" v="Achat envoyé" />}
             </dl>
-            {s.syncError && !s.reviewNote && <p className="mt-3 text-xs break-words text-red-600">{s.syncError}</p>}
+            {s.syncError && !s.shopifyOrderId && (
+              <p className="mt-3 text-xs break-words text-red-600">
+                {s.syncError}
+                {s.nextSyncAt && !s.reviewNote && (
+                  <span className="block text-zinc-500">
+                    Nouvel essai automatique le {s.nextSyncAt.toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: "Europe/Paris" })} (essai {s.syncAttempts + 1})
+                  </span>
+                )}
+              </p>
+            )}
             {s.status === "PAID" && !s.shopifyOrderId && !s.reviewNote && (
               <form action={resyncOrderAction.bind(null, storeId, s.id)} className="mt-3">
                 <SubmitButton size="sm" variant="secondary">

@@ -328,6 +328,8 @@ export type PaymentInfo = {
   /** Saved payment method, used for one-click post-purchase offers. */
   memberId?: string | null;
   paymentMethodId?: string | null;
+  /** card, apple_pay, paypal, klarna… (analytics) */
+  paymentMethodType?: string | null;
   buyer?: PaymentBuyer;
 };
 
@@ -363,30 +365,18 @@ export function reviewReasons(
 }
 
 /**
- * Marks the session paid and creates the Shopify order. Safe to call repeatedly
- * (webhook retries, reconciliation). Never throws for a Shopify failure: the payment
- * is recorded and the sync is retried in the background with backoff.
+ * Marks the session paid and creates the Shopify order. Safe to call repeatedly and
+ * concurrently (webhook redeliveries, reconciliation). Never throws for a Shopify
+ * failure: the payment is recorded and the sync is retried in the background.
+ *
+ * With `deferSync`, returns true when the caller must run `syncOrderSafely` itself
+ * (the webhook does it after answering Whop).
  */
-export async function markPaid(sessionId: string, payment: PaymentInfo) {
+export async function markPaid(sessionId: string, payment: PaymentInfo, opts: { deferSync?: boolean } = {}): Promise<boolean> {
   const session = await db.checkoutSession.findUnique({ where: { id: sessionId } });
   if (!session) throw new Error(`Session ${sessionId} introuvable`);
 
-  if (session.status === "PAID") {
-    if (session.whopPaymentId && session.whopPaymentId !== payment.id) {
-      // A second payment for the same cart (e.g. wallet + card): keep the first, flag the extra one.
-      const note = `Paiement supplémentaire ${payment.id} reçu pour ce panier — à rembourser dans Whop.`;
-      if (!session.reviewNote?.includes(payment.id)) {
-        await db.checkoutSession.update({
-          where: { id: sessionId },
-          data: { reviewNote: session.reviewNote ? `${session.reviewNote}\n${note}` : note },
-        });
-        await recordEvent({ storeId: session.storeId, sessionId, level: "warn", kind: "payment.duplicate", message: note, alert: true });
-      }
-      return;
-    }
-    if (!session.reviewNote) await syncOrderSafely(sessionId);
-    return;
-  }
+  if (session.status === "PAID") return alreadyPaid(session, payment, opts);
 
   // The configuration that was actually paid decides what the order contains.
   const configId = payment.checkoutConfigurationId ?? session.whopCheckoutId;
@@ -402,54 +392,60 @@ export async function markPaid(sessionId: string, payment: PaymentInfo) {
     (payment.buyer ? addressFromPayment(payment.buyer) : null);
 
   const reasons = reviewReasons(
-    paid ?? {
-      totalCents: session.totalCents,
-      currency: session.currency,
-      shippingCountries: [],
-      shippingRateId: null,
-    },
+    paid ?? { totalCents: session.totalCents, currency: session.currency, shippingCountries: [], shippingRateId: null },
     payment,
     address,
   );
   if (!paid) reasons.push("configuration de paiement inconnue");
 
-  const transition = await db.checkoutSession.updateMany({
-    where: { id: sessionId, status: { not: "PAID" } },
-    data: {
-      status: "PAID",
-      paidAt: new Date(),
-      whopPaymentId: payment.id,
-      whopMemberId: payment.memberId ?? null,
-      whopPaymentMethodId: payment.paymentMethodId ?? null,
-      syncError: null,
-      email: session.email ?? payment.buyer?.email ?? null,
-      ...(address ? { shippingAddress: address as Prisma.InputJsonValue } : {}),
-      ...(paid
-        ? {
-            paidQuoteId: paid.id,
-            whopCheckoutId: paid.whopCheckoutId,
-            shippingRateId: paid.shippingRateId,
-            discountCode: paid.discountCode,
-            addOnIds: paid.addOnIds,
-            subtotalCents: paid.subtotalCents,
-            discountCents: paid.discountCents,
-            shippingCents: paid.shippingCents,
-            addOnsCents: paid.addOnsCents,
-            totalCents: paid.totalCents,
-          }
-        : {}),
-    },
+  // One transaction: PAID, the discount use and the review decision become visible
+  // together, so a concurrent delivery can never see "PAID, no hold" and sync an
+  // order that should have been held.
+  const outcome = await db.$transaction(async (tx) => {
+    const transition = await tx.checkoutSession.updateMany({
+      where: { id: sessionId, status: { not: "PAID" } },
+      data: {
+        status: "PAID",
+        paidAt: new Date(),
+        whopPaymentId: payment.id,
+        whopMemberId: payment.memberId ?? null,
+        whopPaymentMethodId: payment.paymentMethodId ?? null,
+        paymentMethodType: payment.paymentMethodType ?? null,
+        syncError: null,
+        email: session.email ?? payment.buyer?.email ?? null,
+        ...(address ? { shippingAddress: address as Prisma.InputJsonValue } : {}),
+        ...(paid
+          ? {
+              paidQuoteId: paid.id,
+              whopCheckoutId: paid.whopCheckoutId,
+              shippingRateId: paid.shippingRateId,
+              discountCode: paid.discountCode,
+              addOnIds: paid.addOnIds,
+              subtotalCents: paid.subtotalCents,
+              discountCents: paid.discountCents,
+              shippingCents: paid.shippingCents,
+              addOnsCents: paid.addOnsCents,
+              totalCents: paid.totalCents,
+            }
+          : {}),
+      },
+    });
+    if (transition.count === 0) return null;
+    const all = [...reasons];
+    if (paid?.discountCode) {
+      // Atomic: a code with one use left can't be consumed twice.
+      const used = await tx.$executeRaw`
+        UPDATE "DiscountCode" SET "usageCount" = "usageCount" + 1
+        WHERE "storeId" = ${session.storeId} AND "code" = ${paid.discountCode}
+          AND ("usageLimit" IS NULL OR "usageCount" < "usageLimit")`;
+      if (used === 0) all.push(`code promo ${paid.discountCode} déjà épuisé au moment du paiement`);
+    }
+    const reviewNote = all.length ? `À vérifier : ${all.join(" ; ")}. Remboursez dans Whop ou synchronisez la commande manuellement.` : null;
+    if (reviewNote) await tx.checkoutSession.update({ where: { id: sessionId }, data: { reviewNote } });
+    return { reviewNote };
   });
-  if (transition.count === 0) return markPaid(sessionId, payment); // lost a race: re-run as "already paid"
-
-  if (paid?.discountCode) {
-    // Atomic: a code with one use left can't be consumed twice.
-    const used = await db.$executeRaw`
-      UPDATE "DiscountCode" SET "usageCount" = "usageCount" + 1
-      WHERE "storeId" = ${session.storeId} AND "code" = ${paid.discountCode}
-        AND ("usageLimit" IS NULL OR "usageCount" < "usageLimit")`;
-    if (used === 0) reasons.push(`code promo ${paid.discountCode} déjà épuisé au moment du paiement`);
-  }
+  // Lost the race: another delivery marked it paid first (its decision is committed).
+  if (!outcome) return markPaid(sessionId, payment, opts);
 
   await recordEvent({
     storeId: session.storeId,
@@ -461,17 +457,44 @@ export async function markPaid(sessionId: string, payment: PaymentInfo) {
     log.error("conversions.failed", "Server-side purchase event failed", { sessionId, err }),
   );
 
-  if (reasons.length) {
-    const reviewNote = `À vérifier : ${reasons.join(" ; ")}. Remboursez dans Whop ou synchronisez la commande manuellement.`;
-    await db.checkoutSession.update({ where: { id: sessionId }, data: { reviewNote } });
-    await recordEvent({ storeId: session.storeId, sessionId, level: "warn", kind: "review.hold", message: reviewNote, alert: true });
-    return;
+  if (outcome.reviewNote) {
+    await recordEvent({ storeId: session.storeId, sessionId, level: "warn", kind: "review.hold", message: outcome.reviewNote, alert: true });
+    return false;
   }
+  if (opts.deferSync) return true;
   await syncOrderSafely(sessionId);
+  return false;
+}
+
+async function alreadyPaid(session: CheckoutSession, payment: PaymentInfo, opts: { deferSync?: boolean }): Promise<boolean> {
+  if (session.whopPaymentId && session.whopPaymentId !== payment.id) {
+    // A second payment for the same cart (e.g. wallet + card): keep the first order
+    // going, and flag the extra payment for a refund without blocking anything.
+    const added = await db.$executeRaw`
+      UPDATE "CheckoutSession" SET "extraPaymentIds" = array_append("extraPaymentIds", ${payment.id})
+      WHERE id = ${session.id} AND NOT (${payment.id} = ANY("extraPaymentIds"))`;
+    if (added > 0) {
+      await recordEvent({
+        storeId: session.storeId,
+        sessionId: session.id,
+        level: "warn",
+        kind: "payment.duplicate",
+        message: `Paiement supplémentaire ${payment.id} reçu pour un panier déjà payé — à rembourser dans Whop.`,
+        alert: true,
+      });
+    }
+    return false;
+  }
+  if (session.reviewNote || session.shopifyOrderId) return false;
+  if (opts.deferSync) return true;
+  await syncOrderSafely(session.id);
+  return false;
 }
 
 /** Minutes to wait before each automatic retry of a failed Shopify sync. */
-export const SYNC_BACKOFF_MINUTES = [1, 5, 15, 60, 180, 360, 720, 1440];
+// Starts at 5 min: Shopify's order search is eventually consistent, so an order created
+// by a timed-out attempt must be findable before we try again.
+export const SYNC_BACKOFF_MINUTES = [5, 15, 60, 180, 360, 720, 1440];
 
 /** Runs syncOrder; failures are already recorded and scheduled for retry, so they don't propagate. */
 export async function syncOrderSafely(sessionId: string) {
@@ -491,6 +514,8 @@ export async function syncOrder(sessionId: string) {
       id: sessionId,
       status: "PAID",
       shopifyOrderId: null,
+      // A payment held for review is only synced after the merchant clears the hold.
+      reviewNote: null,
       OR: [{ syncStartedAt: null }, { syncStartedAt: { lt: leaseExpired } }],
     },
     data: { syncStartedAt: new Date() },
@@ -501,7 +526,8 @@ export async function syncOrder(sessionId: string) {
   let order: { id: string; name: string } | null = null;
   try {
     // Idempotency: an earlier attempt may have created the order and then failed to record it.
-    order = await findOrderForSession(session.store, session.id).catch(() => null);
+    // If this lookup fails we must not guess: the error goes to the retry backoff.
+    order = await findOrderForSession(session.store, session.id);
     if (!order) order = await createPaidOrder(session.store, await buildOrderInput(session));
   } catch (err) {
     const attempts = session.syncAttempts + 1;

@@ -16,9 +16,14 @@ const ago = (d: Date | string | null) => {
 /** Live health checks shown on the overview and the Journal page. */
 export async function storeHealth(storeId: string): Promise<HealthItem[]> {
   const base = `/dashboard/stores/${storeId}`;
-  const [store, unsynced, holds, lastPaid, tick, failedConversions] = await Promise.all([
+  const [store, unsynced, oldestUnsynced, holds, lastPaid, tick, failedConversions] = await Promise.all([
     db.store.findUnique({ where: { id: storeId } }),
     db.checkoutSession.count({ where: { storeId, status: "PAID", shopifyOrderId: null, reviewNote: null } }),
+    db.checkoutSession.findFirst({
+      where: { storeId, status: "PAID", shopifyOrderId: null, reviewNote: null },
+      orderBy: { paidAt: "asc" },
+      select: { paidAt: true },
+    }),
     db.checkoutSession.count({ where: { storeId, status: "PAID", shopifyOrderId: null, reviewNote: { not: null } } }),
     db.checkoutSession.findFirst({ where: { storeId, status: "PAID" }, orderBy: { paidAt: "desc" }, select: { paidAt: true } }),
     tickStatus(),
@@ -26,6 +31,7 @@ export async function storeHealth(storeId: string): Promise<HealthItem[]> {
   ]);
   if (!store) return [];
   const tickAge = tick.at ? Date.now() - new Date(tick.at).getTime() : Infinity;
+  const tickFailed = tick.report ? Object.values(tick.report).some((v) => typeof v === "string" && v.startsWith("error")) : false;
   const items: HealthItem[] = [
     {
       key: "shopify",
@@ -45,7 +51,10 @@ export async function storeHealth(storeId: string): Promise<HealthItem[]> {
       key: "sync",
       label: "Commandes vers Shopify",
       ok: unsynced === 0,
-      detail: unsynced === 0 ? "Toutes synchronisées" : `${unsynced} en attente (nouvel essai automatique)`,
+      detail:
+        unsynced === 0
+          ? "Toutes synchronisées"
+          : `${unsynced} en attente depuis ${ago(oldestUnsynced?.paidAt ?? null).replace("il y a ", "")} (nouvel essai automatique)`,
       href: `${base}/orders`,
     },
     {
@@ -58,8 +67,14 @@ export async function storeHealth(storeId: string): Promise<HealthItem[]> {
     {
       key: "tick",
       label: "Maintenance automatique",
-      ok: tickAge < 26 * 3600_000 ? true : tick.at ? false : null,
-      detail: tick.at ? `Dernier passage ${ago(tick.at)}` : "Pas encore exécutée",
+      ok: tick.at ? tickAge < 20 * 60_000 && !tickFailed : null,
+      detail: !tick.at
+        ? "Pas encore exécutée"
+        : tickFailed
+          ? `Dernier passage ${ago(tick.at)} avec une erreur (voir le journal)`
+          : tickAge < 20 * 60_000
+            ? `Dernier passage ${ago(tick.at)}`
+            : `Dernier passage ${ago(tick.at)} : configurez CRON_SECRET + le planificateur pour un passage toutes les 10 min`,
       href: `${base}/journal`,
     },
     {

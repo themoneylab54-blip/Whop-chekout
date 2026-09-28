@@ -118,7 +118,7 @@ export default async function SettingsPage({
               />
             </div>
             <div>
-              <Label htmlFor="statementDescriptor" hint="5 à 22 lettres/chiffres, ex. le nom de votre boutique. Appliqué aux nouveaux produits Whop et aux offres post-achat.">
+              <Label htmlFor="statementDescriptor" hint="Affiché « WHOP*VOTRE NOM » (17 caractères après WHOP*). Appliqué aux nouveaux produits Whop et aux offres post-achat.">
                 Libellé sur le relevé bancaire
               </Label>
               <Input id="statementDescriptor" name="statementDescriptor" defaultValue={store.statementDescriptor ?? ""} placeholder="MA BOUTIQUE" className="uppercase" />

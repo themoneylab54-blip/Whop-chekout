@@ -161,6 +161,17 @@
     } catch (e) {}
   })();
 
+  // Stable anonymous visitor id (first-party cookie, 1 year): the same shopper keeps
+  // the same A/B variant across checkouts. Random, carries no personal data.
+  function visitorId() {
+    var v = cookie("whopco_vid");
+    if (!v) {
+      v = (window.crypto && crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now()).replace(/-/g, "");
+      document.cookie = "whopco_vid=" + v + "; path=/; max-age=31536000; SameSite=Lax";
+    }
+    return v.slice(0, 64);
+  }
+
   function overlay(show) {
     var id = "whopco-overlay";
     var el = document.getElementById(id);
@@ -231,6 +242,7 @@
             returnUrl: location.origin + "/",
             utm: utm(),
             tracking: tracking(),
+            visitorId: visitorId(),
           }),
         });
       })

@@ -54,9 +54,30 @@ export async function recordEvent(e: {
   }
   if (e.alert && e.storeId) {
     try {
-      await sendAlert(e.storeId, e.message, e.sessionId ?? null);
+      if (await claimAlertSlot(e.storeId, e.kind)) await sendAlert(e.storeId, e.message, e.sessionId ?? null);
+      else emit("info", "alert.throttled", "Alert grouped with a recent one of the same kind", { storeId: e.storeId, kind: e.kind });
     } catch (err) {
       emit("error", "alert.failed", "Could not send the alert", { err });
     }
   }
+}
+
+/** Kinds that must always ping: each one needs its own action from the merchant. */
+const NEVER_THROTTLED = new Set(["review.hold", "payment.duplicate", "dispute.created", "dispute_alert.created", "dispute_alert.refunded"]);
+const ALERT_WINDOW_MS = 15 * 60_000;
+
+/**
+ * At most one alert per store and kind every 15 minutes (a Shopify outage must not
+ * send one message per order). Everything stays in the journal regardless.
+ */
+async function claimAlertSlot(storeId: string, kind: string): Promise<boolean> {
+  if (NEVER_THROTTLED.has(kind)) return true;
+  const key = `alert:${storeId}:${kind}`;
+  const now = new Date().toISOString();
+  const cutoff = new Date(Date.now() - ALERT_WINDOW_MS).toISOString();
+  const claimed = await db.$executeRaw`
+    INSERT INTO "AppSetting" ("key", "value", "updatedAt") VALUES (${key}, ${now}, now())
+    ON CONFLICT ("key") DO UPDATE SET "value" = EXCLUDED."value", "updatedAt" = now()
+    WHERE "AppSetting"."value" < ${cutoff}`;
+  return claimed > 0;
 }

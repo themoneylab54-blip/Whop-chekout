@@ -6,6 +6,8 @@ import type { CartLine } from "@/lib/pricing";
 import { CheckoutView } from "@/components/checkout/CheckoutView";
 import { designFor } from "@/lib/experiments";
 import { activeUpsells } from "@/lib/upsell";
+import { browserPixel } from "@/lib/conversions";
+import { AdPixels } from "@/components/checkout/AdPixels";
 
 export const dynamic = "force-dynamic";
 
@@ -28,6 +30,7 @@ export default async function CheckoutPage({ params }: { params: Promise<{ id: s
   const theme = loadTheme(design.theme, store.name);
   const fonts = themeFontHrefs(theme);
   // Save the card for the one-click post-purchase offer only when one is live.
+  const pixel = browserPixel(session, "checkout");
   const saveCard = activeUpsells({ thankYouLayout: design.thankYouLayout }).length > 0;
 
   return (
@@ -35,6 +38,7 @@ export default async function CheckoutPage({ params }: { params: Promise<{ id: s
       {fonts.map((href) => (
         <link key={href} rel="stylesheet" href={href} />
       ))}
+      {pixel && <AdPixels {...pixel} />}
       <CheckoutView
         theme={theme}
         layout={loadCheckoutLayout(design.checkoutLayout)}

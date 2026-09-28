@@ -2,9 +2,10 @@ import "server-only";
 import { Prisma, type CheckoutSession, type Store } from "@prisma/client";
 import { db } from "./db";
 import { loadThankYouLayout, type BlockOf } from "./layout";
+import { sendUpsellConversions } from "./conversions";
 import { designFor } from "./experiments";
 import { recordEvent } from "./log";
-import { createPaidOrder, findOrderForSession, priceCart, type Address } from "./shopify";
+import { createPaidOrder, createRefund, findOrderForSession, priceCart, tagOrder, type Address } from "./shopify";
 import { centsToDecimal } from "./pricing";
 import { statementDescriptor, storeClient } from "./whop";
 
@@ -192,6 +193,7 @@ export async function markUpsellPaid(chargeId: string, paymentId: string, storeI
       where: { id: charge.id },
       data: { shopifyOrderId: order.id, shopifyOrderName: order.name, error: null },
     });
+    await sendUpsellConversions(updated.id).catch(() => undefined);
     await recordEvent({
       storeId,
       sessionId: session.id,
@@ -201,15 +203,83 @@ export async function markUpsellPaid(chargeId: string, paymentId: string, storeI
     return updated;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await db.upsellCharge.update({ where: { id: charge.id }, data: { error: message.slice(0, 500) } });
+    const updated = await db.upsellCharge.update({
+      where: { id: charge.id },
+      data: { error: message.slice(0, 500), syncAttempts: { increment: 1 } },
+    });
     await recordEvent({
       storeId,
       sessionId: session.id,
       level: "error",
       kind: "upsell.sync_failed",
-      message: `Offre post-achat payée mais commande Shopify non créée : ${message}`,
-      alert: true,
+      message: `Offre post-achat payée mais commande Shopify non créée (essai ${updated.syncAttempts}) : ${message}. Nouvel essai automatique.`,
+      alert: updated.syncAttempts === 1,
     });
     return null;
   }
+}
+
+/** Declined card, 3-D Secure abandoned…: the buyer may try again. */
+export async function markUpsellFailed(chargeId: string, storeId: string, reason: string | null) {
+  const charge = await db.upsellCharge.findUnique({ where: { id: chargeId }, include: { session: true } });
+  if (!charge || charge.session.storeId !== storeId || charge.status === "PAID") return;
+  await db.upsellCharge.update({ where: { id: chargeId }, data: { status: "FAILED", error: (reason ?? "Paiement refusé").slice(0, 500) } });
+  await recordEvent({ storeId, sessionId: charge.sessionId, kind: "upsell.declined_by_bank", message: `Offre post-achat refusée par la banque : ${reason ?? "sans motif"}` });
+}
+
+/** Background retry of paid offers whose Shopify order could not be created. */
+export async function retryUpsellSyncs(deadline: number): Promise<number> {
+  const due = await db.upsellCharge.findMany({
+    where: { status: "PAID", shopifyOrderId: null, whopPaymentId: { not: null }, syncAttempts: { lt: 8 } },
+    include: { session: { select: { storeId: true } } },
+    take: 10,
+    orderBy: { createdAt: "asc" },
+  });
+  let done = 0;
+  for (const c of due) {
+    if (Date.now() > deadline) break;
+    await markUpsellPaid(c.id, c.whopPaymentId!, c.session.storeId);
+    done++;
+  }
+  return done;
+}
+
+/** Refund on an offer's payment: mirrored on the offer's own Shopify order, once per refund id. */
+export async function recordUpsellRefund(paymentId: string, storeId: string, refundId: string, amountCents: number) {
+  const charge = await db.upsellCharge.findUnique({ where: { whopPaymentId: paymentId }, include: { session: { include: { store: true } } } });
+  if (!charge || charge.session.storeId !== storeId || amountCents <= 0) return;
+  const marker = `refund:${refundId}`;
+  try {
+    await db.webhookEvent.create({ data: { id: marker, storeId, type: "refund" } });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") return;
+    throw err;
+  }
+  try {
+    if (charge.shopifyOrderId) await createRefund(charge.session.store, charge.shopifyOrderId, amountCents, "Remboursé via Whop");
+    await db.upsellCharge.update({ where: { id: charge.id }, data: { refundedCents: { increment: amountCents } } });
+  } catch (err) {
+    await db.webhookEvent.delete({ where: { id: marker } });
+    throw err;
+  }
+  await recordEvent({ storeId, sessionId: charge.sessionId, kind: "refund.recorded", message: `Offre post-achat remboursée (${amountCents / 100} ${charge.session.currency})` });
+}
+
+export async function recordUpsellDispute(paymentId: string, storeId: string) {
+  const charge = await db.upsellCharge.findUnique({ where: { whopPaymentId: paymentId }, include: { session: { include: { store: true } } } });
+  if (!charge || charge.session.storeId !== storeId) return;
+  if (charge.shopifyOrderId) await tagOrder(charge.session.store, charge.shopifyOrderId, ["litige-whop"]).catch(() => undefined);
+  await recordEvent({
+    storeId,
+    sessionId: charge.sessionId,
+    level: "warn",
+    kind: "dispute.created",
+    message: `Litige ouvert sur une offre post-achat (${charge.title}, ${charge.amountCents / 100} ${charge.session.currency})`,
+    alert: true,
+  });
+}
+
+/** Counts the offer as shown (acceptance rate = accepted / shown). */
+export async function markUpsellShown(sessionId: string) {
+  await db.checkoutSession.updateMany({ where: { id: sessionId, upsellShownAt: null }, data: { upsellShownAt: new Date() } });
 }

@@ -7,6 +7,8 @@ import type { Address } from "@/lib/shopify";
 import { ThankYouView } from "@/components/checkout/ThankYouView";
 import { designFor } from "@/lib/experiments";
 import { upsellEligible } from "@/lib/upsell";
+import { browserPixel } from "@/lib/conversions";
+import { AdPixels } from "@/components/checkout/AdPixels";
 
 export const dynamic = "force-dynamic";
 
@@ -21,6 +23,8 @@ export default async function ThankYouPage({ params }: { params: Promise<{ id: s
 
   const design = await designFor(session.store, session);
   const theme = loadTheme(design.theme, session.store.name);
+  // Browser pixel for the purchase, only once the payment is confirmed.
+  const pixel = session.status === "PAID" ? browserPixel(session, "purchase") : null;
   const charges = await db.upsellCharge.findMany({ where: { sessionId: session.id }, select: { blockId: true, status: true } });
   const fonts = themeFontHrefs(theme);
   const a = session.shippingAddress as Address | null;
@@ -35,6 +39,7 @@ export default async function ThankYouPage({ params }: { params: Promise<{ id: s
       {fonts.map((href) => (
         <link key={href} rel="stylesheet" href={href} />
       ))}
+      {pixel && <AdPixels {...pixel} />}
       <ThankYouView
         theme={theme}
         layout={loadThankYouLayout(design.thankYouLayout)}

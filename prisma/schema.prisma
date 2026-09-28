@@ -72,6 +72,10 @@ model Store {
   metaTestEventCode String?
   tiktokPixelId     String?
   tiktokAccessToken String? // encrypted
+  // Only send conversions when the storefront banner explicitly allowed marketing
+  pixelRequireConsent Boolean @default(false)
+  // Meta content_ids format: "variant" (variant id) or "shopify" (shopify_FR_<product>_<variant>, Shopify catalog)
+  metaContentIdFormat String @default("variant")
 
   // --- Alerts (Telegram and/or e-mail through Resend) ---
   resendApiKey     String? // encrypted
@@ -210,6 +214,8 @@ model CheckoutSession {
   // Set when a payment needs a human look (amount/country/code mismatch, extra payment):
   // the Shopify order is then only created by a manual "sync" from the dashboard.
   reviewNote       String?
+  // Other Whop payments received for this same cart (e.g. wallet + card): to refund
+  extraPaymentIds  String[]  @default([])
   // Automatic retries of the Shopify sync (exponential backoff)
   syncAttempts     Int       @default(0)
   nextSyncAt       DateTime?
@@ -219,11 +225,22 @@ model CheckoutSession {
   payClickedAt  DateTime? // buyer clicked "Pay"
   termsAcceptedAt DateTime?
 
+  // Created while the store was in test mode (excluded from analytics by default)
+  test       Boolean  @default(false)
+  // Stable anonymous visitor id from the storefront (A/B stickiness, unique visitors)
+  visitorId  String?
+  // Whop payment method used (card, apple_pay, paypal, klarna…)
+  paymentMethodType String?
+  paymentFailedAt   DateTime?
+  upsellShownAt     DateTime?
+
   // Attribution & ads (fbp, fbc, ttp, ttclid, marketing consent…)
   tracking   Json?
   clientIp   String?
   userAgent  String?
-  pixelSentAt DateTime?
+  pixelSentAt DateTime? // every configured platform accepted the purchase
+  pixelStatus Json?     // { meta: "sent" | "failed", tiktok: … }
+  pixelAttempts Int     @default(0)
 
   // A/B test
   experimentId String?
@@ -294,6 +311,8 @@ model Experiment {
   storeId   String
   store     Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
   name      String
+  // Control (A) is pinned to the design published when the test started
+  versionIdA String?
   versionId String
   splitB    Int       @default(50)
   status    String    @default("RUNNING") // RUNNING | STOPPED
@@ -317,6 +336,8 @@ model UpsellCharge {
   shopifyOrderId   String?
   shopifyOrderName String?
   error            String?
+  syncAttempts     Int             @default(0)
+  refundedCents    Int             @default(0)
   createdAt        DateTime        @default(now())
 
   @@unique([sessionId, blockId])

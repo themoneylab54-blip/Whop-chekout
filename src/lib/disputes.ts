@@ -63,6 +63,8 @@ export function buildEvidence(session: CheckoutSession, tracking: { number: stri
     billing_address: a ? [a.address1, a.address2, a.zip, a.city, a.countryCode].filter(Boolean).join(", ") : null,
     product_description: lines.map((l) => `${l.quantity} × ${l.title}${l.variantTitle ? ` (${l.variantTitle})` : ""}`).join("; ").slice(0, 1000),
     service_date: (session.paidAt ?? session.createdAt).toISOString().slice(0, 10),
+    cancellation_policy_disclosure:
+      "Droit de rétractation de 14 jours à compter de la réception (rappelé au client sur la page de confirmation), retour du produit à la charge du client sauf défaut.",
     refund_policy_disclosure: policyUrls.length
       ? `Politiques affichées au moment du paiement : ${policyUrls.join(" · ")}`
       : "Politique de retour de 14 jours affichée sur la boutique.",

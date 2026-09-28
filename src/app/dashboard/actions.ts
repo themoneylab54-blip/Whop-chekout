@@ -448,9 +448,20 @@ export async function startExperimentAction(storeId: string, fd: FormData) {
   const split = Math.min(90, Math.max(10, parseInt(str(fd, "split"), 10) || 50));
   const version = await db.layoutVersion.findFirst({ where: { id: versionId, storeId } });
   if (!version) back(path, { error: "Choisissez la version à tester (variante B)." });
+  const store = await db.store.findUniqueOrThrow({ where: { id: storeId } });
+  // Pin the control: publishing during the test must not change variant A.
+  const control = await db.layoutVersion.create({
+    data: {
+      storeId,
+      label: `Contrôle A — ${new Date().toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: "Europe/Paris" })}`,
+      theme: (store.theme ?? {}) as Prisma.InputJsonValue,
+      checkoutLayout: (store.checkoutLayout ?? { blocks: [] }) as Prisma.InputJsonValue,
+      thankYouLayout: (store.thankYouLayout ?? { blocks: [] }) as Prisma.InputJsonValue,
+    },
+  });
   await db.experiment.updateMany({ where: { storeId, status: "RUNNING" }, data: { status: "STOPPED", endedAt: new Date() } });
   await db.experiment.create({
-    data: { storeId, versionId, splitB: split, name: str(fd, "name").slice(0, 80) || `Test « ${version.label} »` },
+    data: { storeId, versionId, versionIdA: control.id, splitB: split, name: str(fd, "name").slice(0, 80) || `Test « ${version.label} »` },
   });
   await recordEvent({ storeId, kind: "experiment.started", message: `Test A/B lancé : ${version.label} sur ${split} % du trafic` });
   back(path, { ok: `Test A/B lancé : ${split} % des nouveaux checkouts voient « ${version.label} ».` });
@@ -718,6 +729,8 @@ export async function saveTrackingAction(storeId: string, fd: FormData) {
       metaTestEventCode: str(fd, "metaTestEventCode").slice(0, 40) || null,
       tiktokPixelId,
       tiktokAccessToken: secretField(fd, "tiktokAccessToken", store.tiktokAccessToken, path),
+      pixelRequireConsent: fd.get("pixelRequireConsent") === "on",
+      metaContentIdFormat: str(fd, "metaContentIdFormat") === "shopify" ? "shopify" : "variant",
     },
   });
   back(path, { ok: "Pixels enregistrés" });
@@ -774,7 +787,7 @@ export async function saveShieldAction(storeId: string, fd: FormData) {
   const path = storePath(storeId, "settings");
   const raw = str(fd, "statementDescriptor");
   const descriptor = raw ? statementDescriptor(raw) : null;
-  if (raw && !descriptor) back(path, { error: "Libellé bancaire : 5 à 22 lettres ou chiffres." });
+  if (raw && !descriptor) back(path, { error: "Libellé bancaire : il doit contenir au moins une lettre." });
   await db.store.update({
     where: { id: storeId },
     data: {
