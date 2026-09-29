@@ -10,7 +10,7 @@ const secs = (ms: number | null) => (ms == null ? "—" : ms < 1000 ? `${ms} ms`
 const count = (n: number) => n.toLocaleString("fr-FR");
 
 /**
- * "Services externes" (Journal page): each provider called in the last 24 h (Shopify, Whop, ad
+ * "Services externes" (Journal page): each provider called in the last 24 h (Shopify, Whop, Stripe, ad
  * platforms, ECB, e-mails, Mondial Relay) with its calls, error rate and p95 latency over 1 h and
  * 24 h, its last success and its last error in plain French. Status (providerStatus, also the
  * sidebar dots): En panne = every call of the last hour failed (≥ 3 calls) or no success in 24 h;
@@ -24,7 +24,7 @@ export function ProvidersCard({ providers, tz, now = new Date() }: { providers: 
       icon={PlugZap}
       iconColor="#8b5cf6"
       title="Services externes"
-      description="Appels de l'app vers Shopify, Whop, les régies publicitaires et les autres services : volume, erreurs et temps de réponse. p95 : 95 % des appels répondent plus vite que cette durée."
+      description="Appels de l'app vers Shopify, Whop, Stripe, les régies publicitaires et les autres services : volume, erreurs et temps de réponse. p95 : 95 % des appels répondent plus vite que cette durée."
       className="mb-6"
     >
       {providers.length === 0 ? (

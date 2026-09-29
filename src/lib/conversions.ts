@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import type { CheckoutSession, Prisma, Store } from "@prisma/client";
 import { db } from "./db";
 import { decrypt } from "./crypto";
+import { feeCents } from "./charge";
 import { checkoutBaseUrl } from "./checkout-domain";
 import { log, recordEvent } from "./log";
 import { boundedTimeout, DeadlineError, stopForTime } from "./deadline";
@@ -158,9 +159,9 @@ export const DEFAULT_FEE_RATE = 0.03;
 /** Fee rate of the store's recent payments (recorded fees ÷ amounts), else DEFAULT_FEE_RATE. */
 export async function storeFeeRate(storeId: string): Promise<number> {
   const [r] = await db.$queryRaw<{ fee: number | null; total: number | null }[]>`
-    SELECT sum("whopFeeCents")::float8 AS fee, sum("totalCents")::float8 AS total FROM (
-      SELECT "whopFeeCents", "totalCents" FROM "CheckoutSession"
-      WHERE "storeId" = ${storeId} AND status = 'PAID' AND "whopFeeCents" IS NOT NULL AND "totalCents" > 0
+    SELECT sum(fee)::float8 AS fee, sum("totalCents")::float8 AS total FROM (
+      SELECT COALESCE("whopFeeCents", "providerFeeCents") AS fee, "totalCents" FROM "CheckoutSession"
+      WHERE "storeId" = ${storeId} AND status = 'PAID' AND COALESCE("whopFeeCents", "providerFeeCents") IS NOT NULL AND "totalCents" > 0
       ORDER BY "paidAt" DESC NULLS LAST LIMIT 200
     ) x`;
   const rate = r?.total ? Number(r.fee ?? 0) / Number(r.total) : NaN;
@@ -168,7 +169,9 @@ export async function storeFeeRate(storeId: string): Promise<number> {
 }
 
 /** Margin context of a paid checkout (paid quote's carrier and bump costs, fee). */
-export async function marginContext(session: Pick<CheckoutSession, "storeId" | "paidQuoteId" | "shippingRateId" | "whopFeeCents">): Promise<MarginContext> {
+export async function marginContext(session: Pick<CheckoutSession, "storeId" | "paidQuoteId" | "shippingRateId" | "whopFeeCents"> & Partial<Pick<CheckoutSession, "providerFeeCents">>): Promise<MarginContext> {
+  // The processor's fee: Whop's, or another processor's (Stripe's balance transaction fee).
+  const fee = feeCents(session);
   const quote = session.paidQuoteId
     ? await db.checkoutQuote.findUnique({ where: { id: session.paidQuoteId }, select: { shippingCostCents: true, shippingRateId: true, addOns: true } })
     : null;
@@ -180,8 +183,8 @@ export async function marginContext(session: Pick<CheckoutSession, "storeId" | "
     ...(vatCategories?.size ? { vatCategories } : {}),
     shipCostCents: rateCost ?? 0,
     bumpCostCents: bumps.reduce((t, a) => t + (typeof a?.costCents === "number" ? a.costCents : 0), 0),
-    feeCents: session.whopFeeCents ?? null,
-    feeRate: session.whopFeeCents == null ? await storeFeeRate(session.storeId) : DEFAULT_FEE_RATE,
+    feeCents: fee,
+    feeRate: fee == null ? await storeFeeRate(session.storeId) : DEFAULT_FEE_RATE,
   };
 }
 
@@ -387,6 +390,9 @@ export function pixelNextAttempt(attempts: number, now = Date.now()): Date | nul
 
 /** Consent: a refusal on the storefront banner always wins; strict mode also needs an explicit yes. */
 export function consentAllows(session: CheckoutSession & { store: Pick<Store, "pixelRequireConsent" | "metaTestEventCode"> }) {
+  // « Tester le secours » (admin-forced processor): the merchant's own test purchase, even in live
+  // mode, is never a conversion (server events, upsell events and the browser pixel all check here).
+  if (session.forcedProvider) return false;
   // Test-mode orders never reach the ad platforms (except in Meta's test-events mode).
   if (session.test && !session.store.metaTestEventCode) return false;
   const marketing = ((session.tracking ?? {}) as Tracking).marketing;

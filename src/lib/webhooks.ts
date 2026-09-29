@@ -1,7 +1,7 @@
 import "server-only";
 import { Prisma } from "@prisma/client";
 import { db } from "./db";
-import { applyRefundOnce, markPaid, recordDispute, recordRefund, settleUnsyncedSession, syncOrderSafely } from "./checkout";
+import { applyRefundOnce, markPaid, recordDispute, recordPaymentFailure, recordRefund, settleUnsyncedSession, syncOrderSafely } from "./checkout";
 import { disputeDueDate, handleDisputeAlert } from "./disputes";
 import { log, recordEvent, withLogContext } from "./log";
 import { DeadlineError, notePartial, stopForTime } from "./deadline";
@@ -74,43 +74,13 @@ export async function handleEvent(type: string, data: Record<string, unknown>, s
       }
       const sessionId = await sessionIdFor(data, storeId);
       if (sessionId) {
-        // A late failure of an earlier attempt never erases a newer one (a "Pay" click or a PayPal
-        // window after this payment was created): the session keeps that attempt's state (PAYING,
-        // in flight). Unknown creation time: counted as the latest (as before). The rule, per time:
-        // - payClickedAt (our confirm, always BEFORE the payment it creates): newer only when later
-        //   than created_at + 1 s. The 1 s covers Whop's second-precision (truncated) created_at, so
-        //   the current attempt's own failure is never "older"; a retry clicked 2 s after the first
-        //   payment's creation is newer, so that first failure can't mark FAILED under the retry.
-        // - paypalWindowAt (a window from Whop's own button: the payment is created by that click,
-        //   our stamp lands AFTER it, once the page lost the focus and the POST arrived): newer only
-        //   when later than created_at + 5 s. (Our own PayPal confirm stamps it equal to its click,
-        //   which the strict rule above already covers.)
-        // - paypalBeatAt (heartbeat / late popup): liveness only, never an attempt, never compared.
-        const createdAt = paymentCreatedAt(data);
-        const notNewer: Prisma.CheckoutSessionWhereInput = createdAt
-          ? {
-              AND: [
-                { OR: [{ payClickedAt: null }, { payClickedAt: { lte: new Date(createdAt.getTime() + 1000) } }] },
-                { OR: [{ paypalWindowAt: null }, { paypalWindowAt: { lte: new Date(createdAt.getTime() + 5000) } }] },
-              ],
-            }
-          : {};
-        const changed = await db.checkoutSession.updateMany({
-          where: { id: sessionId, status: { not: "PAID" }, ...notNewer },
-          data: { status: "FAILED", paymentFailedAt: new Date() },
-        });
+        // A late failure of an earlier attempt never erases a newer one: see recordPaymentFailure
+        // (Whop's created_at is the attempt's time; our own PayPal confirm stamps paypalWindowAt
+        // equal to its click, which the strict payClickedAt rule already covers).
         const reason = `${typeof data.failure_message === "string" && data.failure_message ? ` : ${data.failure_message}` : ""}${
           typeof data.payment_method_type === "string" ? ` (${data.payment_method_type})` : ""
         }`;
-        // In the order's timeline: why the bank refused (the buyer can still retry).
-        if (changed.count) {
-          await recordEvent({ storeId, sessionId, kind: "payment.failed", message: `Paiement refusé${reason}` });
-        } else if (createdAt && (await db.checkoutSession.count({ where: { id: sessionId, status: { not: "PAID" } } }))) {
-          // A real decline all the same: counted by the analytics (paymentFailedAt, first one only),
-          // the status of the newer attempt left alone.
-          await db.checkoutSession.updateMany({ where: { id: sessionId, status: { not: "PAID" }, paymentFailedAt: null }, data: { paymentFailedAt: new Date() } });
-          await recordEvent({ storeId, sessionId, kind: "payment.failed", message: `Paiement refusé${reason} — tentative antérieure, un nouvel essai est en cours.` });
-        }
+        await recordPaymentFailure(storeId, sessionId, paymentCreatedAt(data), reason);
       }
       return null;
     }
@@ -234,7 +204,7 @@ export async function handleEvent(type: string, data: Record<string, unknown>, s
   }
 }
 
-async function alreadyDisputed(target: PaymentTarget): Promise<boolean> {
+export async function alreadyDisputed(target: PaymentTarget): Promise<boolean> {
   if (target.kind === "session") return !!(await db.checkoutSession.findUnique({ where: { id: target.sessionId }, select: { disputed: true } }))?.disputed;
   if (target.kind === "offer") return !!(await db.upsellCharge.findUnique({ where: { id: target.chargeId }, select: { disputed: true } }))?.disputed;
   return true; // duplicates/attempts: journaled only, nothing to open
@@ -242,9 +212,10 @@ async function alreadyDisputed(target: PaymentTarget): Promise<boolean> {
 
 /**
  * Won/lost/closed: recorded on the order (a lost dispute is money gone: profit
- * analytics subtract it) and journaled; a lost one alerts. Idempotent per status.
+ * analytics subtract it) and journaled; a lost one alerts. Idempotent per status. Shared with
+ * Stripe's disputes (stripe-webhooks.ts), whose `data` carries the lost amount the same way.
  */
-async function recordDisputeOutcome(storeId: string, target: PaymentTarget, disputeId: string | null, data: Record<string, unknown>) {
+export async function recordDisputeOutcome(storeId: string, target: PaymentTarget, disputeId: string | null, data: Record<string, unknown>) {
   const status = typeof data.status === "string" ? data.status : null;
   if (!status || !["won", "lost", "closed"].includes(status)) return;
   const lostCents = status === "lost" ? (refundAmountIn(target.currency, data, "charge" in target ? target.charge : undefined) ?? null) : 0;
@@ -320,7 +291,18 @@ export function paymentCreatedAt(data: Record<string, unknown>): Date | null {
 /** Keeps the raw event for audit and replay (bounded size; a truncated one can't be replayed). */
 export const MAX_PAYLOAD = 512_000;
 export function safePayload(raw: string) {
-  if (raw.length > MAX_PAYLOAD) return { truncated: true, length: raw.length };
+  if (raw.length > MAX_PAYLOAD) {
+    // A Stripe event keeps what re-reading it needs: its connected account and its mode (whose keys).
+    const marker: { truncated: true; length: number; account?: string; livemode?: boolean } = { truncated: true, length: raw.length };
+    try {
+      const p = JSON.parse(raw) as { account?: unknown; livemode?: unknown } | null;
+      if (typeof p?.account === "string" && p.account) marker.account = p.account;
+      if (typeof p?.livemode === "boolean") marker.livemode = p.livemode;
+    } catch {
+      // unreadable: the bare marker
+    }
+    return marker;
+  }
   try {
     return JSON.parse(raw);
   } catch {
@@ -333,6 +315,9 @@ export function safePayload(raw: string) {
 export const STALE_CLAIM_MS = 3 * 60_000;
 
 export type ClaimResult = "claimed" | "done" | "in_flight";
+
+/** WebhookEvent ids of Stripe events: "stripe:<event id>" (never mixed with Whop's delivery ids). */
+export const STRIPE_EVENT_PREFIX = "stripe:";
 
 /** Primary key of a claimed event: per store (a shared Whop account delivers the same id to each store). */
 export const eventKey = (storeId: string, webhookId: string) => ({ storeId_id: { storeId, id: webhookId } });
@@ -364,7 +349,7 @@ export async function claimEvent(webhookId: string, storeId: string, type: strin
         storeId,
         level: "warn",
         kind: "webhook.stale_claim",
-        message: `Événement Whop ${type} resté inachevé (interruption) : repris.`,
+        message: `Événement ${webhookId.startsWith(STRIPE_EVENT_PREFIX) ? "Stripe" : "Whop"} ${type} resté inachevé (interruption) : repris.`,
         data: { webhookId },
       });
     return "claimed";
@@ -462,13 +447,14 @@ export async function failEvent(storeId: string, webhookId: string, err: unknown
 
 /** Journal line (and alert) for an event given up: a human must look at it in Whop. */
 export async function recordGaveUp(storeId: string, webhookId: string, type: string, outcome: FailOutcome, err: unknown) {
+  const via = webhookId.startsWith(STRIPE_EVENT_PREFIX) ? "Stripe" : "Whop";
   await recordEvent({
     storeId,
     level: "error",
     kind: "webhook.gave_up",
-    message: `Événement Whop ${type} (${webhookId}) abandonné après ${outcome.attempts} rejeu(x) local(aux) et ${outcome.deliveries} envoi(s) de Whop (${
+    message: `Événement ${via} ${type} (${webhookId}) abandonné après ${outcome.attempts} rejeu(x) local(aux) et ${outcome.deliveries} envoi(s) de ${via} (${
       err instanceof Error ? err.message : String(err)
-    }) : plus aucun essai automatique. Vérifiez-le dans Whop, puis « Relancer » ou « Traité » dans le Journal.`,
+    }) : plus aucun essai automatique. Vérifiez-le dans ${via}, puis « Relancer » ou « Traité » dans le Journal.`,
     data: { webhookId, attempts: outcome.attempts, deliveries: outcome.deliveries },
     alert: true,
   });
@@ -476,16 +462,23 @@ export async function recordGaveUp(storeId: string, webhookId: string, type: str
 
 /**
  * Background replay of events whose handling was interrupted (crash) or failed and
- * that Whop may have stopped retrying. Gives up after the backoff list, loudly.
+ * that the processor may have stopped retrying. Gives up after the backoff list, loudly.
+ * `provider`: Whop's events (their delivery ids), or Stripe's ("stripe:evt_…", replayed from the
+ * stored event, re-read from Stripe when the stored copy was truncated) — two tick jobs, so a
+ * hanging Whop never holds Stripe's replays (and the other way round).
  */
-export async function replayStaleEvents(deadline: number): Promise<number> {
+export async function replayStaleEvents(deadline: number, provider: "whop" | "stripe" = "whop"): Promise<number> {
+  const stripe = provider === "stripe";
+  const via = stripe ? "Stripe" : "Whop";
   const stale = await db.webhookEvent.findMany({
     where: {
       processedAt: null,
       receivedAt: { lt: new Date(Date.now() - STALE_CLAIM_MS) },
       attempts: { lt: GAVE_UP_ATTEMPTS },
       OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: new Date() } }],
-      NOT: [{ id: { startsWith: "refund:" } }, { id: { startsWith: "refund-skip:" } }],
+      ...(stripe
+        ? { id: { startsWith: STRIPE_EVENT_PREFIX } }
+        : { NOT: [{ id: { startsWith: "refund:" } }, { id: { startsWith: "refund-skip:" } }, { id: { startsWith: STRIPE_EVENT_PREFIX } }] }),
     },
     take: 20,
     orderBy: { receivedAt: "asc" },
@@ -496,18 +489,23 @@ export async function replayStaleEvents(deadline: number): Promise<number> {
     const taken = await db.webhookEvent.updateMany({ where: { storeId: e.storeId, id: e.id, processedAt: null, receivedAt: e.receivedAt }, data: { receivedAt: new Date() } });
     if (taken.count === 0) continue;
     const evt = (e.payload ?? {}) as WhopEvent & { truncated?: boolean };
-    const type = eventType(evt) || e.type;
-    if (evt.truncated) {
+    const type = stripe ? e.type : eventType(evt) || e.type;
+    if (evt.truncated && !stripe) {
       await db.webhookEvent.update({ where: eventKey(e.storeId, e.id), data: { attempts: GAVE_UP_ATTEMPTS, lastError: "payload tronqué" } });
       await recordEvent({ storeId: e.storeId, level: "error", kind: "webhook.gave_up", message: `Événement Whop ${type} (${e.id}) trop volumineux pour être rejoué : vérifiez-le dans Whop.`, alert: true });
       continue;
     }
     try {
-      const syncId = await withLogContext({ webhookId: e.id, event: type, replay: true }, () => handleEvent(type, (evt.data ?? {}) as Record<string, unknown>, e.storeId));
+      const syncId = await withLogContext({ webhookId: e.id, event: type, replay: true }, async () => {
+        if (!stripe) return handleEvent(type, (evt.data ?? {}) as Record<string, unknown>, e.storeId);
+        // Loaded lazily: stripe-webhooks.ts builds on this module (no import cycle at load time).
+        const { replayStripeEvent } = await import("./stripe-webhooks");
+        return replayStripeEvent(e.storeId, e.id.slice(STRIPE_EVENT_PREFIX.length), e.payload);
+      });
       await db.webhookEvent.update({ where: eventKey(e.storeId, e.id), data: { processedAt: new Date(), lastError: null, nextAttemptAt: null } });
       // Inside the tick's Whop-side phase the Shopify order is created by its follow-ups job.
       if (syncId && !defer("order.sync", () => syncOrderSafely(syncId))) await syncOrderSafely(syncId);
-      await recordEvent({ storeId: e.storeId, level: "warn", kind: "webhook.replayed", message: `Événement Whop ${type} rejoué automatiquement${e.attempts ? ` (après ${e.attempts} échec(s))` : " (interrompu)"}.` });
+      await recordEvent({ storeId: e.storeId, level: "warn", kind: "webhook.replayed", message: `Événement ${via} ${type} rejoué automatiquement${e.attempts ? ` (après ${e.attempts} échec(s))` : " (interrompu)"}.` });
       n++;
     } catch (err) {
       if (isDeadline(err)) {
@@ -524,7 +522,7 @@ export async function replayStaleEvents(deadline: number): Promise<number> {
           storeId: e.storeId,
           level: "warn",
           kind: "webhook.replay_failed",
-          message: `Rejeu de l'événement Whop ${type} en échec (rejeu ${outcome.attempts}) : ${err instanceof Error ? err.message : String(err)}. Prochain rejeu ${
+          message: `Rejeu de l'événement ${via} ${type} en échec (rejeu ${outcome.attempts}) : ${err instanceof Error ? err.message : String(err)}. Prochain rejeu ${
             outcome.nextAttemptAt ? `à ${outcome.nextAttemptAt.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Paris" })}` : "bientôt"
           }.`,
           data: { webhookId: e.id },

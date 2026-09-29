@@ -82,7 +82,7 @@ export function stopForTime(deadline: number, reserveMs = 0): boolean {
 
 /* Per-run circuit breakers ------------------------------------------------------------------------ */
 
-export type BreakerProvider = "whop" | "shopify";
+export type BreakerProvider = "whop" | "shopify" | "stripe";
 /** Breakers of one background run (`breakers` in the log context): the provider that hung, and on which call. */
 export type Breakers = Partial<Record<BreakerProvider, { at: number; what: string }>>;
 
@@ -111,7 +111,7 @@ export function breakerOpen(provider: BreakerProvider): boolean {
 
 /** Throws DeadlineError (not a failure: lease released, no try spent, job partial) when the provider's breaker is open. */
 export function assertBreakerClosed(provider: BreakerProvider, what: string): void {
-  if (breakerOpen(provider)) throw new DeadlineError(`${what} : ${provider === "whop" ? "Whop" : "Shopify"} ne répond pas, appels suspendus pour ce passage`);
+  if (breakerOpen(provider)) throw new DeadlineError(`${what} : ${provider === "whop" ? "Whop" : provider === "stripe" ? "Stripe" : "Shopify"} ne répond pas, appels suspendus pour ce passage`);
 }
 
 /** A fetch rejected because its time ran out (AbortSignal.timeout / the SDK's own timeout signal). Pure. */

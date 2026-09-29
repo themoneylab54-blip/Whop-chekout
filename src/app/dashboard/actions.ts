@@ -1,6 +1,6 @@
 "use server";
 
-import { whopRefundAmount } from "@/lib/charge";
+import { providerRefundAmount } from "@/lib/charge";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { headers } from "next/headers";
@@ -40,6 +40,18 @@ import { flashUrl, issueField, type FlashParams } from "@/lib/flash";
 import { checkoutHostOf, formatDomainError, normalizeCheckoutDomain, parseDomainError } from "@/lib/checkout-domain";
 import { APPLE_PAY_ASSOCIATION_KEY, checkStoreDomain, reregisterApplePayDomain, retireCheckoutDomain, retiredDomainOwner, unretireCheckoutDomain } from "@/lib/checkout-domain-check";
 import { addProjectDomain, getProjectDomain, VercelApiError, vercelConfig, type VercelConfig } from "@/lib/vercel-domains";
+import { deauthorize as deauthorizeStripe, refundStripe, registerStripeDomain, stripeConfigured, stripeForMode, stripeModeOf, stripeWalletHosts } from "@/lib/stripe";
+import {
+  disconnectBlockMessage,
+  ensureStripeWebhook,
+  forgetStripeAccount,
+  markPastStripeAccountRevoked,
+  pastStripeAccounts,
+  sessionStripeAccount,
+  stripeConnectionMode,
+  stripeDisconnectBlockers,
+} from "@/lib/stripe-connection";
+import { anyProviderConnected, PAYMENT_MODE_LABELS, paymentModeProblem, providerConnected, storeReady, stripeUnusableReason } from "@/lib/payment-provider";
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -314,15 +326,22 @@ export async function saveSettingsAction(storeId: string, fd: FormData) {
     // Sandbox and production use different Whop keys: the connection must be redone.
     await teardownWhop(store).catch(() => undefined);
   }
+  // The store as the new mode leaves it: Whop to reconnect, no failover; the checkout stays live only
+  // when a processor can still charge (a Stripe connection covering the new mode).
+  const next = { ...store, testMode, providerFailoverAt: null, ...(modeChanged && store.whopConnectedAt ? { whopConnectedAt: null } : {}) };
+  const noProcessorLeft = modeChanged && !anyProviderConnected(next);
+  const stripeKeeps = modeChanged && providerConnected(next, "stripe");
   await db.store.update({
     where: { id: storeId },
     data: {
       name,
       testMode,
       timezone,
+      // A processor failover belongs to the previous mode's connections: the new mode starts clean.
+      ...(modeChanged ? { providerFailoverAt: null, providerFailoverReason: null } : {}),
+      ...(noProcessorLeft ? { enabled: false } : {}),
       ...(modeChanged && store.whopConnectedAt
         ? {
-            enabled: false,
             whopApiKey: null,
             whopAccountId: null,
             whopProductId: null,
@@ -333,27 +352,55 @@ export async function saveSettingsAction(storeId: string, fd: FormData) {
         : {}),
     },
   });
-  if (modeChanged && store.whopConnectedAt) await recordCheckoutEnabled(storeId, store.enabled, false, "Mode test / production changé");
-  revalidatePath(storePath(storeId), "layout");
-  if (modeChanged && store.whopConnectedAt) {
-    back(storePath(storeId, "whop"), {
-      ok: `Mode ${testMode ? "test" : "production"} activé. Reconnectez Whop avec la clé ${testMode ? "sandbox" : "de production"}.`,
+  if (noProcessorLeft) await recordCheckoutEnabled(storeId, store.enabled, false, "Mode test / production changé");
+  // Stripe still charging in the new mode: its Connect webhook and wallet domains are the new mode's
+  // (another platform key), set up now rather than at the first payment.
+  let stripeSetupNote = "";
+  if (stripeKeeps) {
+    const webhook = await ensureStripeWebhook(storeId, stripeModeOf(next));
+    const domains = await registerWalletDomains(next);
+    stripeSetupNote = `${webhook ? ` Webhook Stripe du nouveau mode à réparer : ${webhook}.` : ""}${domains.failed.length ? ` Apple Pay pas enregistré chez Stripe : ${domains.failed.join(", ")} (bouton « Enregistrer les domaines » sur la page Stripe).` : ""}`;
+  }
+  // Stripe: a connection made in test mode can't charge in production (a live one covers both).
+  const stripeNote =
+    modeChanged && !testMode && store.stripeAccountId && store.stripeLivemode !== true ? " Reconnectez Stripe en production : ce compte Stripe a été connecté en mode test et ne peut pas encaisser en production." : "";
+  const liveNote = modeChanged && store.enabled && !noProcessorLeft && store.whopConnectedAt ? " Le checkout reste en ligne : Stripe encaisse en attendant." : "";
+  if (modeChanged) {
+    await recordEvent({
+      storeId,
+      level: stripeNote || stripeSetupNote ? "warn" : "info",
+      kind: "store.mode_changed",
+      message: `Mode ${testMode ? "test" : "production"} activé depuis les réglages.${store.whopConnectedAt ? " Whop est à reconnecter." : ""}${liveNote}${stripeNote}${stripeSetupNote}${store.providerFailoverAt ? " La bascule de processeur en cours est levée." : ""}`,
+      data: { testMode, stripeReconnect: !!stripeNote, disabled: noProcessorLeft && store.enabled },
     });
   }
+  revalidatePath(storePath(storeId), "layout");
+  if (modeChanged && store.whopConnectedAt) {
+    // The switch itself succeeded; a Stripe problem it leaves is said apart, as an error.
+    const stripeProblem = `${stripeNote}${stripeSetupNote}`.trim();
+    back(storePath(storeId, "whop"), {
+      ok: `Mode ${testMode ? "test" : "production"} activé. Reconnectez Whop avec la clé ${testMode ? "sandbox" : "de production"}.${liveNote}`,
+      ...(stripeProblem ? { error: stripeProblem } : {}),
+    });
+  }
+  if (stripeNote) back(storePath(storeId, "stripe"), { ok: "Mode production activé.", error: `${stripeNote}${stripeSetupNote}`.trim() });
+  if (stripeSetupNote) back(storePath(storeId, "stripe"), { ok: `Mode ${testMode ? "test" : "production"} activé.`, error: stripeSetupNote.trim() });
   back(storePath(storeId, "settings"), { ok: "Réglages enregistrés" });
 }
 
 export async function setEnabledAction(storeId: string, enabled: boolean) {
   const store = await getStore(storeId);
-  if (enabled && (!store.shopifyConnectedAt || !store.whopConnectedAt)) {
-    back(storePath(storeId), { error: "Connectez Shopify et Whop avant d'activer le checkout." });
+  // Live = Shopify connected and at least one processor able to charge under the payment mode (Whop,
+  // or Stripe alone: a Stripe-only store never needs Whop).
+  if (enabled && !storeReady(store)) {
+    back(storePath(storeId), { error: "Connectez Shopify et un moyen de paiement (Whop ou Stripe) avant d'activer le checkout." });
   }
   await db.store.update({ where: { id: storeId }, data: { enabled } });
   // Charts show the hours the checkout was off (sales on Shopify's checkout, outside these figures).
-  await recordCheckoutEnabled(storeId, store.enabled, enabled, enabled ? null : "Checkout Whop désactivé à la main");
+  await recordCheckoutEnabled(storeId, store.enabled, enabled, enabled ? null : "Checkout désactivé à la main");
   revalidatePath(storePath(storeId), "layout");
   back(storePath(storeId), {
-    ok: enabled ? "Checkout Whop activé sur la boutique" : "Checkout Whop désactivé : la boutique utilise le checkout Shopify.",
+    ok: enabled ? "Checkout activé sur la boutique" : "Checkout désactivé : la boutique utilise le checkout Shopify.",
   });
 }
 
@@ -476,10 +523,12 @@ export async function connectWhopAction(storeId: string, fd: FormData) {
 export async function disconnectWhopAction(storeId: string) {
   const store = await getStore(storeId);
   await teardownWhop(store).catch(() => undefined);
+  // Stripe able to charge on its own: the checkout stays live on it; otherwise buyers go back to Shopify's.
+  const noProcessorLeft = !anyProviderConnected({ ...store, whopConnectedAt: null });
   await db.store.update({
     where: { id: storeId },
     data: {
-      enabled: false,
+      ...(noProcessorLeft ? { enabled: false } : {}),
       whopApiKey: null,
       whopAccountId: null,
       whopProductId: null,
@@ -488,9 +537,125 @@ export async function disconnectWhopAction(storeId: string) {
       whopConnectedAt: null,
     },
   });
-  await recordCheckoutEnabled(storeId, store.enabled, false, "Whop déconnecté");
+  if (noProcessorLeft) await recordCheckoutEnabled(storeId, store.enabled, false, "Whop déconnecté");
   revalidatePath(storePath(storeId), "layout");
-  back(storePath(storeId, "whop"), { ok: "Whop déconnecté." });
+  back(storePath(storeId, "whop"), { ok: store.enabled && !noProcessorLeft ? "Whop déconnecté. Le checkout reste en ligne : Stripe encaisse seul." : "Whop déconnecté." });
+}
+
+/* ------------------------------------------------------------------ */
+/* Stripe connection                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * « Déconnecter » Stripe: the platform lets go of the account (unless another store uses it, with the
+ * keys of the mode it was connected in), the store forgets it. Refused while Stripe payments are in
+ * flight or recent ones still lack their Shopify order, unless « Déconnecter quand même » is ticked.
+ */
+export async function disconnectStripeAction(storeId: string, fd?: FormData) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "stripe");
+  if (!store.stripeAccountId) back(path, { ok: "Stripe n'était pas connecté." });
+  const force = fd?.get("force") === "on";
+  const blocked = disconnectBlockMessage(await stripeDisconnectBlockers(storeId));
+  if (blocked && !force) back(path, { error: blocked });
+  const shared = await db.store.count({ where: { stripeAccountId: store.stripeAccountId, id: { not: storeId } } });
+  // The store lets go of the account first: the account.application.deauthorized webhook that the
+  // revocation below triggers then finds a past account (marked revoked, quiet), never the current
+  // connection (which would journal a false « Stripe a retiré l'accès » alert).
+  const forgotten = await forgetStripeAccount(store, {
+    by: "merchant",
+    message: `Compte Stripe « ${store.stripeAccountName ?? store.stripeAccountId} » déconnecté depuis le dashboard${blocked ? ` malgré l'avertissement (${blocked.replace(/^Déconnexion refusée : /, "").split(".")[0]})` : ""}.`,
+    revoked: false,
+  });
+  let revokeFailed = false;
+  // Not forgotten here (a reconnection or another disconnect raced this one): its access is left alone.
+  if (forgotten && !shared) {
+    try {
+      await deauthorizeStripe(store.stripeAccountId, stripeConnectionMode(store));
+      await markPastStripeAccountRevoked(storeId, store.stripeAccountId);
+    } catch (err) {
+      revokeFailed = true;
+      log.warn("stripe.deauthorize_failed", "Stripe deauthorization failed (the store forgot the account anyway)", { storeId, err });
+    }
+  }
+  revalidatePath(storePath(storeId), "layout");
+  back(path, {
+    ok: revokeFailed
+      ? "Stripe déconnecté de cette boutique. Stripe n'a pas confirmé le retrait de l'accès : retirez l'app dans Stripe → Paramètres → Applications connectées si elle y figure encore."
+      : "Stripe déconnecté.",
+  });
+}
+
+const PAYMENT_MODES = ["whop_primary", "stripe_primary", "stripe_only"] as const;
+
+/** Which processor goes first: « Whop principal » (default), « Stripe principal » or « Stripe uniquement ». */
+export async function savePaymentModeAction(storeId: string, fd: FormData) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "stripe");
+  const mode = str(fd, "paymentMode");
+  if (!(PAYMENT_MODES as readonly string[]).includes(mode)) back(path, { error: "Mode de paiement inconnu", field: "paymentMode" });
+  const next = mode as (typeof PAYMENT_MODES)[number];
+  const problem = paymentModeProblem(store, next);
+  if (problem) back(path, { error: problem, field: "paymentMode" });
+  if (next === store.paymentMode) back(path, { ok: "Mode de paiement inchangé" });
+  // A failover belongs to the previous order of the processors: the new one starts clean.
+  await db.store.update({ where: { id: storeId }, data: { paymentMode: next, providerFailoverAt: null, providerFailoverReason: null } });
+  const label = PAYMENT_MODE_LABELS[next];
+  await recordEvent({ storeId, kind: "payment_mode.changed", message: `Mode de paiement : « ${label} ».`, data: { from: store.paymentMode, to: next } });
+  revalidatePath(storePath(storeId), "layout");
+  back(path, { ok: `Mode de paiement enregistré : ${label}.` });
+}
+
+/** Registers (again) the checkout hosts on the connected Stripe account for Apple Pay / Google Pay. */
+export async function registerStripeDomainsAction(storeId: string) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "stripe");
+  if (!store.stripeAccountId) back(path, { error: "Connectez Stripe d'abord" });
+  // Registered with the keys of the store's mode: only when the connection covers that mode.
+  if (!stripeConfigured(stripeModeOf(store)) || (!store.testMode && store.stripeLivemode !== true)) {
+    back(path, { error: stripeUnusableReason(store) ?? "Stripe n'est pas utilisable dans le mode actuel de la boutique." });
+  }
+  const { hosts, failed, pending } = await registerWalletDomains(store);
+  // While Stripe is being worked on: its Connect webhook too (journaled when it can't be set up).
+  const webhook = await ensureStripeWebhook(storeId, stripeModeOf(store), { lazy: true });
+  const webhookError = webhook ? `Webhook Stripe à réparer (« Réparer la liaison Stripe ») : ${webhook}.` : undefined;
+  if (!hosts.length) {
+    back(path, {
+      error: `Aucun domaine à enregistrer : le checkout est servi sur une adresse locale. Configurez un domaine du checkout vérifié (Réglages) ou une APP_URL publique, puis réessayez.${webhookError ? ` ${webhookError}` : ""}`,
+    });
+  }
+  if (failed.length) back(path, { error: `Stripe n'a pas pu enregistrer : ${failed.join(", ")}.${webhookError ? ` ${webhookError}` : ""}` });
+  if (pending.length) back(path, { error: `Domaine(s) enregistré(s) chez Stripe, Apple Pay pas encore actif : ${pending.join(", ")}. Réessayez dans quelques minutes.${webhookError ? ` ${webhookError}` : ""}` });
+  // Domains fine: that success is said as such, the webhook problem apart.
+  back(path, { ok: `Apple Pay actif chez Stripe sur ${hosts.join(", ")}.`, error: webhookError });
+}
+
+/** Registers the store's wallet hosts (stripeWalletHosts) on its connected account: those Stripe refused, those not active yet. */
+async function registerWalletDomains(store: Parameters<typeof stripeWalletHosts>[0] & Parameters<typeof registerStripeDomain>[0]): Promise<{ hosts: string[]; failed: string[]; pending: string[] }> {
+  const hosts = stripeWalletHosts(store);
+  const failed: string[] = [];
+  const pending: string[] = [];
+  for (const host of hosts) {
+    try {
+      if ((await registerStripeDomain(store, host)) !== "active") pending.push(host);
+    } catch (err) {
+      log.warn("stripe.domain_failed", "Could not register a payment method domain on Stripe", { storeId: store.id, host, err });
+      failed.push(`${host} (${errorMessage(err)})`);
+    }
+  }
+  return { hosts, failed, pending };
+}
+
+/** « Réparer la liaison Stripe »: (re)creates or checks the platform's Connect webhook of the store's mode. */
+export async function repairStripeWebhookAction(storeId: string) {
+  const store = await getStore(storeId);
+  const path = storePath(storeId, "stripe");
+  if (!store.stripeAccountId) back(path, { error: "Connectez Stripe d'abord" });
+  const error = await ensureStripeWebhook(storeId, stripeModeOf(store));
+  if (error) back(path, { error: `Liaison Stripe non réparée : ${error}` });
+  await recordEvent({ storeId, kind: "stripe.webhook_repaired", message: "Liaison Stripe (webhook) vérifiée depuis le tableau de bord." });
+  revalidatePath(storePath(storeId), "layout");
+  back(path, { ok: "Liaison Stripe vérifiée : le webhook est en place." });
 }
 
 /** Saves Apple's domain-association file (from Whop) and registers the checkout domain. */
@@ -1238,44 +1403,60 @@ export async function refundOrderAction(storeId: string, sessionId: string, fd: 
   if (amount == null || amount <= 0 || amount > remaining) back(path, { error: "Montant de remboursement invalide", field: "amount" });
   const full = amount === remaining;
   const amountLabel = `${centsToDecimal(amount).replace(".", ",")} ${session.currency}`;
+  // Refunded where it was paid: Whop, or Stripe (on the connected account).
+  const stripe = session.paymentProvider === "stripe";
+  const via = stripe ? "Stripe" : "Whop";
+  if (stripe) {
+    // A past account whose access was removed (disconnected, revoked): the platform can't refund on it
+    // any more (Stripe would answer with an authentication error), the merchant can in their Stripe.
+    const account = sessionStripeAccount(session, store);
+    if (account && account !== store.stripeAccountId && (await pastStripeAccounts(storeId)).some((a) => a.id === account && a.revoked)) {
+      back(path, { error: "Ce paiement a été fait sur un ancien compte Stripe déconnecté : remboursez-le depuis votre dashboard Stripe, puis indiquez-le dans Shopify." });
+    }
+  }
   try {
+    // Charged in the buyer's currency: the processor refunds in that currency (the amount typed is in the
+    // shop's), the rest being exactly what remains of the charge.
+    const providerAmount = providerRefundAmount({
+      amountCents: amount,
+      totalCents: session.totalCents,
+      refundedCents: session.refundedCents,
+      chargeTotalCents: session.chargeCurrency && session.chargeFxRate && session.paidQuoteId ? ((await db.checkoutQuote.findUnique({ where: { id: session.paidQuoteId }, select: { chargeTotalCents: true } }))?.chargeTotalCents ?? null) : null,
+      refundedChargeCents: session.refundedChargeCents,
+      rate: session.chargeFxRate,
+      currency: session.chargeCurrency,
+    });
     // Same order state + same amount = same key: a double submit or an SDK retry can't refund twice.
-    await refundPayment(
-      store,
-      session.whopPaymentId,
-      // Charged in the buyer's currency: Whop refunds in that currency (the amount typed is in the shop's),
-      // the rest being exactly what remains of the charge.
-      whopRefundAmount({
-        amountCents: amount,
-        totalCents: session.totalCents,
-        refundedCents: session.refundedCents,
-        chargeTotalCents: session.chargeCurrency && session.chargeFxRate && session.paidQuoteId ? ((await db.checkoutQuote.findUnique({ where: { id: session.paidQuoteId }, select: { chargeTotalCents: true } }))?.chargeTotalCents ?? null) : null,
-        refundedChargeCents: session.refundedChargeCents,
-        rate: session.chargeFxRate,
-        currency: session.chargeCurrency,
-      }),
-      `refund_${session.id}_${(str(fd, "nonce") || `${session.refundedCents}_${amount}`).slice(0, 64)}`,
-    );
+    const key = `refund_${session.id}_${(str(fd, "nonce") || `${session.refundedCents}_${amount}`).slice(0, 64)}`;
+    if (stripe) {
+      // On the account the payment was made on (the store may have disconnected or replaced it since).
+      const account = sessionStripeAccount(session, store);
+      if (!account) throw new Error("Stripe n'est plus connecté à cette boutique : remboursez depuis votre dashboard Stripe");
+      // In the payment's own mode (session.test, from its livemode): still right after a mode switch.
+      await refundStripe(stripeForMode(store, !session.test, account), session.whopPaymentId, providerAmount, key, session.chargeCurrency ?? session.currency);
+    } else {
+      await refundPayment(store, session.whopPaymentId, providerAmount, key);
+    }
   } catch (err) {
     await recordEvent({
       storeId,
       sessionId,
       level: "warn",
       kind: "refund.request_failed",
-      message: `Remboursement de ${amountLabel} refusé par Whop : ${errorMessage(err)}`,
-      data: { amountCents: amount, paymentId: session.whopPaymentId, source: "dashboard" },
+      message: `Remboursement de ${amountLabel} refusé par ${via} : ${errorMessage(err)}`,
+      data: { amountCents: amount, paymentId: session.whopPaymentId, provider: session.paymentProvider, source: "dashboard" },
     });
-    back(path, { error: `Whop a refusé le remboursement : ${errorMessage(err)}` });
+    back(path, { error: `${via} a refusé le remboursement : ${errorMessage(err)}` });
   }
   await recordEvent({
     storeId,
     sessionId,
     kind: "refund.requested",
-    message: `Remboursement ${full ? "total" : "partiel"} de ${amountLabel} demandé depuis le dashboard`,
-    data: { amountCents: amount, full, paymentId: session.whopPaymentId, source: "dashboard" },
+    message: `Remboursement ${full ? "total" : "partiel"} de ${amountLabel} demandé à ${via} depuis le dashboard`,
+    data: { amountCents: amount, full, paymentId: session.whopPaymentId, provider: session.paymentProvider, source: "dashboard" },
   });
-  // The refund.created webhook records it in Shopify.
-  back(path, { ok: `Remboursement de ${amountLabel} demandé à Whop. Il apparaîtra dans Shopify dès confirmation.` });
+  // The processor's refund webhook (refund.created / charge.refunded) records it in Shopify.
+  back(path, { ok: `Remboursement de ${amountLabel} demandé à ${via}. Il apparaîtra dans Shopify dès confirmation.` });
 }
 
 export type OrderSearchHit = { id: string; shopifyOrderName: string | null; email: string | null; name: string | null; status: string; totalCents: number; currency: string; createdAt: string };

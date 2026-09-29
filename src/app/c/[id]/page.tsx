@@ -32,7 +32,7 @@ export const dynamic = "force-dynamic";
 const loadSession = cache((id: string) => db.checkoutSession.findUnique({ where: { id }, include: { store: true } }));
 
 /** Tab title "<Store> · Paiement" in the checkout's language (no app suffix). */
-type PageProps = { params: Promise<{ id: string }>; searchParams: Promise<{ lang?: string | string[]; via?: string | string[] }> };
+type PageProps = { params: Promise<{ id: string }>; searchParams: Promise<{ lang?: string | string[]; via?: string | string[]; payment?: string | string[] }> };
 
 export async function generateMetadata({ params, searchParams }: PageProps): Promise<Metadata> {
   const { id } = await params;
@@ -211,7 +211,8 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
         }))}
         // Shopify codes (when enabled and readable) need the promo field too, even without app codes.
         hasDiscounts={discountCount > 0 || (store.shopifyDiscountCodes && canReadShopifyDiscounts(store))}
-        mode={{ kind: "live", sessionId: session.id, testMode: store.testMode, saveCard }}
+        // payment=failed: back from a Stripe redirect (3-D Secure, bank page) that failed (see merci/page).
+        mode={{ kind: "live", sessionId: session.id, testMode: store.testMode, saveCard, paymentFailed: (await searchParams).payment === "failed" }}
         initialEmail={session.email}
         initialCountry={initialCountry}
         localeCountry={localeCountry}

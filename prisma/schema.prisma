@@ -43,6 +43,24 @@ model Store {
   whopWebhookSecret String? // encrypted
   whopConnectedAt   DateTime?
 
+  // --- Stripe (migration 0034_stripe_provider) ---
+  // Connected account (Stripe Connect OAuth, Standard): charges are direct charges on it
+  stripeAccountId        String?
+  stripeConnectedAt      DateTime?
+  stripeLivemode         Boolean?
+  stripeAccountName      String?
+  // Whether the connected account can take payments (Stripe's charges_enabled; migration
+  // 0037_stripe_lifecycle): saved at connection, refreshed on the Stripe page and by account.updated.
+  // null = unknown (never read): treated as usable
+  stripeChargesEnabled   Boolean?
+  // Last Stripe Connect webhook event received for this store (0037_stripe_lifecycle)
+  lastStripeWebhookAt    DateTime?
+  // Which processor takes payments: Whop first (Stripe as secours), Stripe first, or Stripe only
+  paymentMode            PaymentMode @default(whop_primary)
+  // Store-level failover: the primary processor is failing, new sessions use the secondary one
+  providerFailoverAt     DateTime?
+  providerFailoverReason String?
+
   // --- State ---
   enabled  Boolean @default(false) // master switch: false = native Shopify checkout
   testMode Boolean @default(true) // Whop sandbox + Shopify test orders
@@ -205,6 +223,9 @@ model Store {
   productVat       ProductVat[]
   // Images uploaded in the builder (migration 0028_media_uploads)
   media            StoreMedia[]
+
+  // Stripe webhooks resolve the store(s) from event.account
+  @@index([stripeAccountId])
 }
 
 model ShippingRate {
@@ -281,6 +302,17 @@ enum SessionStatus {
   PAID
   FAILED
   ABANDONED
+}
+
+enum PaymentMode {
+  whop_primary
+  stripe_primary
+  stripe_only
+}
+
+enum PaymentProvider {
+  whop
+  stripe
 }
 
 model CheckoutSession {
@@ -491,6 +523,23 @@ model CheckoutSession {
   // Random key the storefront loader sends with the session POST: a retry of the same click
   // (timeout on the checkout domain, then the app's API) gets the same session, never a second one
   requestKey              String?
+  // --- Migration 0034_stripe_provider ---
+  // Processor this session charges through (Whop by default; Stripe as secours or primary)
+  paymentProvider         PaymentProvider   @default(whop)
+  stripePaymentIntentId   String?           @unique
+  stripeCustomerId        String?
+  // Saved payment method (one-click upsell, off-session)
+  stripePaymentMethodId   String?
+  // Processor fee for non-Whop payments (Stripe balance transaction fee); feeCents() reads either
+  providerFeeCents        Int?
+  // --- Migration 0036_forced_provider --- Processor forced for this session: only set by the
+  // dashboard's « Tester le secours » (admin-created test session), never from a buyer's request
+  forcedProvider          PaymentProvider?
+  // --- Migration 0037_stripe_lifecycle --- Connected Stripe account the session's PaymentIntent
+  // was created on: refunds, disputes and reconciliation keep using it after a disconnect / replace
+  stripeAccountId         String?
+  // Whether the buyer's card was saved off-session on the PaymentIntent (one-click offers; 0037)
+  stripeOffSessionSaved   Boolean?
 
   @@unique([storeId, requestKey])
   @@index([storeId, googleAdsAdjustDue])
@@ -657,6 +706,8 @@ model UpsellCharge {
   disputeTagAttempts       Int             @default(0)
   nextDisputeTagAt         DateTime?
   disputeTagGaveUpAt       DateTime?
+  // Processor of the offer's charge (migration 0034_stripe_provider)
+  provider                 PaymentProvider @default(whop)
 
   @@unique([sessionId, blockId])
   @@index([status, createdAt])
@@ -698,7 +749,7 @@ model CheckoutQuote {
   id                         String          @id @default(cuid())
   sessionId                  String
   session                    CheckoutSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  whopCheckoutId             String          @unique
+  whopCheckoutId             String?         @unique
   fingerprint                String
   currency                   String
   subtotalCents              Int
@@ -735,6 +786,9 @@ model CheckoutQuote {
   addOns                     Json
   addOnIds                   String[]
   createdAt                  DateTime        @default(now())
+  // Processor of this quote (migration 0034_stripe_provider) and its Stripe PaymentIntent
+  provider                   PaymentProvider @default(whop)
+  stripePaymentIntentId      String?         @unique
 
   @@index([sessionId, fingerprint])
 }
@@ -786,13 +840,15 @@ model AlertOutbox {
 
 /// Every Whop refund applied, dated (refunds of the period, CSV, audit).
 model RefundRecord {
-  id          String   @id // Whop refund id
+  id          String          @id // Whop refund id
   storeId     String
   sessionId   String
   chargeId    String?
   amountCents Int
   currency    String
-  createdAt   DateTime @default(now())
+  createdAt   DateTime        @default(now())
+  // Processor that issued the refund (migration 0034_stripe_provider)
+  provider    PaymentProvider @default(whop)
 
   @@index([storeId, createdAt])
   @@index([sessionId])

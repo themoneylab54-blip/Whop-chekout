@@ -17,6 +17,7 @@ import { logoutAction } from "../../../actions";
 import { tzOf } from "@/lib/time";
 import { providersOverview, type ProviderOverview } from "@/lib/providers";
 import { providerStatus, type ProviderStatus } from "@/lib/provider-status";
+import { PROVIDER_STORE_SELECT, providerConnected, storeLive, stripeUnusableReason } from "@/lib/payment-provider";
 
 /**
  * Dashboard visits run the background tick after answering (maybeTick in after()): its hard limit
@@ -72,7 +73,7 @@ export default async function StoreLayout({ children, params }: { children: Reac
   const { storeId } = await params;
   const [store, stores, admin, unsynced, providers] = await Promise.all([
     db.store.findUnique({ where: { id: storeId } }),
-    db.store.findMany({ orderBy: { createdAt: "asc" }, select: { id: true, name: true, enabled: true, shopifyConnectedAt: true, whopConnectedAt: true } }),
+    db.store.findMany({ orderBy: { createdAt: "asc" }, select: { id: true, name: true, enabled: true, shopifyConnectedAt: true, ...PROVIDER_STORE_SELECT } }),
     db.adminUser.findUnique({ where: { id: adminId }, select: { email: true } }),
     db.checkoutSession.count({ where: { storeId, status: "PAID", shopifyOrderId: null, syncHandledAt: null } }),
     // Same status as Journal › Services externes: a connected but failing provider shows red.
@@ -90,7 +91,8 @@ export default async function StoreLayout({ children, params }: { children: Reac
   });
   if (!store) notFound();
   const base = `/dashboard/stores/${store.id}`;
-  const live = store.enabled && !!store.shopifyConnectedAt && !!store.whopConnectedAt;
+  // Live with any processor able to charge (a Stripe-only store never connects Whop).
+  const live = storeLive(store);
   const badges = {
     orders:
       unsynced > 0 ? (
@@ -101,6 +103,11 @@ export default async function StoreLayout({ children, params }: { children: Reac
       ) : undefined,
     shopify: <Dot ok={!!store.shopifyConnectedAt} status={statusOf("shopify")} />,
     whop: <Dot ok={!!store.whopConnectedAt} status={statusOf("whop")} />,
+    // Stripe is optional (secours): no dot until it is connected; amber while connected but unusable
+    // (payments not activated, keys missing, test connection on a live store).
+    ...(store.stripeConnectedAt
+      ? { stripe: <Dot ok={providerConnected(store, "stripe")} offLabel={stripeUnusableReason(store) ?? "Connecté mais inutilisable"} status={statusOf("stripe")} /> }
+      : {}),
   };
 
   return (
@@ -138,7 +145,7 @@ export default async function StoreLayout({ children, params }: { children: Reac
               <Link key={s.id} href={`/dashboard/stores/${s.id}`} className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-zinc-100">
                 <StoreAvatar id={s.id} name={s.name} size={22} />
                 <span className="flex-1 truncate">{s.name}</span>
-                {s.enabled && s.shopifyConnectedAt && s.whopConnectedAt && <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />}
+                {storeLive(s) && <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />}
               </Link>
             ))}
             <Link href="/dashboard/stores/new" className="mt-1 flex items-center gap-2 rounded-lg border-t border-zinc-100 px-2 py-2 text-sm font-medium text-indigo-600 hover:bg-indigo-50">
@@ -223,7 +230,7 @@ export default async function StoreLayout({ children, params }: { children: Reac
             <div className="mb-6 flex items-center gap-2.5 rounded-xl bg-amber-50 px-4 py-2.5 text-sm text-amber-900 ring-1 ring-amber-600/15">
               <FlaskConical className="h-4 w-4 shrink-0" aria-hidden />
               <span>
-                <strong className="font-semibold">Mode test</strong> — paiements Whop sandbox, commandes Shopify marquées « test ».
+                <strong className="font-semibold">Mode test</strong> — paiements Whop sandbox / Stripe test, commandes Shopify marquées « test ».
               </span>
             </div>
           )}
@@ -239,9 +246,9 @@ export default async function StoreLayout({ children, params }: { children: Reac
 }
 
 /** Connection dot: amber "À connecter"; connected, the provider's status (red "En panne", amber "Dégradé"). */
-function Dot({ ok, status }: { ok: boolean; status: ProviderStatus | null }) {
+function Dot({ ok, status, offLabel = "À connecter" }: { ok: boolean; status: ProviderStatus | null; offLabel?: string }) {
   const [color, label] = !ok
-    ? ["bg-amber-400", "À connecter"]
+    ? ["bg-amber-400", offLabel]
     : status?.level === "down"
       ? ["bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,.18)]", `En panne${status.reason ? ` : ${status.reason}` : ""}`]
       : status?.level === "degraded" || status?.level === "watch"

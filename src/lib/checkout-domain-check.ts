@@ -4,6 +4,8 @@ import { db } from "./db";
 import { env } from "./env";
 import { log, recordEvent } from "./log";
 import { registerApplePayDomain, unregisterApplePayDomain } from "./whop";
+import { registerStripeDomain } from "./stripe";
+import { stripeConfigured, stripeModeOf } from "./stripe-config";
 import { removeProjectDomain, vercelConfig, vercelDomainProblem } from "./vercel-domains";
 import { appExtraHosts, hostnameOf, isAppHost } from "./host-guard";
 import {
@@ -172,6 +174,32 @@ async function onVerified(store: Store, domain: string, now: Date) {
   }
   await recordEvent({ storeId: store.id, kind: "checkout_domain.verified", message });
   await registerDomainApplePay(store, domain);
+  await registerDomainStripe(store, domain);
+}
+
+/**
+ * Registers the verified checkout domain on the store's connected Stripe account (Apple Pay / Google
+ * Pay in Stripe's Payment Element there), when Stripe is connected and its keys are set. Best effort,
+ * journaled; never throws (« Enregistrer les domaines » on the Stripe page retries by hand).
+ */
+async function registerDomainStripe(store: Store, domain: string) {
+  if (!store.stripeAccountId || !store.stripeConnectedAt || !stripeConfigured(stripeModeOf(store))) return;
+  try {
+    const status = await registerStripeDomain(store, domain);
+    await recordEvent({
+      storeId: store.id,
+      kind: "checkout_domain.stripe_wallets",
+      message: status === "active" ? `Apple Pay (Stripe) activé sur ${domain}.` : `${domain} enregistré chez Stripe pour Apple Pay (activation en cours).`,
+    });
+  } catch (err) {
+    await recordEvent({
+      storeId: store.id,
+      level: "warn",
+      kind: "checkout_domain.stripe_wallets_failed",
+      message: `Apple Pay : Stripe n'a pas pu enregistrer ${domain} (réessayez depuis la page Stripe › Enregistrer les domaines).`,
+      err,
+    });
+  }
 }
 
 /** AppSetting holding Apple's domain-association file (pasted in Connexions › Whop › Apple Pay). */

@@ -11,6 +11,7 @@ import { stuckImports } from "@/lib/shopify-history";
 import { providersHealth, sustainedFailures } from "@/lib/providers";
 import { scrub } from "@/lib/metrics";
 import { safeEqual } from "@/lib/crypto";
+import { PROVIDER_STORE_SELECT, storeLive } from "@/lib/payment-provider";
 
 export const dynamic = "force-dynamic";
 
@@ -62,7 +63,13 @@ async function handle(req: Request) {
   // Background maintenance is what recovers missed webhooks, failed syncs and refunds: a
   // live store (enabled, Whop and Shopify connected) without a recent tick is unprotected,
   // whatever the configuration (no scheduler, CRON_SECRET missing or wrong).
-  const liveStores = await db.store.count({ where: { enabled: true, whopConnectedAt: { not: null }, shopifyConnectedAt: { not: null } } });
+  // Live = a processor able to charge (Whop, or Stripe alone): candidates in SQL, the rule in JS.
+  const liveStores = (
+    await db.store.findMany({
+      where: { enabled: true, shopifyConnectedAt: { not: null }, OR: [{ whopConnectedAt: { not: null } }, { stripeAccountId: { not: null } }] },
+      select: { enabled: true, shopifyConnectedAt: true, ...PROVIDER_STORE_SELECT },
+    })
+  ).filter((s) => storeLive(s)).length;
   const tickFresh = tick.at != null && Date.now() - new Date(tick.at).getTime() <= TICK_STALE_MS;
   const tickOk = liveStores === 0 || tickFresh;
   const tickReason = tickOk

@@ -9,7 +9,37 @@ import type { Labels } from "./i18n";
 
 type ExpressMethod = ExpressWallet;
 
-export type Prepared = { configId: string; environment: "sandbox" | "production" };
+/** What the page needs to mount Stripe's Payment Element (prepare / pay answer with provider "stripe"). */
+export type StripePrepared = { clientSecret: string; paymentIntentId: string; publishableKey: string; stripeAccount: string };
+
+/**
+ * The checkout the page pays with: a Whop checkout configuration (`configId`), or a Stripe
+ * PaymentIntent (`provider: "stripe"`: `configId` is the PaymentIntent's id; `amountKey` — the
+ * PaymentIntent's own amount and currency as the server returned them — changes when the same
+ * PaymentIntent was updated to a new total, so its form and wallets fetch the new amount).
+ */
+export type Prepared = { configId: string; environment: "sandbox" | "production"; provider?: "whop" | "stripe"; stripe?: StripePrepared; amountKey?: string };
+
+/** The Prepared of a prepare / pay answer (Whop's configuration or Stripe's PaymentIntent), or null. Pure. */
+export function preparedFromBody(body: unknown): Prepared | null {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const environment = b.environment === "production" ? "production" : "sandbox";
+  const totals = b.totals as { totalCents?: unknown } | undefined;
+  if (b.provider === "stripe") {
+    const { clientSecret, paymentIntentId, publishableKey, stripeAccount, amount, currency } = b;
+    if (typeof clientSecret !== "string" || typeof paymentIntentId !== "string" || typeof publishableKey !== "string" || typeof stripeAccount !== "string") return null;
+    // The PaymentIntent's own amount and currency (what the wallets charge), else the page's total.
+    const amountKey = typeof amount === "number" && typeof currency === "string" ? `${amount}:${currency.toLowerCase()}` : String(totals?.totalCents ?? "");
+    return { provider: "stripe", configId: paymentIntentId, environment, stripe: { clientSecret, paymentIntentId, publishableKey, stripeAccount }, amountKey };
+  }
+  return typeof b.checkoutConfigurationId === "string" ? { provider: "whop", configId: b.checkoutConfigurationId, environment } : null;
+}
+
+/** Whether two Prepared are the same checkout at the same amount (the page keeps its form mounted). Pure. */
+export function samePrepared(a: Prepared | null, b: Prepared | null): boolean {
+  if (!a || !b) return a === b;
+  return a.configId === b.configId && (a.provider ?? "whop") === (b.provider ?? "whop") && (a.amountKey ?? "") === (b.amountKey ?? "");
+}
 
 export type BuyerForPayment = {
   email: string;
@@ -321,7 +351,7 @@ export function PaypalWordmark({ className = "h-[22px] w-auto" }: { className?: 
   );
 }
 
-function Divider({ label }: { label: string }) {
+export function Divider({ label }: { label: string }) {
   return (
     <div className="mt-6 flex items-center gap-3 text-xs text-neutral-600">
       <span className="h-px flex-1 bg-neutral-200" />
@@ -1437,7 +1467,7 @@ export function paypalFocusLost(signal: AbortSignal, ms: number): Promise<boolea
   });
 }
 
-function PaymentSkeleton() {
+export function PaymentSkeleton() {
   return (
     <div className="space-y-3 p-4" aria-hidden>
       <div className="flex gap-2">
@@ -1455,7 +1485,7 @@ function PaymentSkeleton() {
   );
 }
 
-function LockIcon() {
+export function LockIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
       <rect x="4" y="11" width="16" height="10" rx="2" />

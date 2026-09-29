@@ -55,6 +55,8 @@ export type ThankYouData = {
   surveyAnswered?: boolean;
   /** Currency the checkout was charged in when it wasn't the shop's (offers are charged in the shop's). */
   chargeCurrency?: string | null;
+  /** The checkout page of this session (a FAILED payment links back to it to pay again). */
+  checkoutUrl?: string | null;
 };
 
 /** One-click offers stay open this long after the payment (server: UPSELL_WINDOW_MS). */
@@ -268,6 +270,8 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
   };
 
   const confirmed = data.status === "PAID" || !!data.orderName;
+  // The payment failed (declined card, a bank page abandoned): never "processing", back to the checkout.
+  const failed = data.status === "FAILED" && !confirmed;
   const estimate = parseDeliveryTime(data.shippingMethod?.deliveryTime);
   const start = hydrated ? new Date(data.paidAt ? Date.parse(data.paidAt) : mountedAt) : null;
   const fmt = (d: Date) =>
@@ -282,7 +286,22 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
 
   // Paid orders always show how: a card unless Whop told us otherwise.
   const methodName = paymentMethodName(data.paymentMethod, L) ?? L.methodCard;
-  const confirmation = (title: string) => (
+  const confirmation = (title: string) =>
+    failed ? (
+      <section role="alert" data-testid="wc-payment-failed" className="space-y-3 rounded-[var(--radius)] border border-red-200 bg-red-50 p-5 text-red-900">
+        <h1 data-order-heading="" tabIndex={-1} className="font-[family-name:var(--heading-font)] text-xl font-semibold tracking-tight focus:outline-none">
+          {L.orderPaymentFailed}
+        </h1>
+        {data.checkoutUrl && (
+          <a
+            href={data.checkoutUrl}
+            className="inline-flex min-h-11 items-center justify-center rounded-[var(--radius)] bg-[image:var(--accent-bg)] px-5 font-medium text-[var(--accent-fg)] shadow-[var(--btn-shadow)]"
+          >
+            {L.backToCheckout}
+          </a>
+        )}
+      </section>
+    ) : (
     <div className="space-y-4">
       <div className="flex items-center gap-4 py-2">
         <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-[image:var(--accent-bg)] text-[var(--accent-fg)] shadow-[var(--btn-shadow)]">

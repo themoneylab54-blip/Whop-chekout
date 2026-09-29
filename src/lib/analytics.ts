@@ -775,7 +775,8 @@ function shopifyReturningSql(storeId: string): Prisma.Sql {
 /** Store, test and dimension filters on a session aliased `s`. */
 function scope(c: Ctx): Prisma.Sql {
   const parts: Prisma.Sql[] = [Prisma.sql`s."storeId" = ${c.storeId}`];
-  if (!c.includeTest) parts.push(Prisma.sql`s."test" = false`);
+  // « Tester le secours » sessions (admin-forced processor) are tests even in live mode.
+  if (!c.includeTest) parts.push(Prisma.sql`s."test" = false AND s."forcedProvider" IS NULL`);
   if (c.filters.source) parts.push(Prisma.sql`${attr(c).source} = ${c.filters.source}`);
   if (c.filters.country) parts.push(Prisma.sql`${COUNTRY} = ${c.filters.country}`);
   if (c.filters.device === "mobile") parts.push(Prisma.sql`s."userAgent" IS NOT NULL AND ${MOBILE}`);
@@ -815,7 +816,7 @@ function ordersCteWhere(c: Ctx, where: Prisma.Sql): Prisma.Sql {
            (s."upsellShownAt" IS NOT NULL AND cardinality(s."upsellShownBlocks") = 0) AS offer_legacy,
            COALESCE(NULLIF(s."totalCents", 0), s."subtotalCents") AS order_gross,
            s."refundedCents" AS order_refunded,
-           s."whopFeeCents" AS order_fee,
+           COALESCE(s."whopFeeCents", s."providerFeeCents") AS order_fee,
            s.disputed AS order_disputed,
            ${lostSql(Prisma.sql`s."disputeStatus"`, Prisma.sql`s."disputeLostCents"`, Prisma.sql`(COALESCE(NULLIF(s."totalCents", 0), s."subtotalCents") - s."refundedCents")`)} AS order_lost,
            ${rate} AS rate, ${vatFlagsOf(c).reduced} AS vat_reduced, ${vatFlagsOf(c).unknown} AS vat_unknown,
@@ -1942,7 +1943,7 @@ export async function storeAnalytics(
         SELECT m.*, EXISTS (
                  SELECT 1 FROM "CheckoutSession" o
                  WHERE o."storeId" = ${storeId} AND o.status = 'PAID' AND lower(o.email) = m.email AND o."paidAt" < m.paid_at
-                 ${c.includeTest ? Prisma.empty : Prisma.sql`AND o."test" = false`}
+                 ${c.includeTest ? Prisma.empty : Prisma.sql`AND o."test" = false AND o."forcedProvider" IS NULL`}
                ) AS app_ret, ${shopifyReturningSql(storeId)} AS shop_ret
         FROM m WHERE m.email IS NOT NULL
       )
@@ -3047,7 +3048,8 @@ export async function setExperimentMetric(experimentId: string, metric: PrimaryM
  * the merchant's choice, else profit when every cost is known, else revenue.
  */
 export async function experimentResults(experiment: { id: string; storeId: string; splitB: number; startedAt?: Date; endedAt?: Date | null }): Promise<ExperimentResults> {
-  const inTest = Prisma.sql`s."storeId" = ${experiment.storeId} AND s."experimentId" = ${experiment.id} AND s."test" = false AND s.variant IN ('A', 'B')`;
+  // « Tester le secours » checkouts (forcedProvider) are the merchant's own: never in a test's figures.
+  const inTest = Prisma.sql`s."storeId" = ${experiment.storeId} AND s."experimentId" = ${experiment.id} AND s."test" = false AND s."forcedProvider" IS NULL AND s.variant IN ('A', 'B')`;
   return abResults(experiment, inTest, Prisma.sql`s.variant`, await experimentMetric(experiment.id));
 }
 
@@ -3058,7 +3060,7 @@ export async function experimentResults(experiment: { id: string; storeId: strin
  */
 export async function checkoutTestResults(test: { id: string; storeId: string; splitB: number; startedAt: Date; endedAt?: Date | null }): Promise<ExperimentResults> {
   const arm = Prisma.sql`(s."checkoutTestArms"->>${test.id})`;
-  const inTest = Prisma.sql`s."storeId" = ${test.storeId} AND s."test" = false AND ${arm} IN ('A', 'B') AND s."createdAt" >= ${test.startedAt}`;
+  const inTest = Prisma.sql`s."storeId" = ${test.storeId} AND s."test" = false AND s."forcedProvider" IS NULL AND ${arm} IN ('A', 'B') AND s."createdAt" >= ${test.startedAt}`;
   return abResults(test, inTest, arm, null);
 }
 
@@ -3758,7 +3760,7 @@ export async function notifyStopLoss(deadline: number, now = new Date(), opts: {
       }
 
       /* No sales since the last payment despite checkouts. */
-      const testSql = includeTest ? Prisma.empty : Prisma.sql`AND s."test" = false`;
+      const testSql = includeTest ? Prisma.empty : Prisma.sql`AND s."test" = false AND s."forcedProvider" IS NULL`;
       const [last] = await db.$queryRaw<{ at: Date | null }[]>`SELECT max(s."paidAt") AS at FROM "CheckoutSession" s WHERE s."storeId" = ${store.id} AND s.status = 'PAID' ${testSql}`;
       const lastPaid = last?.at ?? null;
       const windowStart = new Date(Math.max(lastPaid?.getTime() ?? 0, now.getTime() - 24 * HOUR_MS));

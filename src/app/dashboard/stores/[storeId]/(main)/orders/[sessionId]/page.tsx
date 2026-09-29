@@ -35,6 +35,8 @@ import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
 import type { CartLine } from "@/lib/pricing";
 import { orderAdminUrl, type Address } from "@/lib/shopify";
+import { stripePaymentUrl } from "@/lib/stripe";
+import { STRIPE_EXTRA_PREFIX } from "@/lib/checkout";
 import { Badge, Card, Flash, Label, Select, SubmitButton, Textarea, buttonClass } from "@/components/ui";
 import { PROTECTION_ADDON_ID } from "@/lib/analytics";
 import { CLAIM_KINDS, REASON_LABELS, replacementItems, replacementWaitMinutes, type BuyerReason, type ClaimKind } from "@/lib/claims";
@@ -188,11 +190,27 @@ export default async function OrderDetailPage({
   const fmt = (d: Date) => formatDateTimeLong(d, tzOf(s.store));
   const method = methodLabel(s.paymentMethodType);
   const whopDashboard = s.store.testMode ? "https://sandbox.whop.com/dashboard" : "https://whop.com/dashboard";
+  // The processor that was paid (Whop, or Stripe on the merchant's connected account): wording and links follow it.
+  const stripe = s.paymentProvider === "stripe";
+  const via = stripe ? "Stripe" : "Whop";
+  // On the account the payment was made on (kept on the session: right after a disconnect or a new account too).
+  const stripeAccount = s.stripeAccountId ?? s.store.stripeAccountId;
+  // The mode the Stripe payment was made in (s.test: the PaymentIntent's mode, confirmed by the payment's
+  // livemode), never the store's current one (a live payment stays live after a switch to test mode).
+  const stripeTest = s.test;
+  const stripePayment = stripe && s.whopPaymentId ? stripePaymentUrl(stripeAccount, s.whopPaymentId, stripeTest) : null;
+  // Duplicate payments, each on its own processor ("stripe:pi_…" is Stripe's, anything else Whop's), shown without the prefix.
+  const duplicates = s.extraPaymentIds.map((raw) => {
+    const onStripe = raw.startsWith(STRIPE_EXTRA_PREFIX);
+    const id = onStripe ? raw.slice(STRIPE_EXTRA_PREFIX.length) : raw;
+    return { id, via: onStripe ? "Stripe" : "Whop", href: onStripe ? stripePaymentUrl(stripeAccount, id, stripeTest) : whopDashboard };
+  });
+  const processorDashboard = stripe ? (stripePayment ?? `https://dashboard.stripe.com/${stripeTest ? "test/" : ""}payments`) : whopDashboard;
   // Shown once (header): only when the Shopify order is missing or its last sync failed.
   const needsSync = s.status === "PAID" && (!s.shopifyOrderId || !!s.syncError);
   const canRetrySync = needsSync && !s.shopifyOrderId && !s.reviewNote && !s.syncHandledAt;
 
-  const paidLabel = `Paiement reçu · ${money(s.totalCents || s.subtotalCents)}${method ? ` · ${method}` : ""}`;
+  const paidLabel = `Paiement reçu${stripe ? " via Stripe" : ""} · ${money(s.totalCents || s.subtotalCents)}${method ? ` · ${method}` : ""}`;
   const hasEvent = (p: string) => events.some((e) => e.kind === p || e.kind.startsWith(`${p}.`));
   const timeline: TimelineItem[] = [
     { at: s.createdAt, label: "Checkout ouvert depuis la boutique", icon: ShoppingCart },
@@ -283,15 +301,22 @@ export default async function OrderDetailPage({
       </div>
       <Flash ok={sp.ok} error={sp.error} />
 
-      {s.extraPaymentIds.length > 0 && (
+      {duplicates.length > 0 && (
         <div className="mb-6 flex items-start gap-3 rounded-xl bg-red-50 p-4 text-sm text-red-900 ring-1 ring-red-600/15">
           <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0" aria-hidden />
           <p>
-            <strong>Paiement(s) en double</strong> reçu(s) pour ce panier : <span className="font-mono break-all">{s.extraPaymentIds.join(", ")}</span>. La
-            commande n&apos;est créée qu&apos;une fois ; remboursez le(s) doublon(s){" "}
-            <a href={whopDashboard} target="_blank" rel="noreferrer" className="font-medium underline underline-offset-2">
-              dans Whop → Paiements
-            </a>
+            <strong>Paiement(s) en double</strong> reçu(s) pour ce panier. La commande n&apos;est créée qu&apos;une fois ; remboursez chaque doublon là où il a été
+            payé :{" "}
+            {duplicates.map((d, i) => (
+              <span key={d.id}>
+                {i > 0 && ", "}
+                <a href={d.href} target="_blank" rel="noreferrer" className="font-mono break-all underline underline-offset-2">
+                  {d.id}
+                </a>{" "}
+                (dans {d.via}
+                {d.via === "Whop" ? " → Paiements" : ""})
+              </span>
+            ))}
             .
           </p>
         </div>
@@ -322,7 +347,7 @@ export default async function OrderDetailPage({
                   size="sm"
                   tone="default"
                   title="Créer quand même la commande dans Shopify ?"
-                  description="Le paiement a été mis de côté pour vérification. Confirmez seulement si vous avez vérifié le paiement dans Whop."
+                  description={`Le paiement a été mis de côté pour vérification. Confirmez seulement si vous avez vérifié le paiement dans ${via}.`}
                   confirmLabel="Créer la commande"
                 >
                   Créer la commande dans Shopify
@@ -557,7 +582,7 @@ export default async function OrderDetailPage({
                     </Label>
                     <Textarea id="claim-note" name="note" rows={2} maxLength={300} placeholder="Colis perdu par le transporteur, renvoyé le …" />
                   </div>
-                  <p className="text-xs text-zinc-500 sm:col-span-2">Un remboursement fait dans Whop est déjà compté comme remboursement : ne le déclarez pas ici.</p>
+                  <p className="text-xs text-zinc-500 sm:col-span-2">Un remboursement fait dans {via} est déjà compté comme remboursement : ne le déclarez pas ici.</p>
                   <div className="sm:col-span-2">
                     <SubmitButton>Enregistrer le sinistre</SubmitButton>
                   </div>
@@ -651,7 +676,7 @@ export default async function OrderDetailPage({
                   <p className="font-medium text-zinc-900">{s.status === "PAID" ? "Coordonnées non transmises" : "Pas encore de coordonnées"}</p>
                   <p className="mt-0.5 text-zinc-600">
                     {s.status === "PAID"
-                      ? "Le paiement ne contenait ni e-mail ni adresse. Retrouvez l'acheteur dans Whop avec l'ID du paiement."
+                      ? `Le paiement ne contenait ni e-mail ni adresse. Retrouvez l'acheteur dans ${via} avec l'ID du paiement.`
                       : "Le client a ouvert le checkout mais n'a pas encore saisi son e-mail ni son adresse. Ils s'afficheront ici dès qu'il les renseigne."}
                   </p>
                 </div>
@@ -663,7 +688,21 @@ export default async function OrderDetailPage({
           <Card icon={Tags} title="Paiement & attribution">
             <dl className="space-y-1.5 text-sm">
               <Row k="Shopify" v={<SyncBadge s={s} />} />
-              {s.whopPaymentId && <Row k="Paiement Whop" v={<code className="text-xs break-all">{s.whopPaymentId}</code>} />}
+              {s.whopPaymentId && (
+                <Row
+                  k={`Paiement ${via}`}
+                  v={
+                    stripePayment ? (
+                      <a href={stripePayment} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-indigo-600 underline-offset-2 hover:underline">
+                        <code className="text-xs break-all">{s.whopPaymentId}</code>
+                        <ExternalLink className="h-3 w-3 shrink-0" aria-hidden />
+                      </a>
+                    ) : (
+                      <code className="text-xs break-all">{s.whopPaymentId}</code>
+                    )
+                  }
+                />
+              )}
               {(method || s.status === "PAID") && (
                 <Row
                   k="Moyen de paiement"
@@ -674,12 +713,12 @@ export default async function OrderDetailPage({
                         {method}
                       </span>
                     ) : (
-                      <span className="font-normal text-zinc-500">Non transmis par Whop</span>
+                      <span className="font-normal text-zinc-500">Non transmis par {via}</span>
                     )
                   }
                 />
               )}
-              {s.trackingNumber && <Row k="Suivi transmis à Whop" v={s.trackingNumber} />}
+              {s.trackingNumber && <Row k={stripe ? "Suivi (preuve en cas de litige)" : "Suivi transmis à Whop"} v={s.trackingNumber} />}
               <Row k="Source" v={(utm.utm_source && sourceLabel(utm.utm_source.toLowerCase())) || (utm.fbclid ? "Facebook (pub)" : utm.ttclid ? "TikTok (pub)" : "Directe ou inconnue")} />
               {utm.utm_campaign && <Row k="Campagne" v={utm.utm_campaign} />}
               {s.variant && <Row k="Test A/B" v={`Variante ${s.variant}`} />}
@@ -722,28 +761,39 @@ export default async function OrderDetailPage({
           </Card>
 
           {s.status === "PAID" && s.whopPaymentId && remaining > 0 && (
-            <Card icon={RotateCcw} iconColor="#dc2626" title="Rembourser" description="Remboursé via Whop, puis reporté automatiquement sur la commande Shopify.">
+            <Card icon={RotateCcw} iconColor="#dc2626" title="Rembourser" description={`Remboursé via ${via}, puis reporté automatiquement sur la commande Shopify.`}>
               <RefundForm
                 action={refundOrderAction.bind(null, storeId, s.id)}
                 totalCents={s.totalCents}
                 refundedCents={s.refundedCents}
                 currency={s.currency}
                 nonce={randomUUID()}
+                provider={via}
               />
               <details className="group mt-4 border-t border-zinc-100 pt-3 text-sm">
                 <summary className="inline-flex min-h-8 cursor-pointer list-none items-center gap-1.5 rounded-md font-medium text-zinc-700 hover:text-zinc-900 [&::-webkit-details-marker]:hidden">
-                  <ExternalLink className="h-3.5 w-3.5" aria-hidden /> Rembourser depuis Whop
+                  <ExternalLink className="h-3.5 w-3.5" aria-hidden /> Rembourser depuis {via}
                 </summary>
                 <div className="mt-2 space-y-3 text-zinc-600">
-                  <p>
-                    Ouvrez{" "}
-                    <a href={whopDashboard} target="_blank" rel="noreferrer" className="font-medium text-indigo-600 underline-offset-2 hover:underline">
-                      votre dashboard Whop
-                    </a>{" "}
-                    → <strong>Paiements</strong>, recherchez l&apos;ID ci-dessous, puis <strong>Refund</strong>. Le remboursement sera reporté ici et dans Shopify
-                    automatiquement.
-                  </p>
-                  <CopyField label="ID du paiement Whop" value={s.whopPaymentId} />
+                  {stripe ? (
+                    <p>
+                      Ouvrez{" "}
+                      <a href={processorDashboard} target="_blank" rel="noreferrer" className="font-medium text-indigo-600 underline-offset-2 hover:underline">
+                        ce paiement dans votre dashboard Stripe
+                      </a>
+                      , puis <strong>Rembourser</strong>. Le remboursement sera reporté ici et dans Shopify automatiquement.
+                    </p>
+                  ) : (
+                    <p>
+                      Ouvrez{" "}
+                      <a href={whopDashboard} target="_blank" rel="noreferrer" className="font-medium text-indigo-600 underline-offset-2 hover:underline">
+                        votre dashboard Whop
+                      </a>{" "}
+                      → <strong>Paiements</strong>, recherchez l&apos;ID ci-dessous, puis <strong>Refund</strong>. Le remboursement sera reporté ici et dans Shopify
+                      automatiquement.
+                    </p>
+                  )}
+                  <CopyField label={`ID du paiement ${via}`} value={s.whopPaymentId} />
                 </div>
               </details>
             </Card>
@@ -751,7 +801,7 @@ export default async function OrderDetailPage({
           {s.status === "PAID" && s.whopPaymentId && remaining <= 0 && (
             <Card icon={RotateCcw} iconColor="#71717a" title="Remboursée intégralement">
               <p className="text-sm text-zinc-600">
-                {money(s.refundedCents)} remboursé(s) via Whop. Rien d&apos;autre à faire : Shopify est mis à jour automatiquement.
+                {money(s.refundedCents)} remboursé(s) via {via}. Rien d&apos;autre à faire : Shopify est mis à jour automatiquement.
               </p>
             </Card>
           )}

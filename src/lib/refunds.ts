@@ -60,13 +60,15 @@ type Ctx = {
   paymentMarker?: string;
   /** The checkout's order also holds merged offers: their (marked) refunds aren't the order's. */
   sharesOrder?: boolean;
+  /** Processor that refunded (the refund's note and the Shopify gateway follow it). */
+  provider: "whop" | "stripe";
 };
 
 async function context(target: MirrorTarget, id: string): Promise<Ctx> {
   if (target === "session") {
     const s = await db.checkoutSession.findUniqueOrThrow({ where: { id }, include: { store: true } });
     const merged = await db.upsellCharge.count({ where: { sessionId: s.id, orderMode: "merged" } });
-    return { store: s.store, sessionId: s.id, orderId: s.shopifyOrderId!, orderName: s.shopifyOrderName, currency: s.currency, what: "la commande Shopify", sharesOrder: merged > 0 };
+    return { store: s.store, sessionId: s.id, orderId: s.shopifyOrderId!, orderName: s.shopifyOrderName, currency: s.currency, what: "la commande Shopify", sharesOrder: merged > 0, provider: s.paymentProvider };
   }
   const c = await db.upsellCharge.findUniqueOrThrow({ where: { id }, include: { session: { include: { store: true } } } });
   if (c.orderMode === "merged") {
@@ -80,9 +82,10 @@ async function context(target: MirrorTarget, id: string): Promise<Ctx> {
       marker: offerRefundMarker(c.id),
       paymentMarker: offerMarker(c.id),
       line: c.shopifyLineItemId && !c.shopifyLineItemId.startsWith("pending:") ? { lineItemId: c.shopifyLineItemId, quantity: Math.max(1, c.quantity), amountCents: c.amountCents } : undefined,
+      provider: c.provider,
     };
   }
-  return { store: c.session.store, sessionId: c.sessionId, orderId: c.shopifyOrderId!, orderName: c.shopifyOrderName, currency: c.session.currency, what: "la commande de l'offre" };
+  return { store: c.session.store, sessionId: c.sessionId, orderId: c.shopifyOrderId!, orderName: c.shopifyOrderName, currency: c.session.currency, what: "la commande de l'offre", provider: c.provider };
 }
 
 /**
@@ -112,9 +115,13 @@ export async function mirrorRefund(target: MirrorTarget, id: string, opts: { for
     if (missing > 0) {
       // A merged offer refunded in full also returns its line (no restock); partial refunds are an amount.
       const lineItems = ctx.line && already === 0 && missing >= ctx.line.amountCents ? [{ lineItemId: ctx.line.lineItemId, quantity: ctx.line.quantity }] : [];
-      const note = ctx.marker ? `Remboursé via Whop ${ctx.marker}` : "Remboursé via Whop";
-      // A merged offer's refund goes against its own payment on the shared order (see planRefundTransactions).
-      if (ctx.paymentMarker) await createRefund(ctx.store, ctx.orderId, missing, note, lineItems, { marker: ctx.paymentMarker });
+      const via = ctx.provider === "stripe" ? "Stripe" : "Whop";
+      const note = ctx.marker ? `Remboursé via ${via} ${ctx.marker}` : `Remboursé via ${via}`;
+      // A merged offer's refund goes against its own payment on the shared order (see planRefundTransactions);
+      // a Stripe refund names its gateway (used when the order has no payment to refund against).
+      const stripe = ctx.provider === "stripe" ? { provider: "stripe" as const } : {};
+      if (ctx.paymentMarker) await createRefund(ctx.store, ctx.orderId, missing, note, lineItems, { marker: ctx.paymentMarker, ...stripe });
+      else if (ctx.provider === "stripe") await createRefund(ctx.store, ctx.orderId, missing, note, lineItems, stripe);
       else await createRefund(ctx.store, ctx.orderId, missing, note, lineItems);
     }
     await db.$executeRaw`

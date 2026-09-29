@@ -1,6 +1,9 @@
 import "server-only";
 import { Prisma } from "@prisma/client";
 import { db } from "./db";
+import { PAYMENT_MODE_LABELS, providerConnected, storeLive, stripeUnusableReason } from "./payment-provider";
+import { stripeWebhookStatus } from "./stripe";
+import { stripeModeOf } from "./stripe-config";
 import { starvedJobs, TICK_STALE_MS, tickStatus } from "./tick";
 import { MAX_MIRROR_ATTEMPTS } from "./refunds";
 import { OUTBOX_MAX_ATTEMPTS } from "./log";
@@ -227,6 +230,18 @@ export async function backlog(storeId?: string): Promise<Backlog> {
   };
 }
 
+/** A Stripe payment gets its webhook within minutes: past this without one, the webhook is not arriving. */
+export const STRIPE_WEBHOOK_GRACE_MS = 10 * MIN;
+
+/**
+ * The Stripe webhook line's check, like Whop's: the last Stripe payment (on the current connection)
+ * is older than the grace period and no Stripe webhook arrived since it. No payment yet: nothing to say. Pure.
+ */
+export function stripeWebhookLate(lastPaidAt: Date | null, lastWebhookAt: Date | null, now = Date.now()): boolean {
+  if (!lastPaidAt || now - lastPaidAt.getTime() < STRIPE_WEBHOOK_GRACE_MS) return false;
+  return !lastWebhookAt || lastWebhookAt < lastPaidAt;
+}
+
 /** Live health checks shown on the overview and the Journal page. */
 export async function storeHealth(storeId: string): Promise<HealthItem[]> {
   const base = `/dashboard/stores/${storeId}`;
@@ -240,7 +255,8 @@ export async function storeHealth(storeId: string): Promise<HealthItem[]> {
       select: { paidAt: true },
     }),
     db.checkoutSession.count({ where: { storeId, status: "PAID", shopifyOrderId: null, syncHandledAt: null, reviewNote: { not: null } } }),
-    db.checkoutSession.findFirst({ where: { storeId, status: "PAID" }, orderBy: { paidAt: "desc" }, select: { paidAt: true } }),
+    // Whop's own last payment: a Stripe payment says nothing about Whop's webhook.
+    db.checkoutSession.findFirst({ where: { storeId, status: "PAID", paymentProvider: "whop" }, orderBy: { paidAt: "desc" }, select: { paidAt: true } }),
     tickStatus(),
     db.eventLog.count({ where: { storeId, kind: "conversion.failed", createdAt: { gt: new Date(Date.now() - 24 * 3600_000) } } }),
     backlog(storeId),
@@ -252,7 +268,22 @@ export async function storeHealth(storeId: string): Promise<HealthItem[]> {
     }),
   ]);
   if (!store) return [];
-  const [google, starved] = await Promise.all([googleConversionsHealth(store), starvedJobs().catch(() => [])]);
+  const [google, starved, stripeWebhook, lastStripePaid] = await Promise.all([
+    googleConversionsHealth(store),
+    starvedJobs().catch(() => []),
+    // Stripe usable: is its Connect webhook of the store's mode in place (stored by the app, or made by hand)?
+    providerConnected(store, "stripe") ? stripeWebhookStatus(stripeModeOf(store)).catch(() => null) : Promise.resolve(null),
+    // Stripe's own last payment on the current connection (like Whop's line: a payment with no webhook since).
+    store.stripeConnectedAt
+      ? db.checkoutSession.findFirst({
+          where: { storeId, status: "PAID", paymentProvider: "stripe", paidAt: { gte: store.stripeConnectedAt } },
+          orderBy: { paidAt: "desc" },
+          select: { paidAt: true },
+        })
+      : Promise.resolve(null),
+  ]);
+  const stripeWebhookMissing = !!stripeWebhook && !stripeWebhook.manual && !stripeWebhook.stored;
+  const stripeWebhookSilent = stripeWebhookLate(lastStripePaid?.paidAt ?? null, store.lastStripeWebhookAt);
   const googleOk =
     !google.configured || (google.failed24h === 0 && google.incidents24h === 0 && google.uploadsAbandoned === 0 && google.adjustmentsAbandoned === 0 && google.uploadsOverdue === 0);
   // "Google : 3 en attente · 1 échec (24 h) · dernier envoi il y a 2 h" (+ what waits for the merchant)
@@ -268,7 +299,7 @@ export async function storeHealth(storeId: string): Promise<HealthItem[]> {
   const mergeRatio = mergedN + separateN ? ` · 30 j : ${mergedN} ajoutée(s) à la commande d'origine, ${separateN} en commande séparée (${Math.round((100 * mergedN) / (mergedN + separateN))} % fusionnées)` : "";
   const tickAge = tick.at ? Date.now() - new Date(tick.at).getTime() : Infinity;
   // A live store without a recent tick has no safety net (missed webhooks, retries, refunds).
-  const live = store.enabled && !!store.whopConnectedAt && !!store.shopifyConnectedAt;
+  const live = storeLive(store);
   const tickStale = tickAge > TICK_STALE_MS;
   const tickFailed = tick.report ? Object.values(tick.report).some((v) => typeof v === "string" && v.startsWith("error")) : false;
   const tickSkipped = tick.report ? Object.entries(tick.report).filter(([, v]) => typeof v === "string" && v.startsWith("skipped")).map(([k]) => k) : [];
@@ -305,17 +336,55 @@ export async function storeHealth(storeId: string): Promise<HealthItem[]> {
       detail: !store.shopifyConnectedAt ? "Shopify non connecté" : store.scriptTagId ? "Installé sur la boutique" : "Non installé",
       href: `${base}/shopify`,
     },
-    {
-      key: "webhook",
-      label: "Webhook Whop",
-      ok: store.whopConnectedAt ? (lastPaid?.paidAt && store.lastWebhookAt ? store.lastWebhookAt >= lastPaid.paidAt : store.lastWebhookAt != null || !lastPaid) : false,
-      detail: store.whopConnectedAt
-        ? store.lastWebhookAt
-          ? `Dernier événement reçu ${ago(store.lastWebhookAt)}`
-          : "Aucun événement reçu pour l'instant"
-        : "Whop non connecté",
-      href: `${base}/whop`,
-    },
+    // A Stripe-only store never uses Whop: no Whop line to fix.
+    ...(store.whopConnectedAt || store.paymentMode !== "stripe_only"
+      ? [
+          {
+            key: "webhook",
+            label: "Webhook Whop",
+            ok: store.whopConnectedAt ? (lastPaid?.paidAt && store.lastWebhookAt ? store.lastWebhookAt >= lastPaid.paidAt : store.lastWebhookAt != null || !lastPaid) : false,
+            detail: store.whopConnectedAt
+              ? store.lastWebhookAt
+                ? `Dernier événement reçu ${ago(store.lastWebhookAt)}`
+                : "Aucun événement reçu pour l'instant"
+              : "Whop non connecté",
+            href: `${base}/whop`,
+          } satisfies HealthItem,
+        ]
+      : []),
+    // Stripe (secours or primary): only once connected, or when a mode needs it.
+    ...(store.stripeConnectedAt || store.paymentMode !== "whop_primary"
+      ? [
+          {
+            key: "stripe",
+            label: "Stripe",
+            // Connected but Stripe says it can't charge yet (activation pending): amber, not red.
+            ok: providerConnected(store, "stripe")
+              ? stripeWebhookMissing || stripeWebhookSilent
+                ? false
+                : store.providerFailoverAt
+                  ? null
+                  : true
+              : store.stripeConnectedAt && store.stripeChargesEnabled === false
+                ? null
+                : false,
+            detail: !providerConnected(store, "stripe")
+              ? store.stripeConnectedAt
+                ? (stripeUnusableReason(store) ?? "Compte connecté mais inutilisable dans ce mode : voir la page Stripe")
+                : "Stripe non connecté alors que le mode de paiement l'utilise"
+              : stripeWebhookMissing
+                ? "Webhook Stripe absent : les paiements Stripe ne sont confirmés que par la vérification périodique. Cliquez sur « Réparer la liaison Stripe »."
+                : stripeWebhookSilent
+                  ? `Aucun webhook Stripe reçu depuis le dernier paiement Stripe (${ago(lastStripePaid?.paidAt ?? null)}${
+                      store.lastStripeWebhookAt ? `, dernier webhook ${ago(store.lastStripeWebhookAt)}` : ", aucun webhook reçu"
+                    }) : les paiements ne sont confirmés que par la vérification périodique. Cliquez sur « Réparer la liaison Stripe ».`
+                  : `${PAYMENT_MODE_LABELS[store.paymentMode]}${
+                  store.providerFailoverAt ? ` · bascule active depuis ${ago(store.providerFailoverAt)}${store.providerFailoverReason ? ` (${store.providerFailoverReason})` : ""}` : ""
+                } · ${store.lastStripeWebhookAt ? `dernier webhook Stripe reçu ${ago(store.lastStripeWebhookAt)}` : "aucun webhook Stripe reçu pour l'instant"}`,
+            href: `${base}/stripe`,
+          } satisfies HealthItem,
+        ]
+      : []),
     {
       key: "sync",
       label: "Commandes vers Shopify",

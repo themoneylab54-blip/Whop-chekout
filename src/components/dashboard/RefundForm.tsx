@@ -14,7 +14,7 @@ function parseCents(v: string): number | null {
 }
 
 /**
- * Full or partial refund through Whop. The confirmation dialog spells out the exact amount,
+ * Full or partial refund through the processor that was paid (Whop or Stripe). The confirmation dialog spells out the exact amount,
  * whether it is total or partial, and what will remain refundable. Collapsed behind a
  * « Rembourser… » button so a refund is never one stray click away.
  */
@@ -24,6 +24,7 @@ export function RefundForm({
   refundedCents,
   currency,
   nonce,
+  provider = "Whop",
 }: {
   action: (fd: FormData) => void | Promise<void>;
   totalCents: number;
@@ -31,6 +32,8 @@ export function RefundForm({
   currency: string;
   /** Generated per page render on the server (stable through hydration). */
   nonce: string;
+  /** Processor the order was paid with ("Whop", "Stripe"): the refund goes through it. */
+  provider?: "Whop" | "Stripe";
 }) {
   const remaining = totalCents - refundedCents;
   const initial = (remaining / 100).toFixed(2).replace(".", ",");
@@ -59,7 +62,7 @@ export function RefundForm({
 
   return (
     <form action={action} className="space-y-3">
-      {/* One key per displayed form: a double submit is deduped by Whop, two deliberate refunds aren't. */}
+      {/* One key per displayed form: a double submit is deduped by the processor, two deliberate refunds aren't. */}
       <input type="hidden" name="nonce" value={nonce} />
       <div>
         <Label htmlFor="refund-amount" hint={`Maximum : ${money(remaining)}${refundedCents > 0 ? ` (déjà remboursé : ${money(refundedCents)})` : ""}`}>
@@ -117,7 +120,7 @@ export function RefundForm({
                   <span className="tabular-nums">−{money(amount)}</span>
                 </span>
               </span>
-              Le client est remboursé via Whop, puis la commande Shopify est mise à jour automatiquement. Un remboursement est définitif.
+              Le client est remboursé via {provider}, puis la commande Shopify est mise à jour automatiquement. Un remboursement est définitif.
             </>
           ) : undefined
         }

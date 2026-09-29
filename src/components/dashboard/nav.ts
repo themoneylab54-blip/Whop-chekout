@@ -6,6 +6,7 @@ export type NavIconName =
   | "analytics"
   | "shopify"
   | "whop"
+  | "stripe"
   | "interception"
   | "design"
   | "thankyou"
@@ -33,6 +34,7 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { path: "shopify", label: "Shopify", icon: "shopify" },
       { path: "whop", label: "Whop", icon: "whop" },
+      { path: "stripe", label: "Stripe", icon: "stripe" },
       { path: "interception", label: "Interception", icon: "interception" },
     ],
   },
@@ -94,6 +96,7 @@ export const NAV_SECTIONS: NavSection[] = [
   { label: "Offres post-achat (1 clic)", page: "Shopify", path: "shopify", keywords: "upsell one click" },
   { label: "Apple Pay", page: "Whop", path: "whop", keywords: "domaine" },
   { label: "Paiements locaux & en plusieurs fois", page: "Whop", path: "whop", keywords: "klarna paypal bnpl" },
+  { label: "Mode de paiement (Whop / Stripe)", page: "Stripe", path: "stripe", hash: "mode", keywords: "secours bascule failover processeur" },
   { label: "Boutons interceptés", page: "Interception", path: "interception", keywords: "bouton script theme" },
   { label: "Ventes", page: "Analytics", path: "analytics", keywords: "chiffre affaires benefice pnl" },
   { label: "Acquisition", page: "Analytics", path: "analytics?tab=acquisition", keywords: "sources campagnes utm roas" },

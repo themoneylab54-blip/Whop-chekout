@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Activity, BarChart3, Coins, Crosshair, LayoutDashboard, Megaphone, Menu, Paintbrush, PartyPopper, Percent, Receipt, Settings, Truck, X } from "lucide-react";
-import { ShopifyLogo, WhopLogo } from "@/components/brands";
+import { ShopifyLogo, StripeLogo, WhopLogo } from "@/components/brands";
 import { NAV_GROUPS, isActive, navHref, type NavIconName } from "./nav";
 
 // Server components can't pass component functions to this client component: they pass a name.
@@ -13,6 +13,7 @@ const NAV_ICONS = {
   orders: Receipt,
   shopify: ShopifyLogo,
   whop: WhopLogo,
+  stripe: StripeLogo,
   interception: Crosshair,
   design: Paintbrush,
   thankyou: PartyPopper,
@@ -28,7 +29,7 @@ export type NavIcon = NavIconName;
 
 function NavIconGlyph({ icon, active, hoverable }: { icon: NavIcon; active: boolean; hoverable: boolean }) {
   const Icon = NAV_ICONS[icon];
-  return icon === "shopify" || icon === "whop" ? (
+  return icon === "shopify" || icon === "whop" || icon === "stripe" ? (
     // Real brand marks, in color: they read instantly in the sidebar.
     <Icon className={`h-4 w-4 shrink-0 transition ${active ? "" : `opacity-80 grayscale-[35%] ${hoverable ? "group-hover:opacity-100 group-hover:grayscale-0" : ""}`}`} />
   ) : (

@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { cache } from "react";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { db } from "@/lib/db";
 import { themeFontHrefs, loadCheckoutLayout, loadTheme, loadThankYouLayout, offerArmProps, variantGidOf, type Block, type OfferArm } from "@/lib/layout";
 import type { CartLine } from "@/lib/pricing";
@@ -22,6 +22,7 @@ import { buyerIcons, checkoutLang, CheckoutHtmlLang } from "@/app/c/lang";
 import { keepOnCheckoutHost } from "@/app/c/host";
 import { crossRate, ecbRates } from "@/lib/fx";
 import { localRatesFor, type LocalRates } from "@/components/checkout/localCurrency";
+import { cleanThankYouUrl, failedReturnUrl } from "@/lib/stripe-return";
 
 /** Multipliers to the buyers' local currencies (ECB, cached 12 h); null when unavailable or slow. */
 async function loadLocalRates(currency: string): Promise<LocalRates | null> {
@@ -61,7 +62,7 @@ export const dynamic = "force-dynamic";
 const loadSession = cache((id: string) => db.checkoutSession.findUnique({ where: { id }, include: { store: true } }));
 
 /** Tab title "<Store> · Commande confirmée" in the checkout's language. */
-type PageProps = { params: Promise<{ id: string }>; searchParams: Promise<{ lang?: string | string[] }> };
+type PageProps = { params: Promise<{ id: string }>; searchParams: Promise<{ lang?: string | string[]; redirect_status?: string | string[]; via?: string | string[] }> };
 
 export async function generateMetadata({ params, searchParams }: PageProps): Promise<Metadata> {
   const { id } = await params;
@@ -77,9 +78,18 @@ export default async function ThankYouPage({ params, searchParams }: PageProps) 
   const session = await loadSession(id);
   // Express wallets (Apple/Google Pay) land here before the webhook marks the session:
   // show "processing" for any session that reached a Whop checkout.
-  if (!session || (session.status === "OPEN" && !session.whopCheckoutId)) notFound();
-  // Whop's return parameters are kept (payment status on the store's own domain).
+  if (!session || (session.status === "OPEN" && !session.whopCheckoutId && !session.stripePaymentIntentId)) notFound();
+  // Whop's and Stripe's return parameters are kept (payment status on the store's own domain).
   await keepOnCheckoutHost(session.store, `/c/${id}/merci`, (await searchParams) as Record<string, string | string[] | undefined>);
+  // Back from a Stripe redirect (3-D Secure, bank page) that failed or was abandoned: to the checkout,
+  // which says so (the buyer pays again or another way). A paid session always stays here. Any
+  // status Stripe gives but succeeded / processing (failed, requires_payment_method, canceled…).
+  const failedTo = failedReturnUrl(id, (await searchParams) as Record<string, string | string[] | undefined>, session.status);
+  if (failedTo) redirect(failedTo);
+  // Stripe's return parameters read: the page is served again from its clean URL before anything
+  // loads (the PaymentIntent's client secret never reaches the pixels, analytics or the Referer).
+  const cleanTo = cleanThankYouUrl(id, (await searchParams) as Record<string, string | string[] | undefined>);
+  if (cleanTo) redirect(cleanTo);
 
   const design = await designFor(session.store, session);
   const storeTheme = loadTheme(design.theme, session.store.name);
@@ -211,6 +221,8 @@ export default async function ThankYouPage({ params, searchParams }: PageProps) 
           surveyAnswered: session.surveyAnswer != null,
           // Paid in the buyer's currency: the offers (charged in the shop's) say so.
           chargeCurrency: session.chargeCurrency,
+          // A failed payment: back to this checkout (pays again, or another way).
+          checkoutUrl: `/c/${session.id}${(await searchParams).via === "app" ? "?via=app" : ""}`,
           tracking: session.trackingNumber
             ? { number: session.trackingNumber, url: `https://t.17track.net/${theme.language}#nums=${encodeURIComponent(session.trackingNumber)}` }
             : null,

@@ -32,6 +32,7 @@ import { Sparkline } from "@/components/dashboard/Trend";
 import { formatCents, formatNumber, formatPercent } from "@/components/dashboard/format";
 import { Delta, EstimatedBadge, InfoTip, type DeltaInput } from "@/components/dashboard/AnalyticsKit";
 import { storeHealth } from "@/lib/health";
+import { anyProviderConnected, providerConnected, storeLive, storeReady, stripeUnusableReason } from "@/lib/payment-provider";
 import { setEnabledAction } from "../../../actions";
 import { AnalyticsControls, parseControls, type ControlParams } from "@/components/dashboard/AnalyticsControls";
 
@@ -105,12 +106,13 @@ export default async function OverviewPage({
       brand: "shopify",
     },
     {
-      done: !!store.whopConnectedAt,
-      title: "Connecter Whop",
-      text: "Encaissez les paiements sur votre compte",
-      href: `${base}/whop`,
+      // Any processor able to charge counts (a Stripe-only store never connects Whop).
+      done: anyProviderConnected(store),
+      title: store.stripeConnectedAt && !store.whopConnectedAt ? "Connecter Stripe" : "Connecter Whop",
+      text: store.stripeConnectedAt && !store.whopConnectedAt ? "Terminez la connexion Stripe pour encaisser" : "Encaissez les paiements sur votre compte (ou avec Stripe)",
+      href: store.stripeConnectedAt && !store.whopConnectedAt ? `${base}/stripe` : `${base}/whop`,
       icon: CreditCard,
-      brand: "whop",
+      ...(store.stripeConnectedAt && !store.whopConnectedAt ? {} : { brand: "whop" as const }),
     },
     {
       done: store._count.shippingRates > 0,
@@ -136,8 +138,11 @@ export default async function OverviewPage({
   ];
   const doneCount = steps.filter((s) => s.done).length;
   const health = doneCount === steps.length ? await storeHealth(store.id) : [];
-  const ready = !!store.shopifyConnectedAt && !!store.whopConnectedAt;
-  const live = store.enabled && ready;
+  // Ready / live with any processor able to charge (Whop, or Stripe alone).
+  const paymentReady = anyProviderConnected(store);
+  const paymentHref = store.stripeConnectedAt && !store.whopConnectedAt ? "stripe" : "whop";
+  const ready = storeReady(store);
+  const live = storeLive(store);
 
   return (
     <>
@@ -324,14 +329,15 @@ export default async function OverviewPage({
               <div className="mt-6">
                 {/* Not connectable yet: the next actionable step replaces the unavailable "Mettre en ligne". */}
                 <Link
-                  href={`${base}/${!store.shopifyConnectedAt ? "shopify" : "whop"}`}
+                  href={`${base}/${!store.shopifyConnectedAt ? "shopify" : paymentHref}`}
                   className="inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-white px-4 text-sm font-semibold text-zinc-900 transition hover:bg-zinc-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
                 >
-                  {!store.shopifyConnectedAt ? "Connecter Shopify" : "Connecter Whop"}
+                  {!store.shopifyConnectedAt ? "Connecter Shopify" : paymentHref === "stripe" ? "Terminer la connexion Stripe" : "Connecter Whop"}
                   <ArrowRight className="h-4 w-4" aria-hidden />
                 </Link>
                 <p className="mt-2 text-xs text-white/85">
-                  La mise en ligne sera possible une fois {!store.shopifyConnectedAt && !store.whopConnectedAt ? "Shopify et Whop connectés" : !store.shopifyConnectedAt ? "Shopify connecté" : "Whop connecté"}.
+                  La mise en ligne sera possible une fois{" "}
+                  {!store.shopifyConnectedAt && !paymentReady ? "Shopify et un moyen de paiement (Whop ou Stripe) connectés" : !store.shopifyConnectedAt ? "Shopify connecté" : "un moyen de paiement (Whop ou Stripe) prêt à encaisser"}.
                 </p>
               </div>
             )}
@@ -343,6 +349,14 @@ export default async function OverviewPage({
                 ok={!!store.whopConnectedAt}
                 href={`${base}/whop`}
               />
+              {store.stripeConnectedAt && (
+                <Connection
+                  label="Stripe"
+                  detail={providerConnected(store, "stripe") ? (store.testMode ? "Test" : "Production") : (stripeUnusableReason(store) ?? "Inutilisable")}
+                  ok={providerConnected(store, "stripe")}
+                  href={`${base}/stripe`}
+                />
+              )}
             </div>
           </div>
         </section>

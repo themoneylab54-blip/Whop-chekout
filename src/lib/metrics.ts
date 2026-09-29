@@ -15,6 +15,7 @@ import { db } from "./db";
 export const PROVIDER_LABELS: Record<string, string> = {
   shopify: "Shopify",
   whop: "Whop",
+  stripe: "Stripe",
   meta: "Meta",
   tiktok: "TikTok",
   google_ads: "Google Ads",

@@ -10,6 +10,7 @@ import { BuilderApp } from "@/components/builder/BuilderApp";
 import { discardDraftAction, publishDesignAction, restoreVersionAction, saveBuilderAction } from "../../../../actions";
 import { previewLines, previewThankYou } from "../sample";
 import { canReadShopifyDiscounts } from "@/lib/shopify-discounts";
+import { storeLive } from "@/lib/payment-provider";
 
 export async function generateMetadata({ params }: { params: Promise<{ storeId: string; page: string }> }): Promise<Metadata> {
   const { storeId, page } = await params;
@@ -135,7 +136,7 @@ export default async function BuilderPage({
       published={hasPublished(store) ? publishedDesign(store) : null}
       otherLayout={page === "checkout" ? design.thankYouLayout : design.checkoutLayout}
       initialSelected={typeof select === "string" ? select : null}
-      storeLive={store.enabled && !!store.shopifyConnectedAt && !!store.whopConnectedAt}
+      storeLive={storeLive(store)}
       protectionTest={running.get("protection")?.name ?? null}
     />
   );

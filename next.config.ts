@@ -19,6 +19,11 @@ const nextConfig: NextConfig = {
           { key: "Cache-Control", value: "public, max-age=300" },
         ],
       },
+      {
+        // Self-hosted theme fonts: Stripe's iframes (js.stripe.com) load them cross-origin (Elements `fonts.cssSrc`).
+        source: "/fonts/:path*",
+        headers: [{ key: "Access-Control-Allow-Origin", value: "*" }],
+      },
       { source: "/c/:path*", headers: noFraming },
       { source: "/dashboard/:path*", headers: noFraming },
       { source: "/login", headers: noFraming },

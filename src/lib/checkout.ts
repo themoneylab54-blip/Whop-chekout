@@ -23,7 +23,7 @@ import {
   type RateInput,
   type Totals,
 } from "./pricing";
-import { createPaidOrder, findOrderByPayment, findOrderForSession, priceCart, ShopifyError, tagOrder, type Address, type OrderCustomer } from "./shopify";
+import { createPaidOrder, disputeTag, findOrderByPayment, findOrderForSession, priceCart, ShopifyError, tagOrder, type Address, type OrderCustomer } from "./shopify";
 import { log, recordEvent } from "./log";
 import { mirrorRefund } from "./refunds";
 import { defer } from "./deferred";
@@ -33,9 +33,26 @@ import { pickupPointSchema, type PickupPoint } from "./pickup";
 import { sendPurchaseConversions } from "./conversions";
 import { applyAppCosts } from "./costs";
 import { submitDisputeEvidence } from "./disputes";
-import { createCheckoutConfiguration, MethodUnavailableError } from "./whop";
+import { createCheckoutConfiguration, MethodUnavailableError, storeClient } from "./whop";
 import { designFor } from "./experiments";
-import { loadCheckoutLayout, loadInterception, loadTheme, paypalExpressAllowed } from "./layout";
+import { loadCheckoutLayout, loadInterception, loadThankYouLayout, loadTheme, paypalExpressAllowed, upsellSellable } from "./layout";
+import { chooseProvider, PROVIDER_NAMES, providerOrder, type PaymentProvider } from "./payment-provider";
+import {
+  cancelOpenPaymentIntents,
+  createOrUpdatePaymentIntent,
+  ensureStripeCustomer,
+  fingerprintTag,
+  isStripeMissing,
+  isStripeRejection,
+  paymentInfoFromStripe,
+  retrievePaymentIntent,
+  STRIPE_CLEANUP_CALL,
+  STRIPE_PAGE_CALL,
+  stripeFor,
+  stripeShipping,
+  type CheckoutPaymentIntent,
+} from "./stripe";
+import { afterResponse } from "./route";
 import { automaticDiscountFor, automaticStackFor, CALIBRATION_SETTLE_MS, canReadShopifyDiscounts, lookupShopifyCode, lookupShopifyCodeWithRetry, needsCollections, productCollections, shopifyCodeAsDiscount, shopifyCodeUses, type ShopifyCodeDiscount } from "./shopify-discounts";
 import { overridesFor, withAddOnOverrides, withProtectionOverride } from "./checkout-tests";
 import { PAYPAL_SERVER_IN_FLIGHT_MS } from "./paypal-timing";
@@ -88,6 +105,8 @@ export const paySchema = quoteSchema.extend({
   note: z.string().trim().max(1000).nullable().optional(),
   /** The Whop checkout the page is about to submit. */
   checkoutConfigurationId: z.string().max(100).nullable().optional(),
+  /** Stripe: the PaymentIntent the page's Payment Element is about to confirm. */
+  paymentIntentId: z.string().regex(/^pi_[A-Za-z0-9]+$/).max(100).nullable().optional(),
   /** Relay point, required when the chosen rate is a pickup rate. */
   pickupPoint: pickupPointSchema.nullable().optional(),
 });
@@ -535,14 +554,30 @@ export function quoteFingerprint(quote: Pick<Quote, "totals" | "shippingRateId" 
  * Fingerprint of the snapshot holding a quote's Whop checkout. A PayPal-only checkout charges
  * exactly the same thing but is another Whop configuration: its own snapshot (same content,
  * suffixed fingerprint), so a buyer going back to the card gets the regular checkout again.
+ * The processor is part of it: a Stripe snapshot (its PaymentIntent) is never taken for a Whop one
+ * and vice versa. Whop's fingerprints are unchanged; a PaymentIntent carries no return URL (the page
+ * passes it when confirming), so a Stripe one has no host suffix nor PayPal-only variant.
  */
-export function snapshotFingerprint(quote: Parameters<typeof quoteFingerprint>[0], method?: "paypal" | null, returnUrl?: string | null): string {
+export function snapshotFingerprint(quote: Parameters<typeof quoteFingerprint>[0], method?: "paypal" | null, returnUrl?: string | null, provider: PaymentProvider = "whop"): string {
+  if (provider === "stripe") return `${quoteFingerprint(quote)}|p:stripe`;
   return quoteFingerprint(quote) + (method === "paypal" ? "|m:paypal" : "") + returnHostSuffix(returnUrl);
 }
 
 /** Whether a snapshot fingerprint is a PayPal-only checkout's (segments: "…|m:paypal|h:host"). Pure. */
 export function isPaypalFingerprint(fingerprint: string | null | undefined): boolean {
   return !!fingerprint && fingerprint.split("|").includes("m:paypal");
+}
+
+/**
+ * Appended to the fingerprint of a Whop snapshot whose configuration was deleted (the session
+ * switched to Stripe, see deleteSessionWhopCheckouts): no quote's fingerprint ends so, the snapshot
+ * is never reused (prepare) nor confirmed ready (confirm). Keeps its other segments (PayPal).
+ */
+export const DELETED_SUFFIX = "|x:deleted";
+
+/** Whether a snapshot fingerprint is a deleted Whop configuration's (see DELETED_SUFFIX). Pure. */
+export function isDeletedFingerprint(fingerprint: string | null | undefined): boolean {
+  return !!fingerprint && fingerprint.endsWith(DELETED_SUFFIX);
 }
 
 /**
@@ -632,10 +667,15 @@ export async function clearPaypalRefusals(storeId: string): Promise<number> {
  * frozen snapshot of what it charges) when this exact quote was never prepared.
  * The snapshot — not the session's latest state — later drives the Shopify order, so
  * racing requests or a stale wallet button can never pay for one thing and ship another.
+ *
+ * The processor (see providerFor): Whop as always, or Stripe (a PaymentIntent per snapshot, see
+ * prepareStripe). `opts.provider` forces one (the per-session switch after a failure); never another
+ * processor than the session's under a payment in flight.
  */
-export async function prepareSession(session: SessionWithStore, input: QuoteInput, opts: { host?: string | null } = {}) {
+export async function prepareSession(session: SessionWithStore, input: QuoteInput, opts: PrepareOptions = {}): Promise<PrepareResult> {
   const quote = await quoteSession(session, input);
   assertPayable(session, quote, input);
+  const provider = providerFor(session, opts.provider);
   const method = input.method === "paypal" ? ("paypal" as const) : null;
   // The currency Whop charges (buyer's when the store charges in it): PayPal is remembered per currency.
   const chargeCurrency = quote.charge?.currency ?? session.currency;
@@ -643,39 +683,29 @@ export async function prepareSession(session: SessionWithStore, input: QuoteInpu
   // hidden (where its button lives) = no PayPal-only checkout at all.
   const design = await designFor(session.store, session);
   const paypalAllowed = paypalExpressAllowed(loadTheme(design.theme, session.store.name), loadCheckoutLayout(design.checkoutLayout));
-  if (method === "paypal" && (!paypalAllowed || !(await paypalOffered(session.storeId, chargeCurrency)))) {
+  // PayPal-only checkouts are Whop's (the express PayPal button): Stripe offers PayPal in its own form.
+  if (method === "paypal" && (provider !== "whop" || !paypalAllowed || !(await paypalOffered(session.storeId, chargeCurrency)))) {
     throw new CheckoutError("paypal_unavailable", "PayPal n'est pas disponible pour cette commande.");
   }
+  // Anything failing on the Stripe path is Stripe's side (as anything unclassified is Whop's on its
+  // path), except the database's own errors: never counted as a Stripe outage.
+  if (provider === "stripe") return tagFailureSource(prepareStripe(session, quote, input, design), "stripe", isDbError);
   // Paid through the loader's APP_URL fallback: back to APP_URL (?via=app), not the unreachable domain.
   const redirectUrl = thankYouReturnUrl(session.store, session.id, opts.host);
   const fingerprint = snapshotFingerprint(quote, method, redirectUrl);
 
-  let snapshot = await db.checkoutQuote.findFirst({
-    where: { sessionId: session.id, fingerprint },
-    orderBy: { createdAt: "desc" },
-  });
-  if (!snapshot) {
-    // Local-currency option on, but this buyer is charged in the shop's currency (no fresh ECB rate).
-    if (!quote.charge && session.store.chargeLocalCurrency && input.countryCode) {
-      const why = await chargeFallback(session.store, input.countryCode);
-      if (why) {
-        await recordIncident({
-          storeId: session.storeId,
-          sessionId: session.id,
-          kind: "fx.charge_fallback",
-          message: `Paiement proposé en ${session.currency} au lieu de ${why.currency} (${why.reason === "stale_rates" ? "taux BCE de plus de 3 jours" : why.reason === "no_rates" ? "taux BCE indisponibles" : "pas de taux pour cette devise"}).`,
-          data: why,
+  // Switching back from Stripe: the session's Whop configurations were deleted at the switch to
+  // Stripe (deleteSessionWhopCheckouts, maybe still running): never reused, a fresh one. Those
+  // deleted are also marked (their fingerprint no longer matches any quote), so never found later.
+  let snapshot =
+    session.paymentProvider === "stripe"
+      ? null
+      : await db.checkoutQuote.findFirst({
+          where: { sessionId: session.id, fingerprint, whopCheckoutId: { not: null } },
+          orderBy: { createdAt: "desc" },
         });
-      }
-    }
-    const count = await db.checkoutQuote.count({ where: { sessionId: session.id } });
-    if (count >= MAX_QUOTES_PER_SESSION) {
-      throw new CheckoutError("too_many_changes", "Trop de modifications sur cette commande. Retournez au panier pour recommencer.");
-    }
-    const [rate, addOns] = await Promise.all([
-      quote.shippingRateId ? db.shippingRate.findUnique({ where: { id: quote.shippingRateId } }) : null,
-      db.addOn.findMany({ where: { id: { in: quote.addOnIds } } }),
-    ]);
+  if (!snapshot) {
+    const base = await newSnapshotBase(session, quote, input);
     const whop = await tagFailureSource(createCheckoutConfiguration(session.store, {
       sessionId: session.id,
       storeId: session.storeId,
@@ -699,39 +729,10 @@ export async function prepareSession(session: SessionWithStore, input: QuoteInpu
     }), "whop");
     // Whether Whop offers PayPal, as this new checkout says (the express button follows it).
     if (typeof whop.paypal === "boolean") await rememberPaypal(session.storeId, chargeCurrency, whop.paypal);
-    snapshot = await db.checkoutQuote.create({
-      data: {
-        sessionId: session.id,
-        whopCheckoutId: whop.id,
-        fingerprint,
-        currency: session.currency,
-        subtotalCents: quote.totals.subtotalCents,
-        discountCents: quote.totals.discountCents,
-        shippingCents: quote.totals.shippingCents,
-        addOnsCents: quote.totals.addOnsCents,
-        totalCents: quote.totals.totalCents,
-        shippingRateId: rate?.id ?? null,
-        shippingRateName: rate?.name ?? null,
-        shippingCostCents: rate?.costCents ?? null,
-        shippingCountries: rate?.countries ?? [],
-        discountCode: quote.discount?.code ?? null,
-        // Only when the code really made shipping free: a rate above its maximum stays paid, and
-        // Shopify's free-shipping code would zero it (the order total would then not be what was paid).
-        discountFreeShipping: quote.discount?.type === "FREE_SHIPPING" && !!rate && quote.totals.shippingCents === 0,
-        discountSource: quote.discount ? (quote.discount.source ?? "app") : null,
-        codeDiscountCents: quote.discount ? (quote.totals.codeDiscountCents ?? 0) : null,
-        automaticDiscountCents: quote.totals.automaticDiscountCents ?? 0,
-        chargeCurrency: quote.charge?.currency ?? null,
-        chargeTotalCents: quote.charge?.totalCents ?? null,
-        chargeFxRate: quote.charge?.rate ?? null,
-        ...shopifyCodeLimits(shopifyCodeOf.get(quote)),
-        // Shipping protection: a custom line of the Shopify order, like a variant-less add-on.
-        addOns: [...addOns.map((a) => ({ id: a.id, title: a.title, priceCents: quote.addOnPrices[a.id] ?? a.priceCents, variantId: a.variantId, costCents: a.costCents })), ...quote.extraAddOns],
-        lines: quote.lines as unknown as Prisma.InputJsonValue,
-        addOnIds: addOns.map((a) => a.id),
-      },
-    });
+    snapshot = await db.checkoutQuote.create({ data: { ...base, whopCheckoutId: whop.id, fingerprint, provider: "whop" } });
   }
+  // A Whop snapshot always holds its configuration (only Stripe ones have none).
+  const configId = snapshot.whopCheckoutId!;
 
   // Never over a payment that landed meanwhile (webhook during the Shopify/Whop round-trips).
   const prepared = await db.checkoutSession.updateMany({
@@ -739,12 +740,509 @@ export async function prepareSession(session: SessionWithStore, input: QuoteInpu
     data: {
       ...quoteFields(quote),
       preparedTotalCents: quote.totals.totalCents,
-      whopCheckoutId: snapshot.whopCheckoutId,
+      whopCheckoutId: configId,
+      paymentProvider: "whop",
       preparedAt: session.preparedAt ?? new Date(),
     },
   });
   if (!prepared.count) throw new CheckoutError("already_paid", "Cette commande est déjà payée.");
-  return { checkoutConfigurationId: snapshot.whopCheckoutId, totals: quote.totals, quote, paypal: paypalAllowed && (await paypalOffered(session.storeId, chargeCurrency)) };
+  // Switched away from Stripe (per-session switch, Stripe disconnected): its PaymentIntents still
+  // open are canceled (after the answer), so a stale tab can never pay on Stripe on top of this Whop checkout.
+  if (session.paymentProvider === "stripe") cancelSessionPaymentIntents(session);
+  return { provider: "whop", checkoutConfigurationId: configId, totals: quote.totals, quote, paypal: paypalAllowed && (await paypalOffered(session.storeId, chargeCurrency)) };
+}
+
+export type PrepareOptions = {
+  host?: string | null;
+  /** Forces the processor (per-session switch after a failure); see providerFor. */
+  provider?: PaymentProvider | null;
+};
+
+/** What the page needs to mount Stripe's Payment Element on the connected account. */
+export type StripeClientConfig = {
+  clientSecret: string;
+  paymentIntentId: string;
+  publishableKey: string;
+  stripeAccount: string;
+  /** The PaymentIntent's own amount (Stripe's smallest unit) and currency: the page refreshes its wallets when they change. */
+  amount?: number;
+  currency?: string;
+};
+
+export type PrepareResult =
+  | { provider: "whop"; checkoutConfigurationId: string; totals: Totals; quote: Quote; paypal: boolean; stripe?: undefined }
+  | { provider: "stripe"; checkoutConfigurationId?: undefined; totals: Totals; quote: Quote; paypal: false; stripe: StripeClientConfig };
+
+/**
+ * The processor a prepare (or confirm) of this session uses:
+ * - `requested` (per-session switch) or the session's forcedProvider (admin « Tester le secours »
+ *   session): that one, or an error when it isn't usable (never the other one silently);
+ * - a session already prepared keeps its processor while it stays usable ("sessions on Stripe finish
+ *   on Stripe": a store-level failover or recovery never swaps the form under a buyer);
+ * - otherwise the store's choice (chooseProvider: mode, failover, connections).
+ * Never another processor than the one of a payment still in flight (payment_in_flight). No processor
+ * usable: an error attributed to the mode's primary (counts towards Shopify's own checkout).
+ */
+export function providerFor(session: SessionWithStore, requested?: PaymentProvider | null): PaymentProvider {
+  const forced = requested ?? session.forcedProvider;
+  let provider: PaymentProvider | null = null;
+  if (forced) {
+    provider = chooseProvider(session.store, { forced })?.provider ?? null;
+    if (!provider) throw withFailureSource(new Error(`${PROVIDER_NAMES[forced]} n'est pas disponible pour cette boutique`), forced);
+  } else {
+    if (session.preparedAt) provider = chooseProvider(session.store, { forced: session.paymentProvider })?.provider ?? null;
+    provider ??= chooseProvider(session.store)?.provider ?? null;
+    if (!provider) throw withFailureSource(new Error("Aucun processeur de paiement connecté (Whop ou Stripe)"), providerOrder(session.store.paymentMode)[0]);
+  }
+  if (provider !== session.paymentProvider && inFlightMethod(session) !== null) {
+    throw new CheckoutError("payment_in_flight", "Un paiement est déjà en cours de validation, patientez quelques secondes.");
+  }
+  return provider;
+}
+
+/** Whether the thank-you page offers a one-click offer (the card is then saved for it). */
+function offersOneClick(design: { thankYouLayout: unknown }): boolean {
+  return loadThankYouLayout(design.thankYouLayout).blocks.some((b) => b.type === "upsell" && !b.hidden && upsellSellable(b.props as Parameters<typeof upsellSellable>[0]));
+}
+
+/**
+ * Everything a new snapshot freezes (processor-independent): what is charged and shipped. Checks the
+ * per-session cap first, and journals a local-currency fallback.
+ */
+async function newSnapshotBase(session: SessionWithStore, quote: Quote, input: QuoteInput) {
+  // Local-currency option on, but this buyer is charged in the shop's currency (no fresh ECB rate).
+  if (!quote.charge && session.store.chargeLocalCurrency && input.countryCode) {
+    const why = await chargeFallback(session.store, input.countryCode);
+    if (why) {
+      await recordIncident({
+        storeId: session.storeId,
+        sessionId: session.id,
+        kind: "fx.charge_fallback",
+        message: `Paiement proposé en ${session.currency} au lieu de ${why.currency} (${why.reason === "stale_rates" ? "taux BCE de plus de 3 jours" : why.reason === "no_rates" ? "taux BCE indisponibles" : "pas de taux pour cette devise"}).`,
+        data: why,
+      });
+    }
+  }
+  const count = await db.checkoutQuote.count({ where: { sessionId: session.id } });
+  if (count >= MAX_QUOTES_PER_SESSION) {
+    throw new CheckoutError("too_many_changes", "Trop de modifications sur cette commande. Retournez au panier pour recommencer.");
+  }
+  const [rate, addOns] = await Promise.all([
+    quote.shippingRateId ? db.shippingRate.findUnique({ where: { id: quote.shippingRateId } }) : null,
+    db.addOn.findMany({ where: { id: { in: quote.addOnIds } } }),
+  ]);
+  return {
+    sessionId: session.id,
+    currency: session.currency,
+    subtotalCents: quote.totals.subtotalCents,
+    discountCents: quote.totals.discountCents,
+    shippingCents: quote.totals.shippingCents,
+    addOnsCents: quote.totals.addOnsCents,
+    totalCents: quote.totals.totalCents,
+    shippingRateId: rate?.id ?? null,
+    shippingRateName: rate?.name ?? null,
+    shippingCostCents: rate?.costCents ?? null,
+    shippingCountries: rate?.countries ?? [],
+    discountCode: quote.discount?.code ?? null,
+    // Only when the code really made shipping free: a rate above its maximum stays paid, and
+    // Shopify's free-shipping code would zero it (the order total would then not be what was paid).
+    discountFreeShipping: quote.discount?.type === "FREE_SHIPPING" && !!rate && quote.totals.shippingCents === 0,
+    discountSource: quote.discount ? (quote.discount.source ?? "app") : null,
+    codeDiscountCents: quote.discount ? (quote.totals.codeDiscountCents ?? 0) : null,
+    automaticDiscountCents: quote.totals.automaticDiscountCents ?? 0,
+    chargeCurrency: quote.charge?.currency ?? null,
+    chargeTotalCents: quote.charge?.totalCents ?? null,
+    chargeFxRate: quote.charge?.rate ?? null,
+    ...shopifyCodeLimits(shopifyCodeOf.get(quote)),
+    // Shipping protection: a custom line of the Shopify order, like a variant-less add-on.
+    addOns: [...addOns.map((a) => ({ id: a.id, title: a.title, priceCents: quote.addOnPrices[a.id] ?? a.priceCents, variantId: a.variantId, costCents: a.costCents })), ...quote.extraAddOns],
+    lines: quote.lines as unknown as Prisma.InputJsonValue,
+    addOnIds: addOns.map((a) => a.id),
+  } satisfies Omit<Prisma.CheckoutQuoteUncheckedCreateInput, "fingerprint">;
+}
+
+/** The PaymentIntent target of a quote: the charged amount and currency (buyer's when the store charges in it). */
+function stripeTarget(session: SessionWithStore, quote: Quote, fingerprint: string) {
+  return { fingerprint, amountCents: quote.charge?.totalCents ?? quote.totals.totalCents, currency: quote.charge?.currency ?? session.currency };
+}
+
+/**
+ * Ties a PaymentIntent to its snapshot: the one it now charges (a PaymentIntent updated in place
+ * moves from the previous snapshot to this one: CheckoutQuote.stripePaymentIntentId is unique), the
+ * snapshot created when new. Returns the snapshot.
+ *
+ * Two requests of the same session racing (two tabs, a double prepare) get the same PaymentIntent
+ * (idempotent creation) and may both write it: the loser's unique violation (P2002 on
+ * stripePaymentIntentId) is resolved by running the move once more, then by re-reading the snapshot
+ * that now holds it. Never an outage: an unresolved conflict is a refusal (CheckoutError), which
+ * neither switches processor nor counts towards the failover.
+ */
+export async function attachPaymentIntent(sessionId: string, snapshot: CheckoutQuote | null, create: (() => Prisma.CheckoutQuoteUncheckedCreateInput) | null, piId: string): Promise<CheckoutQuote> {
+  if (snapshot?.stripePaymentIntentId === piId) return snapshot;
+  const move = () =>
+    db.$transaction(async (tx) => {
+      await tx.checkoutQuote.updateMany({ where: { stripePaymentIntentId: piId, sessionId, ...(snapshot ? { id: { not: snapshot.id } } : {}) }, data: { stripePaymentIntentId: null } });
+      if (snapshot) return tx.checkoutQuote.update({ where: { id: snapshot.id }, data: { stripePaymentIntentId: piId } });
+      return tx.checkoutQuote.create({ data: { ...create!(), stripePaymentIntentId: piId } });
+    });
+  const conflict = (err: unknown) => err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
+  try {
+    return await move();
+  } catch (err) {
+    if (!conflict(err)) throw err;
+  }
+  // The other request committed meanwhile: its row already holds this PaymentIntent for this session.
+  const held = await db.checkoutQuote.findUnique({ where: { stripePaymentIntentId: piId } });
+  const wanted = snapshot?.fingerprint ?? create?.().fingerprint;
+  if (held && held.sessionId === sessionId && held.fingerprint === wanted) return held;
+  try {
+    return await move();
+  } catch (err) {
+    if (!conflict(err)) throw err;
+    const again = await db.checkoutQuote.findUnique({ where: { stripePaymentIntentId: piId } });
+    if (again && again.sessionId === sessionId) return again;
+    throw new CheckoutError("init_failed", "Le paiement n'a pas pu être initialisé. Réessayez.");
+  }
+}
+
+/** The page's Stripe configuration for a PaymentIntent (publishable key of the store's mode, connected account, the PaymentIntent's own amount and currency). */
+export function stripeClientConfig(session: SessionWithStore, pi: Pick<CheckoutPaymentIntent, "id" | "clientSecret"> & Partial<Pick<CheckoutPaymentIntent, "amount" | "currency">>): StripeClientConfig {
+  const { publishableKey, stripeAccount } = stripeFor(session.store);
+  return {
+    clientSecret: pi.clientSecret,
+    paymentIntentId: pi.id,
+    publishableKey,
+    stripeAccount,
+    ...(pi.amount != null && pi.currency ? { amount: pi.amount, currency: pi.currency } : {}),
+  };
+}
+
+/**
+ * Whether the Stripe ids the session recorded (PaymentIntent, Customer, and its snapshots'
+ * PaymentIntents) belong to another connected account or mode than the store's now (Stripe
+ * reconnected to another account, test ↔ live switch): they are then ignored (never retrieved,
+ * updated nor canceled with this account's keys: "no such PaymentIntent" would read as a Stripe
+ * failure), and the next Stripe prepare starts afresh. A session without a recorded account (none
+ * prepared on Stripe since 0037) is judged by its mode only. Pure.
+ */
+export function stripeIdsStale(session: Pick<CheckoutSession, "stripeAccountId" | "test"> & { store: Pick<Store, "stripeAccountId" | "testMode"> }): boolean {
+  return (!!session.stripeAccountId && session.stripeAccountId !== session.store.stripeAccountId) || session.test !== session.store.testMode;
+}
+
+/** Budget of a cleanup call on Whop, after the answer: short, no retry. */
+const WHOP_CLEANUP_CALL = { timeoutInSeconds: 3, maxRetries: 0 } as const;
+
+/**
+ * The session's Stripe PaymentIntents still open (current and previous ones recorded on its
+ * snapshots) canceled, best effort, AFTER the answer (never in the buyer's request: Stripe may be the
+ * processor that just failed), each call short and never retried: the buyer now pays with Whop.
+ * Skipped when those ids belong to another account or mode (stripeIdsStale).
+ */
+function cancelSessionPaymentIntents(session: SessionWithStore): void {
+  if (stripeIdsStale(session)) return;
+  afterResponse(async () => {
+    try {
+      const quotes = await db.checkoutQuote.findMany({ where: { sessionId: session.id, stripePaymentIntentId: { not: null } }, select: { stripePaymentIntentId: true } });
+      await cancelOpenPaymentIntents(session.store, [session.stripePaymentIntentId, ...quotes.map((q) => q.stripePaymentIntentId)], STRIPE_CLEANUP_CALL);
+    } catch (err) {
+      log.warn("checkout.pi_cancel_failed", "Could not cancel the session's Stripe PaymentIntents after a switch to Whop", { sessionId: session.id, err });
+    }
+  });
+}
+
+/**
+ * The session's Whop checkout configurations deleted, best effort, AFTER the answer (never in the
+ * buyer's request: Whop may be the processor that just failed), one short call each, no retry: the
+ * buyer now pays with Stripe, and a stale tab (or Whop's own express buttons still on it) can never
+ * pay on Whop on top. A configuration already gone counts as deleted.
+ *
+ * Their snapshots are marked deleted first (DELETED_SUFFIX on the fingerprint: no quote matches it
+ * any more, so neither a prepare nor a confirm ever reuses them; whopCheckoutId stays, a late payment
+ * webhook still finds its snapshot). Only those that existed at the switch (a Whop configuration
+ * created afterwards, the buyer switched back meanwhile, is never touched).
+ */
+function deleteSessionWhopCheckouts(session: SessionWithStore): void {
+  if (!session.store.whopApiKey) return;
+  const switchedAt = new Date();
+  afterResponse(async () => {
+    let ids: string[] = [];
+    try {
+      const quotes = await db.checkoutQuote.findMany({
+        where: { sessionId: session.id, provider: "whop", whopCheckoutId: { not: null }, createdAt: { lte: switchedAt } },
+        select: { id: true, whopCheckoutId: true, fingerprint: true },
+      });
+      await Promise.all(
+        quotes
+          .filter((q) => !isDeletedFingerprint(q.fingerprint))
+          .map((q) => db.checkoutQuote.updateMany({ where: { id: q.id, fingerprint: q.fingerprint }, data: { fingerprint: `${q.fingerprint}${DELETED_SUFFIX}` } })),
+      );
+      ids = [...new Set([session.whopCheckoutId, ...quotes.map((q) => q.whopCheckoutId)].filter((id): id is string => !!id))];
+    } catch (err) {
+      log.warn("checkout.whop_delete_failed", "Could not list the session's Whop checkouts after a switch to Stripe", { sessionId: session.id, err });
+      return;
+    }
+    await Promise.all(
+      ids.map(async (id) => {
+        try {
+          await storeClient(session.store).checkoutConfigurations.delete({ id }, WHOP_CLEANUP_CALL);
+        } catch (err) {
+          const status = (err as { status?: unknown; statusCode?: unknown }).status ?? (err as { statusCode?: unknown }).statusCode;
+          // Already gone: deleted.
+          if (status !== 404) log.warn("checkout.whop_delete_failed", "Could not delete a Whop checkout after the session switched to Stripe", { sessionId: session.id, checkoutConfigurationId: id, err });
+        }
+      }),
+    );
+  });
+}
+
+/**
+ * A PaymentIntent of the session met succeeded by a prepare or a confirm (the webhook late or lost):
+ * the session is marked paid from it (markPaid, idempotent, like the webhook and the status route),
+ * then the page is told (already_paid: the thank-you page). Should that fail (Stripe, the database),
+ * the buyer waits instead (payment_in_flight: the webhook finishes it), never a new form over a
+ * payment made. Always throws a CheckoutError (a refusal: never a switch of processor).
+ */
+async function settlePaidPaymentIntent(session: SessionWithStore, paymentIntentId: string): Promise<never> {
+  let paid = false;
+  try {
+    const pi = await retrievePaymentIntent(session.store, paymentIntentId);
+    if (pi.status === "succeeded" && pi.metadata?.checkout_session_id === session.id) {
+      const syncLater = await markPaid(session.id, paymentInfoFromStripe(pi), { deferSync: true });
+      if (syncLater) afterResponse(() => syncOrderSafely(session.id));
+      paid = true;
+    }
+  } catch (err) {
+    log.warn("checkout.pi_settle_failed", "Could not mark the session paid from its succeeded PaymentIntent", { sessionId: session.id, paymentIntentId, err });
+  }
+  if (paid) throw new CheckoutError("already_paid", "Cette commande est déjà payée.");
+  throw new CheckoutError("payment_in_flight", "Un paiement est déjà en cours de validation, patientez quelques secondes.");
+}
+
+/** A PaymentIntent paid or with a payment going through: settled (already_paid) or waited on (payment_in_flight), never replaced. */
+async function assertPaymentIntentIdle(session: SessionWithStore, pi: Pick<CheckoutPaymentIntent, "id" | "status">): Promise<void> {
+  if (pi.status === "succeeded") await settlePaidPaymentIntent(session, pi.id);
+  // Processing (bank debit, wallet), authorized (requires_capture): see stripe.ts PI_SETTLING.
+  if (pi.status === "processing" || pi.status === "requires_capture") throw new CheckoutError("payment_in_flight", "Un paiement est déjà en cours de validation, patientez quelques secondes.");
+}
+
+/**
+ * prepareSession on Stripe: the snapshot of this quote and its PaymentIntent (see
+ * createOrUpdatePaymentIntent: the session's PaymentIntent updated in place when nothing was submitted
+ * on it and nothing is in flight, else a new one). Stripe's errors are tagged "stripe".
+ */
+async function prepareStripe(session: SessionWithStore, quote: Quote, input: QuoteInput, design: { thankYouLayout: unknown }): Promise<PrepareResult> {
+  const fingerprint = snapshotFingerprint(quote, null, null, "stripe");
+  let snapshot = await db.checkoutQuote.findFirst({ where: { sessionId: session.id, fingerprint }, orderBy: { createdAt: "desc" } });
+  const base = snapshot ? null : await newSnapshotBase(session, quote, input);
+  // Ids of another connected account or mode (reconnection, test ↔ live): ignored, a fresh start.
+  const stale = stripeIdsStale(session);
+  const sessionPiId = stale ? null : session.stripePaymentIntentId;
+  const existingId = stale ? null : (snapshot?.stripePaymentIntentId ?? sessionPiId);
+  // A payment was submitted on the session's PaymentIntent, and this prepare is for another one (the
+  // total changed since): that one is checked first, a payment made or going through on it is never
+  // left behind for a new form.
+  // One gone from the account (404: deleted) has nothing on it: nothing to check.
+  if (sessionPiId && sessionPiId !== existingId && session.payClickedAt) {
+    const current = await tagFailureSource(retrievePaymentIntent(session.store, sessionPiId), "stripe").catch((err: unknown) => {
+      if (isStripeMissing(err)) return null;
+      throw err;
+    });
+    if (current) await assertPaymentIntentIdle(session, current);
+  }
+  // Never a PaymentIntent changed (nor canceled) under a payment being submitted (another tab's): a new one then.
+  const idle = inFlightMethod(session) === null;
+  const paymentIntent = (customerId: string | null) =>
+    tagFailureSource(
+      createOrUpdatePaymentIntent(session.store, session, stripeTarget(session, quote, fingerprint), {
+        existingId,
+        reusable: idle,
+        // The PaymentIntent a new one replaces: canceled while nothing was submitted on it.
+        cancelReplaced: idle,
+        saveCard: offersOneClick(design),
+        buyer: { customerId },
+      }),
+      "stripe",
+    );
+  // The session's Customer gone from the account ("No such customer"): dropped (the confirm creates a fresh one).
+  let customerGone = false;
+  const pi = await paymentIntent(stale ? null : session.stripeCustomerId).catch((err: unknown) => {
+    if (stale || !session.stripeCustomerId || !isStripeMissing(err, "customer")) throw err;
+    customerGone = true;
+    return paymentIntent(null);
+  });
+  // Paid or going through (createOrUpdatePaymentIntent never replaces such a PaymentIntent): marked
+  // paid (already_paid) or waited on (payment_in_flight), never a new form over it.
+  await assertPaymentIntentIdle(session, pi);
+  snapshot = await attachPaymentIntent(session.id, snapshot, base && (() => ({ ...base, fingerprint, provider: "stripe" })), pi.id);
+  const prepared = await db.checkoutSession.updateMany({
+    where: { id: session.id, status: { not: "PAID" } },
+    data: {
+      ...quoteFields(quote),
+      preparedTotalCents: quote.totals.totalCents,
+      paymentProvider: "stripe",
+      stripePaymentIntentId: pi.id,
+      // The other account's (or mode's) Customer is dropped: the confirm creates this account's.
+      ...(stale || customerGone ? { stripeCustomerId: null } : {}),
+      ...stripePiFields(session, pi),
+      preparedAt: session.preparedAt ?? new Date(),
+    },
+  });
+  if (!prepared.count) throw new CheckoutError("already_paid", "Cette commande est déjà payée.");
+  // Switched away from Whop (per-session switch, Whop disconnected): its checkouts are deleted (after
+  // the answer), so a stale tab or Whop's express buttons can never pay on Whop on top of this PaymentIntent.
+  if (session.paymentProvider === "whop" && session.whopCheckoutId) deleteSessionWhopCheckouts(session);
+  return { provider: "stripe", totals: quote.totals, quote, paypal: false, stripe: stripeClientConfig(session, pi) };
+}
+
+/**
+ * What the session records of its PaymentIntent: the connected account it lives on (a later
+ * reconnection to another account never loses it) and whether the card is saved for off-session
+ * offers (setup_future_usage "off_session").
+ */
+function stripePiFields(session: SessionWithStore, pi: Pick<CheckoutPaymentIntent, "offSessionSaved">) {
+  // The mode too (`test`): a session carried over a test ↔ live switch pays in the store's mode now
+  // (its analytics follow), and its ids are no longer judged stale (stripeIdsStale) once replaced.
+  return { stripeAccountId: session.store.stripeAccountId, test: session.store.testMode, stripeOffSessionSaved: pi.offSessionSaved };
+}
+
+/**
+ * The processor a failed prepare can switch to for this session, or null: an unexpected failure
+ * (never a refusal) of Whop or Stripe, the other processor usable for the store (mode, connection),
+ * nothing in flight, no PayPal-only checkout asked, not a forced (test) session. Pure.
+ */
+export function switchTarget(session: SessionWithStore, input: Pick<QuoteInput, "method">, err: unknown): PaymentProvider | null {
+  if (err instanceof CheckoutError || input.method === "paypal" || session.forcedProvider) return null;
+  const source = checkoutFailureSource(err);
+  if (source === "shopify") return null;
+  if (inFlightMethod(session) !== null) return null;
+  const alt: PaymentProvider = source === "whop" ? "stripe" : "whop";
+  return chooseProvider(session.store, { forced: alt }) ? alt : null;
+}
+
+/**
+ * prepareSession with the per-session instant failover: when the processor fails (Whop down, Stripe
+ * down) and the other one is usable (see switchTarget), the failure is journaled (it counts towards
+ * the store-level failover), the same prepare runs again on the other processor in the same request,
+ * and the switch is journaled (checkout.provider_switched, once per session per 10 min). The buyer
+ * simply gets the other processor's form. Throws the (unjournaled) error when no switch applies or
+ * the other processor fails too.
+ */
+export async function prepareWithFailover(session: SessionWithStore, input: QuoteInput, opts: PrepareOptions & { stage?: "prepare" | "pay" } = {}): Promise<PrepareResult & { switchedFrom?: PaymentProvider }> {
+  // The processor this attempt uses (a failure of the other one's is no reason to switch to it).
+  let attempted: PaymentProvider | null = null;
+  try {
+    attempted = providerFor(session, opts.provider);
+  } catch {
+    attempted = null;
+  }
+  try {
+    return await prepareSession(session, input, opts);
+  } catch (err) {
+    if (checkoutFailureSource(err) !== attempted) throw err;
+    return switchAfterFailure(session, input, opts, err);
+  }
+}
+
+/**
+ * The per-session switch after a processor failure `err` (prepare, or the Pay click): when
+ * switchTarget allows it (re-checked on a fresh read: a payment may have started meanwhile in
+ * another tab, never switched under it), the failure is journaled, the other processor prepared and
+ * the switch journaled (checkout.provider_switched, once per session per 10 min). Throws `err` as is
+ * (unjournaled) otherwise, or the other processor's error when it fails too.
+ */
+async function switchAfterFailure(session: SessionWithStore, input: QuoteInput, opts: PrepareOptions & { stage?: "prepare" | "pay" }, err: unknown): Promise<PrepareResult & { switchedFrom?: PaymentProvider }> {
+  const from = checkoutFailureSource(err);
+  if (from === "shopify" || !switchTarget(session, input, err)) throw err;
+  const fresh = await db.checkoutSession.findUnique({ where: { id: session.id }, include: { store: true } });
+  const alt = fresh ? switchTarget(fresh, input, err) : null;
+  if (!fresh || !alt) throw err;
+  // Leaving Stripe on a page (re)load: a payment submitted earlier (past the in-flight window, e.g.
+  // a delayed method still processing) is checked first, never a Whop form on top of it.
+  if (from === "stripe" && (opts.stage ?? "prepare") === "prepare" && (await checkPaymentIntentBeforeSwitch(fresh)) === "unreachable") throw err;
+  await journalCheckoutFailure(session, opts.stage ?? "prepare", err);
+  const result = await prepareSession(fresh, input, { ...opts, provider: alt });
+  await journalSwitch(session, from, alt, opts.stage ?? "prepare", err instanceof Error ? err.message : String(err));
+  return { ...result, switchedFrom: from };
+}
+
+async function journalSwitch(session: Pick<CheckoutSession, "id" | "storeId">, from: PaymentProvider, to: PaymentProvider, stage: string, why: string, message?: string) {
+  if (!(await rateLimit(`journal:provider_switched:${session.id}`, 1, 10 * 60_000))) return;
+  await recordEvent({
+    storeId: session.storeId,
+    sessionId: session.id,
+    level: "warn",
+    kind: "checkout.provider_switched",
+    message: message ?? `${PROVIDER_NAMES[from]} n'a pas pu ouvrir le paiement : ce client paie avec ${PROVIDER_NAMES[to]} (bascule automatique, même page).`,
+    data: { from, to, stage, err: why.slice(0, 300) },
+  });
+}
+
+/**
+ * Before leaving Stripe for Whop on a session where a payment was submitted: the session's
+ * PaymentIntent is checked (paid → settled, going through → payment_in_flight, gone → nothing on
+ * it). "unreachable" when Stripe's API could not answer: the caller never switches blind then (a
+ * delayed method, e.g. SEPA, may still be processing on it).
+ */
+async function checkPaymentIntentBeforeSwitch(session: SessionWithStore): Promise<"ok" | "unreachable"> {
+  if (!session.payClickedAt || !session.stripePaymentIntentId || stripeIdsStale(session)) return "ok";
+  const piId = session.stripePaymentIntentId;
+  let current: Awaited<ReturnType<typeof retrievePaymentIntent>> | null;
+  try {
+    current = await retrievePaymentIntent(session.store, piId, STRIPE_PAGE_CALL);
+  } catch (e) {
+    if (!isStripeMissing(e)) {
+      log.warn("checkout.switch_check", "Could not check the session's PaymentIntent before switching to Whop", { sessionId: session.id, paymentIntentId: piId, err: e });
+      return "unreachable";
+    }
+    current = null;
+  }
+  if (current) await assertPaymentIntentIdle(session, { id: current.id, status: current.status });
+  return "ok";
+}
+
+/** Journal kind of a payment form that could not load in the buyer's browser (Stripe.js blocked or down). */
+export const CLIENT_FAILED_KIND = "checkout.client_failed";
+/** A browser failure report counts only from a session served a Stripe form (snapshot created) within this time. */
+export const CLIENT_FAILED_SERVED_MS = 5 * 60_000;
+
+/**
+ * The page could not load Stripe's form in the buyer's browser (Stripe.js blocked, timed out or
+ * failed: `clientFailed: "stripe"` on /prepare). The buyer is switched to Whop when it is usable
+ * (same rules as a server failure: nothing in flight, not a PayPal-only checkout, not a forced test
+ * session); the failure is journaled (checkout.client_failed, once per session per 10 min) and
+ * counted apart (noteCheckoutFailure with its own kind: one buyer's ad blocker never flips the store;
+ * three sessions within 10 min do). Otherwise the regular prepare runs (the page says Stripe's form
+ * could not load).
+ */
+export async function prepareAfterClientFailure(session: SessionWithStore, input: QuoteInput, opts: PrepareOptions = {}): Promise<PrepareResult & { switchedFrom?: PaymentProvider }> {
+  if (session.paymentProvider !== "stripe") return prepareWithFailover(session, input, opts);
+  const why = "Le formulaire Stripe n'a pas pu se charger dans le navigateur du client (Stripe.js bloqué ou indisponible)";
+  if (await rateLimit(`journal:client_failed:${session.id}`, 1, 10 * 60_000)) {
+    // The report comes from the page (forgeable): it counts towards the store only for a session
+    // this server served a Stripe form to moments ago (a Stripe snapshot of it created recently).
+    const served = await db.checkoutQuote.findFirst({
+      where: { sessionId: session.id, provider: "stripe", createdAt: { gt: new Date(Date.now() - CLIENT_FAILED_SERVED_MS) } },
+      select: { id: true },
+    });
+    await recordEvent({
+      storeId: session.storeId,
+      sessionId: session.id,
+      level: "warn",
+      kind: CLIENT_FAILED_KIND,
+      message: `${why}.`,
+      data: { source: "stripe", stage: "client", ...(session.forcedProvider ? { forced: true } : {}), ...(served ? {} : { unverified: true }) },
+    });
+    if (!session.forcedProvider && served) await noteCheckoutFailure(session.storeId, "stripe", CLIENT_FAILED_KIND);
+  }
+  const err = withFailureSource(new Error(why), "stripe");
+  if (!switchTarget(session, input, err)) return prepareWithFailover(session, input, opts);
+  // A payment was submitted on its PaymentIntent (e.g. the form loaded, then failed on a later
+  // load): paid → settled (already_paid), going through → waited on (payment_in_flight), never a
+  // Whop form on top. Stripe's API unreachable too: no switch without that check (the regular prepare).
+  if ((await checkPaymentIntentBeforeSwitch(session)) === "unreachable") return prepareWithFailover(session, input, opts);
+  const result = await prepareSession(session, input, { ...opts, provider: "whop" });
+  await journalSwitch(session, "stripe", "whop", "client", why, "Le formulaire Stripe n'a pas pu se charger chez ce client : il paie avec Whop (bascule automatique, même page).");
+  return { ...result, switchedFrom: "stripe" };
 }
 
 function quoteFields(quote: Quote) {
@@ -788,12 +1286,24 @@ export function inFlightMethod(
   return paypalAt >= clicked ? "paypal" : "other";
 }
 
-type InFlightFields = Pick<CheckoutSession, "status" | "payClickedAt" | "paypalWindowAt" | "paypalBeatAt">;
+type InFlightFields = Pick<CheckoutSession, "status" | "payClickedAt" | "paypalWindowAt" | "paypalBeatAt" | "paymentProvider">;
 
-/** Refuses a confirm with another method than the payment in flight (see inFlightMethod). */
-function assertNoOtherInFlight(session: InFlightFields, method: PayInput["method"]) {
-  const inFlight = inFlightMethod(session);
-  if (inFlight && inFlight !== (method === "paypal" ? "paypal" : "other")) {
+/**
+ * inFlightMethod with the processor of that attempt: the session's paymentProvider, stamped by the
+ * confirm that started it (a prepare never changes it under a payment in flight, see providerFor). Pure.
+ */
+export function inFlightAttempt(session: InFlightFields, now = Date.now()): { method: "paypal" | "other"; provider: PaymentProvider } | null {
+  const method = inFlightMethod(session, now);
+  return method ? { method, provider: session.paymentProvider } : null;
+}
+
+/**
+ * Refuses a confirm with another method or another processor than the payment in flight (see
+ * inFlightAttempt): a Stripe payment going through blocks a Whop confirm and vice versa.
+ */
+function assertNoOtherInFlight(session: InFlightFields, method: PayInput["method"], provider: PaymentProvider) {
+  const inFlight = inFlightAttempt(session);
+  if (inFlight && (inFlight.method !== (method === "paypal" ? "paypal" : "other") || inFlight.provider !== provider)) {
     throw new CheckoutError("payment_in_flight", "Un paiement est déjà en cours de validation, patientez quelques secondes.");
   }
 }
@@ -803,11 +1313,13 @@ function assertNoOtherInFlight(session: InFlightFields, method: PayInput["method
  * If the checkout the page holds doesn't charge exactly the current quote, returns
  * a fresh one instead so the buyer is never charged a stale amount.
  */
-export async function confirmSession(session: SessionWithStore, input: PayInput, opts: { host?: string | null } = {}) {
-  // A payment still going through with another method (e.g. a PayPal window in a second tab):
-  // never a second charge on top of it. The same method (a card retried) and a FAILED session pass
-  // (unless a PayPal window opened after the failed card). Checked again atomically below.
-  assertNoOtherInFlight(session, input.method);
+export async function confirmSession(session: SessionWithStore, input: PayInput, opts: { host?: string | null } = {}): Promise<ConfirmOutcome> {
+  // The processor this session pays with now (see providerFor: sticky, forced, or the store's).
+  const provider = providerFor(session);
+  // A payment still going through with another method or processor (e.g. a PayPal window in a
+  // second tab): never a second charge on top of it. The same method (a card retried) and a FAILED
+  // session pass (unless a PayPal window opened after the failed card). Checked again atomically below.
+  assertNoOtherInFlight(session, input.method, provider);
   const quoteInput = { ...input, countryCode: input.address.countryCode };
   const quote = await quoteSession(session, quoteInput);
   assertPayable(session, quote, quoteInput);
@@ -834,20 +1346,102 @@ export async function confirmSession(session: SessionWithStore, input: PayInput,
     throw new CheckoutError("pickup_required", "Choisissez un point relais dans votre pays de livraison.");
   }
 
+  const expected =
+    provider === "stripe" ? snapshotFingerprint(quote, null, null, "stripe") : snapshotFingerprint(quote, input.method, thankYouReturnUrl(session.store, session.id, opts.host));
   const configId = input.checkoutConfigurationId ?? session.whopCheckoutId;
-  const snapshot = configId
-    ? await db.checkoutQuote.findUnique({ where: { whopCheckoutId: configId } })
-    : null;
-  // The checkout must charge this quote AND offer the chosen method (PayPal-only or regular).
-  if (!snapshot || snapshot.sessionId !== session.id || snapshot.fingerprint !== snapshotFingerprint(quote, input.method, thankYouReturnUrl(session.store, session.id, opts.host))) {
-    const prepared = await prepareSession(session, quoteInput, opts);
-    return { ready: false as const, checkoutConfigurationId: prepared.checkoutConfigurationId, totals: prepared.totals };
+  // The page's Whop checkout, or its Stripe PaymentIntent (whichever processor the session uses now).
+  const snapshot =
+    provider === "stripe"
+      ? input.paymentIntentId
+        ? await db.checkoutQuote.findUnique({ where: { stripePaymentIntentId: input.paymentIntentId } })
+        : null
+      : configId
+        ? await db.checkoutQuote.findUnique({ where: { whopCheckoutId: configId } })
+        : null;
+  // The checkout must charge this quote AND offer the chosen method (PayPal-only or regular) on
+  // this processor. Otherwise a fresh one (nothing was submitted yet: the per-session switch applies).
+  // Stripe: a PaymentIntent (and Customer) of another connected account or mode (reconnection, test ↔
+  // live switch, see stripeIdsStale) is never confirmed: a fresh one on the store's account first.
+  // Whop: a configuration deleted at a switch to Stripe (marked, or the session still on Stripe:
+  // its deletion may be running) is never ready: a fresh one first.
+  const whopDeleted = provider === "whop" && (session.paymentProvider === "stripe" || isDeletedFingerprint(snapshot?.fingerprint));
+  if (!snapshot || snapshot.sessionId !== session.id || snapshot.provider !== provider || snapshot.fingerprint !== expected || whopDeleted || (provider === "stripe" && stripeIdsStale(session))) {
+    return notReady(await prepareWithFailover(session, quoteInput, { ...opts, stage: "pay" }));
+  }
+
+  // Stripe: the buyer's Customer (the saved card of a one-click offer hangs on it), receipt e-mail
+  // and shipping go on the PaymentIntent before the page confirms it.
+  let stripeFields: ({ stripePaymentIntentId: string; stripeCustomerId: string } & ReturnType<typeof stripePiFields>) | null = null;
+  let stripeConfig: StripeClientConfig | null = null;
+  if (provider === "stripe") {
+    let customerId: string;
+    let pi: CheckoutPaymentIntent;
+    try {
+      // One Customer per session (see ensureStripeCustomer), its e-mail kept up to date. `replaces`:
+      // the Customer a PaymentIntent call said is gone (deleted on the account): a fresh one.
+      const customer = (replaces?: string) =>
+        tagFailureSource(
+          ensureStripeCustomer(session.store, {
+            email: input.email,
+            name: `${input.address.firstName} ${input.address.lastName}`.trim(),
+            sessionId: session.id,
+            customerId: session.stripeCustomerId,
+            previousEmail: session.email,
+            replaces,
+          }),
+          "stripe",
+        );
+      // Recorded at once (not only with the Pay click below): a PaymentIntent call failing next, or
+      // the PaymentIntent replaced, never leaves a Customer the session forgets (and re-creates).
+      const remember = async (id: string) => {
+        if (id !== session.stripeCustomerId) await db.checkoutSession.updateMany({ where: { id: session.id, status: { not: "PAID" } }, data: { stripeCustomerId: id } });
+      };
+      const paymentIntent = (id: string) =>
+        tagFailureSource(
+          createOrUpdatePaymentIntent(session.store, session, stripeTarget(session, quote, expected), {
+            existingId: snapshot.stripePaymentIntentId,
+            reusable: false,
+            cancelReplaced: true,
+            saveCard: offersOneClick(design),
+            buyer: { email: input.email, customerId: id, shipping: stripeShipping(input.address) },
+          }),
+          "stripe",
+        );
+      customerId = await customer();
+      await remember(customerId);
+      try {
+        pi = await paymentIntent(customerId);
+      } catch (err) {
+        // The recorded Customer is gone from the account ("No such customer"): a fresh one, once.
+        if (!isStripeMissing(err, "customer")) throw err;
+        customerId = await customer(customerId);
+        await remember(customerId);
+        pi = await paymentIntent(customerId);
+      }
+    } catch (err) {
+      // Stripe failing at the Pay click (nothing submitted yet): this buyer is switched to Whop when
+      // it is usable (switchAfterFailure: journaled, counted), the page shows Whop's form first.
+      if (err instanceof CheckoutError || checkoutFailureSource(err) !== "stripe") throw err;
+      return notReady(await switchAfterFailure(session, quoteInput, { ...opts, stage: "pay" }, err));
+    }
+    // Paid meanwhile (webhook late or lost): marked paid here (already_paid); going through: waited on.
+    await assertPaymentIntentIdle(session, pi);
+    // Its PaymentIntent was canceled meanwhile: a new one, which the page mounts first.
+    if (pi.id !== snapshot.stripePaymentIntentId) {
+      await attachPaymentIntent(session.id, snapshot, null, pi.id);
+      await db.checkoutSession.updateMany({ where: { id: session.id, status: { not: "PAID" } }, data: { stripePaymentIntentId: pi.id, stripeCustomerId: customerId, paymentProvider: "stripe", ...stripePiFields(session, pi) } });
+      return { ready: false, provider: "stripe", totals: quote.totals, stripe: stripeClientConfig(session, pi) };
+    }
+    stripeFields = { stripePaymentIntentId: pi.id, stripeCustomerId: customerId, ...stripePiFields(session, pi) };
+    stripeConfig = stripeClientConfig(session, pi);
   }
 
   const clickedAt = new Date();
   const data = {
     ...quoteFields(quote),
-    whopCheckoutId: snapshot.whopCheckoutId,
+    ...(provider === "whop" ? { whopCheckoutId: snapshot.whopCheckoutId } : stripeFields),
+    // The processor of this attempt (inFlightAttempt): another one is refused while it is in flight.
+    paymentProvider: provider,
     preparedTotalCents: snapshot.totalCents,
     status: "PAYING" as const,
     payClickedAt: clickedAt,
@@ -871,15 +1465,46 @@ export async function confirmSession(session: SessionWithStore, input: PayInput,
       data,
     });
     if (confirmed.count) break;
-    const now = await db.checkoutSession.findUnique({ where: { id: session.id }, select: { status: true, payClickedAt: true, paypalWindowAt: true, paypalBeatAt: true } });
+    const now = await db.checkoutSession.findUnique({ where: { id: session.id }, select: { status: true, payClickedAt: true, paypalWindowAt: true, paypalBeatAt: true, paymentProvider: true } });
     if (!now || now.status === "PAID") throw new CheckoutError("already_paid", "Cette commande est déjà payée.");
-    assertNoOtherInFlight(now, input.method);
+    assertNoOtherInFlight(now, input.method, provider);
     // Attempts keep landing (never in practice): refused like one in flight, the buyer retries.
     if (round >= 2) throw new CheckoutError("payment_in_flight", "Un paiement est déjà en cours de validation, patientez quelques secondes.");
     seen = now;
   }
   if (input.method === "paypal") log.info("checkout.pay_method", "Paiement lancé avec PayPal (bouton express)", { storeId: session.storeId, sessionId: session.id, method: "paypal" });
-  return { ready: true as const, checkoutConfigurationId: snapshot.whopCheckoutId, totals: quote.totals };
+  if (stripeConfig) return { ready: true, provider: "stripe", totals: quote.totals, stripe: stripeConfig };
+  return { ready: true, provider: "whop", checkoutConfigurationId: snapshot.whopCheckoutId!, totals: quote.totals };
+}
+
+/**
+ * confirmSession's answer: `ready` = the page submits its form now; otherwise the fresh checkout it
+ * must show first (Whop configuration, or Stripe PaymentIntent: maybe on the other processor after a
+ * per-session switch, `switchedFrom`).
+ */
+export type ConfirmOutcome =
+  | { ready: boolean; provider: "whop"; checkoutConfigurationId: string; totals: Totals; stripe?: undefined; switchedFrom?: PaymentProvider }
+  | { ready: boolean; provider: "stripe"; checkoutConfigurationId?: undefined; totals: Totals; stripe: StripeClientConfig; switchedFrom?: PaymentProvider };
+
+function notReady(prepared: PrepareResult & { switchedFrom?: PaymentProvider }): ConfirmOutcome {
+  const switched = prepared.switchedFrom ? { switchedFrom: prepared.switchedFrom } : {};
+  return prepared.provider === "stripe"
+    ? { ready: false, provider: "stripe", totals: prepared.totals, stripe: prepared.stripe, ...switched }
+    : { ready: false, provider: "whop", checkoutConfigurationId: prepared.checkoutConfigurationId, totals: prepared.totals, ...switched };
+}
+
+/**
+ * The prepare / pay routes' JSON for a prepared checkout: Whop's configuration as always, or what the
+ * page needs to mount Stripe's Payment Element (client secret, publishable key of the store's mode,
+ * connected account). `environment` stays for Whop's embed.
+ */
+export function paymentPayload(r: { provider: PaymentProvider; checkoutConfigurationId?: string; stripe?: StripeClientConfig; switchedFrom?: PaymentProvider }, store: Pick<Store, "testMode">) {
+  const environment = store.testMode ? ("sandbox" as const) : ("production" as const);
+  const switched = r.switchedFrom ? { switchedFrom: r.switchedFrom } : {};
+  if (r.provider === "stripe" && r.stripe) {
+    return { provider: "stripe" as const, checkoutConfigurationId: null, ...r.stripe, environment, ...switched };
+  }
+  return { provider: "whop" as const, checkoutConfigurationId: r.checkoutConfigurationId ?? null, environment, ...switched };
 }
 
 /* ------------------------------------------------------------------ */
@@ -925,6 +1550,8 @@ export function addressFromPayment(buyer: Pick<PaymentBuyer, "address" | "phone"
 
 export type PaymentInfo = {
   id: string;
+  /** Processor of the payment (absent: Whop, the historical one). */
+  provider?: "whop" | "stripe";
   /** Settlement amount (`total`). */
   totalCents: number | null;
   currency: string | null;
@@ -937,8 +1564,17 @@ export type PaymentInfo = {
   paymentMethodId?: string | null;
   /** card, apple_pay, paypal, klarna… (analytics) */
   paymentMethodType?: string | null;
-  /** Whop's fee on the payment, in cents (net-margin analytics). */
+  /** The processor's fee on the payment, in cents (net-margin analytics). */
   feeCents?: number | null;
+  /** Stripe only: the Customer and the saved PaymentMethod (one-click offers, off-session). */
+  stripeCustomerId?: string | null;
+  stripePaymentMethodId?: string | null;
+  /** Stripe only: the PaymentIntent's metadata.fingerprint (hash of the snapshot it charges, see fingerprintTag). */
+  stripeFingerprint?: string | null;
+  /** Stripe only: whether the paid PaymentIntent saved the card off session (setup_future_usage). */
+  stripeOffSessionSaved?: boolean | null;
+  /** Stripe only: the payment's mode (the event's / PaymentIntent's `livemode`); null when unknown. */
+  livemode?: boolean | null;
   buyer?: PaymentBuyer;
 };
 
@@ -998,9 +1634,18 @@ export async function markPaid(
 
   if (session.status === "PAID") return alreadyPaid(session, payment, opts);
 
-  // The configuration that was actually paid decides what the order contains.
-  const configId = payment.checkoutConfigurationId ?? session.whopCheckoutId;
-  const snapshot = configId ? await db.checkoutQuote.findUnique({ where: { whopCheckoutId: configId } }) : null;
+  const stripe = payment.provider === "stripe";
+  // The configuration that was actually paid decides what the order contains: Whop's checkout
+  // configuration, or the quote the Stripe PaymentIntent was created (or last updated) for.
+  let snapshot: CheckoutQuote | null;
+  let snapshotMismatch: string | null = null;
+  if (stripe) {
+    snapshot = await stripeSnapshot(sessionId, payment);
+    if (!snapshot && payment.stripeFingerprint) snapshotMismatch = `le paiement Stripe ne correspond à aucun récapitulatif enregistré (empreinte ${payment.stripeFingerprint.slice(0, 12)})`;
+  } else {
+    const configId = payment.checkoutConfigurationId ?? session.whopCheckoutId;
+    snapshot = configId ? await db.checkoutQuote.findUnique({ where: { whopCheckoutId: configId } }) : null;
+  }
   const paid = snapshot && snapshot.sessionId === sessionId ? snapshot : null;
 
   const walletAddress = payment.buyer?.shippingAddress
@@ -1025,7 +1670,7 @@ export async function markPaid(
   );
   const feeCents =
     payment.feeCents != null && charged && payment.currency?.toUpperCase() === charged.currency.toUpperCase() ? toShopCents(payment.feeCents, charged.rate) : payment.feeCents;
-  if (!paid) reasons.push("configuration de paiement inconnue");
+  if (!paid) reasons.push(snapshotMismatch ?? "configuration de paiement inconnue");
   // A physical order with no shipping address from the wallet nor from our form (e.g. Google Pay
   // express: Whop collects no shipping address there): never shipped to a guess silently. Held for
   // review, with the billing address (if any) as a starting point for the merchant.
@@ -1033,6 +1678,14 @@ export async function markPaid(
   const shipsGoods = Array.isArray(paidLines) && paidLines.some((l) => l?.requiresShipping);
   if (shipsGoods && !walletAddress && !formAddress) {
     reasons.push(address ? "adresse de livraison absente du paiement (adresse de facturation reprise, à confirmer)" : "adresse de livraison absente du paiement");
+  }
+  // A Stripe payment of the other mode than the store's (a test payment on a live store, or a live one
+  // on a store in test mode): held. The order's Shopify test flag follows the payment's own mode
+  // (session.test, set below), so a test payment never becomes a real order.
+  const paymentLivemode = stripe && typeof payment.livemode === "boolean" ? payment.livemode : null;
+  if (paymentLivemode != null) {
+    const store = await db.store.findUnique({ where: { id: session.storeId }, select: { testMode: true } });
+    if (store && paymentLivemode === store.testMode) reasons.push("paiement Stripe en mode test/production différent de la boutique");
   }
 
   // One transaction: PAID, the discount use and the review decision become visible
@@ -1044,11 +1697,27 @@ export async function markPaid(
       data: {
         status: "PAID",
         paidAt: new Date(),
+        // The processor's payment id (Whop "pay_…" or Stripe "pi_…"): every lookup by payment id
+        // (refunds, disputes, duplicates, the Shopify order's payment tag) reads this column.
         whopPaymentId: payment.id,
+        paymentProvider: stripe ? "stripe" : "whop",
         whopMemberId: payment.memberId ?? null,
         whopPaymentMethodId: payment.paymentMethodId ?? null,
         paymentMethodType: payment.paymentMethodType ?? null,
-        whopFeeCents: feeCents ?? null,
+        // Whop's fee in its historical column, any other processor's in providerFeeCents (see feeCents()).
+        whopFeeCents: stripe ? null : (feeCents ?? null),
+        ...(stripe
+          ? {
+              stripePaymentIntentId: payment.id,
+              stripeCustomerId: payment.stripeCustomerId ?? null,
+              stripePaymentMethodId: payment.stripePaymentMethodId ?? null,
+              // The paid PaymentIntent decides (not the last one prepared): only a card it saved off session is charged in one click.
+              ...(payment.stripeOffSessionSaved != null ? { stripeOffSessionSaved: payment.stripeOffSessionSaved } : {}),
+              providerFeeCents: feeCents ?? null,
+              // The payment's mode decides whether its order is a Shopify test order.
+              ...(paymentLivemode != null ? { test: !paymentLivemode } : {}),
+            }
+          : {}),
         syncError: null,
         email: session.email ?? payment.buyer?.email ?? null,
         ...(address ? { shippingAddress: address as Prisma.InputJsonValue } : {}),
@@ -1085,7 +1754,7 @@ export async function markPaid(
     }
     // Shopify codes: this app's own ledger (Shopify's count only moves once the orders exist).
     if (paid?.discountCode && paid.discountSource === "shopify") all.push(...(await claimShopifyCodeUse(tx, session.storeId, sessionId, session.email ?? payment.buyer?.email ?? null, paid)));
-    const reviewNote = all.length ? `À vérifier : ${all.join(" ; ")}. Remboursez dans Whop ou synchronisez la commande manuellement.` : null;
+    const reviewNote = all.length ? `À vérifier : ${all.join(" ; ")}. Remboursez dans ${stripe ? "Stripe" : "Whop"} ou synchronisez la commande manuellement.` : null;
     if (reviewNote) await tx.checkoutSession.update({ where: { id: sessionId }, data: { reviewNote } });
     return { reviewNote };
   });
@@ -1099,7 +1768,8 @@ export async function markPaid(
     storeId: session.storeId,
     sessionId,
     kind: "payment.succeeded",
-    message: `Paiement ${payment.id} reçu (${(paid?.totalCents ?? session.totalCents) / 100} ${session.currency})`,
+    message: `Paiement ${stripe ? "Stripe" : "Whop"} ${payment.id} reçu (${(paid?.totalCents ?? session.totalCents) / 100} ${session.currency})`,
+    data: { paymentId: payment.id, provider: stripe ? "stripe" : "whop" },
   });
   const conversions = () =>
     sendPurchaseConversions(sessionId).catch((err) => log.error("conversions.failed", "Server-side purchase event failed", { sessionId, err }));
@@ -1174,20 +1844,58 @@ function recentSince(checkedAt: Date | null | undefined): Date {
   return checkedAt ? new Date(checkedAt.getTime() - CALIBRATION_SETTLE_MS) : new Date(0);
 }
 
+/**
+ * The snapshot a Stripe PaymentIntent paid: the quote it is attached to, when the PaymentIntent's own
+ * metadata (fingerprint hash, written with its amount) agrees; else this session's quote whose
+ * fingerprint has that hash (the PaymentIntent was moved to another snapshot after the payment was
+ * submitted, or a later attach lost the race); else none (held for review by markPaid). A
+ * PaymentIntent without the metadata (older ones) keeps the attached quote.
+ */
+async function stripeSnapshot(sessionId: string, payment: Pick<PaymentInfo, "id" | "stripeFingerprint">): Promise<CheckoutQuote | null> {
+  const attached = await db.checkoutQuote.findUnique({ where: { stripePaymentIntentId: payment.id } });
+  const tag = payment.stripeFingerprint;
+  if (!tag) return attached;
+  if (attached && attached.sessionId === sessionId && fingerprintTag(attached.fingerprint) === tag) return attached;
+  const candidates = await db.checkoutQuote.findMany({ where: { sessionId, provider: "stripe" }, orderBy: { createdAt: "desc" } });
+  const match = candidates.find((q) => fingerprintTag(q.fingerprint) === tag) ?? null;
+  if (match) {
+    log.warn("stripe.snapshot_mismatch", "Stripe PaymentIntent paid another snapshot than the one attached: the matching one is used", { sessionId, paymentId: payment.id, attached: attached?.id ?? null, used: match.id });
+  }
+  return match;
+}
+
+/** Prefix of Stripe payment ids in CheckoutSession.extraPaymentIds ("stripe:pi_…"). */
+export const STRIPE_EXTRA_PREFIX = "stripe:";
+
+/** How a duplicate payment is kept in extraPaymentIds: Whop's id as is, Stripe's prefixed. Pure. */
+export function extraPaymentId(payment: Pick<PaymentInfo, "id" | "provider">): string {
+  return payment.provider === "stripe" ? `${STRIPE_EXTRA_PREFIX}${payment.id}` : payment.id;
+}
+
+/**
+ * The processor's fee on a paid checkout (Whop's or another processor's), null when unknown.
+ * Same as charge.ts `feeCents`, re-exported where the payment is recorded. Pure.
+ */
+export { feeCents } from "./charge";
+
 async function alreadyPaid(session: CheckoutSession, payment: PaymentInfo, opts: { deferSync?: boolean }): Promise<boolean> {
   if (session.whopPaymentId && session.whopPaymentId !== payment.id) {
-    // A second payment for the same cart (e.g. wallet + card): keep the first order
-    // going, and flag the extra payment for a refund without blocking anything.
+    // A second payment for the same cart (e.g. wallet + card, or Whop then Stripe): keep the first
+    // order going, and flag the extra payment for a refund without blocking anything. A Stripe
+    // payment is kept as "stripe:pi_…" (never mistaken for a Whop id).
+    const stripe = payment.provider === "stripe";
+    const extraId = extraPaymentId(payment);
     const added = await db.$executeRaw`
-      UPDATE "CheckoutSession" SET "extraPaymentIds" = array_append("extraPaymentIds", ${payment.id})
-      WHERE id = ${session.id} AND NOT (${payment.id} = ANY("extraPaymentIds"))`;
+      UPDATE "CheckoutSession" SET "extraPaymentIds" = array_append("extraPaymentIds", ${extraId})
+      WHERE id = ${session.id} AND NOT (${extraId} = ANY("extraPaymentIds"))`;
     if (added > 0) {
       await recordEvent({
         storeId: session.storeId,
         sessionId: session.id,
         level: "warn",
         kind: "payment.duplicate",
-        message: `Paiement supplémentaire ${payment.id} reçu pour un panier déjà payé — à rembourser dans Whop.`,
+        message: `Paiement ${stripe ? "Stripe" : "Whop"} supplémentaire ${payment.id} reçu pour un panier déjà payé — à rembourser dans ${stripe ? "Stripe" : "Whop"}.`,
+        data: { paymentId: payment.id, provider: stripe ? "stripe" : "whop" },
         alert: true,
       });
     }
@@ -1397,7 +2105,7 @@ async function afterOrderCreated(session: SessionWithStore, order: { id: string;
     await mirrorRefunds(sessionId, { force: true });
     const fresh = await db.checkoutSession.findUniqueOrThrow({ where: { id: sessionId }, select: { disputed: true } });
     if (fresh.disputed) {
-      await tagOrder(session.store, order.id, ["litige-whop"]);
+      await tagOrder(session.store, order.id, [disputeTag(session.paymentProvider)]);
       await db.checkoutSession.update({ where: { id: sessionId }, data: { disputeTaggedAt: new Date() } });
     }
   } catch (err) {
@@ -1466,16 +2174,21 @@ async function buildOrderInput(session: SessionWithStore) {
     shipping,
     totalCents: snapshot?.totalCents ?? session.totalCents,
     whopPaymentId: session.whopPaymentId ?? "",
-    test: session.store.testMode,
+    // The order's gateway, tags and note follow the processor that was paid.
+    provider: session.paymentProvider,
+    // A Stripe payment's own mode (session.test, set by markPaid from its livemode): a test payment is
+    // never a real order, even on a store switched to live since. Whop: the store's mode.
+    test: session.paymentProvider === "stripe" ? session.test : session.store.testMode,
   };
 }
 
 /**
- * Applies one Whop refund, exactly once per refund id: the id marker and the amount
- * are written in one transaction (a crash can't keep one without the other).
+ * Applies one Whop / Stripe refund, exactly once per refund id (Stripe's are "stripe:re_…"): the id
+ * marker and the amount are written in one transaction (a crash can't keep one without the other).
  * Mirroring to Shopify is a separate, retryable step.
  */
-export async function recordRefund(sessionId: string, refundCents: number, refundId: string, chargeCents: number | null = null) {
+export async function recordRefund(sessionId: string, refundCents: number, refundId: string, chargeCents: number | null = null, provider: "whop" | "stripe" = "whop") {
+  const via = provider === "stripe" ? "Stripe" : "Whop";
   if (refundCents <= 0 && !(chargeCents && chargeCents > 0)) return;
   let amountCents = refundCents;
   const applied = await applyRefundOnce(refundId, async (tx) => {
@@ -1506,7 +2219,7 @@ export async function recordRefund(sessionId: string, refundCents: number, refun
       },
     });
     // Dated record: "refunds of the period" and the CSV use the refund's own date.
-    await tx.refundRecord.create({ data: { id: refundId, storeId: session.storeId, sessionId, amountCents, currency: session.currency } });
+    await tx.refundRecord.create({ data: { id: refundId, storeId: session.storeId, sessionId, amountCents, currency: session.currency, provider } });
     return session;
   });
   if (!applied) return;
@@ -1514,7 +2227,8 @@ export async function recordRefund(sessionId: string, refundCents: number, refun
     storeId: applied.storeId,
     sessionId,
     kind: "refund.recorded",
-    message: `Remboursement Whop de ${amountCents / 100} ${applied.currency} enregistré`,
+    message: `Remboursement ${via} de ${amountCents / 100} ${applied.currency} enregistré`,
+    data: { refundId, provider },
   });
   if (!applied.shopifyOrderId && !applied.syncHandledAt) {
     // Paid, not in Shopify yet: fully refunded now, it must never be created.
@@ -1528,7 +2242,7 @@ export async function recordRefund(sessionId: string, refundCents: number, refun
       sessionId,
       level: "warn",
       kind: "refund.manual_order",
-      message: `Remboursement Whop de ${formatAmount(amountCents, applied.currency)} : reportez-le à la main sur ${applied.shopifyOrderName ?? "la commande créée à la main"} dans Shopify (commande liée à la main, pas de report automatique).`,
+      message: `Remboursement ${via} de ${formatAmount(amountCents, applied.currency)} : reportez-le à la main sur ${applied.shopifyOrderName ?? "la commande créée à la main"} dans Shopify (commande liée à la main, pas de report automatique).`,
       data: { refundId, amountCents },
       alert: true,
     });
@@ -1599,31 +2313,53 @@ export function mirrorRefunds(sessionId: string, opts: { force?: boolean } = {})
  * invalid code…) at info level, an unexpected failure (Whop/Shopify down) as an error
  * with an alert (grouped per store every 15 min, so an outage pings once).
  */
-export type CheckoutFailureSource = "whop" | "shopify";
+export type CheckoutFailureSource = "whop" | "stripe" | "shopify";
 const FAILURE_SOURCE = Symbol.for("whop-checkout.failureSource");
 
-/** Marks the errors of a call with the provider they come from (kept when rethrown as is). */
-export async function tagFailureSource<T>(p: Promise<T>, source: CheckoutFailureSource): Promise<T> {
+/** Marks an error with the provider it comes from (see tagFailureSource). */
+export function withFailureSource<E>(err: E, source: CheckoutFailureSource): E {
+  if (err && typeof err === "object") (err as Record<symbol, unknown>)[FAILURE_SOURCE] = source;
+  return err;
+}
+
+/**
+ * Marks the errors of a call with the provider they come from (kept when rethrown as is). An error
+ * already tagged inside the call keeps its tag (the innermost call knows best), and a refusal
+ * (CheckoutError) is never attributed to a processor.
+ */
+export async function tagFailureSource<T>(p: Promise<T>, source: CheckoutFailureSource, except?: (err: unknown) => boolean): Promise<T> {
   try {
     return await p;
   } catch (err) {
-    if (err && typeof err === "object") (err as Record<symbol, unknown>)[FAILURE_SOURCE] = source;
-    throw err;
+    const tagged = err && typeof err === "object" && FAILURE_SOURCE in (err as object);
+    throw tagged || err instanceof CheckoutError || except?.(err) ? err : withFailureSource(err, source);
   }
+}
+
+/** Whether an error is the database's (Prisma): never a processor's failure. Pure. */
+export function isDbError(err: unknown): boolean {
+  return (
+    err instanceof Prisma.PrismaClientKnownRequestError ||
+    err instanceof Prisma.PrismaClientUnknownRequestError ||
+    err instanceof Prisma.PrismaClientInitializationError ||
+    err instanceof Prisma.PrismaClientRustPanicError ||
+    err instanceof Prisma.PrismaClientValidationError
+  );
 }
 
 /**
  * Which side a checkout init failure comes from: Shopify (pricing, stock, the cart: ShopifyError or a
- * call tagged "shopify") or Whop (the checkout configuration — and anything unclassified, which keeps
- * the safe behaviour of sending buyers to Shopify's own checkout). Pure.
+ * call tagged "shopify"), Stripe (a PaymentIntent call, tagged "stripe") or Whop (the checkout
+ * configuration — and anything unclassified, which keeps the safe behaviour of sending buyers to
+ * Shopify's own checkout). Pure.
  */
 export function checkoutFailureSource(err: unknown): CheckoutFailureSource {
   const tagged = err && typeof err === "object" ? (err as Record<symbol, unknown>)[FAILURE_SOURCE] : undefined;
-  if (tagged === "whop" || tagged === "shopify") return tagged;
+  if (tagged === "whop" || tagged === "stripe" || tagged === "shopify") return tagged;
   return err instanceof ShopifyError ? "shopify" : "whop";
 }
 
-export async function journalCheckoutFailure(session: Pick<CheckoutSession, "id" | "storeId">, stage: "prepare" | "pay", err: unknown) {
+export async function journalCheckoutFailure(session: Pick<CheckoutSession, "id" | "storeId"> & Partial<Pick<CheckoutSession, "forcedProvider">>, stage: "prepare" | "pay", err: unknown) {
   if (err instanceof CheckoutError) {
     await recordEvent({ storeId: session.storeId, sessionId: session.id, kind: "checkout.rejected", message: `Paiement bloqué (${err.code}) : ${err.message}`, data: { stage, code: err.code } });
     return;
@@ -1642,28 +2378,39 @@ export async function journalCheckoutFailure(session: Pick<CheckoutSession, "id"
     });
     return;
   }
-  // One row per session per 10 min (a buyer retrying during an outage); the failure still counts below.
-  if (!(await rateLimit(`journal:init_failed:${session.id}`, 1, 10 * 60_000))) {
-    await noteCheckoutFailure(session.storeId);
+  // Whop or Stripe: counted per processor (store-level failover, then Shopify's own checkout).
+  const source = checkoutFailureSource(err) === "stripe" ? ("stripe" as const) : ("whop" as const);
+  // Not counted towards the store: a forced session (« Tester le secours » by the merchant), and a
+  // Stripe refusal of this one request (4xx: currency, amount too small, idempotency, invalid request:
+  // Stripe answered, it isn't down). Both still journaled (and may have switched this buyer).
+  const forced = !!session.forcedProvider;
+  const rejected = source === "stripe" && isStripeRejection(err);
+  const counts = !forced && !rejected;
+  // One row per session per processor per 10 min (a buyer retrying during an outage); the failure still counts below.
+  if (!(await rateLimit(`journal:init_failed:${source === "stripe" ? "stripe:" : ""}${session.id}`, 1, 10 * 60_000))) {
+    if (counts) await noteCheckoutFailure(session.storeId, source);
     return;
   }
+  const code = rejected ? (err as { code?: unknown }).code : undefined;
   await recordEvent({
     storeId: session.storeId,
     sessionId: session.id,
-    level: "error",
+    level: counts ? "error" : "warn",
     kind: "checkout.init_failed",
-    message: `Le formulaire de paiement n'a pas pu s'ouvrir (${stage}) : ${err instanceof Error ? err.message : String(err)}`,
-    data: { stage, source: "whop", err: err instanceof Error ? err.message : String(err) },
-    alert: true,
+    message: `Le formulaire de paiement ${PROVIDER_NAMES[source]} n'a pas pu s'ouvrir (${stage}) : ${err instanceof Error ? err.message : String(err)}${rejected ? " (refus de Stripe pour cette commande, non compté comme une panne)" : forced ? " (session de test « Tester le secours », non comptée)" : ""}`,
+    data: { stage, source, err: err instanceof Error ? err.message : String(err), ...(forced ? { forced: true } : {}), ...(rejected ? { rejected: true, ...(typeof code === "string" ? { code } : {}) } : {}) },
+    alert: counts,
     // The Error itself (stack, type) goes to Sentry; the journal keeps its message only (data above).
     err,
   });
-  await noteCheckoutFailure(session.storeId);
+  if (counts) await noteCheckoutFailure(session.storeId, source);
 }
 
 export async function recordDispute(sessionId: string, disputeId: string | null, dueAt: Date | null = null) {
   const session = await db.checkoutSession.findUnique({ where: { id: sessionId }, include: { store: true } });
   if (!session) return;
+  const via = session.paymentProvider === "stripe" ? "Stripe" : "Whop";
+  const tagName = disputeTag(session.paymentProvider);
   // Atomic "first time": concurrent deliveries can't alert twice.
   const first = await db.checkoutSession.updateMany({ where: { id: sessionId, disputed: false }, data: { disputed: true, disputeOpenedAt: new Date() } });
   if (first.count) {
@@ -1671,7 +2418,7 @@ export async function recordDispute(sessionId: string, disputeId: string | null,
       const orderId = session.shopifyOrderId;
       // Backstopped by the tick (disputeTaggedAt stays null until Shopify confirms).
       const tag = () =>
-        tagOrder(session.store, orderId, ["litige-whop"])
+        tagOrder(session.store, orderId, [tagName])
           .then(() => db.checkoutSession.update({ where: { id: sessionId }, data: { disputeTaggedAt: new Date() } }))
           .catch((err) => log.warn("dispute.tag_failed", "Could not tag the disputed Shopify order (the tick retries)", { sessionId, err }));
       if (!defer("dispute.tag", tag)) await tag();
@@ -1681,7 +2428,7 @@ export async function recordDispute(sessionId: string, disputeId: string | null,
         sessionId,
         level: "warn",
         kind: "dispute.manual_order",
-        message: `Litige sur ${session.shopifyOrderName ?? "une commande créée à la main"} (commande liée à la main) : ajoutez le tag « litige-whop » dans Shopify et fournissez le numéro de suivi à la main dans Whop (aucun envoi automatique).`,
+        message: `Litige sur ${session.shopifyOrderName ?? "une commande créée à la main"} (commande liée à la main) : ajoutez le tag « ${tagName} » dans Shopify et fournissez le numéro de suivi à la main dans ${via} (aucun envoi automatique).`,
         data: { disputeId },
         alert: true,
       });
@@ -1691,10 +2438,10 @@ export async function recordDispute(sessionId: string, disputeId: string | null,
       sessionId,
       level: "warn",
       kind: "dispute.created",
-      message: `Litige ouvert sur ${session.shopifyOrderName ?? "une commande"} (${session.totalCents / 100} ${session.currency})${
+      message: `Litige ${via} ouvert sur ${session.shopifyOrderName ?? "une commande"} (${session.totalCents / 100} ${session.currency})${
         dueAt ? `, réponse attendue avant le ${dueAt.toISOString().slice(0, 10)}` : ""
       }`,
-      data: { disputeId },
+      data: { disputeId, provider: session.paymentProvider },
       alert: true,
     });
   }
@@ -1702,13 +2449,50 @@ export async function recordDispute(sessionId: string, disputeId: string | null,
   const set = await db.checkoutSession.updateMany({ where: { id: sessionId, disputeId: null }, data: { disputeId, disputeDueAt: dueAt } });
   if (!set.count && session.disputeId !== disputeId) {
     // A second dispute on the same payment: the automatic evidence covers the first one only.
-    await recordEvent({ storeId: session.storeId, sessionId, level: "error", kind: "dispute.second", message: `Deuxième litige (${disputeId}) sur cette commande : répondez-y dans Whop.`, alert: true });
+    await recordEvent({ storeId: session.storeId, sessionId, level: "error", kind: "dispute.second", message: `Deuxième litige (${disputeId}) sur cette commande : répondez-y dans ${via}.`, alert: true });
     return;
   }
   // Submit now if the parcel is already tracked; otherwise the tick waits for tracking (never past the due date).
   if (set.count && session.store.autoDisputeEvidence && session.trackingNumber && !session.disputeEvidenceAt) {
     const evidence = async () => submitDisputeEvidence(await db.checkoutSession.findUniqueOrThrow({ where: { id: sessionId }, include: { store: true } }), disputeId);
     if (!defer("dispute.evidence", evidence)) await evidence();
+  }
+}
+
+/**
+ * A declined payment attempt (Whop payment.failed, Stripe payment_intent.payment_failed). A late
+ * failure of an earlier attempt never erases a newer one (a "Pay" click or a PayPal window after this
+ * attempt): the session keeps that attempt's state (PAYING, in flight). `attemptAt` is when the failed
+ * attempt was made (Whop: the payment's created_at; Stripe: the failure event's time); unknown =
+ * counted as the latest. The rule, per time:
+ * - payClickedAt (our confirm, always BEFORE the attempt it makes): newer only when later than
+ *   attemptAt + 1 s. The 1 s covers second-precision (truncated) timestamps, so the current
+ *   attempt's own failure is never "older"; a retry clicked 2 s after is newer.
+ * - paypalWindowAt (a window from Whop's own button: the payment is created by that click, our
+ *   stamp lands AFTER it): newer only when later than attemptAt + 5 s.
+ * - paypalBeatAt (heartbeat / late popup): liveness only, never an attempt, never compared.
+ */
+export async function recordPaymentFailure(storeId: string, sessionId: string, attemptAt: Date | null, reason: string) {
+  const notNewer: Prisma.CheckoutSessionWhereInput = attemptAt
+    ? {
+        AND: [
+          { OR: [{ payClickedAt: null }, { payClickedAt: { lte: new Date(attemptAt.getTime() + 1000) } }] },
+          { OR: [{ paypalWindowAt: null }, { paypalWindowAt: { lte: new Date(attemptAt.getTime() + 5000) } }] },
+        ],
+      }
+    : {};
+  const changed = await db.checkoutSession.updateMany({
+    where: { id: sessionId, status: { not: "PAID" }, ...notNewer },
+    data: { status: "FAILED", paymentFailedAt: new Date() },
+  });
+  // In the order's timeline: why the bank refused (the buyer can still retry).
+  if (changed.count) {
+    await recordEvent({ storeId, sessionId, kind: "payment.failed", message: `Paiement refusé${reason}` });
+  } else if (attemptAt && (await db.checkoutSession.count({ where: { id: sessionId, status: { not: "PAID" } } }))) {
+    // A real decline all the same: counted by the analytics (paymentFailedAt, first one only),
+    // the status of the newer attempt left alone.
+    await db.checkoutSession.updateMany({ where: { id: sessionId, status: { not: "PAID" }, paymentFailedAt: null }, data: { paymentFailedAt: new Date() } });
+    await recordEvent({ storeId, sessionId, kind: "payment.failed", message: `Paiement refusé${reason} — tentative antérieure, un nouvel essai est en cours.` });
   }
 }
 

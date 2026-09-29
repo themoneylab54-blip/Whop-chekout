@@ -28,11 +28,15 @@ import {
   payOrderBalance,
   priceCart,
   ShopifyError,
+  disputeTag,
   tagOrder,
   type Address,
 } from "./shopify";
 import { centsToDecimal, productKey, type CartLine } from "./pricing";
 import { paymentInfoFromWhop, statementDescriptor, storeClient } from "./whop";
+import { chargeOffSession, paymentInfoFromStripe, retrievePaymentIntent, stripeAppHost, stripeForMode } from "./stripe";
+import { sessionStripeAccount } from "./stripe-connection";
+import type Stripe from "stripe";
 import { resolveAutoOffers, upsellContextFor } from "./offer-auto";
 
 /*
@@ -184,8 +188,11 @@ export function upsellEligible(session: CheckoutSession, now = Date.now()) {
     session.reviewNote == null &&
     !session.disputed &&
     session.refundedCents === 0 &&
-    !!session.whopMemberId &&
-    !!session.whopPaymentMethodId &&
+    // The payment method saved at checkout, on the processor that was paid. Stripe: only a card the
+    // PaymentIntent actually saved for off-session use (setup_future_usage) may be charged in one click.
+    (session.paymentProvider === "stripe"
+      ? !!session.stripeCustomerId && !!session.stripePaymentMethodId && session.stripeOffSessionSaved === true
+      : !!session.whopMemberId && !!session.whopPaymentMethodId) &&
     !!session.paidAt &&
     now - session.paidAt.getTime() < UPSELL_WINDOW_MS
   );
@@ -246,7 +253,8 @@ export async function acceptUpsell(session: SessionWithStore, blockId: string, r
   if (!block) throw new UpsellError("Offre introuvable", "upsell_unavailable");
   const quantity = upsellQuantity(block, requestedQuantity);
   if (quantity == null) throw new UpsellError("Quantité invalide", "upsell_quantity");
-  if (!store.whopAccountId || !store.whopProductId) throw new UpsellError("Paiement indisponible", "upsell_unavailable");
+  const stripe = session.paymentProvider === "stripe";
+  if (stripe ? !store.stripeAccountId : !store.whopAccountId || !store.whopProductId) throw new UpsellError("Paiement indisponible", "upsell_unavailable");
   // The arm is decided here (sticky per visitor), never by the browser.
   const visitor = visitorKeyOf(session);
   const arms = offerArmsFor(offers, visitor);
@@ -292,6 +300,8 @@ export async function acceptUpsell(session: SessionWithStore, blockId: string, r
         costSource: cost.costSource,
         shopifyCostCents: cost.shopifyCostCents,
         chargeStartedAt: new Date(),
+        // Charged on the processor the checkout was paid with (its saved payment method).
+        provider: stripe ? "stripe" : "whop",
       },
     });
   } catch (err) {
@@ -320,13 +330,24 @@ export async function acceptUpsell(session: SessionWithStore, blockId: string, r
     if (retried.count === 0) return { status: "pending" };
     charge = await db.upsellCharge.findUniqueOrThrow({ where: { id: existing.id } });
   }
-  return chargeWhop(session, charge);
+  return chargeOffer(session, charge);
+}
+
+/** Charges the offer on the processor its charge was created for (Whop, or Stripe off session). */
+function chargeOffer(session: SessionWithStore, charge: Charge): Promise<UpsellResult> {
+  return charge.provider === "stripe" ? chargeStripe(session, charge) : chargeWhop(session, charge);
 }
 
 type Charge = Awaited<ReturnType<typeof db.upsellCharge.findUniqueOrThrow>>;
 
-/** Whop answered with a client error: nothing was charged. Anything else (timeout, 5xx) is uncertain. */
-function definitelyRejected(err: unknown) {
+/**
+ * The processor answered with a client error: nothing was charged. Anything else (timeout, 5xx) is
+ * uncertain — and so is Stripe's idempotency error (the key was already used with other parameters, or
+ * the first request is still running): the original request may well have charged.
+ */
+export function definitelyRejected(err: unknown) {
+  const type = (err as { type?: unknown } | null)?.type;
+  if (type === "StripeIdempotencyError" || type === "idempotency_error") return false;
   const status = (err as { statusCode?: number }).statusCode;
   return typeof status === "number" && status >= 400 && status < 500 && status !== 409 && status !== 429;
 }
@@ -402,6 +423,92 @@ async function applyPayment(chargeId: string, storeId: string, payment: { id: st
   return { status: "pending" };
 }
 
+/** Buyer-facing refusal when the bank asks for a confirmation a one-click (off-session) charge can't get. */
+export const UPSELL_SCA_MESSAGE = "Votre banque demande une confirmation pour ce paiement : l'offre en un clic n'est pas possible avec cette carte. Aucun montant n'a été débité.";
+
+/**
+ * Stripe: a PaymentIntent confirmed off session on the payment method saved at checkout. The
+ * Idempotency-Key is fixed per attempt (like Whop's), so the SDK's retries and the sweep's replay
+ * never charge twice. A card error (declined, or authentication_required: the bank wants 3-D Secure,
+ * which an off-session charge can't do) fails the offer at once with a buyer message; an unknown
+ * outcome stays PENDING for the sweep.
+ */
+async function chargeStripe(session: SessionWithStore, charge: Charge): Promise<UpsellResult> {
+  const store = session.store;
+  const a = session.shippingAddress as Address | null;
+  let pi: Stripe.PaymentIntent;
+  try {
+    if (!session.stripeCustomerId || !session.stripePaymentMethodId) throw Object.assign(new Error("Moyen de paiement Stripe non enregistré"), { statusCode: 400 });
+    // On the account the checkout was paid on (the saved card lives there), in that payment's mode.
+    pi = await chargeOffSession(stripeForMode(store, !session.test, sessionStripeAccount(session, store)), {
+      amountCents: charge.amountCents,
+      currency: session.currency,
+      customer: session.stripeCustomerId,
+      paymentMethod: session.stripePaymentMethodId,
+      description: `Offre : ${charge.quantity > 1 ? `${charge.quantity} × ` : ""}${charge.title}`.slice(0, 200),
+      // app_host: the webhook of another deployment sharing the platform ignores it (like the checkout's).
+      metadata: { checkout_session_id: session.id, upsell_charge_id: charge.id, store_id: store.id, app_host: stripeAppHost() },
+      shipping: a
+        ? {
+            name: `${a.firstName} ${a.lastName}`.trim() || "Client",
+            address: { line1: a.address1, line2: a.address2 ?? undefined, city: a.city, state: a.province ?? undefined, postal_code: a.zip, country: a.countryCode },
+            ...(a.phone ? { phone: a.phone } : {}),
+          }
+        : undefined,
+      idempotencyKey: `upsell_${charge.id}_${charge.chargeAttempts}`,
+    });
+  } catch (err) {
+    if (err instanceof DeadlineError) throw err;
+    const e = err as { type?: string; code?: string; statusCode?: number; message?: string; payment_intent?: { id?: string } | null };
+    const message = err instanceof Error ? err.message : String(err);
+    const failedPi = e.payment_intent?.id ?? null;
+    if (e.type === "StripeCardError" || definitelyRejected(err)) {
+      const sca = e.code === "authentication_required";
+      await db.upsellCharge.update({
+        where: { id: charge.id },
+        // The failed PaymentIntent is kept: a late event on it (or a refund) is still attributed.
+        data: { status: "FAILED", error: (sca ? `Authentification requise (3-D Secure) : ${message}` : message).slice(0, 500), ...(failedPi ? { whopPaymentId: failedPi } : {}) },
+      });
+      await recordEvent({
+        storeId: store.id,
+        sessionId: session.id,
+        level: "warn",
+        kind: sca ? "upsell.authentication_required" : "upsell.failed",
+        message: sca
+          ? `Offre post-achat « ${charge.title} » non débitée : la banque du client demande une authentification (3-D Secure), impossible en un clic.`
+          : `Offre post-achat refusée par Stripe : ${message}`,
+        data: { chargeId: charge.id, paymentId: failedPi, code: e.code ?? null },
+      });
+      if (sca) throw new UpsellError(UPSELL_SCA_MESSAGE, "upsell_authentication_required");
+      throw new UpsellError(
+        e.type === "StripeCardError" ? "Le paiement a été refusé. Aucun montant n'a été débité." : "Le paiement n'a pas pu être effectué. Aucun montant n'a été débité.",
+        e.type === "StripeCardError" ? "upsell_card_declined" : "upsell_payment_failed",
+      );
+    }
+    // Unknown outcome: stay PENDING; the sweep replays the same key to learn the result.
+    await db.upsellCharge.update({ where: { id: charge.id }, data: { error: message.slice(0, 500) } });
+    await recordEvent({ storeId: store.id, sessionId: session.id, level: "warn", kind: "upsell.uncertain", message: `Réponse de Stripe incertaine pour une offre post-achat (${message}) : vérification automatique en cours.` });
+    return { status: "pending" };
+  }
+  return applyStripePayment(charge.id, store.id, pi);
+}
+
+/** A Stripe PaymentIntent of an offer: paid, failed, or still processing (the webhook or the sweep finishes it). */
+async function applyStripePayment(chargeId: string, storeId: string, pi: Stripe.PaymentIntent): Promise<UpsellResult> {
+  await db.upsellCharge.update({ where: { id: chargeId }, data: { whopPaymentId: pi.id } });
+  if (pi.status === "succeeded") {
+    const done = await markUpsellPaid(chargeId, pi.id, storeId, paymentInfoFromStripe(pi).feeCents);
+    return { status: "paid", orderName: done?.shopifyOrderName ?? null };
+  }
+  if (pi.status === "requires_action" || pi.status === "requires_payment_method" || pi.status === "canceled") {
+    // Off session, a PaymentIntent needing the buyer can't be finished here: nothing was debited.
+    const sca = pi.status === "requires_action";
+    await markUpsellFailed(chargeId, storeId, sca ? "Authentification requise (3-D Secure)" : `Paiement ${pi.status}`, pi.id);
+    throw sca ? new UpsellError(UPSELL_SCA_MESSAGE, "upsell_authentication_required") : new UpsellError("Le paiement a été refusé. Aucun montant n'a été débité.", "upsell_card_declined");
+  }
+  return { status: "pending" };
+}
+
 /**
  * Resolves offers stuck in PENDING (lost webhook, crash, timeout): asks Whop for the
  * payment, or replays the same idempotent request when we never learned its id.
@@ -410,10 +517,27 @@ async function applyPayment(chargeId: string, storeId: string, payment: { id: st
  */
 export const UPSELL_REPLAY_LIMIT_MS = UPSELL_WINDOW_MS + 10 * 60_000;
 
-export async function sweepPendingUpsells(deadline: number): Promise<number> {
+/** A Stripe offer payment still `processing` (asynchronous confirmation by the bank) waits this long before it is given up. */
+export const STRIPE_PROCESSING_MAX_MS = 7 * 24 * 3600_000;
+
+/**
+ * When the sweep gives up on a Stripe offer PaymentIntent that is neither paid nor failed: `processing`
+ * after 7 days (Stripe may still settle it: the merchant checks), any other open state after 24 h
+ * (never confirmed). Null: keep waiting. Pure.
+ */
+export function stripeOfferGiveUp(status: string, ageMs: number): { reason: string; journal: string } | null {
+  if (status === "processing") {
+    return ageMs > STRIPE_PROCESSING_MAX_MS ? { reason: "Toujours en traitement chez Stripe après 7 jours", journal: "paiement toujours « en traitement » chez Stripe après 7 jours, offre marquée échouée" } : null;
+  }
+  return ageMs > 24 * 3600_000 ? { reason: `Jamais confirmé (${status})`, journal: `paiement jamais confirmé chez Stripe en 24 h (état ${status}), offre marquée échouée` } : null;
+}
+
+export async function sweepPendingUpsells(deadline: number, provider: "whop" | "stripe" = "whop"): Promise<number> {
   const stuck = await db.upsellCharge.findMany({
     where: {
       status: "PENDING",
+      // One tick job per processor (a hanging Whop never holds Stripe's offers, and the other way round).
+      provider,
       AND: [
         { OR: [{ chargeStartedAt: { lt: new Date(Date.now() - 5 * 60_000) } }, { chargeStartedAt: null, createdAt: { lt: new Date(Date.now() - 5 * 60_000) } }] },
         // Charges waiting on the buyer (3-D Secure) are re-checked every 15 min, not every tick.
@@ -431,7 +555,25 @@ export async function sweepPendingUpsells(deadline: number): Promise<number> {
     const storeId = c.session.storeId;
     const age = Date.now() - (c.chargeStartedAt ?? c.createdAt).getTime();
     try {
-      if (c.whopPaymentId) {
+      if (c.whopPaymentId && provider === "stripe") {
+        const pi = await retrievePaymentIntent(stripeForMode(c.session.store, !c.session.test, sessionStripeAccount(c.session, c.session.store)), c.whopPaymentId);
+        const giveUp = stripeOfferGiveUp(pi.status, age);
+        if (pi.status === "succeeded") await markUpsellPaid(c.id, pi.id, storeId, paymentInfoFromStripe(pi).feeCents);
+        else if (["requires_payment_method", "requires_action", "canceled"].includes(pi.status)) await markUpsellFailed(c.id, storeId, `Paiement ${pi.status}`, pi.id);
+        else if (giveUp) {
+          await markUpsellFailed(c.id, storeId, giveUp.reason, pi.id, {
+            level: "error",
+            kind: "upsell.gave_up",
+            message: `Offre post-achat « ${c.title} » : ${giveUp.journal} (paiement Stripe ${pi.id}). Vérifiez dans Stripe si le client a été débité avant de relancer quoi que ce soit.`,
+            alert: true,
+          });
+        } else {
+          // A payment still processing at Stripe (bank debit, delayed card) is re-checked hourly, not every tick.
+          const every = pi.status === "processing" ? 60 * 60_000 : 15 * 60_000;
+          await db.upsellCharge.update({ where: { id: c.id }, data: { nextCheckAt: new Date(Date.now() + every) } });
+          continue;
+        }
+      } else if (c.whopPaymentId) {
         const p = await storeClient(c.session.store).payments.retrieve({ id: c.whopPaymentId });
         if (p.status === "paid") await markUpsellPaid(c.id, p.id, storeId, paymentInfoFromWhop(p as unknown as Record<string, unknown>).feeCents);
         else if (["void", "uncollectible"].includes(p.status)) await markUpsellFailed(c.id, storeId, `Paiement ${p.status}`, p.id);
@@ -441,9 +583,9 @@ export async function sweepPendingUpsells(deadline: number): Promise<number> {
           continue;
         }
       } else if (age < UPSELL_REPLAY_LIMIT_MS) {
-        // Same key as the original request: Whop returns the original result, no new charge. A refusal
-        // is recorded by chargeWhop; out of time, nothing was sent (retried next run, not journaled).
-        await chargeWhop(c.session, c).catch((err) => {
+        // Same key as the original request: the processor returns the original result, no new charge. A
+        // refusal is recorded by chargeOffer; out of time, nothing was sent (retried next run, not journaled).
+        await chargeOffer(c.session, c).catch((err) => {
           if (err instanceof DeadlineError) throw err;
         });
       } else {
@@ -454,7 +596,7 @@ export async function sweepPendingUpsells(deadline: number): Promise<number> {
             sessionId: c.sessionId,
             level: "error",
             kind: "upsell.gave_up",
-            message: `Offre post-achat « ${c.title} » : réponse de Whop jamais reçue, aucun nouvel essai (trop tard). Vérifiez dans Whop si le client a été débité.`,
+            message: `Offre post-achat « ${c.title} » : réponse de ${provider === "stripe" ? "Stripe" : "Whop"} jamais reçue, aucun nouvel essai (trop tard). Vérifiez dans ${provider === "stripe" ? "Stripe" : "Whop"} si le client a été débité.`,
             alert: true,
           });
         }
@@ -573,7 +715,7 @@ export async function markUpsellPaid(chargeId: string, paymentId: string, storeI
           storeId,
           sessionId: session.id,
           kind: "upsell.paid",
-          message: `Offre post-achat acceptée : ${charge.title} (${charge.amountCents / 100} ${session.currency}) → ajoutée à ${merged.orderName}${merged.paid ? "" : " (paiement Whop pas encore enregistré sur la commande : nouvel essai automatique)"}`,
+          message: `Offre post-achat acceptée : ${charge.title} (${charge.amountCents / 100} ${session.currency}) → ajoutée à ${merged.orderName}${merged.paid ? "" : ` (paiement ${charge.provider === "stripe" ? "Stripe" : "Whop"} pas encore enregistré sur la commande : nouvel essai automatique)`}`,
           data: { chargeId: charge.id, orderMode: "merged" },
         });
         return updated;
@@ -621,7 +763,9 @@ export async function markUpsellPaid(chargeId: string, paymentId: string, storeI
         shipping: null,
         totalCents: charge.amountCents,
         whopPaymentId: paymentId,
-        test: session.store.testMode,
+        provider: charge.provider,
+        // A Stripe offer is charged in the checkout payment's mode (session.test): never a real order from a test payment.
+        test: charge.provider === "stripe" ? session.test : session.store.testMode,
       }));
     const updated = await db.upsellCharge.update({
       where: { id: charge.id },
@@ -750,7 +894,7 @@ export function offerMergeWait(
  */
 async function mergeOfferIntoOrder(
   session: SessionWithStore,
-  charge: { id: string; variantId: string; amountCents: number; shopifyLineItemId: string | null; createdAt: Date },
+  charge: { id: string; variantId: string; amountCents: number; shopifyLineItemId: string | null; createdAt: Date; provider?: "whop" | "stripe" },
   quantity: number,
   opts: { resume?: boolean } = {},
 ): Promise<{ orderId: string; orderName: string; lineItemId: string; paid: boolean } | null | "defer"> {
@@ -826,7 +970,7 @@ async function mergeOfferIntoOrder(
     await db.upsellCharge.update({ where: { id: charge.id }, data: { shopifyLineItemId: `pending:${[...snapshot].join(",")}`, syncAmbiguousAt: new Date() } });
     let r: Awaited<ReturnType<typeof addVariantToOrder>>;
     try {
-      r = await addVariantToOrder(store, { orderId: order.id, variantId: charge.variantId, quantity, amountCents: charge.amountCents, currency: session.currency, marker });
+      r = await addVariantToOrder(store, { orderId: order.id, variantId: charge.variantId, quantity, amountCents: charge.amountCents, currency: session.currency, marker, provider: charge.provider });
     } catch (err) {
       if (err instanceof OrderEditNotCommittedError) {
         // Nothing committed: no consistency wait, no snapshot; retried with backoff (no fallback).
@@ -854,7 +998,7 @@ async function mergeOfferIntoOrder(
   if (!target.tags.includes(marker)) await tagOrder(store, target.id, [marker]).catch((err) => log.warn("upsell.merge_tag_failed", "Could not tag the merged order", { chargeId: charge.id, err }));
   // Out of time for the balance: the offer is merged all the same; its payment is recorded by the
   // balance retry job (retryOfferBalances), without a false "unpaid" alert.
-  const balance = await settleOfferBalance(store, target.id, charge.amountCents, session.currency, marker).catch((err) => {
+  const balance = await settleOfferBalance(store, target.id, charge.amountCents, session.currency, marker, charge.provider).catch((err) => {
     if (err instanceof DeadlineError) return { paid: false as const, reason: "temps de maintenance épuisé", deadline: true };
     throw err;
   });
@@ -864,7 +1008,7 @@ async function mergeOfferIntoOrder(
       sessionId: session.id,
       level: "warn",
       kind: "upsell.merge_unpaid",
-      message: `Offre ajoutée à ${target.name} mais le paiement Whop n'a pas pu y être enregistré (${balance.reason}) : nouvel essai automatique ; sinon marquez le solde comme payé dans Shopify.`,
+      message: `Offre ajoutée à ${target.name} mais le paiement ${charge.provider === "stripe" ? "Stripe" : "Whop"} n'a pas pu y être enregistré (${balance.reason}) : nouvel essai automatique ; sinon marquez le solde comme payé dans Shopify.`,
       data: { chargeId: charge.id },
       alert: true,
     });
@@ -878,7 +1022,14 @@ async function mergeOfferIntoOrder(
  * offer's balance is never taken (exact amount only), and a failed payment is re-checked before it
  * is reported. `paid` = the order owes nothing for this offer.
  */
-async function settleOfferBalance(store: Store, orderId: string, amountCents: number, currency: string, marker: string): Promise<{ paid: true } | { paid: false; reason: string }> {
+async function settleOfferBalance(
+  store: Store,
+  orderId: string,
+  amountCents: number,
+  currency: string,
+  marker: string,
+  provider?: "whop" | "stripe",
+): Promise<{ paid: true } | { paid: false; reason: string }> {
   const reason = (err: unknown) => (err instanceof Error ? err.message : String(err));
   let state: ReturnType<typeof offerBalanceState>;
   try {
@@ -893,7 +1044,8 @@ async function settleOfferBalance(store: Store, orderId: string, amountCents: nu
   }
   if (state !== "due") return { paid: true };
   try {
-    await payOrderBalance(store, orderId, amountCents, currency, marker);
+    if (provider === "stripe") await payOrderBalance(store, orderId, amountCents, currency, marker, provider);
+    else await payOrderBalance(store, orderId, amountCents, currency, marker);
     return { paid: true };
   } catch (err) {
     // Refused to start (no time left): nothing was recorded on the order.
@@ -937,7 +1089,7 @@ export async function retryOfferBalances(deadline: number): Promise<number> {
     if (claim.count === 0) continue;
     let r: Awaited<ReturnType<typeof settleOfferBalance>>;
     try {
-      r = await settleOfferBalance(c.session.store, c.shopifyOrderId!, c.amountCents, c.session.currency, offerMarker(c.id));
+      r = await settleOfferBalance(c.session.store, c.shopifyOrderId!, c.amountCents, c.session.currency, offerMarker(c.id), c.provider);
     } catch (err) {
       if (!(err instanceof DeadlineError)) throw err;
       // Out of time: the try is given back (never counted towards giving up), retried next run.
@@ -947,7 +1099,7 @@ export async function retryOfferBalances(deadline: number): Promise<number> {
     }
     if (r.paid) {
       await db.upsellCharge.update({ where: { id: c.id }, data: { balanceSettledAt: new Date(), nextBalanceAt: null } });
-      await recordEvent({ storeId: c.session.storeId, sessionId: c.sessionId, kind: "upsell.merge_paid", message: `Paiement Whop de l'offre « ${c.title} » enregistré sur ${c.shopifyOrderName ?? "la commande d'origine"}.` });
+      await recordEvent({ storeId: c.session.storeId, sessionId: c.sessionId, kind: "upsell.merge_paid", message: `Paiement ${c.provider === "stripe" ? "Stripe" : "Whop"} de l'offre « ${c.title} » enregistré sur ${c.shopifyOrderName ?? "la commande d'origine"}.` });
       settled++;
       continue;
     }
@@ -962,7 +1114,7 @@ export async function retryOfferBalances(deadline: number): Promise<number> {
         sessionId: c.sessionId,
         level: "error",
         kind: "upsell.merge_unpaid_gave_up",
-        message: `Paiement Whop de l'offre « ${c.title} » (${formatAmount(c.amountCents, c.session.currency)}) toujours absent de ${c.shopifyOrderName ?? "la commande d'origine"} (${r.reason}) : marquez ce montant comme payé dans Shopify.`,
+        message: `Paiement ${c.provider === "stripe" ? "Stripe" : "Whop"} de l'offre « ${c.title} » (${formatAmount(c.amountCents, c.session.currency)}) toujours absent de ${c.shopifyOrderName ?? "la commande d'origine"} (${r.reason}) : marquez ce montant comme payé dans Shopify.`,
         data: { chargeId: c.id },
         alert: true,
       });
@@ -972,7 +1124,11 @@ export async function retryOfferBalances(deadline: number): Promise<number> {
 }
 
 /** A second payment for an offer that is already paid: alert once per payment, keep the id for refunds. */
-async function reportDuplicateOffer(charge: { id: string; sessionId: string; title: string; whopPaymentId: string | null; previousPaymentIds: string[] }, paymentId: string, storeId: string) {
+async function reportDuplicateOffer(
+  charge: { id: string; sessionId: string; title: string; whopPaymentId: string | null; previousPaymentIds: string[]; provider?: "whop" | "stripe" },
+  paymentId: string,
+  storeId: string,
+) {
   if (charge.previousPaymentIds.includes(paymentId)) return;
   await db.upsellCharge.update({ where: { id: charge.id }, data: { previousPaymentIds: { push: paymentId } } });
   await recordEvent({
@@ -980,14 +1136,21 @@ async function reportDuplicateOffer(charge: { id: string; sessionId: string; tit
     sessionId: charge.sessionId,
     level: "error",
     kind: "payment.duplicate",
-    message: `Offre « ${charge.title} » payée deux fois (${charge.whopPaymentId} et ${paymentId}) : remboursez le doublon ${paymentId} dans Whop.`,
+    message: `Offre « ${charge.title} » payée deux fois (${charge.whopPaymentId} et ${paymentId}) : remboursez le doublon ${paymentId} dans ${paymentId.startsWith("pi_") ? "Stripe" : "Whop"}.`,
     data: { paymentId, chargeId: charge.id },
     alert: true,
   });
 }
 
 /** Declined card, 3-D Secure abandoned…: the buyer may try again. */
-export async function markUpsellFailed(chargeId: string, storeId: string, reason: string | null, paymentId: string | null) {
+export async function markUpsellFailed(
+  chargeId: string,
+  storeId: string,
+  reason: string | null,
+  paymentId: string | null,
+  /** The journal line when it isn't the bank's refusal (e.g. the sweep giving up). */
+  journal?: { level: "warn" | "error"; kind: string; message: string; alert?: boolean },
+) {
   const charge = await db.upsellCharge.findUnique({ where: { id: chargeId }, include: { session: true } });
   if (!charge || charge.session.storeId !== storeId || charge.status === "PAID") return;
   // Only the attempt that failed: a late failure of an earlier try must not free a
@@ -997,6 +1160,10 @@ export async function markUpsellFailed(chargeId: string, storeId: string, reason
     data: { status: "FAILED", error: (reason ?? "Paiement refusé").slice(0, 500) },
   });
   if (changed.count === 0) return;
+  if (journal) {
+    await recordEvent({ storeId, sessionId: charge.sessionId, level: journal.level, kind: journal.kind, message: journal.message, data: { chargeId, paymentId }, alert: journal.alert });
+    return;
+  }
   await recordEvent({ storeId, sessionId: charge.sessionId, kind: "upsell.declined_by_bank", message: `Offre post-achat refusée par la banque : ${reason ?? "sans motif"}` });
 }
 
@@ -1038,8 +1205,9 @@ export async function retryUpsellSyncs(deadline: number): Promise<number> {
 }
 
 /** Refund on an offer's payment: counted once per refund id, then mirrored on the offer's own Shopify order. */
-export async function recordUpsellRefund(chargeId: string, refundId: string, amountCents: number) {
+export async function recordUpsellRefund(chargeId: string, refundId: string, amountCents: number, provider: "whop" | "stripe" = "whop") {
   if (amountCents <= 0) return;
+  const via = provider === "stripe" ? "Stripe" : "Whop";
   const applied = await applyRefundOnce(refundId, async (tx) => {
     const charge = await tx.upsellCharge.update({
       where: { id: chargeId },
@@ -1047,7 +1215,7 @@ export async function recordUpsellRefund(chargeId: string, refundId: string, amo
       include: { session: { select: { storeId: true, currency: true } } },
     });
     await tx.refundRecord.create({
-      data: { id: refundId, storeId: charge.session.storeId, sessionId: charge.sessionId, chargeId: charge.id, amountCents, currency: charge.session.currency },
+      data: { id: refundId, storeId: charge.session.storeId, sessionId: charge.sessionId, chargeId: charge.id, amountCents, currency: charge.session.currency, provider },
     });
     // The order's Google Ads conversion value changed (offer refunded): adjusted by the tick.
     await tx.checkoutSession.update({ where: { id: charge.sessionId }, data: GOOGLE_ADJUST_DUE });
@@ -1068,7 +1236,7 @@ export async function recordUpsellRefund(chargeId: string, refundId: string, amo
       sessionId: applied.sessionId,
       level: "warn",
       kind: "refund.manual_order",
-      message: `Remboursement Whop de ${formatAmount(amountCents, applied.session.currency)} sur l'offre « ${applied.title} » : reportez-le à la main sur ${applied.shopifyOrderName ?? "sa commande créée à la main"} dans Shopify (commande liée à la main, pas de report automatique).`,
+      message: `Remboursement ${via} de ${formatAmount(amountCents, applied.session.currency)} sur l'offre « ${applied.title} » : reportez-le à la main sur ${applied.shopifyOrderName ?? "sa commande créée à la main"} dans Shopify (commande liée à la main, pas de report automatique).`,
       data: { refundId, amountCents, chargeId },
       alert: true,
     });
@@ -1093,9 +1261,10 @@ export async function recordUpsellDispute(paymentId: string, storeId: string, di
     await db.upsellCharge.update({ where: { id: charge.id }, data: { disputeId, disputeDueAt: dueAt } });
   }
   const first = await db.upsellCharge.updateMany({ where: { id: charge.id, disputed: false }, data: { disputed: true, disputeOpenedAt: new Date() } });
+  const via = charge.provider === "stripe" ? "Stripe" : "Whop";
   if (first.count === 0) {
     if (disputeId && charge.disputeId && disputeId !== charge.disputeId) {
-      await recordEvent({ storeId, sessionId: charge.sessionId, level: "error", kind: "dispute.second", message: `Deuxième litige (${disputeId}) sur l'offre « ${charge.title} » : répondez-y dans Whop.`, alert: true });
+      await recordEvent({ storeId, sessionId: charge.sessionId, level: "error", kind: "dispute.second", message: `Deuxième litige (${disputeId}) sur l'offre « ${charge.title} » : répondez-y dans ${via}.`, alert: true });
     }
     return;
   }
@@ -1103,7 +1272,7 @@ export async function recordUpsellDispute(paymentId: string, storeId: string, di
     const orderId = charge.shopifyOrderId;
     // Backstopped by the tick (disputeTaggedAt stays null until Shopify confirms).
     const tag = () =>
-      tagOrder(charge.session.store, orderId, ["litige-whop"])
+      tagOrder(charge.session.store, orderId, [disputeTag(charge.provider)])
         .then(() => db.upsellCharge.update({ where: { id: charge.id }, data: { disputeTaggedAt: new Date() } }))
         .catch((err) => log.warn("dispute.tag_failed", "Could not tag the disputed offer order (the tick retries)", { chargeId: charge.id, err }));
     if (!defer("dispute.tag", tag)) await tag();
@@ -1113,7 +1282,7 @@ export async function recordUpsellDispute(paymentId: string, storeId: string, di
       sessionId: charge.sessionId,
       level: "warn",
       kind: "dispute.manual_order",
-      message: `Litige sur l'offre « ${charge.title} » (commande ${charge.shopifyOrderName ?? "créée à la main"}, liée à la main) : ajoutez le tag « litige-whop » dans Shopify et fournissez le numéro de suivi à la main dans Whop (aucun envoi automatique).`,
+      message: `Litige sur l'offre « ${charge.title} » (commande ${charge.shopifyOrderName ?? "créée à la main"}, liée à la main) : ajoutez le tag « ${disputeTag(charge.provider)} » dans Shopify et fournissez le numéro de suivi à la main dans ${via} (aucun envoi automatique).`,
       data: { disputeId },
       alert: true,
     });

@@ -2,6 +2,7 @@ import "server-only";
 import { type Breakers, DeadlineError, isTimeoutError, notePartial, stopForTime } from "./deadline";
 import type { Store } from "@prisma/client";
 import { db } from "./db";
+import { PROVIDER_STORE_SELECT, storeLive } from "./payment-provider";
 import { markPaid, syncOrder, syncOrderSafely } from "./checkout";
 import { retryRefundMirrors } from "./refunds";
 import { probeFallbacks } from "./fallback";
@@ -12,6 +13,7 @@ import { pushTracking, recordTrackingFailure, retryAlertRefunds, submitDueDisput
 import { autoPromoteExperiments, notifyAnomalies, notifyStopLoss, sendDailyReport, sendLateLeakageAlerts } from "./analytics";
 import { markUpsellPaid, retryOfferBalances, retryUpsellSyncs, sweepPendingUpsells } from "./upsell";
 import { handleEvent, replayStaleEvents, RetryLater } from "./webhooks";
+import { reconcileStripe } from "./stripe-webhooks";
 import { eventPaymentId, eventPaymentMetadata, paymentOwner, refundAmountIn, resolvePayment } from "./payments";
 import { retryConversions } from "./conversions";
 import { fxUpkeep } from "./charge";
@@ -145,6 +147,8 @@ type JobSpec = {
    * inline, then run by the `followUps` job (each is also backstopped by its own retry job below).
    */
   whopSide?: boolean;
+  /** Processor the job talks to, when not Whop (reports and health group by it). */
+  provider?: "stripe";
   /**
    * Reserved slice: the job still runs, for this long, once the run's budget is used (never past the
    * run's hard deadline, with a margin for the report). For work with a hard external due date.
@@ -166,12 +170,18 @@ export const TICK_JOBS: JobSpec[] = [
   // DB-only: run among the first jobs, so a provider outage is alerted even on runs the outage slows down.
   { name: "providersWatched", job: watchProviders, money: true },
   { name: "fallbackProbed", job: probeFallbacks, money: true, whopSide: true },
-  { name: "upsellsSwept", job: sweepPendingUpsells, money: true, whopSide: true },
+  { name: "upsellsSwept", job: (d) => sweepPendingUpsells(d, "whop"), money: true, whopSide: true },
   { name: "reconciled", job: reconcilePayments, money: true, whopSide: true },
   { name: "refundsReconciled", job: reconcileRefunds, money: true, whopSide: true },
   { name: "disputesReconciled", job: reconcileDisputes, money: true, whopSide: true },
   { name: "alertRefunds", job: retryAlertRefunds, money: true, whopSide: true },
-  { name: "webhooksReplayed", job: replayStaleEvents, money: true, whopSide: true },
+  { name: "webhooksReplayed", job: (d) => replayStaleEvents(d, "whop"), money: true, whopSide: true },
+  // Stripe's side (provider "stripe": its own per-run breaker and metrics, never capped by the Whop
+  // phase): one-click offers still pending, payments / refunds / disputes whose webhook never came,
+  // failed Stripe events replayed. Their Shopify follow-ups run inline (retry jobs backstop them).
+  { name: "stripeUpsellsSwept", job: (d) => sweepPendingUpsells(d, "stripe"), money: true, provider: "stripe" },
+  { name: "stripeReconciled", job: reconcileStripe, money: true, provider: "stripe" },
+  { name: "stripeWebhooksReplayed", job: (d) => replayStaleEvents(d, "stripe"), money: true, provider: "stripe" },
   // The Shopify follow-ups the Whop-side jobs just collected (orders of healed payments, mirrors…).
   { name: "followUps", job: runFollowUps, money: true },
   // Disputes have a hard due date: tracking, then evidence (a freshly tracked parcel makes its evidence
@@ -474,7 +484,13 @@ export async function warnIfTickStale(storeId?: string): Promise<boolean> {
     const tick = await tickStatus();
     const age = tick.at ? Date.now() - new Date(tick.at).getTime() : Infinity;
     if (age <= TICK_STALE_MS) return false;
-    const live = await db.store.findMany({ where: { enabled: true, whopConnectedAt: { not: null }, shopifyConnectedAt: { not: null } }, select: { id: true, name: true } });
+    // Live = a processor able to charge (Whop, or Stripe alone): candidates in SQL, the rule in JS.
+    const live = (
+      await db.store.findMany({
+        where: { enabled: true, shopifyConnectedAt: { not: null }, OR: [{ whopConnectedAt: { not: null } }, { stripeAccountId: { not: null } }] },
+        select: { id: true, name: true, enabled: true, shopifyConnectedAt: true, ...PROVIDER_STORE_SELECT },
+      })
+    ).filter((s) => storeLive(s));
     if (!live.length) return false;
     const now = new Date().toISOString();
     const cutoff = new Date(Date.now() - TICK_STALE_ALERT_EVERY_MS).toISOString();

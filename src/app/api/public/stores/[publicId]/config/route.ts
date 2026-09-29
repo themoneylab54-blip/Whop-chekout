@@ -3,6 +3,7 @@ import { checkoutBaseUrl } from "@/lib/checkout-domain";
 import { json, preflight } from "@/lib/http";
 import { loadInterception } from "@/lib/layout";
 import { route } from "@/lib/route";
+import { anyProviderConnected } from "@/lib/payment-provider";
 
 export const dynamic = "force-dynamic";
 
@@ -13,10 +14,27 @@ async function handle(_req: Request, ctx: { params: Promise<{ publicId: string }
   const { publicId } = await ctx.params;
   const store = await db.store.findUnique({
     where: { publicId },
-    select: { enabled: true, interception: true, whopConnectedAt: true, shopifyConnectedAt: true, fallbackActiveAt: true, attributionDays: true, checkoutDomain: true, checkoutDomainVerifiedAt: true },
+    select: {
+      enabled: true,
+      interception: true,
+      whopConnectedAt: true,
+      shopifyConnectedAt: true,
+      fallbackActiveAt: true,
+      attributionDays: true,
+      checkoutDomain: true,
+      checkoutDomainVerifiedAt: true,
+      paymentMode: true,
+      providerFailoverAt: true,
+      testMode: true,
+      stripeAccountId: true,
+      stripeConnectedAt: true,
+      stripeLivemode: true,
+      stripeChargesEnabled: true,
+    },
   });
-  // While Whop is failing, the storefront keeps Shopify's checkout (see fallback.ts).
-  const live = !!store?.enabled && !!store.whopConnectedAt && !!store.shopifyConnectedAt && !store.fallbackActiveAt;
+  // Live with at least one usable processor (Whop and/or Stripe, under the store's mode). While the
+  // processors are failing, the storefront keeps Shopify's checkout (see fallback.ts).
+  const live = !!store?.enabled && anyProviderConnected(store) && !!store.shopifyConnectedAt && !store.fallbackActiveAt;
   return json(
     {
       enabled: live,

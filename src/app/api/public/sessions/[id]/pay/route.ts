@@ -2,10 +2,13 @@ import { clientIp, rateLimit } from "@/lib/ratelimit";
 import { db } from "@/lib/db";
 import { isForeignCheckoutHost } from "@/lib/checkout-domain-check";
 import { json, readJson } from "@/lib/http";
-import { CheckoutError, journalCheckoutFailure, confirmSession, paySchema } from "@/lib/checkout";
+import { CheckoutError, journalCheckoutFailure, confirmSession, paySchema, paymentPayload } from "@/lib/checkout";
 import { after } from "next/server";
 import { route } from "@/lib/route";
 import { sendPaymentInfoConversions } from "@/lib/conversions";
+
+/** A processor slow to answer at the Pay click, then the other one prepared in the same request. */
+export const maxDuration = 60;
 
 /** Saves the buyer's details just before the embedded Whop form is submitted. */
 async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
@@ -21,7 +24,8 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
   try {
     const result = await confirmSession(session, parsed.data, { host: req.headers.get("host") });
     after(() => sendPaymentInfoConversions(session.id).catch(() => undefined));
-    return json({ ...result, environment: session.store.testMode ? "sandbox" : "production" });
+    // Whop: the configuration to submit; Stripe: the PaymentIntent the page confirms (or a fresh one to mount first).
+    return json({ ready: result.ready, totals: result.totals, ...paymentPayload(result, session.store) });
   } catch (err) {
     await journalCheckoutFailure(session, "pay", err);
     if (err instanceof CheckoutError) return json({ error: err.message, code: err.code }, { status: 400 });

@@ -25,6 +25,19 @@ export const SHOPIFY_SCOPES = [
 
 export const GATEWAY_NAME = "Whop";
 
+/** Processor a paid order went through (the order's gateway, tags and note follow it). */
+export type PaymentGatewayProvider = "whop" | "stripe";
+
+/** Gateway name of the Shopify transactions of a processor ("Whop", "Stripe"). Pure. */
+export function gatewayName(provider: PaymentGatewayProvider | null | undefined): string {
+  return provider === "stripe" ? "Stripe" : GATEWAY_NAME;
+}
+
+/** Tag of a disputed Shopify order, per processor ("litige-whop", "litige-stripe"). Pure. */
+export function disputeTag(provider: PaymentGatewayProvider | null | undefined): string {
+  return provider === "stripe" ? "litige-stripe" : "litige-whop";
+}
+
 /* ------------------------------------------------------------------ */
 /* OAuth                                                               */
 /* ------------------------------------------------------------------ */
@@ -348,7 +361,10 @@ export type PaidOrderInput = {
   automaticDiscount?: { cents: number; lineCents?: Record<string, number> } | null;
   shipping: { title: string; priceCents: number } | null;
   totalCents: number;
+  /** The processor's payment id (Whop "pay_…", Stripe PaymentIntent "pi_…"). */
   whopPaymentId: string;
+  /** Processor of the payment (absent: Whop). */
+  provider?: PaymentGatewayProvider | null;
   test: boolean;
 };
 
@@ -467,7 +483,7 @@ export function buildOrderCreateInput(o: PaidOrderInput) {
       {
         kind: "SALE",
         status: "SUCCESS",
-        gateway: GATEWAY_NAME,
+        gateway: gatewayName(o.provider),
         authorizationCode: o.whopPaymentId,
         amountSet: money(o.totalCents, o.currency),
         test: o.test,
@@ -476,8 +492,16 @@ export function buildOrderCreateInput(o: PaidOrderInput) {
     sourceName: "whop-checkout",
     sourceIdentifier: o.sessionId,
     // The session tag lets a retry find an order that was created but not recorded.
-    tags: ["whop-checkout", sessionTag(o.sessionId), ...(o.whopPaymentId ? [paymentTag(o.whopPaymentId)] : []), ...(o.test ? ["test"] : []), ...(o.pickupPoint ? ["point-relais"] : [])],
-    note: `${o.buyerNote ? `Note du client : ${o.buyerNote}\n\n` : ""}${o.cart?.note && o.cart.note !== o.buyerNote ? `Note du panier : ${o.cart.note}\n\n` : ""}Payé via Whop — paiement ${o.whopPaymentId}${
+    // "whop-checkout" marks every order of this app (whatever the processor); Stripe's also carry "stripe-checkout".
+    tags: [
+      "whop-checkout",
+      ...(o.provider === "stripe" ? ["stripe-checkout"] : []),
+      sessionTag(o.sessionId),
+      ...(o.whopPaymentId ? [paymentTag(o.whopPaymentId)] : []),
+      ...(o.test ? ["test"] : []),
+      ...(o.pickupPoint ? ["point-relais"] : []),
+    ],
+    note: `${o.buyerNote ? `Note du client : ${o.buyerNote}\n\n` : ""}${o.cart?.note && o.cart.note !== o.buyerNote ? `Note du panier : ${o.cart.note}\n\n` : ""}Payé via ${gatewayName(o.provider)} — paiement ${o.whopPaymentId}${
       o.pickupPoint ? `\nLivraison en point relais Mondial Relay n°${o.pickupPoint.id} : ${o.pickupPoint.name}, ${o.pickupPoint.address1}, ${o.pickupPoint.zip} ${o.pickupPoint.city}` : ""
     }`,
     customer: {
@@ -522,7 +546,7 @@ export function sessionTag(sessionId: string) {
   return `wc-${sessionId}`;
 }
 
-/** Tag carrying the Whop payment id: a second, independent key to find an order after a timeout. */
+/** Tag carrying the processor's payment id (Whop "pay_…", Stripe "pi_…"): a second, independent key to find an order after a timeout. */
 export function paymentTag(paymentId: string) {
   return `wp-${paymentId}`;
 }
@@ -565,14 +589,15 @@ export async function orderRefundedCents(store: ConnectedStore, orderId: string)
 /** Tracking numbers of an order's fulfillments (for the dispute shield). */
 export async function orderTracking(store: ConnectedStore, orderId: string) {
   const data = await shopifyGraphql<{
-    order: { fulfillments: { status: string; trackingInfo: { number: string | null; company: string | null; url: string | null }[] }[] } | null;
-  }>(store, `query($id: ID!) { order(id: $id) { fulfillments(first: 10) { status trackingInfo(first: 5) { number company url } } } }`, {
+    order: { fulfillments: { status: string; createdAt?: string | null; trackingInfo: { number: string | null; company: string | null; url: string | null }[] }[] } | null;
+  }>(store, `query($id: ID!) { order(id: $id) { fulfillments(first: 10) { status createdAt trackingInfo(first: 5) { number company url } } } }`, {
     id: orderId,
   });
+  // shippedAt: when the parcel's fulfillment was created in Shopify (the dispute evidence's shipping date).
   return (data.order?.fulfillments ?? [])
     .filter((f) => f.status !== "CANCELLED")
-    .flatMap((f) => f.trackingInfo)
-    .filter((t): t is { number: string; company: string | null; url: string | null } => !!t.number);
+    .flatMap((f) => f.trackingInfo.map((t) => ({ ...t, shippedAt: f.createdAt ?? null })))
+    .filter((t): t is { number: string; company: string | null; url: string | null; shippedAt: string | null } => !!t.number);
 }
 
 const STOCK_ERROR = /stock|inventor|quantit|disponib|available/i;
@@ -660,11 +685,18 @@ const OFFER_GATEWAY_MARK = "wc-offer-in-";
  * (gateway carrying its marker) first; the checkout's its own payment. Otherwise one payment
  * with enough left to refund (never another offer's), else the amount is split across payments,
  * other offers' payments last.
- * Throws when the payments can't cover the refund (Shopify would refuse it anyway). Pure.
+ * Throws when the payments can't cover the refund (Shopify would refuse it anyway). `gateway`: the
+ * processor's gateway name, used when a payment has none (or there is no payment at all). Pure.
  */
-export function planRefundTransactions(txs: OrderTx[], amountCents: number, marker?: string): { parentId: string | undefined; gateway: string; cents: number }[] {
+export function planRefundTransactions(
+  txs: OrderTx[],
+  amountCents: number,
+  marker?: string,
+  gateway: string = GATEWAY_NAME,
+): { parentId: string | undefined; gateway: string; cents: number }[] {
+  const GATEWAY = gateway;
   const sales = txs.filter((t) => (t.kind === "SALE" || t.kind === "CAPTURE") && t.status === "SUCCESS");
-  if (sales.length === 0) return [{ parentId: undefined, gateway: GATEWAY_NAME, cents: amountCents }];
+  if (sales.length === 0) return [{ parentId: undefined, gateway: GATEWAY, cents: amountCents }];
   const refunded = new Map<string, number>();
   for (const t of txs) {
     if (t.kind === "REFUND" && t.status === "SUCCESS" && t.parentId) refunded.set(t.parentId, (refunded.get(t.parentId) ?? 0) + t.cents);
@@ -676,13 +708,13 @@ export function planRefundTransactions(txs: OrderTx[], amountCents: number, mark
   const pool = [...own, ...plain, ...others];
   // Another offer's payment is only used for what the target's own payments can't cover.
   const one = [...own, ...plain].find((t) => left(t) >= amountCents);
-  if (one) return [{ parentId: one.id, gateway: one.gateway || GATEWAY_NAME, cents: amountCents }];
+  if (one) return [{ parentId: one.id, gateway: one.gateway || GATEWAY, cents: amountCents }];
   const plan: { parentId: string | undefined; gateway: string; cents: number }[] = [];
   let rest = amountCents;
   for (const t of pool) {
     const take = Math.min(rest, left(t));
     if (take <= 0) continue;
-    plan.push({ parentId: t.id, gateway: t.gateway || GATEWAY_NAME, cents: take });
+    plan.push({ parentId: t.id, gateway: t.gateway || GATEWAY, cents: take });
     rest -= take;
     if (rest === 0) break;
   }
@@ -690,7 +722,7 @@ export function planRefundTransactions(txs: OrderTx[], amountCents: number, mark
   return plan;
 }
 
-/** Records a refund made in Whop on the Shopify order (money already moved in Whop). */
+/** Records a refund made in Whop / Stripe on the Shopify order (money already moved at the processor). */
 export async function createRefund(
   store: ConnectedStore,
   orderId: string,
@@ -698,11 +730,11 @@ export async function createRefund(
   note: string,
   /** Line items refunded (a merged offer's line, refunded in full), never restocked. */
   lineItems: { lineItemId: string; quantity: number }[] = [],
-  /** Merged offer: its merge marker, to refund against its own payment on the shared order. */
-  opts: { marker?: string } = {},
+  /** Merged offer: its merge marker, to refund against its own payment on the shared order. `provider`: the processor (gateway fallback). */
+  opts: { marker?: string; provider?: PaymentGatewayProvider | null } = {},
 ) {
   const payments = await orderPayments(store, orderId);
-  const plan = planRefundTransactions(payments?.transactions ?? [], amountCents, opts.marker);
+  const plan = planRefundTransactions(payments?.transactions ?? [], amountCents, opts.marker, gatewayName(opts.provider));
   const data = await shopifyGraphql<{ refundCreate: { userErrors: { field: string[] | null; message: string }[] } }>(
     store,
     `mutation($input: RefundInput!) { refundCreate(input: $input) { refund { id } userErrors { field message } } }`,
@@ -748,8 +780,8 @@ export function legacyOfferMarker(chargeId: string) {
 }
 
 /** Gateway name of an offer's manual payment on the shared order (carries its marker). */
-export function offerGateway(marker: string) {
-  return `${GATEWAY_NAME} ${marker}`;
+export function offerGateway(marker: string, provider?: PaymentGatewayProvider | null) {
+  return `${gatewayName(provider)} ${marker}`;
 }
 
 export type EditableOrder = {
@@ -894,7 +926,7 @@ function definiteAnswer(err: unknown) {
  */
 export async function addVariantToOrder(
   store: ConnectedStore,
-  input: { orderId: string; variantId: string; quantity: number; amountCents: number; currency: string; marker: string },
+  input: { orderId: string; variantId: string; quantity: number; amountCents: number; currency: string; marker: string; provider?: PaymentGatewayProvider | null },
 ): Promise<{ status: "committed" } | { status: "refused"; reason: string }> {
   const refused = (reason: string) => ({ status: "refused" as const, reason });
   const errs = (e: UserErrors | undefined) => (e?.length ? e.map((x) => x.message).join("; ") : null);
@@ -973,7 +1005,7 @@ export async function addVariantToOrder(
   const commit = await shopifyGraphql<{ orderEditCommit: { order: { id: string } | null; userErrors: UserErrors } }>(
     store,
     `mutation($id: ID!, $staffNote: String) { orderEditCommit(id: $id, notifyCustomer: false, staffNote: $staffNote) { order { id } userErrors { field message } } }`,
-    { id: calcId, staffNote: `Offre post-achat payée via Whop (${input.marker})` },
+    { id: calcId, staffNote: `Offre post-achat payée via ${gatewayName(input.provider)} (${input.marker})` },
     { retry: false },
   );
   if (errs(commit.orderEditCommit.userErrors) || !commit.orderEditCommit.order) return refused(errs(commit.orderEditCommit.userErrors) ?? "validation refusée");
@@ -1000,11 +1032,11 @@ export function offerBalanceState(p: { outstandingCents: number; transactions: O
  * the offer's marker, so a retry sees it and a refund of that offer targets it). Not idempotent by
  * itself: callers check offerBalanceState first.
  */
-export async function payOrderBalance(store: ConnectedStore, orderId: string, amountCents: number, currency: string, marker: string) {
+export async function payOrderBalance(store: ConnectedStore, orderId: string, amountCents: number, currency: string, marker: string, provider?: PaymentGatewayProvider | null) {
   const data = await shopifyGraphql<{ orderCreateManualPayment: { userErrors: UserErrors } }>(
     store,
     `mutation($id: ID!, $amount: MoneyInput!, $name: String) { orderCreateManualPayment(id: $id, amount: $amount, paymentMethodName: $name) { order { id } userErrors { field message } } }`,
-    { id: orderId, amount: { amount: centsToDecimal(amountCents), currencyCode: currency }, name: offerGateway(marker) },
+    { id: orderId, amount: { amount: centsToDecimal(amountCents), currencyCode: currency }, name: offerGateway(marker, provider) },
     { retry: false },
   );
   assertNoUserErrors(data.orderCreateManualPayment.userErrors, "Paiement de l'offre sur la commande");

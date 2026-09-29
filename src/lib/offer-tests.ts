@@ -151,7 +151,7 @@ export async function offerArmAggregates(
       SELECT s.id, b AS arm, s."paidAt" AS at, ${rate} AS rate
       FROM "CheckoutSession" s, unnest(s."upsellShownBlocks") b
       WHERE s."storeId" = ${store.id} AND s.status = 'PAID' AND s."paidAt" >= ${since} AND s."paidAt" < ${until}
-        ${includeTest ? Prisma.empty : Prisma.sql`AND s."test" = false`}
+        ${includeTest ? Prisma.empty : Prisma.sql`AND s."test" = false AND s."forcedProvider" IS NULL`}
     )
     SELECT imp.arm, count(*) AS n, count(u.id) AS takes, count(u.id) FILTER (WHERE u."costCents" IS NOT NULL) AS costed,
            COALESCE(sum(v.v), 0)::float8 AS sum, COALESCE(sum(v.v * v.v), 0)::float8 AS sumsq,

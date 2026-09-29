@@ -23,6 +23,7 @@ export const INCIDENT_KINDS = {
   "google.conversions_account_error": "envoi(s) des conversions Google Ads suspendu(s) (erreur du compte)",
   "google.conversion_retrying": "envoi(s) ou ajustement(s) de conversion Google Ads en échec (nouvel essai automatique)",
   "reconcile.whop_slow": "vérification(s) Whop (paiements, remboursements, litiges) reportée(s) : Whop lent ou indisponible",
+  "reconcile.stripe_slow": "vérification(s) Stripe (paiements, remboursements, litiges) reportée(s) : Stripe lent ou indisponible",
   "import.background_failed": "import(s) en arrière-plan en échec depuis plus de 48 h (historique clients, commandes hors checkout ou dépenses pub)",
 } as const;
 export type IncidentKind = keyof typeof INCIDENT_KINDS;

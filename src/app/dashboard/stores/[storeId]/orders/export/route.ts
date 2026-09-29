@@ -1,5 +1,6 @@
 import { requireAdmin } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { feeCents } from "@/lib/charge";
 import type { CartLine } from "@/lib/pricing";
 import type { Address } from "@/lib/shopify";
 import { addDays, tzOf, zonedDay, zoneLabel } from "@/lib/time";
@@ -113,8 +114,10 @@ export async function GET(req: Request, ctx: { params: Promise<{ storeId: string
     // Reduced-rate variants (Coûts produits › TVA): the lines' blended rate, like Analytics.
     const rate = blendedVatRate(lines, (v) => vatCategories.get(v), a?.countryCode, { vatExempt: store.vatExempt, domesticOnly: store.vatDomesticOnly, homeCountry: store.homeCountry || undefined }).rate;
     const { htCents, vatCents } = splitVat(net, rate);
-    const feesKnown = s.whopFeeCents != null && s.upsells.every((u) => u.whopFeeCents != null);
-    const fees = (s.whopFeeCents ?? 0) + s.upsells.reduce((x, u) => x + (u.whopFeeCents ?? 0), 0);
+    // The processor's fee (Whop's or Stripe's) on the order and its offers.
+    const orderFee = feeCents(s);
+    const feesKnown = orderFee != null && s.upsells.every((u) => u.whopFeeCents != null);
+    const fees = (orderFee ?? 0) + s.upsells.reduce((x, u) => x + (u.whopFeeCents ?? 0), 0);
     const productsKnown = lines.every((l) => l.unitCostCents != null) && s.upsells.every((u) => u.costCents != null);
     const productCost = lines.reduce((x, l) => x + l.quantity * (l.unitCostCents ?? 0), 0) + s.upsells.reduce((x, u) => x + (u.costCents ?? 0) * u.quantity, 0);
     const bumpsKnown = bumps.every((b) => b.costCents != null);

@@ -22,7 +22,7 @@ export type PaymentTarget =
  */
 export async function resolvePayment(storeId: string, paymentId: string, metadata?: Record<string, unknown> | null): Promise<PaymentTarget | null> {
   const session = await db.checkoutSession.findFirst({
-    where: { storeId, OR: [{ whopPaymentId: paymentId }, { extraPaymentIds: { has: paymentId } }] },
+    where: { storeId, OR: [{ whopPaymentId: paymentId }, { extraPaymentIds: { hasSome: extraKeys(paymentId) } }] },
     select: { id: true, whopPaymentId: true, currency: true, chargeCurrency: true, chargeFxRate: true },
   });
   if (session)
@@ -32,7 +32,7 @@ export async function resolvePayment(storeId: string, paymentId: string, metadat
       currency: session.currency,
       ...(session.chargeCurrency && session.chargeFxRate ? { charge: { currency: session.chargeCurrency, rate: session.chargeFxRate } } : {}),
     };
-  const upsellId = typeof metadata?.upsell_id === "string" ? metadata.upsell_id : null;
+  const upsellId = offerIdOf(metadata);
   const charge = await db.upsellCharge.findFirst({
     where: { session: { storeId }, OR: [{ whopPaymentId: paymentId }, { previousPaymentIds: { has: paymentId } }, ...(upsellId ? [{ id: upsellId }] : [])] },
     select: { id: true, sessionId: true, status: true, whopPaymentId: true, previousPaymentIds: true, session: { select: { currency: true } } },
@@ -54,6 +54,23 @@ export async function resolvePayment(storeId: string, paymentId: string, metadat
   }
   // Another payment than the one recorded, not a known earlier attempt: not attributable yet.
   throw new RetryLater(`paiement ${paymentId} de l'offre ${charge.id} pas encore enregistré`);
+}
+
+/** The one-click offer a payment's metadata names: Whop's `upsell_id`, Stripe's `upsell_charge_id`. Pure. */
+export function offerIdOf(metadata: Record<string, unknown> | null | undefined): string | null {
+  for (const key of ["upsell_id", "upsell_charge_id"]) {
+    const v = metadata?.[key];
+    if (typeof v === "string" && v) return v;
+  }
+  return null;
+}
+
+/**
+ * How a payment id can appear in CheckoutSession.extraPaymentIds: as is (Whop), and — for a Stripe
+ * PaymentIntent — prefixed "stripe:" (see checkout.ts extraPaymentId). Pure.
+ */
+export function extraKeys(paymentId: string): string[] {
+  return paymentId.startsWith("pi_") ? [paymentId, `stripe:${paymentId}`] : [paymentId];
 }
 
 /** The payment id of a refund/dispute event, whatever its shape (webhook: `payment.id`; list API: `payment_id`). */
@@ -130,7 +147,14 @@ export async function paymentOwner(
   const decide = (owner: string | null | undefined): PaymentOwner | null => (owner ? (owner === storeId ? { kind: "ours" } : { kind: "sibling", storeId: owner }) : null);
   if (p.paymentId) {
     const session = await db.checkoutSession.findFirst({
-      where: { OR: [{ whopPaymentId: p.paymentId }, { extraPaymentIds: { has: p.paymentId } }] },
+      where: {
+        OR: [
+          { whopPaymentId: p.paymentId },
+          { extraPaymentIds: { hasSome: extraKeys(p.paymentId) } },
+          // A Stripe PaymentIntent created for a checkout (paid or not yet).
+          ...(p.paymentId.startsWith("pi_") ? [{ stripePaymentIntentId: p.paymentId }, { quotes: { some: { stripePaymentIntentId: p.paymentId } } }] : []),
+        ],
+      },
       select: { storeId: true },
     });
     const bySession = decide(session?.storeId);
@@ -142,7 +166,7 @@ export async function paymentOwner(
     const byCharge = decide(charge?.session.storeId);
     if (byCharge) return byCharge;
   }
-  const upsellId = typeof p.metadata?.upsell_id === "string" ? p.metadata.upsell_id : null;
+  const upsellId = offerIdOf(p.metadata);
   if (upsellId) {
     const charge = await db.upsellCharge.findUnique({ where: { id: upsellId }, select: { session: { select: { storeId: true } } } });
     const owner = decide(charge?.session.storeId);

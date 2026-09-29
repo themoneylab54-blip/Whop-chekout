@@ -56,12 +56,30 @@ import {
   ExpressPreview,
   PaymentPanel,
   PaymentPreview,
+  PaymentSkeleton,
   paypalStaysChosen,
+  preparedFromBody,
+  samePrepared,
   type ConfirmResult,
   type PaidCheck,
   type PanelLock,
   type Prepared,
 } from "./Payment";
+import dynamic from "next/dynamic";
+import type { WalletBuyer } from "./StripePanel";
+import { stripeExpressAny } from "./stripe-options";
+
+// Stripe's side (its React components, then Stripe.js itself) is only loaded in the browser when the
+// session really pays with Stripe: a Whop checkout never downloads any of it.
+const StripePanel = dynamic(() => import("./StripePanel").then((m) => m.StripePanel), {
+  ssr: false,
+  loading: () => (
+    <div className="min-h-[264px] rounded-[var(--radius)] border border-neutral-200 bg-white p-3" aria-busy>
+      <PaymentSkeleton />
+    </div>
+  ),
+});
+const StripeExpress = dynamic(() => import("./StripePanel").then((m) => m.StripeExpress), { ssr: false, loading: () => <div className="min-h-[76px]" aria-hidden /> });
 
 export type AddOnView = {
   id: string;
@@ -77,7 +95,8 @@ export type CheckoutMode =
       selectedBlockId?: string | null;
       onSelectBlock?: (id: string) => void;
     }
-  | { kind: "live"; sessionId: string; testMode: boolean; saveCard?: boolean };
+  /** paymentFailed: back from a Stripe redirect (3-D Secure, bank page) that failed: said in the payment section. */
+  | { kind: "live"; sessionId: string; testMode: boolean; saveCard?: boolean; paymentFailed?: boolean };
 
 type Props = {
   theme: Theme;
@@ -698,12 +717,22 @@ export function CheckoutView({
   const [showAllErrors, setShowAllErrors] = useState(false);
   const [note, setNote] = useState("");
   const [prepared, setPrepared] = useState<Prepared | null>(null);
+  // The latest prepared checkout, for handlers of a render that may be stale (a Whop form clicked
+  // right after the session switched to Stripe, or the reverse): never a confirm for the wrong one.
+  const preparedRef = useRef<Prepared | null>(null);
+  useEffect(() => {
+    preparedRef.current = prepared;
+  }, [prepared]);
+  // Stripe.js couldn't load in this browser: the next prepare says so (the server switches to Whop).
+  const stripeClientFailed = useRef(false);
   const [preparing, setPreparing] = useState(false);
   const [prepareError, setPrepareError] = useState<string | null>(null);
   // Support reference of the last failed prepare (x-request-id), shown discreetly.
   const [prepareRef, setPrepareRef] = useState<string | null>(null);
   // Bumped by "Try again" to prepare the Whop checkout again without reloading.
   const [retryKey, setRetryKey] = useState(0);
+  // The thank-you page (set below once known): a prepare answering "already paid" goes there.
+  const thankYouUrlRef = useRef("#");
   // Express PayPal: whether Whop offers PayPal here (from prepare), the buyer chose it (the
   // payment panel then shows a PayPal-only checkout), and that checkout's own state.
   const [paypalOffered, setPaypalOffered] = useState(false);
@@ -742,6 +771,8 @@ export function CheckoutView({
   // The payment panel submitting (or a PayPal payment possibly still going through): the express
   // buttons are locked meanwhile, so no second payment can start from them.
   const [panelLock, setPanelLock] = useState<PanelLock>(null);
+  // A Stripe express payment being confirmed (its sheet open after our check): the Pay button waits.
+  const [expressBusy, setExpressBusy] = useState(false);
   // For the prepares below (async): PayPal can't be dropped while the panel is locked.
   const panelLockRef = useRef<PanelLock>(null);
   useEffect(() => {
@@ -750,8 +781,12 @@ export function CheckoutView({
   // A payment of this session still going through as the page loads (a second tab, a reload
   // during a PayPal window): the payment panel starts in its server wait (see inFlightAtLoad).
   const [inFlightAtLoad, setInFlightAtLoad] = useState(false);
+  // Switch of processor at the Pay click or at a prepare (the answer carried another processor's
+  // form, `switchedFrom`): said above the new form, cleared by the next Pay click.
+  const [providerSwitched, setProviderSwitched] = useState(false);
   useEffect(() => {
-    if (mode.kind !== "live") return;
+    // Back from a failed Stripe redirect: that attempt is over (its failure is shown), never waited on.
+    if (mode.kind !== "live" || mode.paymentFailed) return;
     let gone = false;
     const url = `/api/public/sessions/${mode.sessionId}/status`;
     void Promise.resolve()
@@ -1033,10 +1068,20 @@ export function CheckoutView({
               protection,
               // The quantities the server last confirmed (already saved on the session).
               ...(qtyTouched ? { quantities: confirmedQty } : {}),
+              // Stripe's form couldn't load here: the server switches this buyer to Whop when it can.
+              ...(stripeClientFailed.current ? { clientFailed: "stripe" } : {}),
             }),
             signal: ctrl.signal,
           });
           const body = await res.json().catch(() => ({}));
+          // Its PaymentIntent already paid (marked so by the server): the thank-you page.
+          if (body?.code === "already_paid") {
+            router.push(thankYouUrlRef.current);
+            return;
+          }
+          // A payment of this session still going through (its PaymentIntent processing): the panel
+          // waits for it (polling the status), never a new form under it.
+          if (body?.code === "payment_in_flight") setInFlightAtLoad(true);
           if (!res.ok) {
             const err = new Error(errorText(L, body)) as Error & { retry?: boolean; ref?: string | null };
             err.retry = res.status >= 500;
@@ -1052,14 +1097,16 @@ export function CheckoutView({
           // (any "PayPal isn't available" message stays; see stopPaypal). Not while a PayPal payment
           // may still go through: only its express button goes, the choice once the panel unlocks.
           if (!offered && panelLockRef.current === null) endPaypal(paypalChoiceReset({ keepError: true }));
-          setPrepared((p) =>
-            p?.configId === body.checkoutConfigurationId
-              ? p
-              : {
-                  configId: body.checkoutConfigurationId,
-                  environment: body.environment,
-                },
-          );
+          // Whop's configuration, or Stripe's PaymentIntent (also after a switch of processor for this
+          // buyer): the form stays mounted while it is the same checkout at the same amount.
+          const next = preparedFromBody(body);
+          if (!next) throw new Error(L.error);
+          stripeClientFailed.current = false;
+          preparedRef.current = next;
+          setPrepared((p) => (samePrepared(p, next) ? p : next));
+          // Switched to the other processor at this prepare (the first one failed, or its form
+          // couldn't load here): said above the form, as after a switch at the click.
+          if (body.switchedFrom) setProviderSwitched(true);
           break;
         } catch (err) {
           if (ctrl.signal.aborted) return;
@@ -1365,6 +1412,9 @@ export function CheckoutView({
     () => false,
   );
   const thankYouUrl = liveSessionId ? `/c/${liveSessionId}/merci?lang=${theme.language}${viaApp ? "&via=app" : ""}` : "#";
+  useEffect(() => {
+    thankYouUrlRef.current = thankYouUrl;
+  }, [thankYouUrl]);
   // Whop needs an absolute return URL; the origin is only known in the browser.
   const origin = useSyncExternalStore(
     noopSubscribe,
@@ -1417,32 +1467,50 @@ export function CheckoutView({
     }
   }
 
-  async function confirm(): Promise<ConfirmResult> {
+  /**
+   * Saves the buyer on the server right before the payment is submitted (the server checks totals,
+   * terms and any payment in flight). `wallet`: a Stripe express payment, whose sheet gave the
+   * e-mail and address (the form may be empty; its terms notice stands for acceptance).
+   */
+  async function confirm(wallet?: WalletBuyer, from?: "whop" | "stripe"): Promise<ConfirmResult> {
     if (!liveSessionId) return { ok: false };
-    if (!revealErrors()) return { ok: false };
+    // A form of the other processor (a stale render after this buyer's switch): never submitted; the
+    // current processor's form is on screen (the buyer clicks Pay again there).
+    const latest = preparedRef.current;
+    if (from && latest && (latest.provider ?? "whop") !== from) return { ok: false, refreshedConfigId: latest.configId };
+    if (!wallet && !revealErrors()) return { ok: false };
     // Only on this device, only when asked: contact + address, never payment data.
-    if (remember) writeSavedBuyer(email, address);
-    else if (saved && saved.email.toLowerCase() === email.trim().toLowerCase()) clearSavedBuyer();
+    if (!wallet) {
+      if (remember) writeSavedBuyer(email, address);
+      else if (saved && saved.email.toLowerCase() === email.trim().toLowerCase()) clearSavedBuyer();
+    }
+    setProviderSwitched(false);
+    const buyerEmail = wallet?.email ?? email;
+    const buyerAddress = wallet?.address ?? address;
+    const onStripe = (latest ?? prepared)?.provider === "stripe";
+    const current = latest ?? prepared;
     const res = await fetch(`/api/public/sessions/${liveSessionId}/pay`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        email,
+        email: buyerEmail,
         acceptsMarketing: marketing,
-        acceptsTerms: termsAccepted,
-        address,
+        acceptsTerms: wallet ? termsAccepted || theme.requireTerms : termsAccepted,
+        address: buyerAddress,
         note: note.trim() || null,
         // PayPal chosen: the PayPal-only checkout (the server swaps in a fresh one if it's stale).
-        checkoutConfigurationId: (paypalActive ? paypalPrepared?.configId : prepared?.configId) ?? null,
-        method: paypalActive ? "paypal" : null,
-        countryCode: address.countryCode,
+        checkoutConfigurationId: onStripe ? null : ((paypalActive ? paypalPrepared?.configId : current?.configId) ?? null),
+        // Stripe: the PaymentIntent the page is about to confirm.
+        paymentIntentId: onStripe ? (current?.stripe?.paymentIntentId ?? null) : null,
+        method: paypalActive && !onStripe ? "paypal" : null,
+        countryCode: buyerAddress.countryCode,
         shippingRateId: q.shippingRateId,
         discountCode: appliedCode,
         addOnIds,
         protection,
         // What the buyer sees; if the server prices it differently, it answers with a new checkout.
         ...(qtyTouched ? { quantities: qty } : {}),
-        pickupPoint: pickupSelected && validPickup ? pickupPayload(validPickup) : null,
+        pickupPoint: !wallet && pickupSelected && validPickup ? pickupPayload(validPickup) : null,
       }),
     });
     const body = await res.json();
@@ -1461,25 +1529,31 @@ export function CheckoutView({
       return { ok: false, error: errorText(L, body) };
     }
     if (!body.ready) {
-      (paypalActive ? setPaypalPrepared : setPrepared)({
-        configId: body.checkoutConfigurationId,
-        environment: body.environment,
-      });
-      return { ok: false, refreshedConfigId: body.checkoutConfigurationId };
+      // A fresh checkout to show first: Whop's (the PayPal-only one while PayPal is chosen), or
+      // Stripe's PaymentIntent (maybe after a switch of processor for this buyer).
+      const next = preparedFromBody(body);
+      // This buyer was switched to the other processor at the click: said above its form.
+      if (body.switchedFrom) setProviderSwitched(true);
+      if (next && paypalActive && next.provider !== "stripe") setPaypalPrepared(next);
+      else if (next) {
+        preparedRef.current = next;
+        setPrepared((p) => (samePrepared(p, next) ? p : next));
+      }
+      return { ok: false, refreshedConfigId: next?.configId ?? "refreshed" };
     }
     return {
       ok: true,
       buyer: {
-        email,
+        email: buyerEmail,
         address: {
-          name: `${address.firstName} ${address.lastName}`.trim(),
-          line1: address.address1,
-          line2: address.address2 || undefined,
-          city: address.city,
-          state: address.province,
-          postalCode: address.zip,
-          country: address.countryCode,
-          phone: address.phone || undefined,
+          name: `${buyerAddress.firstName} ${buyerAddress.lastName}`.trim(),
+          line1: buyerAddress.address1,
+          line2: buyerAddress.address2 || undefined,
+          city: buyerAddress.city,
+          state: buyerAddress.province,
+          postalCode: buyerAddress.zip,
+          country: buyerAddress.countryCode,
+          phone: buyerAddress.phone || undefined,
         },
       },
     };
@@ -1586,6 +1660,10 @@ export function CheckoutView({
   // Payment title: the payment-logos block's methods, small, only those this checkout offers.
   const iconsBlock = layout.blocks.find((b) => b.type === "payment_icons" && !b.hidden);
   const paymentLogos = iconsBlock?.type === "payment_icons" ? offeredPaymentLogos(iconsBlock.props.methods, offeredWallets) : [];
+  // Stripe's express row is on the page (same conditions as its section below): Apple Pay / Google
+  // Pay live there, never twice in the Payment Element.
+  const stripeExpressRow =
+    theme.expressCheckout && !pickupSelected && stripeExpressAny(theme.expressMethods) && layout.blocks.some((b) => b.type === "express" && !b.hidden && b.props.enabled);
 
   // "Complétez votre commande": under the summary on desktop, above the payment on mobile.
   const recoBlock = arranged.recommendations;
@@ -1696,6 +1774,31 @@ export function CheckoutView({
       case "express":
         // Hidden by its own switch, or by the legacy theme switch (older designs).
         if (!block.props.enabled || !theme.expressCheckout) return null;
+        // Paying with Stripe (its primary, the store's secours, or this buyer's switch): Stripe's own
+        // express buttons (its sheet collects the shipping address), never Whop's nor our PayPal flow.
+        if (mode.kind === "live" && prepared?.provider === "stripe") {
+          if (!stripeExpressAny(theme.expressMethods) || pickupSelected) return null;
+          return (
+            <StripeExpress
+              key={prepared.configId}
+              prepared={prepared}
+              theme={theme}
+              labels={L}
+              returnUrl={`${origin}${thankYouUrl}`}
+              confirmExpress={(buyer) => confirm(buyer, "stripe")}
+              onPaid={onPaid}
+              shippable={cartShippable(displayLines, giftLines)}
+              country={address.countryCode}
+              // Locked while a payment is under way below, and while the total is being re-priced
+              // (a prepare or a quantity change pending): never a wallet paying the old total.
+              lock={panelLock ?? (preparing || qtyPending ? "busy" : null)}
+              onBusy={setExpressBusy}
+              title={block.props.title}
+              dividerLabel={block.props.dividerLabel}
+              termsNotice={theme.requireTerms ? <TermsText L={L} theme={theme} express /> : null}
+            />
+          );
+        }
         // Every express button switched off by the merchant (or none for this cart): no section, no "OR".
         if (!expressShown.wallets.length && !expressShown.paypal) return null;
         // Nothing to show until the Whop checkout exists (no empty gap above Contact).
@@ -2132,7 +2235,49 @@ export function CheckoutView({
             sectionRef={paymentRef}
             aside={iconsBlock?.type === "payment_icons" ? <PaymentHeaderLogos methods={paymentLogos} label={iconsBlock.props.label || L.acceptedPaymentMethods} /> : null}
           >
-            {mode.kind === "live" ? (
+            {mode.kind === "live" && providerSwitched && (
+              <p role="status" data-testid="wc-provider-switched" className="mb-3 rounded-[var(--radius)] bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                {L.providerSwitched}
+              </p>
+            )}
+            {mode.kind === "live" && prepared?.provider === "stripe" ? (
+              // Stripe's Payment Element (same page, same Pay button, same lock and in-flight rules).
+              <StripePanel
+                prepared={prepared}
+                preparing={preparing || qtyPending}
+                prepareError={prepareError}
+                theme={theme}
+                labels={L}
+                payLabel={payLabel}
+                returnUrl={`${origin}${thankYouUrl}`}
+                testMode={mode.testMode}
+                confirm={() => confirm(undefined, "stripe")}
+                onPaid={onPaid}
+                expressWallets={stripeExpressRow}
+                onStripeLoadFailed={() => {
+                  // Stripe.js blocked or down in this browser: the server switches this buyer to Whop.
+                  stripeClientFailed.current = true;
+                  setPrepareError(null);
+                  setRetryKey((k) => k + 1);
+                }}
+                beforeButton={termsBox}
+                incomplete={incomplete}
+                showIncomplete={showAllErrors || Object.keys(touched).length > 0}
+                incompleteHint={invalidFields.length === 1 ? (invalidFields[0] === "pickup" ? L.pickupChoose : invalidFields[0] === "terms" ? L.acceptTermsToContinue : undefined) : undefined}
+                onIncomplete={revealErrors}
+                onRetry={() => {
+                  setPrepareError(null);
+                  setRetryKey((k) => k + 1);
+                }}
+                interacted={interacted}
+                errorRef={prepareRef}
+                onLockChange={setPanelLock}
+                inFlightAtLoad={inFlightAtLoad}
+                checkPaid={checkPaid}
+                externalBusy={expressBusy}
+                initialError={mode.paymentFailed ? L.paymentRedirectFailed : null}
+              />
+            ) : mode.kind === "live" ? (
               <PaymentPanel
                 prepared={prepared}
                 // A quantity change is re-priced first: no paying the old total meanwhile.
@@ -2143,7 +2288,7 @@ export function CheckoutView({
                 payLabel={payLabel}
                 returnUrl={`${origin}${thankYouUrl}`}
                 testMode={mode.testMode}
-                confirm={confirm}
+                confirm={() => confirm(undefined, "whop")}
                 onPaid={onPaid}
                 saveCard={!!mode.saveCard}
                 beforeButton={termsBox}

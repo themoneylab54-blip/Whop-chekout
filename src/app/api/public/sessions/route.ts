@@ -18,6 +18,7 @@ import { touchWithin } from "@/lib/analytics";
 import { geoCountryOf } from "@/lib/geo";
 import { sessionCart, startCartRead } from "@/lib/cart-session";
 import { resolveVisitor, signVisitorId, verifyVisitorId } from "@/lib/visitor";
+import { anyProviderConnected } from "@/lib/payment-provider";
 
 export const OPTIONS = preflight;
 
@@ -109,7 +110,8 @@ async function handle(req: Request) {
   if (unsupported) return json({ error: unsupported === "selling_plan" ? "Abonnement : checkout Shopify" : "Carte cadeau : checkout Shopify", fallback: true, reason: unsupported }, { status: 409, cors: true });
 
   const store = await db.store.findUnique({ where: { publicId } });
-  if (!store?.enabled || !store.shopifyConnectedAt || !store.whopConnectedAt || store.fallbackActiveAt) {
+  // At least one processor able to take the payment (Whop and/or Stripe, under the store's mode).
+  if (!store?.enabled || !store.shopifyConnectedAt || !anyProviderConnected(store) || store.fallbackActiveAt) {
     return json({ error: "Checkout désactivé", fallback: true }, { status: 409, cors: true });
   }
   // Called on another store's checkout domain: unknown here (the loader then uses Shopify's checkout).

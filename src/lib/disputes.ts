@@ -8,8 +8,10 @@ import { paymentOwner, resolvePayment } from "./payments";
 import { loadTheme } from "./layout";
 import { log, recordEvent } from "./log";
 import type { CartLine } from "./pricing";
-import { orderTracking, ShopifyError, tagOrder, type Address } from "./shopify";
+import { disputeTag, orderTracking, ShopifyError, tagOrder, type Address } from "./shopify";
 import { refundPayment, storeClient, whopCallOptions } from "./whop";
+import { refundStripe, stripeForMode, submitStripeDispute } from "./stripe";
+import type Stripe from "stripe";
 
 /*
  * Dispute shield: everything that keeps chargebacks (and the Whop account) under control.
@@ -20,7 +22,19 @@ import { refundPayment, storeClient, whopCallOptions } from "./whop";
 
 type SessionWithStore = CheckoutSession & { store: Store };
 
-/** Pushes the first tracking number of the Shopify order to the Whop payment. */
+/**
+ * The store as Stripe calls about this checkout's payment must see it: on the connected account the
+ * PaymentIntent was created on (kept on the session: still right after a disconnect or a new account),
+ * in the payment's own mode (session.test, set from its livemode: still right after a mode switch).
+ */
+function stripeStoreOf(session: SessionWithStore): Store {
+  return stripeForMode(session.store, !session.test, session.stripeAccountId);
+}
+
+/**
+ * Pushes the first tracking number of the Shopify order to the Whop payment. Stripe payments: only
+ * recorded here (no push; the number goes with the dispute evidence).
+ */
 export async function pushTracking(session: SessionWithStore): Promise<boolean> {
   if (!session.shopifyOrderId || !session.whopPaymentId) return false;
   // Claim (overlapping runs must not create the Whop shipment twice).
@@ -36,6 +50,18 @@ export async function pushTracking(session: SessionWithStore): Promise<boolean> 
   const tracking = await orderTracking(session.store, session.shopifyOrderId);
   const first = tracking[0];
   if (!first) return false;
+  if (session.paymentProvider === "stripe") {
+    // Stripe has no shipment API (Whop-only push): the number is kept for the dispute evidence
+    // (shipping_tracking_number / shipping_carrier), sent with it if the payment is ever disputed.
+    await db.checkoutSession.update({ where: { id: session.id }, data: { trackingNumber: first.number, trackingPushedAt: new Date(), trackingPushError: null } });
+    await recordEvent({
+      storeId: session.storeId,
+      sessionId: session.id,
+      kind: "tracking.recorded",
+      message: `Suivi ${first.number}${first.company ? ` (${first.company})` : ""} enregistré pour ${session.shopifyOrderName ?? "la commande"} (preuve de livraison en cas de litige Stripe)`,
+    });
+    return true;
+  }
   // Idempotency key: a run killed before recording the push can't create the shipment twice.
   await storeClient(session.store).shipments.create(
     {
@@ -100,7 +126,16 @@ export async function recordTrackingFailure(session: Pick<CheckoutSession, "id" 
   return { attempts, gaveUp };
 }
 
-type OfferEvidence = { id: string; title: string; amountCents: number; paidAt: Date; shopifyOrderId: string | null; shopifyOrderName: string | null };
+type OfferEvidence = {
+  id: string;
+  title: string;
+  amountCents: number;
+  paidAt: Date;
+  shopifyOrderId: string | null;
+  shopifyOrderName: string | null;
+  /** The offer's own payment (Stripe: its PaymentIntent), cited in the evidence instead of the checkout's. */
+  paymentId?: string | null;
+};
 
 /** Text evidence built from what the checkout knows: order, delivery, consent, policies. */
 export function buildEvidence(
@@ -146,7 +181,51 @@ export function buildEvidence(
   };
 }
 
-/** After this many failed automatic submissions, the merchant answers in Whop. */
+/**
+ * The same evidence in Stripe's fields (disputes.update): the buyer, the delivery (address, carrier,
+ * tracking numbers), the product, the purchase IP, the policies, and the order's story (receipt /
+ * order reference) as uncategorized text. Empty fields are left out. Pure.
+ */
+export function stripeEvidence(
+  session: Pick<CheckoutSession, "id" | "shopifyOrderName" | "clientIp" | "shippingAddress" | "whopPaymentId"> & Partial<Pick<CheckoutSession, "lines" | "trackingPushedAt">>,
+  tracking: { number: string; company: string | null; url: string | null; shippedAt?: string | null }[],
+  base: ReturnType<typeof buildEvidence>,
+  offer?: { paymentId?: string | null; shopifyOrderName?: string | null } | null,
+): Stripe.DisputeUpdateParams.Evidence {
+  const a = session.shippingAddress as Address | null;
+  // Physical goods (shipped lines, or a parcel tracked): Stripe's shipping_date; a service's date otherwise.
+  const lines = Array.isArray(session.lines) ? (session.lines as { requiresShipping?: boolean }[]) : [];
+  const physical = tracking.length > 0 || lines.some((l) => l?.requiresShipping);
+  // The shipping date: the first Shopify fulfillment's creation (of this order, or of the offer's own
+  // order); else when the tracking number was first seen (checkout order only); else none — left out
+  // rather than claiming the payment's date as a shipping date (not shipped yet, or date unknown).
+  const fulfilledMs = tracking.map((t) => (t.shippedAt ? Date.parse(t.shippedAt) : NaN)).filter((ms) => Number.isFinite(ms));
+  const shippedOn = fulfilledMs.length
+    ? new Date(Math.min(...fulfilledMs)).toISOString().slice(0, 10)
+    : !offer && session.trackingPushedAt
+      ? session.trackingPushedAt.toISOString().slice(0, 10)
+      : undefined;
+  // An offer is its own payment (its own PaymentIntent and order): cited instead of the checkout's.
+  const paymentRef = offer ? (offer.paymentId ?? null) : session.whopPaymentId;
+  const orderRef = offer ? (offer.shopifyOrderName ?? `offre post-achat de la commande ${session.shopifyOrderName ?? session.id}`) : (session.shopifyOrderName ?? session.id);
+  const out: Record<string, string | undefined> = {
+    customer_email_address: base.customer_email_address ?? undefined,
+    customer_name: base.customer_name ?? undefined,
+    billing_address: base.billing_address ?? undefined,
+    product_description: base.product_description || undefined,
+    ...(physical ? { shipping_date: shippedOn } : { service_date: base.service_date }),
+    shipping_address: a ? [`${a.firstName} ${a.lastName}`.trim(), a.address1, a.address2, `${a.zip} ${a.city}`, a.countryCode].filter(Boolean).join(", ") : undefined,
+    shipping_carrier: tracking.find((t) => t.company)?.company ?? undefined,
+    shipping_tracking_number: tracking.length ? tracking.map((t) => t.number).join(", ").slice(0, 500) : undefined,
+    customer_purchase_ip: session.clientIp ?? undefined,
+    cancellation_policy_disclosure: base.cancellation_policy_disclosure,
+    refund_policy_disclosure: base.refund_policy_disclosure,
+    uncategorized_text: `${base.notes}\nRéférence : commande ${orderRef}${paymentRef ? `, paiement ${paymentRef}` : ""}.`.slice(0, 20_000),
+  };
+  return Object.fromEntries(Object.entries(out).filter(([, v]) => typeof v === "string" && v.trim() !== "")) as Stripe.DisputeUpdateParams.Evidence;
+}
+
+/** After this many failed automatic submissions, the merchant answers in Whop (or Stripe). */
 export const MAX_EVIDENCE_TRIES = 3;
 
 /**
@@ -174,10 +253,29 @@ export async function submitDisputeEvidence(session: SessionWithStore, disputeId
       withdrawalShown: theme.withdrawalNotice,
       offer,
     });
-    const client = storeClient(session.store);
-    // Each call bounded by the time left when it starts (the tracking read above may have used some).
-    await client.disputes.update({ id: disputeId, evidence }, whopCallOptions("Whop litige"));
-    await client.disputes.submit({ id: disputeId }, whopCallOptions("Whop litige"));
+    if (session.paymentProvider === "stripe") {
+      // The dispute read, then the evidence filled and submitted (submit: true) on the connected account
+      // the payment was made on — unless it was already answered (in Stripe) or needs no response.
+      const res = await submitStripeDispute(stripeStoreOf(session), disputeId, stripeEvidence(session, tracking, evidence, offer ?? null));
+      if ("skipped" in res) {
+        const done = { disputeEvidenceAt: new Date(), disputeEvidenceStartedAt: null };
+        if (offer) await db.upsellCharge.update({ where: { id: offer.id }, data: done });
+        else await db.checkoutSession.update({ where: { id: session.id }, data: done });
+        await recordEvent({
+          storeId: session.storeId,
+          sessionId: session.id,
+          kind: "dispute.evidence_skipped",
+          message: `Litige ${disputeId}${offer ? ` (offre « ${offer.title} »)` : ""} déjà traité dans Stripe (${res.skipped}) : aucune preuve envoyée automatiquement.`,
+          data: { disputeId },
+        });
+        return false;
+      }
+    } else {
+      const client = storeClient(session.store);
+      // Each call bounded by the time left when it starts (the tracking read above may have used some).
+      await client.disputes.update({ id: disputeId, evidence }, whopCallOptions("Whop litige"));
+      await client.disputes.submit({ id: disputeId }, whopCallOptions("Whop litige"));
+    }
     const done = { disputeEvidenceAt: new Date(), disputeEvidenceStartedAt: null };
     if (offer) await db.upsellCharge.update({ where: { id: offer.id }, data: done });
     else await db.checkoutSession.update({ where: { id: session.id }, data: done });
@@ -207,7 +305,7 @@ export async function submitDisputeEvidence(session: SessionWithStore, disputeId
       level: last ? "error" : "warn",
       kind: last ? "dispute.evidence_gave_up" : "dispute.evidence_failed",
       message: last
-        ? `Envoi automatique des preuves impossible après ${updated.disputeEvidenceTries} essais (${err instanceof Error ? err.message : String(err)}) : répondez au litige ${disputeId} dans Whop${updated.disputeDueAt ? ` avant le ${updated.disputeDueAt.toISOString().slice(0, 10)}` : ""}.`
+        ? `Envoi automatique des preuves impossible après ${updated.disputeEvidenceTries} essais (${err instanceof Error ? err.message : String(err)}) : répondez au litige ${disputeId} dans ${session.paymentProvider === "stripe" ? "Stripe" : "Whop"}${updated.disputeDueAt ? ` avant le ${updated.disputeDueAt.toISOString().slice(0, 10)}` : ""}.`
         : `Envoi des preuves du litige ${disputeId} en échec (essai ${updated.disputeEvidenceTries}/${MAX_EVIDENCE_TRIES}, ${err instanceof Error ? err.message : String(err)}) : nouvel essai automatique.`,
       alert: last,
       err,
@@ -216,7 +314,7 @@ export async function submitDisputeEvidence(session: SessionWithStore, disputeId
   }
 }
 
-type Tracking = { number: string; company: string | null; url: string | null }[];
+type Tracking = { number: string; company: string | null; url: string | null; shippedAt?: string | null }[];
 
 /**
  * The parcel's tracking for the evidence, read from Shopify. A read failure is never swallowed blindly:
@@ -365,6 +463,7 @@ export async function submitDueDisputeEvidence(deadline: number): Promise<number
       paidAt: c.createdAt,
       shopifyOrderId: c.shopifyOrderId,
       shopifyOrderName: c.shopifyOrderName,
+      paymentId: c.whopPaymentId,
     });
     if (ok) n++;
   }
@@ -515,7 +614,8 @@ export async function runAlertRefund(sessionId: string): Promise<boolean> {
     return true;
   }
   try {
-    await refundPayment(s.store, s.whopPaymentId, undefined, s.alertRefundKey);
+    if (s.paymentProvider === "stripe") await refundStripe(stripeStoreOf(s), s.whopPaymentId, undefined, s.alertRefundKey);
+    else await refundPayment(s.store, s.whopPaymentId, undefined, s.alertRefundKey);
     await db.checkoutSession.update({ where: { id: sessionId }, data: done });
     await recordEvent({
       storeId: s.storeId,
@@ -595,16 +695,16 @@ export async function tagDisputedOrders(deadline: number): Promise<number> {
     db.checkoutSession.findMany({ where: due, include: { store: true }, take: 10, orderBy: { disputeOpenedAt: "asc" } }),
     db.upsellCharge.findMany({ where: due, include: { session: { include: { store: true } } }, take: 10, orderBy: { disputeOpenedAt: "asc" } }),
   ]);
-  type Item = { store: Store; orderId: string; orderName: string | null; sessionId: string; attempts: number; ref: { sessionId: string } | { chargeId: string }; update: (data: { disputeTaggedAt?: Date; disputeTagAttempts?: number; nextDisputeTagAt?: Date | null; disputeTagGaveUpAt?: Date }) => Promise<unknown> };
+  type Item = { store: Store; orderId: string; orderName: string | null; sessionId: string; attempts: number; tag: string; ref: { sessionId: string } | { chargeId: string }; update: (data: { disputeTaggedAt?: Date; disputeTagAttempts?: number; nextDisputeTagAt?: Date | null; disputeTagGaveUpAt?: Date }) => Promise<unknown> };
   const items: Item[] = [
-    ...sessions.map((s) => ({ store: s.store, orderId: s.shopifyOrderId!, orderName: s.shopifyOrderName, sessionId: s.id, attempts: s.disputeTagAttempts, ref: { sessionId: s.id }, update: (data: object) => db.checkoutSession.update({ where: { id: s.id }, data }) })),
-    ...offers.map((c) => ({ store: c.session.store, orderId: c.shopifyOrderId!, orderName: c.shopifyOrderName, sessionId: c.sessionId, attempts: c.disputeTagAttempts, ref: { chargeId: c.id }, update: (data: object) => db.upsellCharge.update({ where: { id: c.id }, data }) })),
+    ...sessions.map((s) => ({ store: s.store, orderId: s.shopifyOrderId!, orderName: s.shopifyOrderName, sessionId: s.id, attempts: s.disputeTagAttempts, tag: disputeTag(s.paymentProvider), ref: { sessionId: s.id }, update: (data: object) => db.checkoutSession.update({ where: { id: s.id }, data }) })),
+    ...offers.map((c) => ({ store: c.session.store, orderId: c.shopifyOrderId!, orderName: c.shopifyOrderName, sessionId: c.sessionId, attempts: c.disputeTagAttempts, tag: disputeTag(c.provider), ref: { chargeId: c.id }, update: (data: object) => db.upsellCharge.update({ where: { id: c.id }, data }) })),
   ];
   let n = 0;
   for (const it of items) {
     if (stopForTime(deadline)) break;
     try {
-      await tagOrder(it.store, it.orderId, ["litige-whop"]);
+      await tagOrder(it.store, it.orderId, [it.tag]);
       await it.update({ disputeTaggedAt: new Date(), nextDisputeTagAt: null });
       n++;
     } catch (err) {
@@ -622,7 +722,7 @@ export async function tagDisputedOrders(deadline: number): Promise<number> {
           sessionId: it.sessionId,
           level: "warn",
           kind: "dispute.tag_gave_up",
-          message: `Tag « litige-whop » impossible à ajouter sur ${it.orderName ?? "la commande Shopify"} après ${attempts} essais (${reason}) : ajoutez-le à la main dans Shopify pour ne pas expédier ni rembourser deux fois.`,
+          message: `Tag « ${it.tag} » impossible à ajouter sur ${it.orderName ?? "la commande Shopify"} après ${attempts} essais (${reason}) : ajoutez-le à la main dans Shopify pour ne pas expédier ni rembourser deux fois.`,
           data: { ...it.ref, attempts },
           alert: true,
         });

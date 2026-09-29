@@ -128,6 +128,22 @@ export async function fxUpkeep(): Promise<number> {
 }
 
 /**
+ * The processor's fee on a paid checkout: Whop's (whopFeeCents) or another processor's
+ * (providerFeeCents, e.g. Stripe's balance transaction fee). Null when unknown. Pure.
+ */
+export function feeCents(s: { whopFeeCents?: number | null; providerFeeCents?: number | null }): number | null {
+  return s.whopFeeCents ?? s.providerFeeCents ?? null;
+}
+
+/**
+ * Amount to ask the processor (Whop or Stripe) to refund for `amountCents` typed in the shop
+ * currency; same rule for both (Stripe refunds in the charged currency too). See whopRefundAmount.
+ */
+export function providerRefundAmount(o: Parameters<typeof whopRefundAmount>[0]): number | undefined {
+  return whopRefundAmount(o);
+}
+
+/**
  * Amount to ask Whop to refund for `amountCents` typed in the shop currency (undefined = the whole
  * payment). Charged in the buyer's currency: in that currency, the remaining refund being exactly
  * chargeTotal − refundedCharge (never a rounded conversion of the shop-currency remainder). Pure.

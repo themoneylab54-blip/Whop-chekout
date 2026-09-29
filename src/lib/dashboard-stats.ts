@@ -1,6 +1,7 @@
 import "server-only";
 import { addDays, tzOf } from "./time";
 import { db } from "./db";
+import { PROVIDER_STORE_SELECT, storeLive, storeReady } from "./payment-provider";
 import { crossRate, ecbRates, type FxRates } from "./fx";
 import { dailySeries, includeTestFor, resolveRange, storeAnalytics, storeSummary, summaryAnomalies, type Analytics, type Anomaly, type DayRange, type StoreSummary, type SummaryFigures } from "./analytics";
 
@@ -176,7 +177,7 @@ export function storeRange(range: DayRange, tz: string): DayRange {
 export async function crossStoreStats(range: DayRange): Promise<{ rows: CrossStoreRow[]; totals: CrossStoreTotals; zones: string[] }> {
   const stores = await db.store.findMany({
     orderBy: { createdAt: "asc" },
-    select: { id: true, name: true, shopCurrency: true, enabled: true, testMode: true, shopifyConnectedAt: true, whopConnectedAt: true, timezone: true },
+    select: { id: true, name: true, shopCurrency: true, enabled: true, shopifyConnectedAt: true, timezone: true, ...PROVIDER_STORE_SELECT },
   });
   const rows = await Promise.all(
     stores.map(async (s) => {
@@ -188,8 +189,9 @@ export async function crossStoreStats(range: DayRange): Promise<{ rows: CrossSto
         id: s.id,
         name: s.name,
         currency: s.shopCurrency,
-        live: s.enabled && !!s.shopifyConnectedAt && !!s.whopConnectedAt,
-        ready: !!s.shopifyConnectedAt && !!s.whopConnectedAt,
+        // Any processor able to charge (a Stripe-only store never connects Whop).
+        live: storeLive(s),
+        ready: storeReady(s),
         testMode: s.testMode,
         includeTest,
         summary,
