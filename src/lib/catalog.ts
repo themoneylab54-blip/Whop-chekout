@@ -1,7 +1,7 @@
 "use server";
 
-import { requireAdmin } from "./auth";
-import { db } from "./db";
+import { redirect } from "next/navigation";
+import { checkStoreAccess } from "./access";
 import { shopifyGraphql } from "./shopify";
 
 /** Shopify catalog lookups for the dashboard's product / variant picker. */
@@ -43,11 +43,16 @@ function toProduct(p: RawProduct): CatalogProduct {
   };
 }
 
+/** The store's Shopify connection, when the signed-in user may open the store (signed out → /login). */
 async function connectedStore(storeId: string) {
-  await requireAdmin();
-  const store = await db.store.findUnique({ where: { id: storeId }, select: { shopDomain: true, shopifyAccessToken: true, shopifyConnectedAt: true } });
-  if (!store?.shopifyConnectedAt || !store.shopDomain || !store.shopifyAccessToken) return null;
-  return store;
+  const res = await checkStoreAccess(storeId, "view");
+  if (!res.ok) {
+    if (res.reason === "login") redirect("/login");
+    return null;
+  }
+  const { shopDomain, shopifyAccessToken, shopifyConnectedAt } = res.store;
+  if (!shopifyConnectedAt || !shopDomain || !shopifyAccessToken) return null;
+  return { shopDomain, shopifyAccessToken, shopifyConnectedAt };
 }
 
 function failure(err: unknown): { ok: false; error: string } {

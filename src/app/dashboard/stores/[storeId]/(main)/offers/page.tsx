@@ -5,7 +5,7 @@ import { notFound } from "next/navigation";
 import { runningTestsByElement } from "@/lib/checkout-tests";
 import { tzOf, zonedDay, zoneLabel } from "@/lib/time";
 import type { AddOn, DiscountCode } from "@prisma/client";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess } from "@/lib/access";
 import { db } from "@/lib/db";
 import { loadTheme } from "@/lib/layout";
 import { centsToDecimal, parseQuantityTiers } from "@/lib/pricing";
@@ -42,8 +42,8 @@ export default async function OffersPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string }>;
 }) {
-  await requireAdmin();
   const { storeId } = await params;
+  await requireStoreAccess(storeId, "view");
   const sp = await searchParams;
   const store = await db.store.findUnique({
     where: { id: storeId },

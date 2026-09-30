@@ -1,19 +1,22 @@
 import { zoneLabel } from "@/lib/time";
 import type { Metadata } from "next";
 import Link from "next/link";
-import { AlertTriangle, ArrowDown, ArrowRight, ArrowUp, ArrowUpDown, Download, LogOut, Plus, ShoppingBag, Store as StoreIcon, XCircle } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowRight, ArrowUp, ArrowUpDown, Download, Plus, ShoppingBag, Store as StoreIcon, XCircle } from "lucide-react";
 import type { Anomaly } from "@/lib/analytics";
-import { requireAdmin } from "@/lib/auth";
+import { requireUser } from "@/lib/auth";
+import { accessibleStoreWhere, roleAtLeast } from "@/lib/access";
 import { db } from "@/lib/db";
 import { storeHealth } from "@/lib/health";
 import { STORE_SORTS, crossStoreStats, sortStores, type CrossStoreRow, type StoreSort } from "@/lib/dashboard-stats";
-import { Badge, Input, Label, SubmitButton, buttonClass } from "@/components/ui";
+import { DASHBOARD_FLASH, flashMessages } from "@/lib/team-rules";
+import { Badge, Flash, Input, Label, SubmitButton, buttonClass } from "@/components/ui";
 import { AuthShell } from "@/components/dashboard/AuthShell";
 import { formatCentsRound } from "@/components/dashboard/format";
 import { Delta, EstimatedBadge, InfoTip, int, multiple, pct, type DeltaInput } from "@/components/dashboard/AnalyticsKit";
 import { AnalyticsControls, hrefWith, parseControls, stateParams, type ControlParams } from "@/components/dashboard/AnalyticsControls";
 import { ProfitChart } from "@/components/dashboard/ProfitChart";
 import { createStoreAction, logoutAction } from "./actions";
+import { UserMenu } from "@/components/dashboard/AccountShell";
 import "./dashboard.css";
 import { PopoverDetails } from "@/components/dashboard/Popover";
 
@@ -60,23 +63,53 @@ const ANOMALY_LABEL: Record<Anomaly["key"], string> = {
 };
 
 /** Every store at a glance for a period (CA HT, orders, conversion, margin, ads, health), same engine as each store's Analytics. */
-export default async function DashboardHome({ searchParams }: { searchParams: Promise<ControlParams & { sort?: string; dir?: string }> }) {
-  await requireAdmin();
+export default async function DashboardHome({ searchParams }: { searchParams: Promise<ControlParams & { sort?: string; dir?: string; ok?: string; error?: string }> }) {
+  const user = await requireUser();
   const sp = await searchParams;
-  const storeCount = await db.store.count();
+  // Fixed codes only (a refusal, a self-demotion): nothing from the URL is shown as is.
+  const flash = flashMessages(DASHBOARD_FLASH, sp);
+  // Only the stores the user may open; viewers can't add one.
+  const where = accessibleStoreWhere(user);
+  const canCreate = roleAtLeast(user.role, "admin");
+  const storeCount = await db.store.count({ where });
+  if (storeCount === 0 && !canCreate) {
+    return (
+      <AuthShell title="Aucune boutique pour l'instant" subtitle="Aucune boutique ne vous est encore attribuée : demandez l'accès au propriétaire du compte.">
+        <Flash ok={flash.ok} error={flash.error} />
+        <div className="flex items-center justify-center gap-4">
+          <Link href="/dashboard/account" className="inline-flex min-h-8 items-center text-sm text-zinc-500 underline-offset-4 hover:underline">
+            Mon profil
+          </Link>
+          <form action={logoutAction}>
+            <button className="min-h-8 text-sm text-zinc-500 underline-offset-4 hover:underline">Se déconnecter</button>
+          </form>
+        </div>
+      </AuthShell>
+    );
+  }
   if (storeCount === 0) {
     return (
       <AuthShell title="Ajoutez votre première boutique" subtitle="Donnez-lui un nom, on s'occupe du reste en 5 minutes.">
+        <Flash ok={flash.ok} error={flash.error} />
         <form action={createStoreAction} className="space-y-4">
           <div>
             <Label htmlFor="name">Nom de la boutique</Label>
-            <Input id="name" name="name" placeholder="Ma boutique" required autoFocus />
+            <Input id="name" name="name" placeholder="Ma boutique" required autoFocus maxLength={80} />
           </div>
           <SubmitButton className="w-full py-2.5">Créer la boutique</SubmitButton>
         </form>
-        <form action={logoutAction} className="mt-6 text-center">
-          <button className="text-sm text-zinc-500 underline-offset-4 hover:underline">Se déconnecter</button>
-        </form>
+        {/* Before any store: the profile and the team (invite someone to set it up) stay reachable. */}
+        <div className="mt-6 flex flex-wrap items-center justify-center gap-x-4 gap-y-1">
+          <Link href="/dashboard/account" className="inline-flex min-h-8 items-center text-sm text-zinc-500 underline-offset-4 hover:underline">
+            Mon profil
+          </Link>
+          <Link href="/dashboard/team" className="inline-flex min-h-8 items-center text-sm text-zinc-500 underline-offset-4 hover:underline">
+            Équipe
+          </Link>
+          <form action={logoutAction}>
+            <button className="min-h-8 text-sm text-zinc-500 underline-offset-4 hover:underline">Se déconnecter</button>
+          </form>
+        </div>
       </AuthShell>
     );
   }
@@ -89,7 +122,7 @@ export default async function DashboardHome({ searchParams }: { searchParams: Pr
     sort: sort === "ca" ? undefined : sort,
     dir: dir === "desc" ? undefined : dir,
   };
-  const { rows: base, totals, zones } = await crossStoreStats(range);
+  const { rows: base, totals, zones } = await crossStoreStats(range, where);
   // Days are each store's own (its time zone): said plainly when the stores don't share one.
   const daysNote = zones.length > 1 ? `Jours du fuseau de chaque boutique (${zones.map((z) => zoneLabel(z)).join(", ")}) : totaux par jour approximatifs.` : `Jours en ${zoneLabel(zones[0] ?? "Europe/Paris")}.`;
   const rows: Row[] = sortStores(
@@ -128,11 +161,7 @@ export default async function DashboardHome({ searchParams }: { searchParams: Pr
             </span>
             Whop Checkout
           </span>
-          <form action={logoutAction}>
-            <button aria-label="Se déconnecter" className="inline-flex min-h-9 items-center gap-1.5 rounded-lg px-2.5 text-sm text-zinc-600 hover:bg-zinc-100">
-              <LogOut className="h-4 w-4" aria-hidden /> <span className="hidden sm:inline">Se déconnecter</span>
-            </button>
-          </form>
+          <UserMenu user={user} />
         </div>
       </header>
 
@@ -147,23 +176,26 @@ export default async function DashboardHome({ searchParams }: { searchParams: Pr
               <Download className="h-4 w-4" aria-hidden /> CSV
               <span className="sr-only"> de toutes les boutiques</span>
             </a>
-            <PopoverDetails className="group relative">
-              <summary className="inline-flex min-h-9 cursor-pointer list-none items-center gap-1.5 rounded-lg bg-white px-3 text-sm font-medium text-zinc-800 shadow-[var(--shadow-card)] hover:bg-zinc-50 [&::-webkit-details-marker]:hidden">
-                <Plus className="h-4 w-4" aria-hidden /> Ajouter une boutique
-              </summary>
-              <form
-                action={createStoreAction}
-                className="absolute right-0 z-20 mt-1.5 hidden w-72 max-w-[calc(100vw-2rem)] space-y-3 group-open:block rounded-xl bg-white p-3 shadow-[var(--shadow-float)]"
-              >
-                <div>
-                  <Label htmlFor="name">Nom de la boutique</Label>
-                  <Input id="name" name="name" placeholder="Ma boutique" required />
-                </div>
-                <SubmitButton className="w-full">Créer</SubmitButton>
-              </form>
-            </PopoverDetails>
+            {canCreate && (
+              <PopoverDetails className="group relative">
+                <summary className="inline-flex min-h-9 cursor-pointer list-none items-center gap-1.5 rounded-lg bg-white px-3 text-sm font-medium text-zinc-800 shadow-[var(--shadow-card)] hover:bg-zinc-50 [&::-webkit-details-marker]:hidden">
+                  <Plus className="h-4 w-4" aria-hidden /> Ajouter une boutique
+                </summary>
+                <form
+                  action={createStoreAction}
+                  className="absolute right-0 z-20 mt-1.5 hidden w-72 max-w-[calc(100vw-2rem)] space-y-3 group-open:block rounded-xl bg-white p-3 shadow-[var(--shadow-float)]"
+                >
+                  <div>
+                    <Label htmlFor="name">Nom de la boutique</Label>
+                    <Input id="name" name="name" placeholder="Ma boutique" required />
+                  </div>
+                  <SubmitButton className="w-full">Créer</SubmitButton>
+                </form>
+              </PopoverDetails>
+            )}
           </div>
         </div>
+        <Flash ok={flash.ok} error={flash.error} />
 
         <AnalyticsControls base="/dashboard" state={state} options={{ sources: [], countries: [] }} testMode={false} showFilters={false} showTest={false} keep={keep} />
         {range.error && (

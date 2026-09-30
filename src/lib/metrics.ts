@@ -19,6 +19,7 @@ export const PROVIDER_LABELS: Record<string, string> = {
   meta: "Meta",
   tiktok: "TikTok",
   google_ads: "Google Ads",
+  google_signin: "Google (connexion)",
   ga4: "Google Analytics 4",
   ecb: "BCE (taux de change)",
   resend: "Resend (e-mails)",

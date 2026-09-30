@@ -3,6 +3,7 @@ import { db } from "@/lib/db";
 import { encrypt } from "@/lib/crypto";
 import { env } from "@/lib/env";
 import { currentAdminId } from "@/lib/auth";
+import { checkStoreAccess, OWNER_ONLY_ERROR } from "@/lib/access";
 import { route } from "@/lib/route";
 import { log, recordEvent } from "@/lib/log";
 import { exchangeGoogleAdsCode, googleAdsOperator, googleAdsRedirectUri, listGoogleAdsAccounts, verifyGoogleAdsState } from "@/lib/google-ads-oauth";
@@ -20,7 +21,10 @@ async function handle(req: Request) {
   const adminId = await currentAdminId();
   if (!adminId) return NextResponse.redirect(`${env.appUrl}/login`);
   const storeId = verifyGoogleAdsState(q.get("state") ?? "", adminId);
-  const store = storeId ? await db.store.findUnique({ where: { id: storeId }, select: { id: true } }) : null;
+  // The Google Ads connection (its tokens) is the owner's, like the other API keys.
+  const access = storeId ? await checkStoreAccess(storeId, "owner") : null;
+  if (access && !access.ok && access.reason === "forbidden") return back(storeId, { error: OWNER_ONLY_ERROR });
+  const store = access?.ok ? { id: access.store.id } : null;
   if (!store) return back(null, {});
   const op = googleAdsOperator();
   if (!op) return back(store.id, { error: "Connexion Google Ads indisponible : l'application Google Ads n'est pas configurée sur ce serveur. Utilisez « Avancé »." });

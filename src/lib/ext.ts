@@ -2,7 +2,7 @@ import "server-only";
 import { log } from "./log";
 
 /** External providers whose calls are logged as `ext.call` (and rolled up in ProviderMetric). */
-export type Provider = "shopify" | "whop" | "stripe" | "meta" | "tiktok" | "google_ads" | "ga4" | "ecb" | "resend" | "telegram" | "mondial_relay" | "judgeme";
+export type Provider = "shopify" | "whop" | "stripe" | "meta" | "tiktok" | "google_ads" | "google_signin" | "ga4" | "ecb" | "resend" | "telegram" | "mondial_relay" | "judgeme";
 
 /**
  * `fetch` to an external provider, logged like the Shopify and Whop clients: one `ext.call` line with

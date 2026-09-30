@@ -3,7 +3,8 @@ import type { ReactNode } from "react";
 import { AlertTriangle, BellRing, Mail, Check, Copy, LifeBuoy, Minus, PiggyBank, Settings, ShieldCheck, ShoppingCart, Store, Trash2 } from "lucide-react";
 import { notFound } from "next/navigation";
 import { DirtyForm, SaveAllWith } from "@/components/dashboard/DirtyForm";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess, roleCan } from "@/lib/access";
+import { OwnerOnlyNote } from "@/components/dashboard/OwnerOnly";
 import { db } from "@/lib/db";
 import { Card, Flash, Input, Label, PageHeader, Select, SubmitButton, Toggle } from "@/components/ui";
 import { TIME_ZONES, tzOf } from "@/lib/time";
@@ -34,6 +35,8 @@ import { CheckoutDomainCard } from "@/components/dashboard/CheckoutDomainCard";
 import { env } from "@/lib/env";
 import { vercelConfig } from "@/lib/vercel-domains";
 import { SecretInput } from "@/components/dashboard/SecretInput";
+import { OwnerBoundInput } from "@/components/dashboard/OwnerBoundInput";
+import { ownerBoundLocked } from "@/lib/owner-bound";
 import { ConfirmButton } from "@/components/dashboard/ConfirmButton";
 import { CostsSettingsCard } from "@/components/dashboard/CostsSettingsCard";
 import { AttributionSettingsCard } from "@/components/dashboard/AttributionSettingsCard";
@@ -50,12 +53,16 @@ export default async function SettingsPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string }>;
 }) {
-  await requireAdmin();
   const { storeId } = await params;
+  const { user } = await requireStoreAccess(storeId, "view");
   const sp = await searchParams;
   const store = await db.store.findUnique({ where: { id: storeId } });
   const paidOrders = await db.checkoutSession.count({ where: { storeId, status: "PAID" } });
   if (!store) notFound();
+  // API keys, the operator's mail account, deleting the store and a mode switch that resets the
+  // payment connections are the account owner's (the actions refuse the others).
+  const isOwner = roleCan(user.role, "owner");
+  const modeLocked = !isOwner && !!(store.whopConnectedAt || store.stripeAccountId);
   const operator = await operatorMailer();
   const alertChannel = !!(store.alertEmail && store.resendApiKey) || !!(store.telegramBotToken && store.telegramChatId);
 
@@ -92,12 +99,21 @@ export default async function SettingsPage({
                   </Select>
                 </div>
                 <div className="border-t border-zinc-100">
-                  <Toggle
-                    name="testMode"
-                    defaultChecked={store.testMode}
-                    label="Mode test"
-                    hint="Paiements Whop sandbox (aucun débit réel) et commandes Shopify marquées « test ». Changer de mode demande de reconnecter Whop avec la clé correspondante."
-                  />
+                  {modeLocked ? (
+                    // Switching tears the payment connections down: owner only. The current mode is sent as is.
+                    <div className="py-3.5">
+                      {store.testMode && <input type="hidden" name="testMode" value="on" />}
+                      <p className="text-sm font-medium text-zinc-900">Mode {store.testMode ? "test" : "production"}</p>
+                      <OwnerOnlyNote className="mt-2">changer de mode déconnecte Whop et change la connexion Stripe.</OwnerOnlyNote>
+                    </div>
+                  ) : (
+                    <Toggle
+                      name="testMode"
+                      defaultChecked={store.testMode}
+                      label="Mode test"
+                      hint="Paiements Whop sandbox (aucun débit réel) et commandes Shopify marquées « test ». Changer de mode demande de reconnecter Whop avec la clé correspondante."
+                    />
+                  )}
                 </div>
               </DirtyForm>
             </Card>
@@ -169,7 +185,8 @@ export default async function SettingsPage({
                   : "Aucun compte de l'opérateur : chaque boutique utilise sa propre clé Resend (section Alertes)."}{" "}
                 Une boutique avec sa propre clé l&apos;utilise en priorité.
               </p>
-              {operator?.source !== "env" && (
+              {operator?.source !== "env" && !isOwner && <OwnerOnlyNote>le compte Resend de l&apos;opérateur sert à toutes les boutiques.</OwnerOnlyNote>}
+              {operator?.source !== "env" && isOwner && (
                 <form action={saveOperatorMailAction.bind(null, store.id)} className="grid grid-cols-[minmax(0,1fr)] gap-4 sm:grid-cols-2">
                   <div>
                     <Label htmlFor="operatorResendApiKey" hint="Commence par re_">
@@ -302,13 +319,19 @@ export default async function SettingsPage({
                     <Label htmlFor="resendApiKey" hint="Pour les alertes par e-mail : resend.com → API Keys">
                       Clé API Resend
                     </Label>
-                    <SecretInput name="resendApiKey" stored={!!store.resendApiKey} placeholder="re_…" />
+                    <SecretInput name="resendApiKey" stored={!!store.resendApiKey} placeholder="re_…" locked={!isOwner} />
                   </div>
                   <div>
                     <Label htmlFor="emailFrom" hint="Adresse de votre domaine vérifié dans Resend">
                       Expéditeur
                     </Label>
-                    <Input id="emailFrom" name="emailFrom" defaultValue={store.emailFrom ?? ""} placeholder="Alertes <alertes@maboutique.fr>" />
+                    <OwnerBoundInput
+                      locked={ownerBoundLocked(user.role, !!store.resendApiKey)}
+                      id="emailFrom"
+                      name="emailFrom"
+                      defaultValue={store.emailFrom ?? ""}
+                      placeholder="Alertes <alertes@maboutique.fr>"
+                    />
                   </div>
                 </div>
                 <div className="grid grid-cols-[minmax(0,1fr)] gap-4 sm:grid-cols-2">
@@ -316,13 +339,20 @@ export default async function SettingsPage({
                     <Label htmlFor="telegramBotToken" hint="Créez un bot avec @BotFather, collez son jeton">
                       Jeton du bot Telegram
                     </Label>
-                    <SecretInput name="telegramBotToken" stored={!!store.telegramBotToken} placeholder="123456:ABC…" />
+                    <SecretInput name="telegramBotToken" stored={!!store.telegramBotToken} placeholder="123456:ABC…" locked={!isOwner} />
                   </div>
                   <div>
                     <Label htmlFor="telegramChatId" hint="Écrivez à @userinfobot pour connaître votre ID">
                       Votre ID Telegram
                     </Label>
-                    <Input id="telegramChatId" name="telegramChatId" defaultValue={store.telegramChatId ?? ""} inputMode="numeric" placeholder="123456789" />
+                    <OwnerBoundInput
+                      locked={ownerBoundLocked(user.role, !!store.telegramBotToken)}
+                      id="telegramChatId"
+                      name="telegramChatId"
+                      defaultValue={store.telegramChatId ?? ""}
+                      inputMode="numeric"
+                      placeholder="123456789"
+                    />
                   </div>
                 </div>
               </DirtyForm>
@@ -440,16 +470,20 @@ export default async function SettingsPage({
                   Désactivez plutôt le checkout dans « Boutique » ci-dessus.
                 </p>
               )}
-              <form action={deleteStoreAction.bind(null, store.id)}>
-                <ConfirmButton
-                  disabled={paidOrders > 0}
-                  title={`Supprimer définitivement « ${store.name} » ?`}
-                  description="Le script Shopify et le webhook Whop sont retirés, puis la boutique et tous ses réglages sont effacés. Cette action est irréversible."
-                  confirmLabel="Supprimer la boutique"
-                >
-                  <Trash2 className="h-4 w-4" aria-hidden /> Supprimer la boutique
-                </ConfirmButton>
-              </form>
+              {isOwner ? (
+                <form action={deleteStoreAction.bind(null, store.id)}>
+                  <ConfirmButton
+                    disabled={paidOrders > 0}
+                    title={`Supprimer définitivement « ${store.name} » ?`}
+                    description="Le script Shopify et le webhook Whop sont retirés, puis la boutique et tous ses réglages sont effacés. Cette action est irréversible."
+                    confirmLabel="Supprimer la boutique"
+                  >
+                    <Trash2 className="h-4 w-4" aria-hidden /> Supprimer la boutique
+                  </ConfirmButton>
+                </form>
+              ) : (
+                <OwnerOnlyNote>seul le propriétaire peut supprimer une boutique.</OwnerOnlyNote>
+              )}
             </Card>
           </Anchor>
         </div>

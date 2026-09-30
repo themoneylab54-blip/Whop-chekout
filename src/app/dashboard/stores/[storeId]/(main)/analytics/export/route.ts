@@ -1,4 +1,4 @@
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess } from "@/lib/access";
 import { tzOf, zoneLabel } from "@/lib/time";
 import { db } from "@/lib/db";
 import { fixedCostsFor, includeTestFor, resolveRange, storeAnalytics, storeCohorts, type AdVerdict, type Filters } from "@/lib/analytics";
@@ -20,8 +20,8 @@ type ExportType = (typeof TYPES)[number];
 const VERDICT: Record<AdVerdict, string> = { early: "Trop tôt (données insuffisantes)", cut: "Couper", keep: "Garder", scale: "Scaler" };
 
 export async function GET(req: Request, ctx: { params: Promise<{ storeId: string }> }) {
-  await requireAdmin();
   const { storeId } = await ctx.params;
+  await requireStoreAccess(storeId, "view");
   const sp = new URL(req.url).searchParams;
   const type = sp.get("type") as ExportType;
   if (!TYPES.includes(type)) return new Response("Type d'export inconnu", { status: 400 });

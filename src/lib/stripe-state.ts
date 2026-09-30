@@ -44,6 +44,16 @@ export function sameOrigin(origin: string | null, appUrl: string): boolean {
   }
 }
 
+/**
+ * Stricter than sameOrigin (sign-in round trips): the request must prove it comes from our pages —
+ * an Origin of this app's host, or, without Origin, the browser's `Sec-Fetch-Site: same-origin`.
+ * Neither header: refused. Pure.
+ */
+export function strictSameOrigin(origin: string | null, secFetchSite: string | null, appUrl: string): boolean {
+  if (origin) return sameOrigin(origin, appUrl);
+  return secFetchSite === "same-origin";
+}
+
 function stateKey(rawKey?: string): Buffer {
   // Domain-separated from the encryption itself: the AES key never signs anything directly.
   return createHmac("sha256", deriveKey(rawKey ?? process.env.ENCRYPTION_KEY ?? "")).update("stripe-connect-state.v1").digest();

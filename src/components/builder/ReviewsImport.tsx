@@ -96,7 +96,7 @@ export function ReviewsImport({
   /** "Lecture de « avis.csv » (4,2 Mo)…" while a file is parsed. */
   const [reading, setReading] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
-  const [judge, setJudge] = useState<{ connected: boolean; shopConnected: boolean } | null>(null);
+  const [judge, setJudge] = useState<{ connected: boolean; shopConnected: boolean; owner: boolean } | null>(null);
   const [tokenOpen, setTokenOpen] = useState(false);
   const [token, setToken] = useState("");
   const tokenId = useId();
@@ -264,16 +264,27 @@ export function ReviewsImport({
       {judge?.connected && (
         <p className="text-[11px] text-zinc-600">
           Jeton Judge.me enregistré (chiffré).{" "}
-          <button type="button" className={linkBtn} onClick={() => setTokenOpen((o) => !o)}>
-            Changer
-          </button>{" "}
-          ·{" "}
-          <button type="button" className={linkBtn} onClick={() => void forget()}>
-            Supprimer
-          </button>
+          {judge.owner ? (
+            <>
+              <button type="button" className={linkBtn} onClick={() => setTokenOpen((o) => !o)}>
+                Changer
+              </button>{" "}
+              ·{" "}
+              <button type="button" className={linkBtn} onClick={() => void forget()}>
+                Supprimer
+              </button>
+            </>
+          ) : (
+            "Le changer ou le supprimer : réservé au propriétaire du compte."
+          )}
         </p>
       )}
-      {tokenOpen && (
+      {tokenOpen && judge && !judge.owner && (
+        <p role="status" className="rounded-md bg-zinc-50 px-2.5 py-2 text-[11px] text-zinc-700 ring-1 ring-zinc-200">
+          Réservé au propriétaire du compte : lui seul peut enregistrer le jeton Judge.me de la boutique. Demandez-lui de le faire, vous pourrez ensuite importer les avis.
+        </p>
+      )}
+      {tokenOpen && (!judge || judge.owner) && (
         <form
           className="space-y-1.5 rounded-md border border-zinc-200 bg-white p-2.5"
           onSubmit={(e) => {

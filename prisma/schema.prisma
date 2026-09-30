@@ -7,11 +7,88 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// Dashboard team roles (migration 0038_team_access): viewer = read only, admin = read + edit
+// (+ invite admins/viewers), owner = everything incl. the team's owners and payment connections.
+enum UserRole {
+  owner
+  admin
+  viewer
+}
+
 model AdminUser {
-  id           String   @id @default(cuid())
-  email        String   @unique
-  passwordHash String
-  createdAt    DateTime @default(now())
+  id                    String        @id @default(cuid())
+  email                 String        @unique
+  // Null for a Google-only account
+  passwordHash          String?
+  createdAt             DateTime      @default(now())
+  // --- Team (migration 0038_team_access) ---
+  name                  String?
+  avatarUrl             String?
+  // Google account linked for "Continuer avec Google" (the ID token's `sub`)
+  googleSub             String?       @unique
+  role                  UserRole      @default(admin)
+  // false = only the stores listed in StoreAccess
+  allStores             Boolean       @default(true)
+  // Removed from the team: refused everywhere, rows kept for the journal
+  disabledAt            DateTime?
+  // Carried by the session cookie (`sv`); bumping it signs the user out everywhere
+  sessionVersion        Int           @default(0)
+  lastLoginAt           DateTime?
+  // --- migration 0039_team_security ---
+  // E-mail of the linked Google account (shown on Profil), null when none
+  googleEmail           String?
+  // Fresh Google re-authentication (auth_time checked): lets a Google-only account set its first password for a few minutes
+  reauthAt              DateTime?
+  // E-mail change awaiting confirmation from the new address (token hashed, 1 hour)
+  pendingEmail          String?
+  pendingEmailTokenHash String?       @unique
+  pendingEmailExpiresAt DateTime?
+  storeAccess           StoreAccess[]
+  invitesSent           TeamInvite[]  @relation("InvitesSent")
+  invitesUsed           TeamInvite[]  @relation("InvitesUsed")
+}
+
+/**
+ * Stores a user with `allStores = false` may open.
+ */
+model StoreAccess {
+  userId  String
+  user    AdminUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  storeId String
+  store   Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@id([userId, storeId])
+  @@index([storeId])
+}
+
+/**
+ * An invitation (token set: 7 days, single use, sent by e-mail) or an authorized e-mail (no token
+ * nor expiry: that address may sign in with Google and gets the role / stores chosen here).
+ */
+model TeamInvite {
+  id          String     @id @default(cuid())
+  // Lowercased
+  email       String
+  role        UserRole   @default(admin)
+  allStores   Boolean    @default(true)
+  storeIds    String[]   @default([])
+  // sha256 of the invitation token (the token itself is only in the link)
+  tokenHash   String?    @unique
+  invitedById String?
+  invitedBy   AdminUser? @relation("InvitesSent", fields: [invitedById], references: [id], onDelete: SetNull)
+  // Who joined through it (an authorized e-mail stays reusable; revoked when that member is removed)
+  usedById    String?
+  usedBy      AdminUser? @relation("InvitesUsed", fields: [usedById], references: [id], onDelete: SetNull)
+  // « Réinitialiser l'accès » (0041): a link for an active member whose password / Google account were
+  // cleared; using it only sets a new way in (never changes the member's role or stores)
+  reset       Boolean    @default(false)
+  expiresAt   DateTime?
+  acceptedAt  DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime   @default(now())
+
+  @@index([email])
+  @@index([usedById])
 }
 
 model Store {
@@ -223,6 +300,8 @@ model Store {
   productVat       ProductVat[]
   // Images uploaded in the builder (migration 0028_media_uploads)
   media            StoreMedia[]
+  // Team members limited to selected stores (migration 0038_team_access)
+  teamAccess       StoreAccess[]
 
   // Stripe webhooks resolve the store(s) from event.account
   @@index([stripeAccountId])

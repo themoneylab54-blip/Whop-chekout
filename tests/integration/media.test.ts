@@ -13,6 +13,7 @@ vi.mock("@/lib/auth", async (orig) => ({
   ...(await orig<typeof import("@/lib/auth")>()),
   requireAdmin: async () => "admin",
   currentAdminId: async () => auth.admin,
+  currentUser: async () => (auth.admin ? (await import("../session-stub")).ownerUser(auth.admin) : null),
 }));
 
 /** Shaped like Next's redirect error (the clone action ends with one). */

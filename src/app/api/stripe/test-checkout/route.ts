@@ -3,6 +3,7 @@ import type { Prisma, Store } from "@prisma/client";
 import { db } from "@/lib/db";
 import { env } from "@/lib/env";
 import { currentAdminId } from "@/lib/auth";
+import { checkStoreAccess, READ_ONLY_ERROR } from "@/lib/access";
 import { route } from "@/lib/route";
 import { flashUrl } from "@/lib/flash";
 import { checkoutBaseUrl } from "@/lib/checkout-domain";
@@ -57,8 +58,14 @@ async function handle(req: Request) {
   if (!sameOrigin(req.headers.get("origin"), env.appUrl)) return new NextResponse("Origine refusée", { status: 403 });
   const form = await req.formData().catch(() => null);
   const storeId = String(form?.get("store") ?? "");
-  const store = storeId ? await db.store.findUnique({ where: { id: storeId } }) : null;
-  if (!store) return NextResponse.redirect(`${env.appUrl}/dashboard`, 303);
+  // A test order is an edit of the store (a viewer can't create one).
+  const access = storeId ? await checkStoreAccess(storeId, "edit") : null;
+  if (!access?.ok) {
+    if (access?.reason === "login") return NextResponse.redirect(`${env.appUrl}/login`, 303);
+    if (access?.reason === "forbidden") return NextResponse.redirect(`${env.appUrl}${flashUrl(`/dashboard/stores/${storeId}/stripe`, { error: READ_ONLY_ERROR })}#test`, 303);
+    return NextResponse.redirect(`${env.appUrl}/dashboard`, 303);
+  }
+  const store = access.store;
   // The form opens a new tab: errors are shown on the Stripe page there (#test card).
   const back = (error: string) => NextResponse.redirect(`${env.appUrl}${flashUrl(`/dashboard/stores/${store.id}/stripe`, { error })}#test`, 303);
   if (!providerConnected(store, "stripe")) return back(stripeUnusableReason(store) ?? "Connectez d'abord Stripe (et ses clés du mode de la boutique) pour tester le secours.");

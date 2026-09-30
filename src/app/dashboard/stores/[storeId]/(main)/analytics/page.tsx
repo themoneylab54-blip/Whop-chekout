@@ -21,7 +21,7 @@ import {
   Target,
   Ticket,
 } from "lucide-react";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess } from "@/lib/access";
 import { tzOf, zoneLabel as zoneLabelOf } from "@/lib/time";
 import { db } from "@/lib/db";
 import {
@@ -113,8 +113,8 @@ export default async function AnalyticsPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<ControlParams & { ok?: string; error?: string; refunds?: string; heat?: string; tab?: string; touch?: string; win?: string; flash?: string }>;
 }) {
-  await requireAdmin();
   const { storeId } = await params;
+  await requireStoreAccess(storeId, "view");
   const sp = await searchParams;
   const store = await db.store.findUnique({ where: { id: storeId } });
   if (!store) notFound();

@@ -3,7 +3,9 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
-import { requireAdmin } from "@/lib/auth";
+import type { AccessLevel } from "@/lib/access";
+import { requireStoreAction } from "@/lib/store-guard";
+import { googleAdsTokenStored, ownerBoundError, resolveOwnerBound } from "@/lib/owner-bound";
 import { db } from "@/lib/db";
 import { importAdSpend, saveSpendRows } from "@/lib/adspend";
 import { parseSpendCsv } from "@/lib/adspend-csv";
@@ -33,11 +35,10 @@ function back(storeId: string, params: FlashParams): never {
 /** Amounts typed in euros: "12,50", "1 250" (at most 2 decimals: "4,905" is refused, not rounded). */
 const DECIMAL_EUROS = /^\d+(?:[.,]\d{0,2})?$/;
 
-async function getStore(storeId: string) {
-  await requireAdmin();
-  const store = await db.store.findUnique({ where: { id: storeId }, select: { id: true, shopCurrency: true, timezone: true } });
-  if (!store) redirect("/dashboard");
-  return store;
+/** The store once the user may act on it at `level` ("edit"; "owner" for the Google Ads connection and its tokens). */
+async function getStore(storeId: string, level: AccessLevel = "edit") {
+  const { store } = await requireStoreAction(storeId, level);
+  return { id: store.id, shopCurrency: store.shopCurrency, timezone: store.timezone };
 }
 
 const optionalId = (re: RegExp, message: string) =>
@@ -54,11 +55,17 @@ const accountsSchema = z.object({
 });
 
 export async function saveAdAccountsAction(storeId: string, fd: FormData) {
-  await getStore(storeId);
+  const { user, store } = await requireStoreAction(storeId, "edit");
   const parsed = accountsSchema.safeParse({ metaAdAccountId: String(fd.get("metaAdAccountId") ?? ""), tiktokAdvertiserId: String(fd.get("tiktokAdvertiserId") ?? "") });
   if (!parsed.success) back(storeId, { error: parsed.error.issues[0]?.message ?? "Valeurs invalides", field: issueField(parsed.error.issues) });
-  await db.store.update({ where: { id: storeId }, data: parsed.data });
+  // The ad accounts are read with the owner's Meta / TikTok tokens: a non-owner keeps them as they are.
+  const bound = resolveOwnerBound(user.role, {
+    metaAdAccountId: { next: parsed.data.metaAdAccountId, current: store.metaAdAccountId, tokenStored: !!store.metaAccessToken },
+    tiktokAdvertiserId: { next: parsed.data.tiktokAdvertiserId, current: store.tiktokAdvertiserId, tokenStored: !!store.tiktokAccessToken },
+  });
+  await db.store.update({ where: { id: storeId }, data: bound.values });
   revalidatePath(growthPath(storeId));
+  if (bound.refused.length) back(storeId, { error: ownerBoundError(bound.refused), field: bound.refused[0] });
   back(storeId, { ok: "Comptes publicitaires enregistrés. L'import des dépenses se fait automatiquement toutes les heures." });
 }
 
@@ -68,7 +75,7 @@ export async function saveAdAccountsAction(storeId: string, fd: FormData) {
  * like the other tokens. A blank secret keeps the stored one; "Supprimer" erases it.
  */
 export async function saveGoogleAdsAction(storeId: string, fd: FormData) {
-  await getStore(storeId);
+  await getStore(storeId, "owner");
   const current = await db.store.findUnique({
     where: { id: storeId },
     select: { googleAdsDeveloperToken: true, googleAdsClientSecret: true, googleAdsRefreshToken: true },
@@ -105,8 +112,8 @@ export async function saveGoogleAdsAction(storeId: string, fd: FormData) {
 
 /** "Connecter Google Ads": to Google's consent screen with a signed, 15-minute state. */
 export async function connectGoogleAdsAction(storeId: string) {
-  const adminId = await requireAdmin();
-  await getStore(storeId);
+  const { user } = await requireStoreAction(storeId, "owner");
+  const adminId = user.id;
   const op = googleAdsOperator();
   if (!op) back(storeId, { error: "Connexion Google Ads indisponible sur ce serveur : saisissez les identifiants dans « Avancé »." });
   redirect(googleAdsAuthUrl(op, signGoogleAdsState(storeId, adminId), googleAdsRedirectUri()));
@@ -114,7 +121,7 @@ export async function connectGoogleAdsAction(storeId: string) {
 
 /** Account picked after the OAuth connection ("1234567890", or "id:managerId" through an MCC). */
 export async function selectGoogleAdsAccountAction(storeId: string, fd: FormData) {
-  await getStore(storeId);
+  await getStore(storeId, "owner");
   const choice = parseAccountChoice(String(fd.get("googleAdsAccount") ?? ""));
   if (!choice) back(storeId, { error: "Choisissez le compte publicitaire Google Ads." });
   await db.store.update({ where: { id: storeId }, data: { googleAdsCustomerId: choice.customerId, googleAdsLoginCustomerId: choice.loginId } });
@@ -125,7 +132,7 @@ export async function selectGoogleAdsAccountAction(storeId: string, fd: FormData
 
 /** "Déconnecter": forgets every Google Ads value (tokens included); imported spend stays. */
 export async function disconnectGoogleAdsAction(storeId: string) {
-  await getStore(storeId);
+  await getStore(storeId, "owner");
   await db.store.update({
     where: { id: storeId },
     data: { googleAdsCustomerId: null, googleAdsLoginCustomerId: null, googleAdsClientId: null, googleAdsClientSecret: null, googleAdsDeveloperToken: null, googleAdsRefreshToken: null },
@@ -137,11 +144,15 @@ export async function disconnectGoogleAdsAction(storeId: string) {
 
 /** Google Ads offline conversions: the conversion action receiving the paid orders (empty = off). */
 export async function saveGoogleConversionAction(storeId: string, fd: FormData) {
-  await getStore(storeId);
-  const store = await db.store.findUnique({ where: { id: storeId }, select: { googleAdsCustomerId: true } });
+  const { user, store } = await requireStoreAction(storeId, "edit");
   const raw = String(fd.get("googleAdsConversionAction") ?? "").trim();
-  const conversionAction = raw ? conversionActionName(raw, store?.googleAdsCustomerId) : null;
+  const conversionAction = raw ? conversionActionName(raw, store.googleAdsCustomerId) : null;
   if (raw && !conversionAction) back(storeId, { error: "Action de conversion invalide : son identifiant numérique (compte Google Ads connecté) ou customers/1234567890/conversionActions/987654321." });
+  // Uploaded with the owner's Google Ads credentials (it may name another customer): a non-owner can't change it.
+  const bound = resolveOwnerBound(user.role, {
+    googleAdsConversionAction: { next: conversionAction, current: store.googleAdsConversionAction, tokenStored: googleAdsTokenStored(store) },
+  });
+  if (bound.refused.length) back(storeId, { error: ownerBoundError(bound.refused, false), field: "googleAdsConversionAction" });
   // A new action: the orders of the last 60 days not uploaded yet are tried again against it.
   const { reset } = await changeConversionAction(storeId, conversionAction);
   await recordEvent({

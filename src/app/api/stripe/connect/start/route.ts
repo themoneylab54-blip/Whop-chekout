@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { db } from "@/lib/db";
 import { env } from "@/lib/env";
 import { currentAdminId } from "@/lib/auth";
+import { checkStoreAccess, OWNER_ONLY_ERROR } from "@/lib/access";
 import { route } from "@/lib/route";
 import { flashUrl } from "@/lib/flash";
 import { oauthAuthorizeUrl, stripeConfigured, stripeModeOf } from "@/lib/stripe";
@@ -21,8 +21,14 @@ async function handle(req: Request) {
   if (!sameOrigin(req.headers.get("origin"), env.appUrl)) return new NextResponse("Origine refusée", { status: 403 });
   const form = await req.formData().catch(() => null);
   const storeId = String(form?.get("store") ?? "");
-  const store = storeId ? await db.store.findUnique({ where: { id: storeId }, select: { id: true, name: true, testMode: true } }) : null;
-  if (!store) return NextResponse.redirect(`${env.appUrl}/dashboard`, 303);
+  // Payment connections are the owner's.
+  const access = storeId ? await checkStoreAccess(storeId, "owner") : null;
+  if (!access?.ok) {
+    if (access?.reason === "login") return NextResponse.redirect(`${env.appUrl}/login`, 303);
+    if (access?.reason === "forbidden") return NextResponse.redirect(`${env.appUrl}${flashUrl(`/dashboard/stores/${storeId}/stripe`, { error: OWNER_ONLY_ERROR })}`, 303);
+    return NextResponse.redirect(`${env.appUrl}/dashboard`, 303);
+  }
+  const store = access.store;
   const mode = stripeModeOf(store);
   if (!stripeConfigured(mode)) {
     return NextResponse.redirect(

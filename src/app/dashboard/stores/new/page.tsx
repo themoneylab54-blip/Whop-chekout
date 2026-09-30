@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
-import { requireAdmin } from "@/lib/auth";
+import { requireRole } from "@/lib/access";
 import { Input, Label, SubmitButton } from "@/components/ui";
 import { AuthShell } from "@/components/dashboard/AuthShell";
 import { createStoreAction } from "../../actions";
@@ -9,7 +9,7 @@ import { createStoreAction } from "../../actions";
 export const metadata: Metadata = { title: "Ajouter une boutique" };
 
 export default async function NewStorePage() {
-  await requireAdmin();
+  await requireRole("admin", "create_store");
   return (
     <AuthShell
       title="Ajouter une boutique"

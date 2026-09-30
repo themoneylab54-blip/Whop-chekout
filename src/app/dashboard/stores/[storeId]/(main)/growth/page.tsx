@@ -2,11 +2,13 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { Megaphone, Radar } from "lucide-react";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess, roleCan } from "@/lib/access";
 import { db } from "@/lib/db";
 import { Card, Flash, Input, Label, LearnMore, PageHeader, Select, SubmitButton, Toggle } from "@/components/ui";
 import { DirtyForm } from "@/components/dashboard/DirtyForm";
 import { SecretInput } from "@/components/dashboard/SecretInput";
+import { OwnerBoundInput } from "@/components/dashboard/OwnerBoundInput";
+import { ownerBoundLocked } from "@/lib/owner-bound";
 import { AdSpendSection } from "@/components/dashboard/AdSpendSection";
 import { saveTrackingAction, testTrackingAction } from "../../../../actions";
 
@@ -28,8 +30,10 @@ export default async function GrowthPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string }>;
 }) {
-  await requireAdmin();
   const { storeId } = await params;
+  const { user } = await requireStoreAccess(storeId, "view");
+  // API tokens and the Google Ads connection are the account owner's.
+  const isOwner = roleCan(user.role, "owner");
   const sp = await searchParams;
   const store = await db.store.findUnique({ where: { id: storeId } });
   if (!store) notFound();
@@ -60,13 +64,20 @@ export default async function GrowthPage({
                 <Label htmlFor="metaPixelId" hint="Gestionnaire d'événements → votre pixel → ID">
                   ID du pixel Meta
                 </Label>
-                <Input id="metaPixelId" name="metaPixelId" defaultValue={store.metaPixelId ?? ""} inputMode="numeric" placeholder="123456789012345" />
+                <OwnerBoundInput
+                  locked={ownerBoundLocked(user.role, !!store.metaAccessToken)}
+                  id="metaPixelId"
+                  name="metaPixelId"
+                  defaultValue={store.metaPixelId ?? ""}
+                  inputMode="numeric"
+                  placeholder="123456789012345"
+                />
               </div>
               <div>
                 <Label htmlFor="metaAccessToken" hint="Paramètres du pixel → API Conversions → Générer un jeton">
                   Jeton d&apos;accès Meta
                 </Label>
-                <SecretInput name="metaAccessToken" stored={!!store.metaAccessToken} placeholder="EAAB…" />
+                <SecretInput name="metaAccessToken" stored={!!store.metaAccessToken} placeholder="EAAB…" locked={!isOwner} />
               </div>
               <div>
                 <Label htmlFor="metaTestEventCode" hint="Facultatif, pour vérifier dans « Événements de test ». Videz-le ensuite.">
@@ -79,13 +90,19 @@ export default async function GrowthPage({
                 <Label htmlFor="tiktokPixelId" hint="TikTok Ads → Événements → Pixel code">
                   Code du pixel TikTok
                 </Label>
-                <Input id="tiktokPixelId" name="tiktokPixelId" defaultValue={store.tiktokPixelId ?? ""} placeholder="C1ABCDEF2GHIJ3KLMNOP" />
+                <OwnerBoundInput
+                  locked={ownerBoundLocked(user.role, !!store.tiktokAccessToken)}
+                  id="tiktokPixelId"
+                  name="tiktokPixelId"
+                  defaultValue={store.tiktokPixelId ?? ""}
+                  placeholder="C1ABCDEF2GHIJ3KLMNOP"
+                />
               </div>
               <div>
                 <Label htmlFor="tiktokAccessToken" hint="Paramètres du pixel → Events API → Générer un jeton">
                   Jeton TikTok Events API
                 </Label>
-                <SecretInput name="tiktokAccessToken" stored={!!store.tiktokAccessToken} />
+                <SecretInput name="tiktokAccessToken" stored={!!store.tiktokAccessToken} locked={!isOwner} />
               </div>
             </div>
             <div className="grid grid-cols-[minmax(0,1fr)] gap-4 sm:grid-cols-2">
@@ -93,13 +110,19 @@ export default async function GrowthPage({
                 <Label htmlFor="ga4MeasurementId" hint="Google Analytics → Admin → Flux de données → ID de mesure">
                   ID de mesure GA4
                 </Label>
-                <Input id="ga4MeasurementId" name="ga4MeasurementId" defaultValue={store.ga4MeasurementId ?? ""} placeholder="G-XXXXXXXXXX" />
+                <OwnerBoundInput
+                  locked={ownerBoundLocked(user.role, !!store.ga4ApiSecret)}
+                  id="ga4MeasurementId"
+                  name="ga4MeasurementId"
+                  defaultValue={store.ga4MeasurementId ?? ""}
+                  placeholder="G-XXXXXXXXXX"
+                />
               </div>
               <div>
                 <Label htmlFor="ga4ApiSecret" hint="Même écran → Secrets de l'API Measurement Protocol → Créer. Les achats (et débuts de checkout) sont envoyés côté serveur, rattachés au visiteur de la boutique.">
                   Secret API Measurement Protocol
                 </Label>
-                <SecretInput name="ga4ApiSecret" stored={!!store.ga4ApiSecret} />
+                <SecretInput name="ga4ApiSecret" stored={!!store.ga4ApiSecret} locked={!isOwner} />
               </div>
             </div>
             <div className="grid grid-cols-[minmax(0,1fr)] gap-4 sm:grid-cols-2">
@@ -174,7 +197,7 @@ export default async function GrowthPage({
 
         {/* Dépenses publicitaires (ROAS / bénéfice après pub) */}
         <div id="adspend" className="scroll-mt-6">
-          <AdSpendSection store={store} />
+          <AdSpendSection store={store} isOwner={isOwner} />
         </div>
       </div>
     </>

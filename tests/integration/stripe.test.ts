@@ -43,6 +43,7 @@ vi.mock("@/lib/auth", async (orig) => ({
   ...(await orig<typeof import("@/lib/auth")>()),
   requireAdmin: async () => auth.admin ?? "admin",
   currentAdminId: async () => auth.admin,
+  currentUser: async () => (auth.admin ? (await import("../session-stub")).ownerUser(auth.admin) : null),
 }));
 vi.mock("@/lib/stripe", async (orig) => ({ ...(await orig<typeof import("@/lib/stripe")>()), ...stripeApi }));
 vi.mock("@/lib/notify", async (orig) => ({ ...(await orig<typeof import("@/lib/notify")>()), ...notify }));

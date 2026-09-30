@@ -3,7 +3,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { Activity, ChevronDown, HeartPulse, ScrollText, Search, SearchX, X } from "lucide-react";
 import type { Prisma } from "@prisma/client";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess } from "@/lib/access";
 import { db } from "@/lib/db";
 import { storeHealth } from "@/lib/health";
 import { tickStatus } from "@/lib/tick";
@@ -34,8 +34,8 @@ export default async function JournalPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ level?: string; ok?: string; error?: string; before?: string; kind?: string; q?: string }>;
 }) {
-  await requireAdmin();
   const { storeId } = await params;
+  const { user } = await requireStoreAccess(storeId, "view");
   const sp = await searchParams;
   const store = await db.store.findUnique({ where: { id: storeId }, select: { id: true, timezone: true } });
   if (!store) notFound();
@@ -127,11 +127,14 @@ export default async function JournalPage({
                 </form>
               </>
             )}
-            <form action={runTickAction.bind(null, storeId)}>
-              <SubmitButton size="sm" variant="secondary">
-                Lancer la maintenance
-              </SubmitButton>
-            </form>
+            {/* The maintenance run processes every store: for members with every store. */}
+            {user.allStores && (
+              <form action={runTickAction.bind(null, storeId)}>
+                <SubmitButton size="sm" variant="secondary">
+                  Lancer la maintenance
+                </SubmitButton>
+              </form>
+            )}
           </div>
         }
         className="mb-6"

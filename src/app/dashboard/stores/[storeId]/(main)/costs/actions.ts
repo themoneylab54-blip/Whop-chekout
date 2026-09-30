@@ -2,8 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { requireAdmin } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { requireStoreAction } from "@/lib/store-guard";
 import { parisDayStart } from "@/lib/analytics";
 import { parseCsvDay, parseCsvAmount } from "@/lib/adspend-csv";
 import { MAX_COST_CENTS, SINCE_ALWAYS, deleteProductCost, normalizeVariantId, parseCostCsv, recomputeMissingCosts, setProductCost } from "@/lib/costs";
@@ -34,11 +33,9 @@ function back(storeId: string, params: FlashParams, hash = ""): never {
   redirect(flashUrl(costsPath(storeId), params, hash));
 }
 
-/** Signed in, store exists: its time zone (effective dates are days of that zone). */
+/** Signed in, may edit the store: its time zone (effective dates are days of that zone). */
 async function guard(storeId: string): Promise<string> {
-  await requireAdmin();
-  const store = await db.store.findUnique({ where: { id: storeId }, select: { id: true, timezone: true } });
-  if (!store) redirect("/dashboard");
+  const { store } = await requireStoreAction(storeId, "edit");
   return tzOf(store);
 }
 

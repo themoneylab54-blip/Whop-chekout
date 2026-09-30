@@ -25,7 +25,7 @@ vi.mock("next/navigation", async (orig) => ({
   },
 }));
 vi.mock("next/cache", async (orig) => ({ ...(await orig<typeof import("next/cache")>()), revalidatePath: () => undefined }));
-vi.mock("@/lib/auth", async (orig) => ({ ...(await orig<typeof import("@/lib/auth")>()), requireAdmin: async () => "admin" }));
+vi.mock("@/lib/auth", async (orig) => ({ ...(await orig<typeof import("@/lib/auth")>()), requireAdmin: async () => "admin", currentUser: async () => (await import("../session-stub")).ownerUser() }));
 
 /** The flash of the redirect an action ends with. */
 async function flashOf(run: () => Promise<unknown>): Promise<{ path: string; ok?: string; error?: string; field?: string; form?: string; hash: string }> {

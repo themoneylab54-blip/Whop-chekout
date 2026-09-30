@@ -17,7 +17,8 @@ import {
   Wallet,
   type LucideIcon,
 } from "lucide-react";
-import { requireAdmin } from "@/lib/auth";
+import { checkStoreAccess, requireStoreAccess } from "@/lib/access";
+import { storeFlashMessage } from "@/lib/team-rules";
 import { db } from "@/lib/db";
 import { overviewStats } from "@/lib/dashboard-stats";
 import { zoneLabel } from "@/lib/time";
@@ -39,9 +40,17 @@ import { AnalyticsControls, parseControls, type ControlParams } from "@/componen
 /** Same segment as the layout, so its "%s · store" template does not apply: built here. */
 export async function generateMetadata({ params }: { params: Promise<{ storeId: string }> }): Promise<Metadata> {
   const { storeId } = await params;
-  const store = await db.store.findUnique({ where: { id: storeId }, select: { name: true } });
-  return { title: { absolute: store ? `Vue d'ensemble · ${store.name}` : "Boutique introuvable" } };
+  // A store the user can't open keeps its name to itself.
+  const access = await checkStoreAccess(storeId, "view");
+  return { title: { absolute: access.ok ? `Vue d'ensemble · ${access.store.name}` : "Boutique introuvable" } };
 }
+
+/** The fixed messages the overview's own action (checkout on / off) sends back as they are. */
+const OVERVIEW_MESSAGES = [
+  "Checkout activé sur la boutique",
+  "Checkout désactivé : la boutique utilise le checkout Shopify.",
+  "Connectez Shopify et un moyen de paiement (Whop ou Stripe) avant d'activer le checkout.",
+] as const;
 
 const noPrev: DeltaInput = { unavailable: "rien sur la période précédente" };
 
@@ -52,8 +61,8 @@ export default async function OverviewPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<ControlParams & { ok?: string; error?: string }>;
 }) {
-  await requireAdmin();
   const { storeId } = await params;
+  await requireStoreAccess(storeId, "view");
   const sp = await searchParams;
   const store = await db.store.findUnique({
     where: { id: storeId },
@@ -154,7 +163,8 @@ export default async function OverviewPage({
       </div>
       {/* In test mode the layout's banner already says test orders are included. */}
       <AnalyticsControls base={base} state={state} options={{ sources: [], countries: [] }} testMode={store.testMode} showFilters={false} showTest={!store.testMode} zone={zoneLabel(store.timezone)} />
-      <Flash ok={sp.ok} error={sp.error ?? range.error} />
+      {/* Only codes (read_only / owner_only) and this page's own fixed messages: nothing typed into the URL is shown. */}
+      <Flash ok={storeFlashMessage(sp.ok, OVERVIEW_MESSAGES)} error={storeFlashMessage(sp.error, OVERVIEW_MESSAGES) ?? range.error} />
 
       {/* Hero: revenue + chart */}
       <section aria-labelledby="revenue-title" className="mb-6 overflow-hidden rounded-2xl bg-white shadow-[var(--shadow-card)]">

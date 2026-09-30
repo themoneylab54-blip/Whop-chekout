@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAction } from "@/lib/store-guard";
 import { db } from "@/lib/db";
 import { syncOrderSafely } from "@/lib/checkout";
 
@@ -11,7 +11,7 @@ const idsSchema = z.array(z.string().min(1).max(64)).min(1, "Sélectionnez au mo
 
 /** Bulk "Relancer la synchro Shopify" on the selected paid orders that have no Shopify order yet. */
 export async function resyncOrdersAction(storeId: string, fd: FormData) {
-  await requireAdmin();
+  await requireStoreAction(storeId, "edit");
   const back = String(fd.get("back") ?? "");
   const path = back.startsWith(`/dashboard/stores/${storeId}/orders`) ? back : `/dashboard/stores/${storeId}/orders`;
   const go = (p: { ok?: string; error?: string }) => {

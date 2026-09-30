@@ -14,4 +14,11 @@ export const env = {
   get sessionSecret() {
     return required("SESSION_SECRET");
   },
+  /** Optional: « Continuer avec Google » (dashboard sign-in). Null when unset. */
+  get googleClientId() {
+    return process.env.GOOGLE_CLIENT_ID?.trim() || null;
+  },
+  get googleClientSecret() {
+    return process.env.GOOGLE_CLIENT_SECRET?.trim() || null;
+  },
 };

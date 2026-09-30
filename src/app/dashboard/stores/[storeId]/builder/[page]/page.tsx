@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { Prisma } from "@prisma/client";
 import { runningTestsByElement } from "@/lib/checkout-tests";
 import { notFound } from "next/navigation";
-import { requireAdmin } from "@/lib/auth";
+import { checkStoreAccess, requireStoreAccess } from "@/lib/access";
 import { db } from "@/lib/db";
 import { canonical, draftDesign, hasDraft, hasPublished, publishedDesign, sameDesign } from "@/lib/design";
 import { loadCheckoutLayout, loadTheme, loadThankYouLayout } from "@/lib/layout";
@@ -14,9 +14,10 @@ import { storeLive } from "@/lib/payment-provider";
 
 export async function generateMetadata({ params }: { params: Promise<{ storeId: string; page: string }> }): Promise<Metadata> {
   const { storeId, page } = await params;
-  const store = await db.store.findUnique({ where: { id: storeId }, select: { name: true } });
   const what = page === "thank-you" ? "Page de remerciement" : "Design du checkout";
-  return { title: { absolute: store ? `${what} · ${store.name}` : what } };
+  // A store the user can't open keeps its name to itself.
+  const access = await checkStoreAccess(storeId, "view");
+  return { title: { absolute: access.ok ? `${what} · ${access.store.name}` : what } };
 }
 
 /**
@@ -60,8 +61,9 @@ export default async function BuilderPage({
   params: Promise<{ storeId: string; page: string }>;
   searchParams: Promise<{ select?: string | string[] }>;
 }) {
-  await requireAdmin();
   const { storeId, page } = await params;
+  // The builder edits: a viewer opens the preview instead.
+  await requireStoreAccess(storeId, "edit");
   const select = (await searchParams).select;
   if (page !== "checkout" && page !== "thank-you") notFound();
   const store = await db.store.findUnique({

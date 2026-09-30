@@ -1,4 +1,4 @@
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess } from "@/lib/access";
 import { db } from "@/lib/db";
 import { feeCents } from "@/lib/charge";
 import type { CartLine } from "@/lib/pricing";
@@ -43,8 +43,8 @@ function lostOf(status: string | null, lostCents: number, net: number): number {
 type QuoteAddOn = { title?: string; priceCents?: number; variantId?: string | null; costCents?: number | null };
 
 export async function GET(req: Request, ctx: { params: Promise<{ storeId: string }> }) {
-  await requireAdmin();
   const { storeId } = await ctx.params;
+  await requireStoreAccess(storeId, "view");
   const url = new URL(req.url);
   const sp = url.searchParams;
   const store = await db.store.findUnique({ where: { id: storeId }, select: { vatExempt: true, vatDomesticOnly: true, homeCountry: true, fulfillmentFeeCents: true, disputeFeeCents: true, timezone: true } });

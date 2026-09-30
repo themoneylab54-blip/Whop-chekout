@@ -2,7 +2,8 @@ import type { Metadata } from "next";
 import { Globe2, KeyRound, Smartphone, Wallet } from "lucide-react";
 import { notFound } from "next/navigation";
 import { DirtyForm } from "@/components/dashboard/DirtyForm";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess, roleCan } from "@/lib/access";
+import { OwnerOnlyNote } from "@/components/dashboard/OwnerOnly";
 import { daysAgo, tzOf } from "@/lib/time";
 import { db } from "@/lib/db";
 import { applePayDomainStatuses, OPTIONAL_PAYMENT_METHODS, whopWebhookUrl, WHOP_WEBHOOK_EVENTS } from "@/lib/whop";
@@ -24,8 +25,12 @@ export default async function WhopPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string; edit?: string }>;
 }) {
-  await requireAdmin();
   const { storeId } = await params;
+  const { user } = await requireStoreAccess(storeId, "view");
+  // The Whop connection (API key) is the account owner's; so is the Apple Pay file, which serves
+  // every store (an owner with every store).
+  const isOwner = roleCan(user.role, "owner");
+  const canApplePayFile = isOwner && user.allStores;
   const sp = await searchParams;
   const [store, applePayFile, methodsRejected, paypalHidden] = await Promise.all([
     db.store.findUnique({ where: { id: storeId } }),
@@ -75,24 +80,31 @@ export default async function WhopPage({
           </div>
           <CopyField label="URL du webhook (créé automatiquement)" value={whopWebhookUrl(store.id)} />
           <div className="mt-5 flex flex-wrap gap-2">
-            <a href="?edit=1" className={buttonClass("secondary")}>
-              Changer de clé API
-            </a>
-            <form action={refreshWhopWebhookAction.bind(null, store.id)}>
-              <SubmitButton variant="secondary" title="À faire après une mise à jour de l'app : ajoute les nouveaux événements (alertes de fraude…)">
-                Mettre à jour le webhook
-              </SubmitButton>
-            </form>
-            <form action={disconnectWhopAction.bind(null, store.id)}>
-              <ConfirmButton
-                title="Déconnecter Whop ?"
-                description="Le checkout Whop sera désactivé et vos clients repasseront par le checkout Shopify. Le webhook et le produit « Checkout » seront retirés de Whop."
-                confirmLabel="Déconnecter"
-              >
-                Déconnecter
-              </ConfirmButton>
-            </form>
+            {isOwner && (
+              <a href="?edit=1" className={buttonClass("secondary")}>
+                Changer de clé API
+              </a>
+            )}
+            {isOwner && (
+              <form action={refreshWhopWebhookAction.bind(null, store.id)}>
+                <SubmitButton variant="secondary" title="À faire après une mise à jour de l'app : ajoute les nouveaux événements (alertes de fraude…)">
+                  Mettre à jour le webhook
+                </SubmitButton>
+              </form>
+            )}
+            {isOwner && (
+              <form action={disconnectWhopAction.bind(null, store.id)}>
+                <ConfirmButton
+                  title="Déconnecter Whop ?"
+                  description="Le checkout Whop sera désactivé et vos clients repasseront par le checkout Shopify. Le webhook et le produit « Checkout » seront retirés de Whop."
+                  confirmLabel="Déconnecter"
+                >
+                  Déconnecter
+                </ConfirmButton>
+              </form>
+            )}
           </div>
+          {!isOwner && <OwnerOnlyNote className="mt-3">changer de clé API, mettre à jour le webhook (il utilise la clé API Whop) ou déconnecter Whop.</OwnerOnlyNote>}
         </Card>
       )}
 
@@ -112,17 +124,29 @@ export default async function WhopPage({
               <li>Téléchargez le fichier de vérification, ouvrez-le avec un éditeur de texte et copiez tout son contenu.</li>
               <li>Collez-le ci-dessous puis cliquez sur le bouton : on l&apos;installe et on enregistre le domaine chez Whop.</li>
             </ol>
-            <DirtyForm label="Apple Pay" action={setupApplePayAction.bind(null, store.id)} className="space-y-3">
-              <Label htmlFor="association">Fichier de vérification Apple Pay</Label>
-              <Textarea
-                id="association"
-                name="association"
-                rows={4}
-                placeholder={applePayFile ? "Fichier déjà installé — collez-en un nouveau pour le remplacer" : "Contenu du fichier apple-developer-merchantid-domain-association"}
-                className="font-mono text-xs"
-              />
-              <SubmitButton>{applePayFile ? "Vérifier le domaine" : "Installer et vérifier"}</SubmitButton>
-            </DirtyForm>
+            {canApplePayFile ? (
+              <DirtyForm label="Apple Pay" action={setupApplePayAction.bind(null, store.id)} className="space-y-3">
+                <Label htmlFor="association">Fichier de vérification Apple Pay</Label>
+                <Textarea
+                  id="association"
+                  name="association"
+                  rows={4}
+                  placeholder={applePayFile ? "Fichier déjà installé — collez-en un nouveau pour le remplacer" : "Contenu du fichier apple-developer-merchantid-domain-association"}
+                  className="font-mono text-xs"
+                />
+                <SubmitButton>{applePayFile ? "Vérifier le domaine" : "Installer et vérifier"}</SubmitButton>
+              </DirtyForm>
+            ) : (
+              <div className="space-y-3">
+                <OwnerOnlyNote>le fichier Apple Pay sert à toutes les boutiques du compte : seul le propriétaire (accès à toutes les boutiques) l&apos;installe.</OwnerOnlyNote>
+                {/* The file installed, registering this store's own domain stays open to its admins. */}
+                {applePayFile && (
+                  <form action={setupApplePayAction.bind(null, store.id)}>
+                    <SubmitButton variant="secondary">Vérifier le domaine</SubmitButton>
+                  </form>
+                )}
+              </div>
+            )}
             {applePay && (
               <ul aria-label="État Apple Pay par domaine" className="mt-4 space-y-1.5 text-sm">
                 {applePayHosts.map((h) => (
@@ -228,14 +252,18 @@ export default async function WhopPage({
             </p>
           </Card>
           <Card brand="whop" title="Connecter Whop">
-            <DirtyForm label="Connexion Whop" action={connectWhopAction.bind(null, store.id)} className="space-y-4">
-              <div>
-                <Label htmlFor="apiKey">Clé API Whop ({env})</Label>
-                <Input id="apiKey" name="apiKey" type="password" autoComplete="off" required placeholder="apik_…" />
-              </div>
-              <SubmitButton className="w-full">Connecter et configurer automatiquement</SubmitButton>
-              <p className="text-xs text-zinc-500">La clé et le secret du webhook sont chiffrés avant d&apos;être enregistrés.</p>
-            </DirtyForm>
+            {isOwner ? (
+              <DirtyForm label="Connexion Whop" action={connectWhopAction.bind(null, store.id)} className="space-y-4">
+                <div>
+                  <Label htmlFor="apiKey">Clé API Whop ({env})</Label>
+                  <Input id="apiKey" name="apiKey" type="password" autoComplete="off" required placeholder="apik_…" />
+                </div>
+                <SubmitButton className="w-full">Connecter et configurer automatiquement</SubmitButton>
+                <p className="text-xs text-zinc-500">La clé et le secret du webhook sont chiffrés avant d&apos;être enregistrés.</p>
+              </DirtyForm>
+            ) : (
+              <OwnerOnlyNote>seul le propriétaire peut enregistrer la clé API Whop et connecter le compte.</OwnerOnlyNote>
+            )}
           </Card>
         </div>
       )}

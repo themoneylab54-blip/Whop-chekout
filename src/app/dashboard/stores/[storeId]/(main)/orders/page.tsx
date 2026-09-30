@@ -3,7 +3,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import type { Prisma, SessionStatus } from "@prisma/client";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess } from "@/lib/access";
 import { db } from "@/lib/db";
 import { addDays, daysAgo, tzOf } from "@/lib/time";
 import { drillSessionIds, hasDrill, isDay, parisDayStart, type Drill } from "@/lib/analytics";
@@ -65,8 +65,8 @@ type Params = {
 } & Partial<Record<(typeof DRILL_KEYS)[number], string>>;
 
 export default async function OrdersPage({ params, searchParams }: { params: Promise<{ storeId: string }>; searchParams: Promise<Params> }) {
-  await requireAdmin();
   const { storeId } = await params;
+  await requireStoreAccess(storeId, "view");
   const sp = await searchParams;
   const filter = FILTERS.find((f) => f.key === sp.filter) ?? FILTERS[0];
   const sort: SortKey = sp.sort && sp.sort in SORTS ? (sp.sort as SortKey) : "date_desc";

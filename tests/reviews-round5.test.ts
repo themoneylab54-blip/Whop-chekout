@@ -24,7 +24,7 @@ const mocks = vi.hoisted(() => ({
     judgemeApiToken: "enc",
   } as Record<string, unknown>,
 }));
-vi.mock("@/lib/auth", () => ({ requireAdmin: vi.fn(async () => ({ id: "admin" })) }));
+vi.mock("@/lib/auth", () => ({ requireAdmin: vi.fn(async () => "admin"), currentUser: vi.fn(async () => ({ id: "admin", role: "owner", allStores: true })) }));
 vi.mock("@/lib/db", () => ({ db: { store: { findUnique: vi.fn(async () => mocks.store), update: vi.fn(async () => ({})), updateMany: vi.fn(async () => ({})) } } }));
 vi.mock("@/lib/crypto", () => ({ decrypt: () => "saved-token-123", encrypt: (s: string) => `enc:${s}` }));
 vi.mock("@/lib/ext", () => ({ extFetch: (...args: unknown[]) => mocks.fetch(...args) }));

@@ -1,13 +1,15 @@
 import type { Metadata } from "next";
 import { ChevronDown, House, MapPin, Pencil, Trash2, Truck } from "lucide-react";
 import { SecretInput } from "@/components/dashboard/SecretInput";
+import { OwnerBoundInput } from "@/components/dashboard/OwnerBoundInput";
+import { ownerBoundLocked } from "@/lib/owner-bound";
 import { CountryMultiSelect } from "@/components/dashboard/CountryMultiSelect";
 import { countriesSummary } from "@/components/dashboard/countries";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { DirtyForm } from "@/components/dashboard/DirtyForm";
 import { CreateCancel, CreateDisclosure } from "@/components/dashboard/CreateDisclosure";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess, roleCan } from "@/lib/access";
 import { db } from "@/lib/db";
 import { loadTheme } from "@/lib/layout";
 import type { Lang } from "@/components/checkout/i18n";
@@ -33,8 +35,8 @@ export default async function ShippingPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string }>;
 }) {
-  await requireAdmin();
   const { storeId } = await params;
+  const { user } = await requireStoreAccess(storeId, "view");
   const sp = await searchParams;
   const store = await db.store.findUnique({ where: { id: storeId }, include: { shippingRates: { orderBy: { position: "asc" } } } });
   if (!store) notFound();
@@ -78,7 +80,8 @@ export default async function ShippingPage({
               <Label htmlFor="mondialRelayEnseigne" hint="Fourni par Mondial Relay (ex. BDTEST13 en test)">
                 Code enseigne
               </Label>
-              <Input
+              <OwnerBoundInput
+                locked={ownerBoundLocked(user.role, !!store.mondialRelayKey)}
                 id="mondialRelayEnseigne"
                 name="mondialRelayEnseigne"
                 defaultValue={store.mondialRelayEnseigne ?? ""}
@@ -92,7 +95,7 @@ export default async function ShippingPage({
               <Label htmlFor="mondialRelayKey" hint={store.mondialRelayKey ? "Configurée ✓ · saisissez une clé pour la remplacer" : "Clé privée de l'espace Mondial Relay (chiffrée)"}>
                 Clé privée
               </Label>
-              <SecretInput name="mondialRelayKey" stored={!!store.mondialRelayKey} placeholder="PrivateK" />
+              <SecretInput name="mondialRelayKey" stored={!!store.mondialRelayKey} placeholder="PrivateK" locked={!roleCan(user.role, "owner")} />
             </div>
           </div>
         </DirtyForm>

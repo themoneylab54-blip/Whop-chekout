@@ -1,5 +1,4 @@
-import { currentAdminId } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { accessRefusal, checkStoreAccess, type AccessLevel } from "@/lib/access";
 import { listMedia, MAX_MEDIA_BYTES, MEDIA_ERRORS, saveMedia } from "@/lib/media";
 
 /*
@@ -8,22 +7,28 @@ import { listMedia, MAX_MEDIA_BYTES, MEDIA_ERRORS, saveMedia } from "@/lib/media
  */
 
 const json = (body: unknown, status = 200) => Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
-// JSON, not a redirect to /login: the builder calls these with fetch() and shows the message.
-const expired = () => json({ error: "auth", message: "Session expirée, reconnectez-vous." }, 401);
+/** JSON, not a redirect to /login: the builder calls these with fetch() and shows the message. */
+async function refused(storeId: string, level: AccessLevel): Promise<Response | null> {
+  const res = await checkStoreAccess(storeId, level);
+  if (res.ok) return null;
+  const { status, body } = accessRefusal(res.reason, level);
+  return json(body, status);
+}
 
 export async function GET(_req: Request, ctx: { params: Promise<{ storeId: string }> }) {
-  if (!(await currentAdminId())) return expired();
   const { storeId } = await ctx.params;
+  const denied = await refused(storeId, "view");
+  if (denied) return denied;
   return json({ media: await listMedia(storeId) });
 }
 
 export async function POST(req: Request, ctx: { params: Promise<{ storeId: string }> }) {
-  if (!(await currentAdminId())) return expired();
   const { storeId } = await ctx.params;
+  // Signed in, may edit the store (a missing store answers 404).
+  const denied = await refused(storeId, "edit");
+  if (denied) return denied;
   // Multipart overhead aside, anything well over the cap is refused before being read.
   if (Number(req.headers.get("content-length") ?? 0) > MAX_MEDIA_BYTES + 64 * 1024) return json({ error: "media_size", message: MEDIA_ERRORS.media_size }, 413);
-  const store = await db.store.findUnique({ where: { id: storeId }, select: { id: true } });
-  if (!store) return json({ error: "store", message: "Boutique introuvable." }, 404);
   let file: File | null = null;
   try {
     const form = await req.formData();

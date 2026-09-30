@@ -1,14 +1,21 @@
-import { currentAdminId } from "@/lib/auth";
+import { accessRefusal, checkStoreAccess, type AccessLevel } from "@/lib/access";
 import { deleteMedia, mediaUsage } from "@/lib/media";
 
 const json = (body: unknown, status = 200) => Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
-// JSON, not a redirect to /login: the builder calls these with fetch() and shows the message.
-const expired = () => json({ error: "auth", message: "Session expirée, reconnectez-vous." }, 401);
+
+/** JSON, not a redirect to /login: the builder calls these with fetch() and shows the message. */
+async function refused(storeId: string, level: AccessLevel): Promise<Response | null> {
+  const res = await checkStoreAccess(storeId, level);
+  if (res.ok) return null;
+  const { status, body } = accessRefusal(res.reason, level);
+  return json(body, status);
+}
 
 /** Where an uploaded image is still used (published design, draft, saved versions): the builder warns first. */
 export async function GET(_req: Request, ctx: { params: Promise<{ storeId: string; mediaId: string }> }) {
-  if (!(await currentAdminId())) return expired();
   const { storeId, mediaId } = await ctx.params;
+  const denied = await refused(storeId, "view");
+  if (denied) return denied;
   return json({ usage: await mediaUsage(storeId, mediaId) });
 }
 
@@ -18,8 +25,9 @@ export async function GET(_req: Request, ctx: { params: Promise<{ storeId: strin
  * draft is removed from it (the builder clears its own copy too).
  */
 export async function DELETE(req: Request, ctx: { params: Promise<{ storeId: string; mediaId: string }> }) {
-  if (!(await currentAdminId())) return expired();
   const { storeId, mediaId } = await ctx.params;
+  const denied = await refused(storeId, "edit");
+  if (denied) return denied;
   const res = await deleteMedia(storeId, mediaId, { allowVersions: new URL(req.url).searchParams.get("versions") === "1" });
   if (res.ok) return json({ ok: true });
   if (res.error === "not_found") return json({ error: "not_found", message: "Image introuvable." }, 404);

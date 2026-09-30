@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess } from "@/lib/access";
 import { db } from "@/lib/db";
 import { themeFontHrefs } from "@/lib/layout";
 import { draftDesign, hasDraft } from "@/lib/design";
@@ -14,8 +14,8 @@ export const metadata: Metadata = { title: "Aperçu", robots: { index: false } }
 
 /** Full-screen preview of what buyers see, rendered from the saved design. */
 export default async function PreviewPage({ params }: { params: Promise<{ storeId: string; page: string }> }) {
-  await requireAdmin();
   const { storeId, page } = await params;
+  await requireStoreAccess(storeId, "view");
   if (page !== "checkout" && page !== "thank-you") notFound();
   const store = await db.store.findUnique({
     where: { id: storeId },

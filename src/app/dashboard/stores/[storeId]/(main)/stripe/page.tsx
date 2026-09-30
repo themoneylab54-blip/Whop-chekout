@@ -2,7 +2,8 @@ import type { Metadata } from "next";
 import { ArrowLeftRight, FlaskConical, KeyRound, Route, Smartphone } from "lucide-react";
 import { notFound } from "next/navigation";
 import { DirtyForm } from "@/components/dashboard/DirtyForm";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess, roleCan } from "@/lib/access";
+import { OwnerOnlyNote } from "@/components/dashboard/OwnerOnly";
 import { tzOf } from "@/lib/time";
 import { db } from "@/lib/db";
 import { Badge, Card, Flash, PageHeader, SubmitButton, buttonClass } from "@/components/ui";
@@ -53,8 +54,10 @@ const SWITCH_KINDS = [
 ];
 
 export default async function StripePage({ params, searchParams }: { params: Promise<{ storeId: string }>; searchParams: Promise<{ ok?: string; error?: string }> }) {
-  await requireAdmin();
   const { storeId } = await params;
+  const { user } = await requireStoreAccess(storeId, "view");
+  // Connecting / disconnecting Stripe and its platform webhook are the account owner's.
+  const isOwner = roleCan(user.role, "owner");
   const sp = await searchParams;
   const [store, switches] = await Promise.all([
     db.store.findUnique({ where: { id: storeId } }),
@@ -157,12 +160,16 @@ export default async function StripePage({ params, searchParams }: { params: Pro
             <li>Rien d&apos;autre à configurer : le webhook et Apple Pay sont réglés automatiquement.</li>
           </ul>
           {/* A POST (Origin checked): no link elsewhere can start a connection; the route redirects to Stripe. */}
-          <form action="/api/stripe/connect/start" method="post">
-            <input type="hidden" name="store" value={store.id} />
-            <button type="submit" className={buttonClass("primary")}>
-              Se connecter avec Stripe
-            </button>
-          </form>
+          {isOwner ? (
+            <form action="/api/stripe/connect/start" method="post">
+              <input type="hidden" name="store" value={store.id} />
+              <button type="submit" className={buttonClass("primary")}>
+                Se connecter avec Stripe
+              </button>
+            </form>
+          ) : (
+            <OwnerOnlyNote>seul le propriétaire peut connecter un compte Stripe.</OwnerOnlyNote>
+          )}
           <p className="mt-3 text-xs text-zinc-500">Mode {mode === "test" ? "test : utilisez un compte Stripe en mode test" : "production"}. Le mode se change dans Réglages.</p>
         </Card>
       )}
@@ -226,9 +233,13 @@ export default async function StripePage({ params, searchParams }: { params: Pro
                   Sans cette liaison, Stripe ne prévient pas l&apos;application des paiements : ils ne sont confirmés que par la vérification périodique (quelques minutes de retard).
                 </p>
               )}
-              <form action={repairStripeWebhookAction.bind(null, store.id)} className="mt-3">
-                <SubmitButton variant="secondary">Réparer la liaison Stripe</SubmitButton>
-              </form>
+              {isOwner ? (
+                <form action={repairStripeWebhookAction.bind(null, store.id)} className="mt-3">
+                  <SubmitButton variant="secondary">Réparer la liaison Stripe</SubmitButton>
+                </form>
+              ) : (
+                webhookMissing && <OwnerOnlyNote className="mt-3">la liaison Stripe (commune à toutes les boutiques) se répare depuis son compte.</OwnerOnlyNote>
+              )}
             </div>
           )}
           <details className="mb-5 text-sm">
@@ -247,7 +258,9 @@ export default async function StripePage({ params, searchParams }: { params: Pro
               <CopyField label="URL du webhook (créé automatiquement, commun à toutes les boutiques)" value={stripeWebhookUrl()} />
             </div>
           </details>
-          {blockedMessage && <p className="mb-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900 ring-1 ring-amber-600/20">{blockedMessage}</p>}
+          {isOwner && blockedMessage && <p className="mb-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900 ring-1 ring-amber-600/20">{blockedMessage}</p>}
+          {!isOwner && <OwnerOnlyNote>seul le propriétaire peut déconnecter Stripe.</OwnerOnlyNote>}
+          {isOwner && (
           <div className="flex flex-wrap gap-2">
             <form action={disconnectStripeAction.bind(null, store.id)}>
               <ConfirmButton
@@ -274,6 +287,7 @@ export default async function StripePage({ params, searchParams }: { params: Pro
               </ConfirmButton>
             </form>
           </div>
+          )}
         </Card>
       )}
 

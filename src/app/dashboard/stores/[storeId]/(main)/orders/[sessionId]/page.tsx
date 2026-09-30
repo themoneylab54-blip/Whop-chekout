@@ -31,7 +31,7 @@ import {
   Webhook,
   type LucideIcon,
 } from "lucide-react";
-import { requireAdmin } from "@/lib/auth";
+import { checkStoreAccess, requireStoreAccess } from "@/lib/access";
 import { db } from "@/lib/db";
 import type { CartLine } from "@/lib/pricing";
 import { orderAdminUrl, type Address } from "@/lib/shopify";
@@ -101,6 +101,8 @@ const methodLabel = (m: string | null) => (m ? (METHOD_LABEL[m] ?? m.replace(/_/
 
 export async function generateMetadata({ params }: { params: Promise<{ storeId: string; sessionId: string }> }): Promise<Metadata> {
   const { storeId, sessionId } = await params;
+  // Nothing of an order of a store the user can't open.
+  if (!(await checkStoreAccess(storeId, "view")).ok) return { title: "Commande introuvable" };
   const s = await db.checkoutSession.findFirst({ where: { id: sessionId, storeId }, select: { shopifyOrderName: true, status: true } });
   if (!s) return { title: "Commande introuvable" };
   return { title: s?.shopifyOrderName ? `Commande ${s.shopifyOrderName}` : s?.status === "PAID" ? "Commande payée" : "Checkout" };
@@ -134,8 +136,8 @@ export default async function OrderDetailPage({
   params: Promise<{ storeId: string; sessionId: string }>;
   searchParams: Promise<{ ok?: string; error?: string }>;
 }) {
-  await requireAdmin();
   const { storeId, sessionId } = await params;
+  await requireStoreAccess(storeId, "view");
   const sp = await searchParams;
   const s = await db.checkoutSession.findFirst({ where: { id: sessionId, storeId }, include: { store: true, upsells: true, protectionClaims: { orderBy: { createdAt: "asc" }, include: { photos: { select: { id: true, mime: true, size: true } } } } } });
   if (!s) notFound();

@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { env } from "@/lib/env";
-import { currentAdminId } from "@/lib/auth";
+import { currentUser } from "@/lib/auth";
+import { canAccessStore, checkStoreAccess, OWNER_ONLY_ERROR } from "@/lib/access";
 import { route } from "@/lib/route";
 import { flashUrl, type FlashParams } from "@/lib/flash";
 import { log, recordEvent } from "@/lib/log";
@@ -39,16 +40,24 @@ async function handle(req: Request) {
     return res;
   };
 
-  if (!(await currentAdminId())) return NextResponse.redirect(`${env.appUrl}/login`);
+  const user = await currentUser();
+  if (!user) return NextResponse.redirect(`${env.appUrl}/login`);
   const verified = claimed ? verifyStripeState(state, cookieValue(req, stripeNonceCookie(claimed))) : null;
   if (!verified) {
     log.warn("stripe.oauth_bad_state", "Stripe OAuth callback with an invalid, expired or foreign state");
-    // An admin (checked above) back on that store's page with what to do; nothing else is trusted from the state.
+    // Back on that store's page with what to do, only when it is one the user may open (a store outside
+    // its scope looks missing: /dashboard); nothing else is trusted from the state.
     const known = claimed ? await db.store.findUnique({ where: { id: claimed }, select: { id: true } }) : null;
-    return done(known?.id ?? null, known ? { error: "Lien de connexion Stripe expiré ou ouvert dans un autre onglet : recommencez." } : {});
+    const open = known && (await canAccessStore(user, known.id)) ? known.id : null;
+    return done(open, open ? { error: "Lien de connexion Stripe expiré ou ouvert dans un autre onglet : recommencez." } : {});
   }
-  const store = await db.store.findUnique({ where: { id: verified.storeId } });
-  if (!store) return done(null, {});
+  // Payment connections are the owner's (checked again: the session may have changed since the start).
+  const access = await checkStoreAccess(verified.storeId, "owner");
+  if (!access.ok) {
+    if (access.reason === "login") return NextResponse.redirect(`${env.appUrl}/login`);
+    return done(access.reason === "forbidden" ? verified.storeId : null, access.reason === "forbidden" ? { error: OWNER_ONLY_ERROR } : {});
+  }
+  const store = access.store;
   const oauthError = q.get("error");
   if (oauthError) {
     return done(store.id, {

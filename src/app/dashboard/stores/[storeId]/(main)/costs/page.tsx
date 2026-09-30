@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { Calculator, Coins, FileUp, History, PackageSearch, Percent, RefreshCw, Trash2 } from "lucide-react";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess } from "@/lib/access";
 import { db } from "@/lib/db";
 import { SINCE_ALWAYS, variantCostOverview, variantNumber, type CostSource, type VariantCost } from "@/lib/costs";
 import { tzOf, zonedDay } from "@/lib/time";
@@ -33,8 +33,8 @@ export default async function CostsPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string; show?: string }>;
 }) {
-  await requireAdmin();
   const { storeId } = await params;
+  await requireStoreAccess(storeId, "view");
   const sp = await searchParams;
   const store = await db.store.findUnique({ where: { id: storeId }, select: { id: true, shopCurrency: true, supplierPaidAtPayment: true, timezone: true, vatExempt: true, vatDomesticOnly: true } });
   if (!store) notFound();

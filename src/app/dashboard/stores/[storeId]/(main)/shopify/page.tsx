@@ -2,7 +2,8 @@ import type { Metadata } from "next";
 import { AlertTriangle, ArrowRight, Blocks, CheckCircle2, PackagePlus } from "lucide-react";
 import { notFound } from "next/navigation";
 import { DirtyForm } from "@/components/dashboard/DirtyForm";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAccess, roleCan } from "@/lib/access";
+import { OwnerOnlyNote } from "@/components/dashboard/OwnerOnly";
 import { db } from "@/lib/db";
 import { env } from "@/lib/env";
 import { SHOPIFY_SCOPES, oauthCallbackUrl } from "@/lib/shopify";
@@ -22,8 +23,10 @@ export default async function ShopifyPage({
   params: Promise<{ storeId: string }>;
   searchParams: Promise<{ ok?: string; error?: string; connected?: string; edit?: string }>;
 }) {
-  await requireAdmin();
   const { storeId } = await params;
+  const { user } = await requireStoreAccess(storeId, "view");
+  // Connecting / disconnecting Shopify (app credentials) is the account owner's.
+  const isOwner = roleCan(user.role, "owner");
   const sp = await searchParams;
   const store = await db.store.findUnique({ where: { id: storeId } });
   if (!store) notFound();
@@ -78,20 +81,24 @@ export default async function ShopifyPage({
               </li>
             )}
           </ul>
-          <div className="flex flex-wrap gap-2">
-            <a href="?edit=1" className={buttonClass("secondary")}>
-              Mettre à jour la connexion / changer de domaine
-            </a>
-            <form action={disconnectShopifyAction.bind(null, store.id)}>
-              <ConfirmButton
-                title="Déconnecter la boutique Shopify ?"
-                description="Le script d'interception sera retiré et le checkout Whop désactivé : vos clients repasseront par le checkout Shopify."
-                confirmLabel="Déconnecter"
-              >
-                Déconnecter
-              </ConfirmButton>
-            </form>
-          </div>
+          {isOwner ? (
+            <div className="flex flex-wrap gap-2">
+              <a href="?edit=1" className={buttonClass("secondary")}>
+                Mettre à jour la connexion / changer de domaine
+              </a>
+              <form action={disconnectShopifyAction.bind(null, store.id)}>
+                <ConfirmButton
+                  title="Déconnecter la boutique Shopify ?"
+                  description="Le script d'interception sera retiré et le checkout Whop désactivé : vos clients repasseront par le checkout Shopify."
+                  confirmLabel="Déconnecter"
+                >
+                  Déconnecter
+                </ConfirmButton>
+              </form>
+            </div>
+          ) : (
+            <OwnerOnlyNote>mettre à jour la connexion Shopify ou la déconnecter.</OwnerOnlyNote>
+          )}
         </Card>
       )}
 
@@ -163,6 +170,9 @@ export default async function ShopifyPage({
           </Card>
 
           <Card brand="shopify" title="2. Connectez la boutique" description="On redirige vers Shopify pour approuver l'installation, puis tout est automatique.">
+            {!isOwner ? (
+              <OwnerOnlyNote>seul le propriétaire peut enregistrer les identifiants de l&apos;app Shopify et installer la connexion.</OwnerOnlyNote>
+            ) : (
             <DirtyForm label="Connexion Shopify" action={startShopifyInstallAction.bind(null, store.id)} className="space-y-4">
               <div>
                 <Label htmlFor="shopDomain" hint="L'adresse en .myshopify.com (Paramètres → Domaines)">
@@ -195,6 +205,7 @@ export default async function ShopifyPage({
                 automatiquement : aucune modification du thème n&apos;est nécessaire.
               </p>
             </DirtyForm>
+            )}
           </Card>
         </div>
       )}

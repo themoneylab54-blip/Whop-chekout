@@ -1,9 +1,9 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
-import { ChevronsUpDown, FlaskConical, LogOut, Plus, ShoppingBag } from "lucide-react";
+import { ChevronsUpDown, Eye, FlaskConical, LogOut, Plus, ShoppingBag, Users } from "lucide-react";
 import { after } from "next/server";
-import { requireAdmin } from "@/lib/auth";
+import { accessibleStoreWhere, checkStoreAccess, requireStoreAccess, roleAtLeast, roleCan } from "@/lib/access";
+import { UserAvatar } from "@/components/dashboard/TeamBits";
 import { maybeTick, warnIfTickStale } from "@/lib/tick";
 import { db } from "@/lib/db";
 import { MobileMenu, SidebarNav } from "@/components/dashboard/NavLink";
@@ -12,6 +12,7 @@ import { UnsavedChangesBar } from "@/components/dashboard/DirtyForm";
 import { PopoverDetails } from "@/components/dashboard/Popover";
 import { HashFocus } from "@/components/dashboard/HashFocus";
 import { FormDraftKeeper } from "@/components/dashboard/FormDraftKeeper";
+import { ReadOnlyScope } from "@/components/dashboard/ReadOnly";
 import "../../../dashboard.css";
 import { logoutAction } from "../../../actions";
 import { tzOf } from "@/lib/time";
@@ -63,18 +64,24 @@ function StoreAvatar({ id, name, size = 32 }: { id: string; name: string; size?:
 /** Tab titles read "Réglages · Maison Lumière"; pages without a title show the store name. */
 export async function generateMetadata({ params }: { params: Promise<{ storeId: string }> }): Promise<Metadata> {
   const { storeId } = await params;
-  const store = await db.store.findUnique({ where: { id: storeId }, select: { name: true } });
-  const name = store?.name ?? "Boutique";
+  // A store the user can't open keeps its name to itself (generic title).
+  const access = await checkStoreAccess(storeId, "view");
+  const name = access.ok ? access.store.name : "Boutique";
   return { title: { template: `%s · ${name}`, default: name } };
 }
 
 export default async function StoreLayout({ children, params }: { children: React.ReactNode; params: Promise<{ storeId: string }> }) {
-  const adminId = await requireAdmin();
   const { storeId } = await params;
-  const [store, stores, admin, unsynced, providers] = await Promise.all([
-    db.store.findUnique({ where: { id: storeId } }),
-    db.store.findMany({ orderBy: { createdAt: "asc" }, select: { id: true, name: true, enabled: true, shopifyConnectedAt: true, ...PROVIDER_STORE_SELECT } }),
-    db.adminUser.findUnique({ where: { id: adminId }, select: { email: true } }),
+  // Pages, actions and routes check again on their own; here: no layout for a store the user can't open.
+  const { user, store } = await requireStoreAccess(storeId, "view");
+  const readOnly = !roleCan(user.role, "edit");
+  const canTeam = roleAtLeast(user.role, "admin");
+  const [stores, unsynced, providers] = await Promise.all([
+    db.store.findMany({
+      where: accessibleStoreWhere(user),
+      orderBy: { createdAt: "asc" },
+      select: { id: true, name: true, enabled: true, shopifyConnectedAt: true, ...PROVIDER_STORE_SELECT },
+    }),
     db.checkoutSession.count({ where: { storeId, status: "PAID", shopifyOrderId: null, syncHandledAt: null } }),
     // Same status as Journal › Services externes: a connected but failing provider shows red.
     providersOverview().catch((): ProviderOverview[] => []),
@@ -89,7 +96,6 @@ export default async function StoreLayout({ children, params }: { children: Reac
     await warnIfTickStale(storeId);
     await maybeTick().catch(() => undefined);
   });
-  if (!store) notFound();
   const base = `/dashboard/stores/${store.id}`;
   // Live with any processor able to charge (a Stripe-only store never connects Whop).
   const live = storeLive(store);
@@ -148,9 +154,11 @@ export default async function StoreLayout({ children, params }: { children: Reac
                 {storeLive(s) && <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />}
               </Link>
             ))}
-            <Link href="/dashboard/stores/new" className="mt-1 flex items-center gap-2 rounded-lg border-t border-zinc-100 px-2 py-2 text-sm font-medium text-indigo-600 hover:bg-indigo-50">
-              <Plus className="h-4 w-4" /> Ajouter une boutique
-            </Link>
+            {!readOnly && (
+              <Link href="/dashboard/stores/new" className="mt-1 flex items-center gap-2 rounded-lg border-t border-zinc-100 px-2 py-2 text-sm font-medium text-indigo-600 hover:bg-indigo-50">
+                <Plus className="h-4 w-4" /> Ajouter une boutique
+              </Link>
+            )}
           </div>
         </PopoverDetails>
 
@@ -158,11 +166,19 @@ export default async function StoreLayout({ children, params }: { children: Reac
 
         <SidebarNav base={base} badges={badges} />
 
-        <div className="mt-3 flex items-center gap-2.5 rounded-xl p-2 hover:bg-zinc-900/[.04]">
-          <span className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-zinc-700 to-zinc-900 text-xs font-semibold text-white">
-            {(admin?.email ?? "?")[0].toUpperCase()}
-          </span>
-          <span className="min-w-0 flex-1 truncate text-xs text-zinc-600">{admin?.email}</span>
+        {canTeam && (
+          <Link href="/dashboard/team" className="mt-3 flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-sm text-zinc-600 hover:bg-zinc-900/[.04] hover:text-zinc-900">
+            <Users className="h-4 w-4 text-zinc-500" aria-hidden /> Équipe
+          </Link>
+        )}
+        <div className={`${canTeam ? "mt-1" : "mt-3"} flex items-center gap-1 rounded-xl p-1 hover:bg-zinc-900/[.04]`}>
+          <Link href="/dashboard/account" title="Mon profil" className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg p-1">
+            <UserAvatar name={user.name} email={user.email} avatarUrl={user.avatarUrl} size={32} />
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-xs font-medium text-zinc-800">{user.name || user.email}</span>
+              {user.name && <span className="block truncate text-[11px] text-zinc-500">{user.email}</span>}
+            </span>
+          </Link>
           <form action={logoutAction}>
             <button title="Se déconnecter" aria-label="Se déconnecter" className="inline-flex h-8 w-8 items-center justify-center rounded-md text-zinc-500 hover:bg-white hover:text-zinc-900">
               <LogOut className="h-4 w-4" />
@@ -190,9 +206,11 @@ export default async function StoreLayout({ children, params }: { children: Reac
                     <span className="flex-1 truncate">{s.name}</span>
                   </Link>
                 ))}
-                <Link href="/dashboard/stores/new" className="flex min-h-10 items-center gap-2 rounded-lg px-2 text-sm font-medium text-indigo-600 hover:bg-indigo-50">
-                  <Plus className="h-4 w-4" /> Ajouter une boutique
-                </Link>
+                {!readOnly && (
+                  <Link href="/dashboard/stores/new" className="flex min-h-10 items-center gap-2 rounded-lg px-2 text-sm font-medium text-indigo-600 hover:bg-indigo-50">
+                    <Plus className="h-4 w-4" /> Ajouter une boutique
+                  </Link>
+                )}
               </div>
             </PopoverDetails>
             <CommandPaletteTrigger variant="icon" />
@@ -209,11 +227,16 @@ export default async function StoreLayout({ children, params }: { children: Reac
                 </span>
               }
               footer={
-                <div className="flex items-center gap-2.5">
-                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-zinc-700 to-zinc-900 text-xs font-semibold text-white">
-                    {(admin?.email ?? "?")[0].toUpperCase()}
-                  </span>
-                  <span className="min-w-0 flex-1 truncate text-xs text-zinc-600">{admin?.email}</span>
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <Link href="/dashboard/account" className="flex min-h-10 min-w-0 flex-1 items-center gap-2.5 rounded-lg">
+                    <UserAvatar name={user.name} email={user.email} avatarUrl={user.avatarUrl} size={32} />
+                    <span className="min-w-0 flex-1 truncate text-xs text-zinc-600">{user.name || user.email}</span>
+                  </Link>
+                  {canTeam && (
+                    <Link href="/dashboard/team" className="inline-flex min-h-10 items-center gap-1.5 rounded-lg px-3 text-sm font-medium text-zinc-700 hover:bg-zinc-900/[.05]">
+                      <Users className="h-4 w-4" aria-hidden /> Équipe
+                    </Link>
+                  )}
                   <form action={logoutAction}>
                     <button className="inline-flex min-h-10 items-center gap-1.5 rounded-lg px-3 text-sm font-medium text-zinc-700 hover:bg-zinc-900/[.05]">
                       <LogOut className="h-4 w-4" aria-hidden /> Déconnexion
@@ -226,6 +249,14 @@ export default async function StoreLayout({ children, params }: { children: Reac
         </div>
         {/* tabIndex -1: the skip link moves the keyboard focus here (no ring on a whole page region). */}
         <main id="contenu" tabIndex={-1} className="mx-auto max-w-[1080px] px-4 py-6 outline-none focus:outline-none md:px-10 md:py-10">
+          {readOnly && (
+            <div role="status" className="mb-6 flex items-center gap-2.5 rounded-xl bg-sky-50 px-4 py-2.5 text-sm text-sky-900 ring-1 ring-sky-600/15">
+              <Eye className="h-4 w-4 shrink-0" aria-hidden />
+              <span>
+                <strong className="font-semibold">Lecture seule</strong> — vous pouvez consulter cette boutique, mais pas la modifier.
+              </span>
+            </div>
+          )}
           {store.testMode && (
             <div className="mb-6 flex items-center gap-2.5 rounded-xl bg-amber-50 px-4 py-2.5 text-sm text-amber-900 ring-1 ring-amber-600/15">
               <FlaskConical className="h-4 w-4 shrink-0" aria-hidden />
@@ -234,7 +265,9 @@ export default async function StoreLayout({ children, params }: { children: Reac
               </span>
             </div>
           )}
-          <div className="animate-fade-up">{children}</div>
+          <ReadOnlyScope readOnly={readOnly} className="animate-fade-up">
+            {children}
+          </ReadOnlyScope>
           <UnsavedChangesBar />
         </main>
         <CommandPalette base={base} storeId={store.id} tz={tzOf(store)} stores={stores.map((s) => ({ id: s.id, name: s.name }))} />

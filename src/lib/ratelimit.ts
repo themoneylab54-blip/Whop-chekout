@@ -43,8 +43,12 @@ export async function rateLimit(key: string, limit: number, windowMs = 60_000): 
   }
 }
 
+/**
+ * The caller's IP: the headers set by the platform itself first (Vercel's `x-vercel-forwarded-for`,
+ * then `x-real-ip`), which a client can't prepend to; else the first X-Forwarded-For entry.
+ */
 export function clientIp(req: Request | Headers): string {
   const h = req instanceof Headers ? req : req.headers;
-  const fwd = h.get("x-forwarded-for");
-  return fwd?.split(",")[0]?.trim() || h.get("x-real-ip") || "unknown";
+  const first = (v: string | null) => v?.split(",")[0]?.trim() || null;
+  return first(h.get("x-vercel-forwarded-for")) || first(h.get("x-real-ip")) || first(h.get("x-forwarded-for")) || "unknown";
 }

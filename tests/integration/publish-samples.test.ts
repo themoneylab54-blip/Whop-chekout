@@ -12,7 +12,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 const hasDb = !!process.env.DATABASE_URL;
 
 vi.mock("next/cache", async (orig) => ({ ...(await orig<typeof import("next/cache")>()), revalidatePath: () => undefined }));
-vi.mock("@/lib/auth", async (orig) => ({ ...(await orig<typeof import("@/lib/auth")>()), requireAdmin: async () => "admin" }));
+vi.mock("@/lib/auth", async (orig) => ({ ...(await orig<typeof import("@/lib/auth")>()), requireAdmin: async () => "admin", currentUser: async () => (await import("../session-stub")).ownerUser() }));
 
 describe.skipIf(!hasDb)("publishDesignAction: sample content publishes but stays hidden from buyers (integration)", async () => {
   const { db } = await import("@/lib/db");

@@ -85,6 +85,22 @@ export async function sendBuyerEmail(
   return true;
 }
 
+/**
+ * E-mail from the operator's Resend account (team invitations…), sent as `senderName`. Returns false
+ * when no operator mailer is configured.
+ */
+export async function sendOperatorEmail(mail: { to: string; subject: string; html: string; text?: string }, senderName = "Whop Checkout"): Promise<boolean> {
+  const op = await operatorMailer();
+  if (!op) return false;
+  const res = await post("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${op.apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ from: senderAs(op.from, senderName), to: [mail.to], subject: mail.subject, html: mail.html, text: mail.text }),
+  });
+  if (!res.ok) throw new Error(`Resend ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return true;
+}
+
 export async function sendTelegram(store: Pick<Store, "telegramBotToken" | "telegramChatId">, text: string): Promise<boolean> {
   if (!store.telegramBotToken || !store.telegramChatId) return false;
   const res = await post(`https://api.telegram.org/bot${decrypt(store.telegramBotToken)}/sendMessage`, {

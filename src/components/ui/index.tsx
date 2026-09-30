@@ -6,6 +6,7 @@ import { CopyButton } from "./CopyButton";
 import { SubmitButton } from "./SubmitButton";
 import { FlashBox } from "./FlashBox";
 import { humanizeError } from "@/lib/humanize-error";
+import { STORE_ACCESS_ERRORS } from "@/lib/team-rules";
 
 export { CopyButton, SubmitButton };
 
@@ -158,9 +159,10 @@ const RAW_ERROR = /^(Shopify API|Shopify injoignable|Whop\b.*\b\d{3}\b|TikTok \d
 
 export function Flash({ ok, error }: { ok?: string | null; error?: string | null }) {
   if (!ok && !error) return null;
-  // A raw provider error passed through as is ("Shopify API 403: …") is reworded; composed
-  // French messages are left alone.
-  const message = error ? (RAW_ERROR.test(error) ? humanizeError(error).text : error) : (ok ?? "");
+  // A store refusal comes as a code (read_only / owner_only: its fixed text). A raw provider error
+  // passed through as is ("Shopify API 403: …") is reworded; composed French messages are left alone.
+  const refusal = error && Object.prototype.hasOwnProperty.call(STORE_ACCESS_ERRORS, error) ? STORE_ACCESS_ERRORS[error as keyof typeof STORE_ACCESS_ERRORS] : null;
+  const message = error ? (refusal ?? (RAW_ERROR.test(error) ? humanizeError(error).text : error)) : (ok ?? "");
   return (
     <FlashBox
       tone={error ? "error" : "ok"}

@@ -21,6 +21,9 @@ import { decrypt } from "@/lib/crypto";
 import { googleBacklog } from "@/lib/google-conversions";
 import { googleAdsAccessToken, googleAdsOperator, listGoogleAdsAccounts, type GoogleAdsAccount } from "@/lib/google-ads-oauth";
 import { SecretInput } from "./SecretInput";
+import { OwnerOnlyNote } from "./OwnerOnly";
+import { OwnerBoundInput } from "./OwnerBoundInput";
+import { googleAdsTokenStored } from "@/lib/owner-bound";
 import { ConfirmButton } from "./ConfirmButton";
 import { AdSpendCsvImport } from "./AdSpendCsvImport";
 import { DirtyForm } from "./DirtyForm";
@@ -48,7 +51,8 @@ async function pickableGoogleAccounts(
   }
 }
 
-export async function AdSpendSection({ store }: { store: Store }) {
+/** `isOwner`: the Google Ads connection and API credentials are the account owner's (others see a note). */
+export async function AdSpendSection({ store, isOwner = true }: { store: Store; isOwner?: boolean }) {
   const today = zonedDay(new Date(), tzOf(store));
   const from = addDays(today, -13);
   const [status, rows, unconverted, googleQueue, backfill] = await Promise.all([
@@ -89,7 +93,7 @@ export async function AdSpendSection({ store }: { store: Store }) {
   const googleOAuth = !!googleOp;
   const googleViaOAuth = !!googleOp && store.googleAdsClientId === googleOp.clientId && !!store.googleAdsRefreshToken;
   const googlePick = googleViaOAuth && !store.googleAdsCustomerId;
-  const googleAccounts = googlePick && googleOp ? await pickableGoogleAccounts(googleOp, store.googleAdsRefreshToken!) : { ok: true as const, accounts: [] };
+  const googleAccounts = googlePick && googleOp && isOwner ? await pickableGoogleAccounts(googleOp, store.googleAdsRefreshToken!) : { ok: true as const, accounts: [] };
 
   return (
     <Card
@@ -119,14 +123,28 @@ export async function AdSpendSection({ store }: { store: Store }) {
             <Label htmlFor="metaAdAccountId" hint="Gestionnaire de publicités › menu des comptes (act_…). Le jeton Meta ci-dessus doit avoir la permission ads_read.">
               ID du compte publicitaire Meta
             </Label>
-            <Input id="metaAdAccountId" name="metaAdAccountId" defaultValue={store.metaAdAccountId ?? ""} inputMode="numeric" placeholder="act_123456789012345" />
+            <OwnerBoundInput
+              locked={!isOwner && metaReady}
+              id="metaAdAccountId"
+              name="metaAdAccountId"
+              defaultValue={store.metaAdAccountId ?? ""}
+              inputMode="numeric"
+              placeholder="act_123456789012345"
+            />
             {store.metaAdAccountId && !metaReady && <p className="mt-1 text-xs text-amber-700">Ajoutez le jeton d&apos;accès Meta ci-dessus pour lancer l&apos;import.</p>}
           </div>
           <div>
             <Label htmlFor="tiktokAdvertiserId" hint="TikTok Ads Manager › Compte › ID de l'annonceur. Jeton : TikTok for Business (Marketing API, lecture des rapports).">
               ID annonceur TikTok
             </Label>
-            <Input id="tiktokAdvertiserId" name="tiktokAdvertiserId" defaultValue={store.tiktokAdvertiserId ?? ""} inputMode="numeric" placeholder="7012345678901234567" />
+            <OwnerBoundInput
+              locked={!isOwner && tiktokReady}
+              id="tiktokAdvertiserId"
+              name="tiktokAdvertiserId"
+              defaultValue={store.tiktokAdvertiserId ?? ""}
+              inputMode="numeric"
+              placeholder="7012345678901234567"
+            />
             {store.tiktokAdvertiserId && !tiktokReady && <p className="mt-1 text-xs text-amber-700">Ajoutez le jeton TikTok ci-dessus pour lancer l&apos;import.</p>}
           </div>
         </div>
@@ -148,7 +166,7 @@ export async function AdSpendSection({ store }: { store: Store }) {
                 Compte <strong className="font-medium text-zinc-900 tabular-nums">{dashedId(store.googleAdsCustomerId!)}</strong>
                 {store.googleAdsLoginCustomerId && <span className="text-zinc-500"> via le compte administrateur {dashedId(store.googleAdsLoginCustomerId)}</span>}
               </span>
-              {googleViaOAuth && (
+              {googleViaOAuth && isOwner && (
                 <span className="ml-auto flex flex-wrap gap-2">
                   <form action={connectGoogleAdsAction.bind(null, store.id)}>
                     <SubmitButton size="sm" variant="secondary">
@@ -163,6 +181,8 @@ export async function AdSpendSection({ store }: { store: Store }) {
                 </span>
               )}
             </div>
+          ) : !isOwner ? (
+            <OwnerOnlyNote>{googlePick ? "choisir le compte Google Ads à utiliser." : "connecter Google Ads."}</OwnerOnlyNote>
           ) : googlePick ? (
             googleAccounts.ok && googleAccounts.accounts.length ? (
               <form action={selectGoogleAdsAccountAction.bind(null, store.id)} className="flex flex-wrap items-end gap-2">
@@ -204,11 +224,15 @@ export async function AdSpendSection({ store }: { store: Store }) {
               <p className="min-w-[16rem] flex-1 text-xs text-zinc-500">Connectez-vous avec le compte Google qui gère vos publicités, puis choisissez le compte : rien à copier.</p>
             </div>
           )
+        ) : !isOwner ? (
+          !googleReady && <OwnerOnlyNote>les identifiants de l&apos;API Google Ads.</OwnerOnlyNote>
         ) : (
           <p className="text-xs text-zinc-500">
             La connexion en un clic n&apos;est pas configurée sur ce serveur : ouvrez « Configurer manuellement » pour saisir les identifiants.
           </p>
         )}
+        {/* API credentials are the account owner's (saveGoogleAdsAction refuses the others). */}
+        {isOwner && (
         <details className="group rounded-lg ring-1 ring-zinc-900/5" open={(googleStarted && !googleViaOAuth && !googleReady) || undefined}>
           <summary className="flex min-h-11 cursor-pointer items-center rounded-lg px-3 text-sm font-medium text-zinc-700 hover:bg-zinc-50 focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none">
             Configurer manuellement (identifiants API)
@@ -283,6 +307,7 @@ export async function AdSpendSection({ store }: { store: Store }) {
           </DirtyForm>
           </div>
         </details>
+        )}
         {/* Offline conversions: outside "Avancé", so stores connected with the OAuth button set it too. */}
         <DirtyForm label="Conversions Google Ads" action={saveGoogleConversionAction.bind(null, store.id)} className="space-y-2">
           <Label
@@ -291,7 +316,14 @@ export async function AdSpendSection({ store }: { store: Store }) {
           >
             Action de conversion hors ligne (commandes payées)
           </Label>
-          <Input id="googleAdsConversionAction" name="googleAdsConversionAction" defaultValue={store.googleAdsConversionAction ?? ""} placeholder="987654321" autoComplete="off" />
+          <OwnerBoundInput
+            locked={!isOwner && googleAdsTokenStored(store)}
+            id="googleAdsConversionAction"
+            name="googleAdsConversionAction"
+            defaultValue={store.googleAdsConversionAction ?? ""}
+            placeholder="987654321"
+            autoComplete="off"
+          />
           <LearnMore>
             Chaque commande payée venant d&apos;un clic Google Ads (gclid, gbraid, wbraid) est envoyée à Google avec son montant, dédoublonnée par numéro de commande (jamais les
             commandes de test), puis ajustée après un remboursement, un litige perdu ou une offre post-achat. Même règle de consentement que Meta et TikTok, pour la conversion comme

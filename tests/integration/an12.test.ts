@@ -26,7 +26,7 @@ vi.mock("@/lib/whop", async (orig) => ({
   storeClient: () => ({ checkoutConfigurations: { delete: whop.deleteConfig } }),
 }));
 vi.mock("@/lib/notify", async (orig) => ({ ...(await orig<typeof import("@/lib/notify")>()), ...notify }));
-vi.mock("@/lib/auth", async (orig) => ({ ...(await orig<typeof import("@/lib/auth")>()), requireAdmin: async () => ({ id: "admin" }) }));
+vi.mock("@/lib/auth", async (orig) => ({ ...(await orig<typeof import("@/lib/auth")>()), requireAdmin: async () => "admin", currentUser: async () => (await import("../session-stub")).ownerUser() }));
 
 const hasDb = !!process.env.DATABASE_URL;
 

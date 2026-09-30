@@ -1,5 +1,6 @@
 import "server-only";
 import { addDays, tzOf } from "./time";
+import type { Prisma } from "@prisma/client";
 import { db } from "./db";
 import { PROVIDER_STORE_SELECT, storeLive, storeReady } from "./payment-provider";
 import { crossRate, ecbRates, type FxRates } from "./fx";
@@ -174,8 +175,13 @@ export function storeRange(range: DayRange, tz: string): DayRange {
 }
 
 /** Every store's summary for a period (+ the previous one) and the totals: the cross-store page and its CSV. */
-export async function crossStoreStats(range: DayRange): Promise<{ rows: CrossStoreRow[]; totals: CrossStoreTotals; zones: string[] }> {
+export async function crossStoreStats(
+  range: DayRange,
+  // The stores the viewer may open (accessibleStoreWhere); default every store.
+  where: Prisma.StoreWhereInput = {},
+): Promise<{ rows: CrossStoreRow[]; totals: CrossStoreTotals; zones: string[] }> {
   const stores = await db.store.findMany({
+    where,
     orderBy: { createdAt: "asc" },
     select: { id: true, name: true, shopCurrency: true, enabled: true, shopifyConnectedAt: true, timezone: true, ...PROVIDER_STORE_SELECT },
   });

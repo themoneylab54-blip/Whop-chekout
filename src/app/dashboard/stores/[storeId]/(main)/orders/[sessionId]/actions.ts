@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { requireAdmin } from "@/lib/auth";
+import { requireStoreAction } from "@/lib/store-guard";
 import { parseCsvAmount } from "@/lib/adspend-csv";
 import { createReplacementOrder, decideClaim, deleteClaim, recordClaim } from "@/lib/claims";
 import { humanizeError } from "@/lib/humanize-error";
@@ -30,7 +30,7 @@ function claimField(message: string): string | undefined {
 }
 
 export async function declareClaimAction(storeId: string, sessionId: string, fd: FormData) {
-  await requireAdmin();
+  await requireStoreAction(storeId, "edit");
   try {
     await recordClaim(storeId, sessionId, {
       kind: String(fd.get("kind") ?? ""),
@@ -46,7 +46,7 @@ export async function declareClaimAction(storeId: string, sessionId: string, fd:
 }
 
 export async function deleteClaimAction(storeId: string, sessionId: string, claimId: string) {
-  await requireAdmin();
+  await requireStoreAction(storeId, "edit");
   const ok = await deleteClaim(storeId, sessionId, claimId);
   revalidatePath(orderPath(storeId, sessionId));
   revalidatePath(`/dashboard/stores/${storeId}/analytics`);
@@ -55,7 +55,7 @@ export async function deleteClaimAction(storeId: string, sessionId: string, clai
 
 /** Accept a buyer's delivery report: its solution and cost then count as a claim. */
 export async function approveClaimAction(storeId: string, sessionId: string, claimId: string, fd: FormData) {
-  await requireAdmin();
+  await requireStoreAction(storeId, "edit");
   let result: Awaited<ReturnType<typeof decideClaim>> | null = null;
   try {
     result = await decideClaim(storeId, sessionId, claimId, {
@@ -81,7 +81,7 @@ export async function approveClaimAction(storeId: string, sessionId: string, cla
 
 /** Retry of the 0 € replacement order of an approved reship. */
 export async function createReplacementAction(storeId: string, sessionId: string, claimId: string) {
-  await requireAdmin();
+  await requireStoreAction(storeId, "edit");
   let name = "";
   try {
     name = (await createReplacementOrder(storeId, claimId)).name;
@@ -94,7 +94,7 @@ export async function createReplacementAction(storeId: string, sessionId: string
 
 /** Refuse a buyer's delivery report (nothing is counted). */
 export async function rejectClaimAction(storeId: string, sessionId: string, claimId: string, fd: FormData) {
-  await requireAdmin();
+  await requireStoreAction(storeId, "edit");
   try {
     const r = await decideClaim(storeId, sessionId, claimId, { approve: false, note: String(fd.get("note") ?? "") || null });
     revalidatePath(orderPath(storeId, sessionId));

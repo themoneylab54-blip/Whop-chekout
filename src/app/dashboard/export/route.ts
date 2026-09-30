@@ -1,4 +1,5 @@
-import { requireAdmin } from "@/lib/auth";
+import { requireUser } from "@/lib/auth";
+import { accessibleStoreWhere } from "@/lib/access";
 import { resolveRange } from "@/lib/analytics";
 import { STORE_SORTS, crossStoreStats, sortStores, type StoreSort } from "@/lib/dashboard-stats";
 import { csvMoney, csvNumber, csvPercent, csvResponse } from "@/lib/csv";
@@ -11,12 +12,13 @@ export const dynamic = "force-dynamic";
  * use several currencies).
  */
 export async function GET(req: Request) {
-  await requireAdmin();
+  // Only the stores the user may open.
+  const user = await requireUser();
   const sp = new URL(req.url).searchParams;
   const range = resolveRange({ range: sp.get("range") ?? undefined, from: sp.get("from") ?? undefined, to: sp.get("to") ?? undefined });
   const sort: StoreSort = STORE_SORTS.includes(sp.get("sort") as StoreSort) ? (sp.get("sort") as StoreSort) : "ca";
   const dir = sp.get("dir") === "asc" ? "asc" : "desc";
-  const { rows, totals } = await crossStoreStats(range);
+  const { rows, totals } = await crossStoreStats(range, accessibleStoreWhere(user));
   const header = [
     "Boutique", "Devise", "Du", "Au", "Commandes", "Commandes (période préc.)", "Visiteurs du checkout", "Conversion checkout (%)", "CA TTC", "CA HT", "CA HT (période préc.)",
     "Marge nette", "Marge nette (période préc.)", "Coûts complets", "Pub", "ROAS HT", "POAS", "Marge après pub", "Marge après pub (période préc.)", "Frais fixes (prorata)",

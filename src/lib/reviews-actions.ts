@@ -1,6 +1,7 @@
 "use server";
 
-import { requireAdmin } from "./auth";
+import { redirect } from "next/navigation";
+import { checkStoreAccess } from "./access";
 import { db } from "./db";
 import { decrypt, encrypt } from "./crypto";
 import { extFetch } from "./ext";
@@ -37,23 +38,28 @@ const SHOPIFY_RATING_PAGE = 50;
 const SHOPIFY_RATING_PAGES = 40;
 const TOKEN_RE = /^[A-Za-z0-9_-]{10,200}$/;
 
+/** The store when the signed-in user may edit it (else null; signed out → /login), and whether it is the owner. */
 async function storeOf(storeId: string) {
-  await requireAdmin();
-  return db.store.findUnique({
-    where: { id: storeId },
-    select: { id: true, shopDomain: true, shopifyAccessToken: true, shopifyConnectedAt: true, judgemeApiToken: true },
-  });
+  const res = await checkStoreAccess(storeId, "edit");
+  if (!res.ok) {
+    if (res.reason === "login") redirect("/login");
+    return null;
+  }
+  const { id, shopDomain, shopifyAccessToken, shopifyConnectedAt, judgemeApiToken } = res.store;
+  return { id, shopDomain, shopifyAccessToken, shopifyConnectedAt, judgemeApiToken, owner: res.user.role === "owner" };
 }
 
 /** Whether a Judge.me token is saved (the token itself never leaves the server). */
-export async function judgeMeStatusAction(storeId: string): Promise<{ connected: boolean; shopConnected: boolean }> {
+export async function judgeMeStatusAction(storeId: string): Promise<{ connected: boolean; shopConnected: boolean; owner: boolean }> {
   const store = await storeOf(storeId);
-  return { connected: !!store?.judgemeApiToken, shopConnected: !!(store?.shopifyConnectedAt && store.shopDomain) };
+  // `owner`: may paste / change / delete the token (the others only import with the saved one).
+  return { connected: !!store?.judgemeApiToken, shopConnected: !!(store?.shopifyConnectedAt && store.shopDomain), owner: !!store?.owner };
 }
 
-/** Forgets the saved Judge.me token. */
-export async function forgetJudgeMeAction(storeId: string): Promise<{ ok: true }> {
-  await requireAdmin();
+/** Forgets the saved Judge.me token (API tokens are the owner's). */
+export async function forgetJudgeMeAction(storeId: string): Promise<{ ok: boolean }> {
+  const store = await storeOf(storeId);
+  if (!store?.owner) return { ok: false };
   await db.store.updateMany({ where: { id: storeId }, data: { judgemeApiToken: null } });
   return { ok: true };
 }
@@ -71,6 +77,7 @@ export async function importJudgeMeAction(
   if (!store) return { ok: false, error: "Boutique introuvable." };
   if (!store.shopDomain || !store.shopifyConnectedAt) return { ok: false, error: "Connectez d'abord votre boutique Shopify : Judge.me identifie vos avis par son adresse .myshopify.com." };
   const pasted = token?.trim();
+  if (pasted && !store.owner) return { ok: false, error: "Seul le propriétaire du compte peut enregistrer un jeton Judge.me." };
   if (pasted && !TOKEN_RE.test(pasted)) return { ok: false, error: "Jeton Judge.me invalide : copiez le « Private API token » (Judge.me › Paramètres › Intégrations › Voir la clé API)." };
   let secret: string | null = pasted || null;
   if (!secret && store.judgemeApiToken) {

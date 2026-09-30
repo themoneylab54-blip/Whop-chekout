@@ -28,6 +28,7 @@ const nextConfig: NextConfig = {
       { source: "/dashboard/:path*", headers: noFraming },
       { source: "/login", headers: noFraming },
       { source: "/setup", headers: noFraming },
+      { source: "/invite/:path*", headers: noFraming },
     ];
   },
 };

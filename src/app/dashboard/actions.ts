@@ -3,11 +3,13 @@
 import { providerRefundAmount } from "@/lib/charge";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { headers } from "next/headers";
 import { rateLimit } from "@/lib/ratelimit";
 import { z } from "zod";
-import { Prisma } from "@prisma/client";
-import { login, logout, requireAdmin } from "@/lib/auth";
+import { Prisma, type UserRole } from "@prisma/client";
+import { logout } from "@/lib/auth";
+import { ownerBoundError, resolveOwnerBound } from "@/lib/owner-bound";
+import { canAccessStore, creatorAccessData, OWNER_ONLY_ERROR, requireRole, requireStoreAccess, roleCan, type AccessLevel } from "@/lib/access";
+import { requireStoreAction } from "@/lib/store-guard";
 import { db } from "@/lib/db";
 import { EU_VAT_AREA, STANDARD_VAT_RATES } from "@/lib/vat";
 import { decrypt, encrypt, randomToken } from "@/lib/crypto";
@@ -66,11 +68,12 @@ function storePath(storeId: string, sub = "") {
   return `/dashboard/stores/${storeId}${sub ? `/${sub}` : ""}`;
 }
 
-async function getStore(storeId: string) {
-  await requireAdmin();
-  const store = await db.store.findUnique({ where: { id: storeId } });
-  if (!store) redirect("/dashboard");
-  return store;
+/**
+ * The store, once the signed-in user may act on it at `level` (default "edit"; "owner" for payment /
+ * platform connections, API keys and deletion). Redirects otherwise (see requireStoreAccess).
+ */
+async function getStore(storeId: string, level: AccessLevel = "edit") {
+  return (await requireStoreAction(storeId, level)).store;
 }
 
 function str(fd: FormData, key: string) {
@@ -113,20 +116,7 @@ function errorMessage(err: unknown) {
 /* Auth                                                                */
 /* ------------------------------------------------------------------ */
 
-export type LoginState = { error?: string; email?: string };
-
-/** Used with useActionState: a failed attempt returns the error and keeps the typed e-mail. */
-export async function loginAction(_prev: LoginState, fd: FormData): Promise<LoginState> {
-  const email = str(fd, "email").slice(0, 200);
-  const h = await headers();
-  const ip = h.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
-  if (!(await rateLimit(`login:${ip}`, 10))) return { error: "Trop de tentatives. Réessayez dans une minute.", email };
-  const ok = await login(email, String(fd.get("password") ?? ""));
-  if (!ok) return { error: "E-mail ou mot de passe incorrect", email };
-  // A single store: land directly on it instead of the store list.
-  const stores = await db.store.findMany({ select: { id: true }, take: 2 });
-  redirect(stores.length === 1 ? storePath(stores[0].id) : "/dashboard");
-}
+// Password sign-in lives in src/app/login/actions.ts (passwordLoginAction).
 
 export async function logoutAction() {
   await logout();
@@ -138,14 +128,14 @@ export async function logoutAction() {
 /* ------------------------------------------------------------------ */
 
 export async function createStoreAction(fd: FormData) {
-  await requireAdmin();
+  const user = await requireRole("admin", "create_store");
   const name = str(fd, "name").slice(0, 80) || "Nouvelle boutique";
-  const store = await db.store.create({ data: { name } });
+  const store = await db.store.create({ data: { name, ...creatorAccessData(user) } });
   redirect(storePath(store.id, "shopify"));
 }
 
 export async function deleteStoreAction(storeId: string) {
-  const store = await getStore(storeId);
+  const store = await getStore(storeId, "owner");
   // Paid orders are accounting records: never erase them by accident.
   const paid = await db.checkoutSession.count({ where: { storeId, status: "PAID" } });
   if (paid > 0) {
@@ -169,12 +159,14 @@ const jsonCopy = (v: Prisma.JsonValue | null) => (v === null ? undefined : (v as
 /**
  * "Cloner la boutique": a new, unconnected store with this store's configuration (design and its
  * uploaded images, interception, shipping rates, add-ons, discount codes with fresh counters, quantity breaks,
- * costs & VAT, pixel IDs, alerts, safety net, conversion value). Never copied: Shopify / Whop
- * connections, pixel tokens, Mondial Relay credentials, the bank statement label, orders and
- * stats; the copy starts offline, in test mode, with its own publicId.
+ * costs & VAT, pixel IDs, alerts — their Resend / Telegram keys only by the owner —, safety net,
+ * conversion value). Never copied: Shopify / Whop connections, pixel tokens, Mondial Relay
+ * credentials, the bank statement label, orders and stats; the copy starts offline, in test mode,
+ * with its own publicId.
  */
 export async function cloneStoreAction(storeId: string) {
-  const src = await getStore(storeId);
+  const { user, store: src } = await requireStoreAction(storeId, "edit");
+  const ownerCopy = roleCan(user.role, "owner");
   const [rates, addOns, discounts] = await Promise.all([
     db.shippingRate.findMany({ where: { storeId }, orderBy: { position: "asc" } }),
     db.addOn.findMany({ where: { storeId }, orderBy: { position: "asc" } }),
@@ -201,6 +193,7 @@ export async function cloneStoreAction(storeId: string) {
       const created = await tx.store.create({
         data: {
           name,
+          ...creatorAccessData(user),
           testMode: true,
           enabled: false,
           shopCurrency: src.shopCurrency,
@@ -233,12 +226,12 @@ export async function cloneStoreAction(storeId: string) {
           metaContentIdFormat: src.metaContentIdFormat,
           metaCatalogCountry: src.metaCatalogCountry,
           conversionValueMode: src.conversionValueMode,
-          // Alerts (the operator's own channels)
+          // Alerts (the operator's own channels). Their API keys are the owner's (like every API key):
+          // copied only by the owner; an admin's copy keeps the addresses and chat, keys to re-enter.
           alertEmail: src.alertEmail,
           emailFrom: src.emailFrom,
-          resendApiKey: src.resendApiKey,
-          telegramBotToken: src.telegramBotToken,
           telegramChatId: src.telegramChatId,
+          ...(ownerCopy ? { resendApiKey: src.resendApiKey, telegramBotToken: src.telegramBotToken } : {}),
           // Safety net & dispute shield
           autoFallback: src.autoFallback,
           pushTracking: src.pushTracking,
@@ -304,7 +297,7 @@ export async function cloneStoreAction(storeId: string) {
     recordEvent({
       storeId: copy.id,
       kind: "store.cloned_from",
-      message: `Boutique créée par duplication de « ${src.name} » : design, livraison, options, codes promo, coûts, pixels (sans jetons) et alertes copiés. Shopify et Whop restent à connecter.`,
+      message: `Boutique créée par duplication de « ${src.name} » : design, livraison, options, codes promo, coûts, pixels (sans jetons) et alertes${ownerCopy ? "" : " (sans les clés Resend et Telegram, réservées au propriétaire)"} copiés. Shopify et Whop restent à connecter.`,
       data: { sourceStoreId: storeId, ...counts },
     }),
   ]);
@@ -312,9 +305,17 @@ export async function cloneStoreAction(storeId: string) {
   back(storePath(copy.id), { ok: `Configuration de « ${src.name} » copiée. Connectez Shopify puis Whop pour mettre cette boutique en ligne.` });
 }
 
+/** Refusal of a test / production switch by a non-owner (it tears the payment connections down). */
+const MODE_SWITCH_OWNER_ERROR = "Changer le mode test / production déconnecte Whop et change la connexion Stripe : réservé au propriétaire du compte.";
+
 export async function saveSettingsAction(storeId: string, fd: FormData) {
-  const store = await getStore(storeId);
+  const { user, store } = await requireStoreAction(storeId, "edit");
   const testMode = fd.get("testMode") === "on";
+  // Switching modes resets the payment connections (Whop keys removed, Stripe re-wired): owner only,
+  // like connecting / disconnecting them. Nothing else of the form is saved then.
+  if (testMode !== store.testMode && (store.whopConnectedAt || store.stripeAccountId) && !roleCan(user.role, "owner")) {
+    back(storePath(storeId, "settings"), { error: MODE_SWITCH_OWNER_ERROR, field: "testMode" });
+  }
   const name = str(fd, "name").slice(0, 80) || store.name;
   // Time zone of the store's days and hours (analytics, reports, alerts); an unknown name keeps the current one.
   const tzRaw = str(fd, "timezone");
@@ -409,7 +410,7 @@ export async function setEnabledAction(storeId: string, enabled: boolean) {
 /* ------------------------------------------------------------------ */
 
 export async function startShopifyInstallAction(storeId: string, fd: FormData) {
-  const store = await getStore(storeId);
+  const store = await getStore(storeId, "owner");
   const path = storePath(storeId, "shopify");
   const shop = normalizeShopDomain(str(fd, "shopDomain"));
   if (!shop) back(path, { error: "Domaine invalide : utilisez l'adresse en .myshopify.com", field: "shopDomain" });
@@ -446,7 +447,7 @@ export async function startShopifyInstallAction(storeId: string, fd: FormData) {
 }
 
 export async function disconnectShopifyAction(storeId: string) {
-  const store = await getStore(storeId);
+  const store = await getStore(storeId, "owner");
   if (store.scriptTagId && store.shopifyAccessToken) {
     await removeScriptTag(store, store.scriptTagId).catch(() => undefined);
   }
@@ -476,7 +477,7 @@ export async function reinstallScriptAction(storeId: string) {
 /* ------------------------------------------------------------------ */
 
 export async function connectWhopAction(storeId: string, fd: FormData) {
-  const store = await getStore(storeId);
+  const store = await getStore(storeId, "owner");
   const path = storePath(storeId, "whop");
   const apiKey = str(fd, "apiKey");
   if (!apiKey) back(path, { error: "Collez votre clé API Whop", field: "apiKey" });
@@ -521,7 +522,7 @@ export async function connectWhopAction(storeId: string, fd: FormData) {
 }
 
 export async function disconnectWhopAction(storeId: string) {
-  const store = await getStore(storeId);
+  const store = await getStore(storeId, "owner");
   await teardownWhop(store).catch(() => undefined);
   // Stripe able to charge on its own: the checkout stays live on it; otherwise buyers go back to Shopify's.
   const noProcessorLeft = !anyProviderConnected({ ...store, whopConnectedAt: null });
@@ -552,7 +553,7 @@ export async function disconnectWhopAction(storeId: string) {
  * flight or recent ones still lack their Shopify order, unless « Déconnecter quand même » is ticked.
  */
 export async function disconnectStripeAction(storeId: string, fd?: FormData) {
-  const store = await getStore(storeId);
+  const store = await getStore(storeId, "owner");
   const path = storePath(storeId, "stripe");
   if (!store.stripeAccountId) back(path, { ok: "Stripe n'était pas connecté." });
   const force = fd?.get("force") === "on";
@@ -608,7 +609,7 @@ export async function savePaymentModeAction(storeId: string, fd: FormData) {
 
 /** Registers (again) the checkout hosts on the connected Stripe account for Apple Pay / Google Pay. */
 export async function registerStripeDomainsAction(storeId: string) {
-  const store = await getStore(storeId);
+  const { user, store } = await requireStoreAction(storeId, "edit");
   const path = storePath(storeId, "stripe");
   if (!store.stripeAccountId) back(path, { error: "Connectez Stripe d'abord" });
   // Registered with the keys of the store's mode: only when the connection covers that mode.
@@ -616,8 +617,10 @@ export async function registerStripeDomainsAction(storeId: string) {
     back(path, { error: stripeUnusableReason(store) ?? "Stripe n'est pas utilisable dans le mode actuel de la boutique." });
   }
   const { hosts, failed, pending } = await registerWalletDomains(store);
-  // While Stripe is being worked on: its Connect webhook too (journaled when it can't be set up).
-  const webhook = await ensureStripeWebhook(storeId, stripeModeOf(store), { lazy: true });
+  // While Stripe is being worked on: its Connect webhook too (journaled when it can't be set up). That
+  // webhook is the platform's (every store's): only checked for an owner, the store's domains being
+  // this store's own business (edit).
+  const webhook = roleCan(user.role, "owner") ? await ensureStripeWebhook(storeId, stripeModeOf(store), { lazy: true }) : null;
   const webhookError = webhook ? `Webhook Stripe à réparer (« Réparer la liaison Stripe ») : ${webhook}.` : undefined;
   if (!hosts.length) {
     back(path, {
@@ -648,7 +651,8 @@ async function registerWalletDomains(store: Parameters<typeof stripeWalletHosts>
 
 /** « Réparer la liaison Stripe »: (re)creates or checks the platform's Connect webhook of the store's mode. */
 export async function repairStripeWebhookAction(storeId: string) {
-  const store = await getStore(storeId);
+  // The Connect webhook is the platform's (shared by every store): a payment-connection matter.
+  const store = await getStore(storeId, "owner");
   const path = storePath(storeId, "stripe");
   if (!store.stripeAccountId) back(path, { error: "Connectez Stripe d'abord" });
   const error = await ensureStripeWebhook(storeId, stripeModeOf(store));
@@ -658,12 +662,21 @@ export async function repairStripeWebhookAction(storeId: string) {
   back(path, { ok: "Liaison Stripe vérifiée : le webhook est en place." });
 }
 
+/** Refusal of the account-wide Apple Pay file to anyone but an owner with every store. */
+const APPLE_PAY_FILE_ERROR = `${OWNER_ONLY_ERROR} Le fichier Apple Pay sert à toutes les boutiques du compte : laissez le champ vide pour seulement enregistrer le domaine de cette boutique.`;
+
+/** Refusal of the account-wide maintenance run to a user limited to some stores. */
+const ACCOUNT_WIDE_ERROR = "La maintenance traite toutes les boutiques du compte : réservée aux membres ayant accès à toutes les boutiques.";
+
 /** Saves Apple's domain-association file (from Whop) and registers the checkout domain. */
 export async function setupApplePayAction(storeId: string, fd: FormData) {
-  const store = await getStore(storeId);
+  const { user, store } = await requireStoreAction(storeId, "edit");
   const path = storePath(storeId, "whop");
   const file = String(fd.get("association") ?? "").trim();
   if (file) {
+    // The association file is served for every store's host (account-wide setting) and re-registers
+    // the other stores: the account owner's call. Registering this store's domain stays at "edit".
+    if (!roleCan(user.role, "owner") || !user.allStores) back(path, { error: APPLE_PAY_FILE_ERROR, field: "association" });
     if (file.length > 20000) back(path, { error: "Fichier Apple Pay trop volumineux : collez uniquement son contenu", field: "association" });
     await db.appSetting.upsert({
       where: { key: APPLE_PAY_ASSOCIATION_KEY },
@@ -705,7 +718,7 @@ export async function setupApplePayAction(storeId: string, fd: FormData) {
  * the Vercel API is configured, then checks it right away (already verified when the DNS was ready).
  */
 export async function saveCheckoutDomainAction(storeId: string, fd: FormData) {
-  const store = await getStore(storeId);
+  const { user, store } = await requireStoreAction(storeId, "edit");
   const path = storePath(storeId, "settings");
   const checked = normalizeCheckoutDomain(str(fd, "checkoutDomain"), {
     storefrontHosts: [store.storefrontHost, store.shopDomain],
@@ -732,8 +745,15 @@ export async function saveCheckoutDomainAction(storeId: string, fd: FormData) {
     if (recheck.verified && !recheck.message) back(path, { ok: `Domaine vérifié : vos clients paient désormais sur ${domain}` });
     back(path, { error: recheck.message ?? "Le domaine ne répond pas encore." });
   }
-  const other = domain ? await db.store.findFirst({ where: { checkoutDomain: domain, NOT: { id: storeId } }, select: { name: true } }) : null;
-  if (other) back(path, { error: `${domain} est déjà le domaine du checkout de la boutique « ${other.name} ».`, field: "checkoutDomain" });
+  const other = domain ? await db.store.findFirst({ where: { checkoutDomain: domain, NOT: { id: storeId } }, select: { id: true, name: true } }) : null;
+  if (other) {
+    // A store the user can't open is not named (its name is none of a store-limited member's business).
+    const named = user.allStores || (await canAccessStore(user, other.id));
+    back(path, {
+      error: named ? `${domain} est déjà le domaine du checkout de la boutique « ${other.name} ».` : "Ce domaine est déjà utilisé par une autre boutique.",
+      field: "checkoutDomain",
+    });
+  }
   // Retired by another store less than 48 h ago: its open checkouts and payment return links still
   // use it (they must keep reaching that store), so it can't be taken over before then.
   const retiredBy = domain ? await retiredDomainOwner(domain) : null;
@@ -1341,6 +1361,9 @@ export async function deleteAddOnAction(storeId: string, id: string) {
 export async function resyncOrderAction(storeId: string, sessionId: string) {
   await getStore(storeId);
   const path = storePath(storeId, `orders/${sessionId}`);
+  // The order must be this store's: another store's id (one the user may not open) stops here.
+  const own = await db.checkoutSession.findFirst({ where: { id: sessionId, storeId }, select: { id: true } });
+  if (!own) back(storePath(storeId, "orders"), { error: "Commande introuvable" });
   // Manual sync is the merchant's decision on an order held for review.
   await db.checkoutSession.updateMany({ where: { id: sessionId, storeId }, data: { reviewNote: null } });
   try {
@@ -1349,8 +1372,8 @@ export async function resyncOrderAction(storeId: string, sessionId: string) {
     back(path, { error: `Échec de la synchronisation : ${errorMessage(err)}` });
   }
   // syncOrder returns quietly when it could not claim the order: say why, never "synchronisée".
-  const after = await db.checkoutSession.findUnique({
-    where: { id: sessionId },
+  const after = await db.checkoutSession.findFirst({
+    where: { id: sessionId, storeId },
     select: { status: true, shopifyOrderId: true, shopifyOrderName: true, syncHandledAt: true, syncSkippedReason: true, syncStartedAt: true, syncAmbiguousAt: true },
   });
   revalidatePath(storePath(storeId), "layout");
@@ -1385,7 +1408,7 @@ export async function retryShopifySyncAction(storeId: string, sessionId: string)
     back(path, { error: `Shopify n'a pas répondu au dernier essai : la commande existe peut-être déjà. Réessayez dans ${wait} min (vérification anti-doublon).` });
   }
   await syncOrderSafely(sessionId);
-  const after = await db.checkoutSession.findUnique({ where: { id: sessionId }, select: { shopifyOrderName: true, shopifyOrderId: true, syncError: true, syncSkippedReason: true } });
+  const after = await db.checkoutSession.findFirst({ where: { id: sessionId, storeId }, select: { shopifyOrderName: true, shopifyOrderId: true, syncError: true, syncSkippedReason: true } });
   revalidatePath(storePath(storeId), "layout");
   if (after?.shopifyOrderId) back(path, { ok: `Commande ${after.shopifyOrderName ?? ""} créée dans Shopify`.replace("  ", " ") });
   if (after?.syncSkippedReason) back(path, { ok: syncSkipMessage(after.syncSkippedReason as SyncSkipReason) });
@@ -1463,7 +1486,7 @@ export type OrderSearchHit = { id: string; shopifyOrderName: string | null; emai
 
 /** ⌘K palette: top 8 orders of the store matching an order number ("#1042", "1042"), an e-mail, the buyer's name or an id. */
 export async function searchOrdersAction(storeId: string, q: string): Promise<OrderSearchHit[]> {
-  await requireAdmin();
+  await requireStoreAccess(storeId, "view");
   const term = q.trim().slice(0, 100);
   if (term.length < 2) return [];
   const digits = term.replace(/^#/, "");
@@ -1514,15 +1537,20 @@ function endOfDayIn(day: string, tz: string): Date | null {
 /* Growth: ads tracking, alerts, dispute shield, payment methods       */
 /* ------------------------------------------------------------------ */
 
-/** Keeps a stored secret when the field is left blank ("•••• enregistré"). */
-function secretField(fd: FormData, key: string, current: string | null, path: string): string | null {
-  if (fd.get(`${key}Clear`) === "on") return null;
+/**
+ * Keeps a stored secret when the field is left blank ("•••• enregistré"). API keys and tokens are
+ * the owner's: an admin saving the rest of the form can't set or clear one.
+ */
+function secretField(fd: FormData, key: string, current: string | null, path: string, role: UserRole): string | null {
+  const clear = fd.get(`${key}Clear`) === "on";
   const v = str(fd, key);
+  if ((clear || v) && role !== "owner") back(path, { error: "Seul le propriétaire du compte peut modifier les clés et jetons d'API.", field: key });
+  if (clear) return null;
   return v ? encryptOrBack(v, path) : current;
 }
 
 export async function saveTrackingAction(storeId: string, fd: FormData) {
-  const store = await getStore(storeId);
+  const { user, store } = await requireStoreAction(storeId, "edit");
   const path = storePath(storeId, "growth");
   const metaPixelId = str(fd, "metaPixelId").replace(/\D/g, "").slice(0, 30) || null;
   const tiktokPixelId = str(fd, "tiktokPixelId").replace(/[^A-Za-z0-9]/g, "").slice(0, 40) || null;
@@ -1530,16 +1558,21 @@ export async function saveTrackingAction(storeId: string, fd: FormData) {
   const modeRaw = fd.has("conversionValueMode") ? str(fd, "conversionValueMode") : store.conversionValueMode;
   if (modeRaw !== "revenue" && modeRaw !== "profit") back(path, { error: "Valeur de conversion inconnue : choisissez le montant de la commande ou la marge HT." });
   const conversionValueMode = modeRaw;
+  const ga4MeasurementId = /^G-[A-Z0-9]{4,20}$/i.test(str(fd, "ga4MeasurementId")) ? str(fd, "ga4MeasurementId").toUpperCase() : null;
+  // The pixel / measurement ids go with the owner's tokens: a non-owner keeps them as they are.
+  const bound = resolveOwnerBound(user.role, {
+    metaPixelId: { next: metaPixelId, current: store.metaPixelId, tokenStored: !!store.metaAccessToken },
+    tiktokPixelId: { next: tiktokPixelId, current: store.tiktokPixelId, tokenStored: !!store.tiktokAccessToken },
+    ga4MeasurementId: { next: ga4MeasurementId, current: store.ga4MeasurementId, tokenStored: !!store.ga4ApiSecret },
+  });
   await db.store.update({
     where: { id: storeId },
     data: {
-      metaPixelId,
-      metaAccessToken: secretField(fd, "metaAccessToken", store.metaAccessToken, path),
+      ...bound.values,
+      metaAccessToken: secretField(fd, "metaAccessToken", store.metaAccessToken, path, user.role),
       metaTestEventCode: str(fd, "metaTestEventCode").slice(0, 40) || null,
-      tiktokPixelId,
-      tiktokAccessToken: secretField(fd, "tiktokAccessToken", store.tiktokAccessToken, path),
-      ga4MeasurementId: /^G-[A-Z0-9]{4,20}$/i.test(str(fd, "ga4MeasurementId")) ? str(fd, "ga4MeasurementId").toUpperCase() : null,
-      ga4ApiSecret: secretField(fd, "ga4ApiSecret", store.ga4ApiSecret, path),
+      tiktokAccessToken: secretField(fd, "tiktokAccessToken", store.tiktokAccessToken, path, user.role),
+      ga4ApiSecret: secretField(fd, "ga4ApiSecret", store.ga4ApiSecret, path, user.role),
       pixelRequireConsent: fd.get("pixelRequireConsent") === "on",
       metaContentIdFormat: str(fd, "metaContentIdFormat") === "shopify" ? "shopify" : "variant",
       metaCatalogCountry: /^[A-Za-z]{2}$/.test(str(fd, "metaCatalogCountry")) ? str(fd, "metaCatalogCountry").toUpperCase() : "FR",
@@ -1548,6 +1581,7 @@ export async function saveTrackingAction(storeId: string, fd: FormData) {
   });
   // Kept per day on the imported ad spend: a platform's reported value is a margin on "profit" days.
   await recordValueModeChange(storeId, store.conversionValueMode, conversionValueMode).catch(() => undefined);
+  if (bound.refused.length) back(path, { error: ownerBoundError(bound.refused), field: bound.refused[0] });
   back(path, { ok: "Pixels enregistrés" });
 }
 
@@ -1565,7 +1599,7 @@ export async function testTrackingAction(storeId: string) {
 }
 
 export async function saveAlertsAction(storeId: string, fd: FormData) {
-  const store = await getStore(storeId);
+  const { user, store } = await requireStoreAction(storeId, "edit");
   const path = storePath(storeId, "settings");
   const alertEmail = str(fd, "alertEmail").slice(0, 200) || null;
   if (alertEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(alertEmail)) back(path, { error: "E-mail d'alerte invalide", field: "alertEmail" });
@@ -1573,16 +1607,21 @@ export async function saveAlertsAction(storeId: string, fd: FormData) {
   if (emailFrom && !/^([^<>]+<)?[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+>?$/.test(emailFrom)) {
     back(path, { error: "Expéditeur invalide : ex. « Alertes <alertes@maboutique.fr> »", field: "emailFrom" });
   }
+  // The sender and the chat go with the owner's Resend key / Telegram token: a non-owner keeps them.
+  const bound = resolveOwnerBound(user.role, {
+    emailFrom: { next: emailFrom, current: store.emailFrom, tokenStored: !!store.resendApiKey },
+    telegramChatId: { next: str(fd, "telegramChatId").replace(/[^\d-]/g, "").slice(0, 30) || null, current: store.telegramChatId, tokenStored: !!store.telegramBotToken },
+  });
   await db.store.update({
     where: { id: storeId },
     data: {
       alertEmail,
-      emailFrom,
-      resendApiKey: secretField(fd, "resendApiKey", store.resendApiKey, path),
-      telegramBotToken: secretField(fd, "telegramBotToken", store.telegramBotToken, path),
-      telegramChatId: str(fd, "telegramChatId").replace(/[^\d-]/g, "").slice(0, 30) || null,
+      ...bound.values,
+      resendApiKey: secretField(fd, "resendApiKey", store.resendApiKey, path, user.role),
+      telegramBotToken: secretField(fd, "telegramBotToken", store.telegramBotToken, path, user.role),
     },
   });
+  if (bound.refused.length) back(path, { error: ownerBoundError(bound.refused), field: bound.refused[0] });
   back(path, { ok: "Alertes enregistrées" });
 }
 
@@ -1765,13 +1804,16 @@ export async function clearFallbackAction(storeId: string) {
 }
 
 export async function savePickupAction(storeId: string, fd: FormData) {
-  const store = await getStore(storeId);
+  const { user, store } = await requireStoreAction(storeId, "edit");
   const path = storePath(storeId, "shipping");
   const enseigne = str(fd, "mondialRelayEnseigne").toUpperCase();
   if (enseigne && !/^[A-Z0-9]{2,10}$/.test(enseigne)) back(path, { error: "Code enseigne Mondial Relay invalide (ex. BDTEST13)", field: "mondialRelayEnseigne" });
-  const key = secretField(fd, "mondialRelayKey", store.mondialRelayKey, path);
-  await db.store.update({ where: { id: storeId }, data: { mondialRelayEnseigne: enseigne || null, mondialRelayKey: key } });
-  const ready = !!enseigne && !!key;
+  const key = secretField(fd, "mondialRelayKey", store.mondialRelayKey, path, user.role);
+  // The enseigne goes with the owner's private key: a non-owner keeps it.
+  const bound = resolveOwnerBound(user.role, { mondialRelayEnseigne: { next: enseigne, current: store.mondialRelayEnseigne, tokenStored: !!store.mondialRelayKey } });
+  await db.store.update({ where: { id: storeId }, data: { ...bound.values, mondialRelayKey: key } });
+  if (bound.refused.length) back(path, { error: ownerBoundError(bound.refused, false), field: "mondialRelayEnseigne" });
+  const ready = !!bound.values.mondialRelayEnseigne && !!key;
   const pickupRates = await db.shippingRate.count({ where: { storeId, kind: "pickup", active: true } });
   back(path, {
     ok: !ready
@@ -1814,9 +1856,12 @@ export async function reactivatePaypalAction(storeId: string) {
   back(storePath(storeId, "whop"), { ok: cleared ? "PayPal réactivé : Whop sera de nouveau consulté au prochain checkout." : "PayPal n'était pas masqué." });
 }
 
-/** Re-creates the Whop webhook with the current event list (e.g. after an app update). */
+/**
+ * Re-creates the Whop webhook with the current event list (e.g. after an app update). Owner only:
+ * it acts on Whop with the owner's API key and rotates the webhook secret, like connecting Whop.
+ */
 export async function refreshWhopWebhookAction(storeId: string) {
-  const store = await getStore(storeId);
+  const store = await getStore(storeId, "owner");
   const path = storePath(storeId, "whop");
   if (!store.whopApiKey) back(path, { error: "Connectez Whop d'abord" });
   let result;
@@ -1945,13 +1990,23 @@ function isRedirect(err: unknown) {
  * retries over now. For when the cause was fixed (Shopify reconnected, Telegram token…).
  */
 export async function retryGaveUpAction(storeId: string) {
-  await getStore(storeId);
+  const { user } = await requireStoreAction(storeId, "edit");
   const { retryGaveUp } = await import("@/lib/maintenance");
+  // This store's items (edit); the maintenance run that picks them up at once is account-wide.
   const n = await retryGaveUp(storeId);
   await recordEvent({ storeId, kind: "maintenance.retry_all", message: `Relance manuelle de ${n} élément(s) abandonné(s) par l'automatisation.` });
+  if (n) await runTickIfAccountWide(user);
+  back(storePath(storeId, "journal"), { ok: n ? `${n} élément(s) relancé(s).${user.allStores ? " Voir l'état ci-dessous." : " Ils seront traités à la prochaine maintenance automatique (quelques minutes)."}` : "Rien à relancer." });
+}
+
+/**
+ * Runs the maintenance (runTick) right away for a user with every store: it processes all stores'
+ * pending jobs, so a user limited to some stores leaves it to the scheduled run.
+ */
+async function runTickIfAccountWide(user: { allStores: boolean }) {
+  if (!user.allStores) return;
   const { runTick } = await import("@/lib/tick");
   await runTick();
-  back(storePath(storeId, "journal"), { ok: n ? `${n} élément(s) relancé(s). Voir l'état ci-dessous.` : "Rien à relancer." });
 }
 
 /** The merchant handled them by hand (refund reported in Shopify, event checked in Whop): stop flagging. */
@@ -1965,7 +2020,7 @@ export async function markGaveUpHandledAction(storeId: string) {
 
 /** One gave-up item from the journal list: retry it now, or mark it handled by hand. */
 export async function gaveUpItemAction(storeId: string, kind: string, id: string, fd: FormData) {
-  await getStore(storeId);
+  const { user } = await requireStoreAction(storeId, "edit");
   const path = storePath(storeId, "journal");
   const { GAVE_UP_KINDS, gaveUpItem } = await import("@/lib/maintenance");
   if (!(GAVE_UP_KINDS as readonly string[]).includes(kind)) back(path, { error: "Élément inconnu." });
@@ -1981,11 +2036,8 @@ export async function gaveUpItemAction(storeId: string, kind: string, id: string
     message: handled ? `Élément abandonné (${kind}) marqué comme traité à la main.` : `Relance manuelle d'un élément abandonné (${kind}).`,
     data: { kind, id },
   });
-  if (!handled) {
-    const { runTick } = await import("@/lib/tick");
-    await runTick();
-  }
-  back(path, { ok: handled ? "Marqué comme traité." : "Relancé. Voir l'état ci-dessous." });
+  if (!handled) await runTickIfAccountWide(user);
+  back(path, { ok: handled ? "Marqué comme traité." : user.allStores ? "Relancé. Voir l'état ci-dessous." : "Relancé : traité à la prochaine maintenance automatique (quelques minutes)." });
 }
 
 /**
@@ -2013,8 +2065,10 @@ export async function markOrderHandledAction(storeId: string, sessionId: string,
   back(path, { ok: "Commande liée. Les remboursements et litiges de cette commande sont à reporter à la main dans Shopify (une alerte vous le rappellera)." });
 }
 
+/** « Lancer la maintenance »: the whole account's run (every store), so for a member with every store. */
 export async function runTickAction(storeId: string) {
-  await getStore(storeId);
+  const { user } = await requireStoreAction(storeId, "edit");
+  if (!user.allStores) back(storePath(storeId, "journal"), { error: ACCOUNT_WIDE_ERROR });
   const { runTick } = await import("@/lib/tick");
   const report = await runTick();
   back(storePath(storeId, "journal"), {
@@ -2027,7 +2081,7 @@ export async function runTickAction(storeId: string) {
  * every store without its own Resend account. Blank key keeps the stored one; "clear" removes it.
  */
 export async function saveOperatorMailAction(storeId: string, fd: FormData) {
-  await getStore(storeId);
+  await getStore(storeId, "owner");
   const path = storePath(storeId, "settings");
   const key = str(fd, "operatorResendApiKey");
   const from = str(fd, "operatorEmailFrom").slice(0, 200);

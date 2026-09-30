@@ -3,6 +3,7 @@ import { db } from "@/lib/db";
 import { decrypt, encrypt, safeEqual } from "@/lib/crypto";
 import { env } from "@/lib/env";
 import { currentAdminId } from "@/lib/auth";
+import { checkStoreAccess, OWNER_ONLY_ERROR } from "@/lib/access";
 import { ensureScriptTag, exchangeCodeForToken, getShopInfo, normalizeShopDomain, verifyOauthHmac } from "@/lib/shopify";
 import { route } from "@/lib/route";
 import { log } from "@/lib/log";
@@ -22,7 +23,11 @@ async function handle(req: Request) {
 
   if (!(await currentAdminId())) return NextResponse.redirect(`${env.appUrl}/login`);
   const [storeId] = state.split(".");
-  const store = storeId ? await db.store.findUnique({ where: { id: storeId } }) : null;
+  // Platform connections are the owner's (the install was started by one: checked again here).
+  const access = storeId ? await checkStoreAccess(storeId, "owner") : null;
+  if (access && !access.ok && access.reason === "login") return NextResponse.redirect(`${env.appUrl}/login`);
+  if (access && !access.ok && access.reason === "forbidden") return fail(storeId, OWNER_ONLY_ERROR);
+  const store = access?.ok ? access.store : null;
   if (!store || !store.shopifyOauthState || !safeEqual(store.shopifyOauthState, state)) {
     return fail(store?.id ?? null, "Lien d'installation expiré, recommencez.");
   }
