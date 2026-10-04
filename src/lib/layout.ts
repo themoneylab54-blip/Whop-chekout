@@ -75,6 +75,9 @@ const imageUrl = z
   .transform((v) => (/^http:\/\//i.test(v) ? `https://${v.slice(7)}` : v))
   .refine((v) => v === "" || (/^https:\/\//i.test(v) && URL.canParse(v)) || MEDIA_PATH_RE.test(v), "URL https attendue");
 
+/** Text caps of the thank-you « Message personnalisé » block (schema and builder inputs). */
+export const MESSAGE_LIMITS = { title: 160, body: 2000, signatureName: 80, signatureRole: 80 } as const;
+
 /* ---------- Express payment buttons (top of the checkout) ---------- */
 
 /** Whop's express wallets, one button each (PayPal is our own button next to them). */
@@ -771,6 +774,27 @@ export const blockSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     ...base,
+    type: z.literal("message"),
+    // Thank-you page: a personal note (founder / brand) with photo, formatted text and signature.
+    // Every field has its own default, so a partial or older value never resets the others; a
+    // stray image, shape or layout falls back on its own (catch) instead of failing the block,
+    // which would reset the merchant's text to the shipped copy on load.
+    props: z.object({
+      photoUrl: imageUrl.default("").catch(""),
+      photoShape: z.enum(["round", "square"]).default("round").catch("round"),
+      // Photo next to the text (left) or above it (top).
+      layout: z.enum(["left", "top"]).default("left").catch("left"),
+      // {prénom} / {name}: the buyer's first name.
+      title: z.string().max(MESSAGE_LIMITS.title).default(""),
+      // Paragraphs (blank line), **bold**, [links](https://…): rendered as React elements, never as HTML.
+      body: z.string().max(MESSAGE_LIMITS.body).default(""),
+      signatureName: z.string().max(MESSAGE_LIMITS.signatureName).default(""),
+      signatureRole: z.string().max(MESSAGE_LIMITS.signatureRole).default(""),
+      signatureImageUrl: imageUrl.default("").catch(""),
+    }),
+  }),
+  z.object({
+    ...base,
     type: z.literal("social"),
     props: z.object({
       title: z.string().max(120),
@@ -867,6 +891,7 @@ export const CHECKOUT_PALETTE: BlockType[] = [
   "why_us",
 ];
 export const THANK_YOU_PALETTE: BlockType[] = [
+  "message",
   "upsell",
   "survey",
   "coupon",
@@ -892,7 +917,7 @@ export const THANK_YOU_PALETTE: BlockType[] = [
 
 /** Blocks that only make sense on one page. */
 const CHECKOUT_ONLY: ReadonlySet<BlockType> = new Set<BlockType>(["order_addons", "order_note", "recommendations", "shipping_protection"]);
-const THANK_YOU_ONLY: ReadonlySet<BlockType> = new Set<BlockType>(["survey"]);
+const THANK_YOU_ONLY: ReadonlySet<BlockType> = new Set<BlockType>(["survey", "message"]);
 
 export const layoutSchema = z.object({ blocks: z.array(blockSchema).max(40) });
 export type Layout = z.infer<typeof layoutSchema>;
@@ -1057,6 +1082,17 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
     claimText: "Colis perdu, volé ou abîmé ? Écrivez-nous dans les 14 jours suivant la livraison prévue avec votre numéro de commande (et une photo en cas de casse) : nous le renvoyons ou vous remboursons.",
   },
   survey: { question: "", options: [...SURVEY_KEYS] },
+  // Shipped French copy, translated for buyers (localize.ts DEFAULT_TEXTS messageTitle / messageBody / messageRole).
+  message: {
+    photoUrl: "",
+    photoShape: "round",
+    layout: "left",
+    title: "Un mot de notre équipe",
+    body: "Votre commande compte énormément pour nous. Chaque colis est préparé avec **le plus grand soin**, et nous avons hâte que vous le découvriez.\n\nMerci de votre confiance, à très vite !",
+    signatureName: "",
+    signatureRole: "L'équipe",
+    signatureImageUrl: "",
+  },
 };
 
 /** Where a new block goes by default: cross-sell cards sit in the summary, the rest in the form. */
@@ -1065,15 +1101,32 @@ const DEFAULT_PLACEMENT: Partial<Record<BlockType, Block["placement"]>> = { reco
 /** Blocks shipped with example proof (reviews, figures, testimonial, coupon, announcement, text). */
 export const SAMPLE_CONTENT_BLOCKS: ReadonlySet<BlockType> = new Set<BlockType>(["reviews", "stats", "testimonial", "coupon", "announcement", "text"]);
 
+/**
+ * Style a new block starts with (palette, template), on top of the shared defaults: the thank-you
+ * message reads as a card. Only applies at creation: saved blocks keep their own style.
+ */
+const DEFAULT_STYLE: Partial<Record<BlockType, Partial<BlockStyle>>> = { message: { card: true } };
+
 export function createBlock<T extends BlockType>(type: T, overrides: Partial<Block> = {}): BlockOf<T> {
   return blockSchema.parse({
     id: newBlockId(),
     type,
     props: structuredClone(DEFAULT_PROPS[type]),
     ...(DEFAULT_PLACEMENT[type] ? { placement: DEFAULT_PLACEMENT[type] } : {}),
+    ...(DEFAULT_STYLE[type] ? { style: { ...DEFAULT_STYLE[type] } } : {}),
     ...(SAMPLE_CONTENT_BLOCKS.has(type) ? { sample: true } : {}),
     ...overrides,
   }) as BlockOf<T>;
+}
+
+/**
+ * A new thank-you message signed with the store name (palette, template) when its signature name
+ * is empty; any other block, or a message already signed, is returned as is.
+ */
+export function signedWithStore<B extends Block>(block: B, storeName: string | null | undefined): B {
+  const name = (storeName ?? "").trim().slice(0, MESSAGE_LIMITS.signatureName);
+  if (block.type !== "message" || !name || block.props.signatureName.trim()) return block;
+  return { ...block, props: { ...block.props, signatureName: name } };
 }
 
 /**

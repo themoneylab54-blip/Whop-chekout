@@ -2,6 +2,7 @@ import "server-only";
 import { WhopClient, WhopEnvironment } from "@whop/sdk";
 import { unwrapWebhook } from "@whop/sdk/helpers";
 import type { Store } from "@prisma/client";
+import { after } from "next/server";
 import { decrypt } from "./crypto";
 import { env } from "./env";
 import { centsToDecimal } from "./pricing";
@@ -104,9 +105,10 @@ export async function setupWhop(opts: {
 
   // Idempotent: reuse this store's product and replace its webhook if a previous
   // attempt (or an older connection) already created them.
+  const title = whopProductTitle(opts.storeName);
   const productInput = {
     account_id: account.id,
-    title: `${opts.storeName || "Boutique"} — Checkout`,
+    title,
     description: "Commandes de la boutique Shopify (créé automatiquement par Whop Checkout).",
     visibility: "hidden" as const,
     collect_shipping_address: false,
@@ -114,13 +116,21 @@ export async function setupWhop(opts: {
     metadata: { source: "whop-checkout", store_id: opts.storeId },
   };
   const descriptor = statementDescriptor(opts.statementDescriptor || opts.storeName);
+  const existing = await findStoreProduct(client, account.id, opts.storeId);
   const product =
-    (await findStoreProduct(client, account.id, opts.storeId)) ??
+    existing ??
     // What buyers see on their bank statement: a recognisable name prevents "unknown charge"
     // disputes. A rejected descriptor must never block the connection.
     (await (descriptor
       ? client.products.create({ ...productInput, custom_statement_descriptor: descriptor }).catch(() => client.products.create(productInput))
       : client.products.create(productInput)));
+  // Whop names the product in the receipt it e-mails buyers: an older product still called
+  // "<Store> — Checkout" is renamed to the store's name (never blocks the connection).
+  if (existing && existing.title !== title) await renameProduct(client, opts.storeId, product.id, title);
+  else await rememberProductTitle(opts.storeId, product.id, title);
+  // Whop's own buyer e-mails are an ACCOUNT-wide setting (every product of the account): never
+  // changed here; the owner switches them explicitly on the Whop page (setWhopCustomerEmails).
+  rememberCustomerEmails(opts.storeId, account.send_customer_emails);
 
   const url = whopWebhookUrl(opts.storeId);
   await deleteWebhooksForUrl(client, account.id, url);
@@ -139,6 +149,163 @@ export async function setupWhop(opts: {
     webhookId: webhook.id,
     webhookSecret: webhook.webhook_secret,
   };
+}
+
+/** The Whop product's name, shown in Whop's buyer receipt: just the store's name. */
+export function whopProductTitle(storeName: string | null | undefined): string {
+  return (storeName?.trim() || "Boutique").slice(0, 80);
+}
+
+const productTitleKey = (storeId: string) => `whop:product-title:${storeId}`;
+/** Titles already applied (this process): spares the AppSetting read on every checkout. */
+const appliedTitles = new Map<string, string>();
+/** Last refused rename per store (this process): retried after a pause, not on every checkout. */
+const renameFailedAt = new Map<string, number>();
+const RENAME_RETRY_MS = 6 * 60 * 60 * 1000;
+
+async function rememberProductTitle(storeId: string, productId: string, title: string) {
+  const key = productTitleKey(storeId);
+  const value = `${productId}:${title}`;
+  appliedTitles.set(storeId, value);
+  try {
+    await db.appSetting.upsert({ where: { key }, create: { key, value }, update: { value } });
+  } catch (err) {
+    log.warn("whop.product_title_save_failed", "Could not remember the Whop product title", { storeId, err });
+  }
+}
+
+async function renameProduct(client: Client, storeId: string, productId: string, title: string, opts?: { timeoutInSeconds: number; maxRetries: number }) {
+  try {
+    await client.products.update({ id: productId, title }, opts);
+    log.info("whop.product_renamed", `Whop product renamed to "${title}"`, { storeId, productId });
+    renameFailedAt.delete(storeId);
+    await rememberProductTitle(storeId, productId, title);
+  } catch (err) {
+    renameFailedAt.set(storeId, Date.now());
+    // Retried on a later checkout: the old name only shows in Whop's receipt.
+    log.warn("whop.product_rename_failed", "Could not rename the Whop product", { storeId, productId, err });
+  }
+}
+
+/**
+ * Renames an existing store's Whop product to the store's name, once: the applied title is
+ * remembered (AppSetting `whop:product-title:<storeId>`), so later checkouts make no Whop call.
+ * Never throws.
+ */
+export async function syncProductTitle(store: Pick<Store, "whopApiKey" | "testMode" | "whopProductId"> & { name?: string | null }, storeId: string): Promise<void> {
+  if (store.name == null || !store.whopProductId || !store.whopApiKey) return;
+  try {
+    const title = whopProductTitle(store.name);
+    const value = `${store.whopProductId}:${title}`;
+    if (appliedTitles.get(storeId) === value) return;
+    if (Date.now() - (renameFailedAt.get(storeId) ?? 0) < RENAME_RETRY_MS) return;
+    const row = await db.appSetting.findUnique({ where: { key: productTitleKey(storeId) } });
+    if (row?.value === value) {
+      appliedTitles.set(storeId, value);
+      return;
+    }
+    await renameProduct(storeClient(store), storeId, store.whopProductId, title, whopCallOptions("Whop product rename"));
+  } catch (err) {
+    log.warn("whop.product_rename_failed", "Could not rename the Whop product", { storeId, err });
+  }
+}
+
+/**
+ * Whop's own buyer e-mails (`send_customer_emails`, the only receipt switch in Whop's API) are a
+ * setting of the whole Whop ACCOUNT: switching them off also silences Whop for the buyers of the
+ * account's other products. So the app never changes it on its own: the owner does, explicitly,
+ * on the Whop page. Its state is read from accounts.me (cached per store for 10 min).
+ */
+const customerEmailsCache = new Map<string, { sends: boolean | null; at: number }>();
+const CUSTOMER_EMAILS_TTL_MS = 10 * 60 * 1000;
+/** An unknown state (Whop failing, slow or silent) is kept 1 min: a Whop outage never costs every page view the full wait. */
+const CUSTOMER_EMAILS_UNKNOWN_TTL_MS = 60 * 1000;
+
+function rememberCustomerEmails(storeId: string, sends: boolean | null | undefined) {
+  customerEmailsCache.set(storeId, { sends: typeof sends === "boolean" ? sends : null, at: Date.now() });
+}
+
+/**
+ * The Whop page's controls for Whop's buyer e-mails: one main action (the one that fixes the double
+ * e-mail first) and, when the state is unknown, a small « Réactiver » link beside it — never two
+ * equal buttons. On: « Couper » only; off: « Réactiver » only. Pure.
+ */
+export function whopEmailsControls(sends: boolean | null): { main: "off" | "on"; link: "on" | null } {
+  if (sends === false) return { main: "on", link: null };
+  return { main: "off", link: sends === null ? "on" : null };
+}
+
+/** Forgets the cached Whop e-mail states (tests). */
+export function resetCustomerEmailsCache(): void {
+  customerEmailsCache.clear();
+}
+
+/**
+ * Whether Whop e-mails buyers itself: true (it does), false (off), null (unknown: Whop silent,
+ * slow or unreachable). Cached 10 min (unknown: 1 min); bounded by `timeoutMs` so the dashboard page never waits on Whop.
+ */
+export async function whopCustomerEmailsStatus(
+  store: Pick<Store, "id" | "whopApiKey" | "testMode">,
+  timeoutMs = 2_500,
+): Promise<boolean | null> {
+  const startedAt = Date.now();
+  const cached = customerEmailsCache.get(store.id);
+  if (cached && Date.now() - cached.at < (cached.sends === null ? CUSTOMER_EMAILS_UNKNOWN_TTL_MS : CUSTOMER_EMAILS_TTL_MS)) return cached.sends;
+  const load = (async () => {
+    const account = await storeClient(store).accounts.me();
+    rememberCustomerEmails(store.id, account.send_customer_emails);
+    return typeof account.send_customer_emails === "boolean" ? account.send_customer_emails : null;
+  })().catch(() => {
+    // Whop failed: "unknown" for a minute (a later success, or the owner's switch, replaces it).
+    rememberCustomerEmails(store.id, null);
+    return null;
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => {
+      // Too slow: "unknown" for a minute, unless the late answer already landed (kept).
+      const now = customerEmailsCache.get(store.id);
+      if (!now || now.at < startedAt) rememberCustomerEmails(store.id, null);
+      resolve(null);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([load, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Turns Whop's own buyer e-mails on or off for the whole Whop account (explicit owner action).
+ * Returns the state Whop reports afterwards (null: Whop didn't say). Throws Whop's refusal as is:
+ * some account keys may not edit their own account; the owner then does it in Whop.
+ */
+export async function setWhopCustomerEmails(store: Pick<Store, "id" | "whopApiKey" | "testMode" | "whopAccountId">, send: boolean): Promise<boolean | null> {
+  const client = storeClient(store);
+  const accountId = store.whopAccountId ?? (await client.accounts.me()).id;
+  const updated = await client.accounts.update({ id: accountId, send_customer_emails: send });
+  const sends = typeof updated?.send_customer_emails === "boolean" ? updated.send_customer_emails : null;
+  // Whop answered with another state than the one asked: treat as refused (nothing silently assumed).
+  if (sends !== null && sends !== send) {
+    rememberCustomerEmails(store.id, sends);
+    throw new Error(`Whop a conservé send_customer_emails=${sends}`);
+  }
+  rememberCustomerEmails(store.id, sends ?? send);
+  return sends;
+}
+
+/** The message the owner sends Whop's support when the API refuses the switch (copied from the Whop page). */
+export function whopSupportEmailsMessage(accountId: string | null): string {
+  return [
+    "Bonjour,",
+    "",
+    `Pourriez-vous désactiver les e-mails envoyés par Whop à mes clients (reçus de paiement) sur mon compte${accountId ? ` ${accountId}` : ""} ?`,
+    "Concrètement : passer le réglage send_customer_emails=false sur ce compte.",
+    "Mes clients reçoivent déjà la confirmation de commande de ma boutique Shopify : le reçu Whop fait doublon.",
+    "",
+    "Merci !",
+  ].join("\n");
 }
 
 type Client = ReturnType<typeof whopClient>;
@@ -268,7 +435,7 @@ export class MethodUnavailableError extends Error {
  * Whop can't honour throws MethodUnavailableError. `paypal` says whether Whop will offer PayPal.
  */
 export async function createCheckoutConfiguration(
-  store: Pick<Store, "whopApiKey" | "testMode" | "whopAccountId" | "whopProductId"> & { paymentMethods?: string[] },
+  store: Pick<Store, "whopApiKey" | "testMode" | "whopAccountId" | "whopProductId"> & { paymentMethods?: string[]; name?: string | null },
   opts: {
     sessionId: string;
     storeId: string;
@@ -282,6 +449,38 @@ export async function createCheckoutConfiguration(
 ): Promise<{ id: string; purchaseUrl: string | null; paypal: boolean | null }> {
   if (!store.whopAccountId || !store.whopProductId) throw new Error("Compte Whop non configuré");
   const client = storeClient(store);
+  // Older stores' product still named "<Store> — Checkout" in Whop's receipt: renamed once, in the
+  // background (never awaited here: a slow rename never delays the checkout; never throws).
+  backgroundTitleSync(store, opts.storeId);
+  return createConfiguration(client, store, opts);
+}
+
+/** Title syncs still running (kept alive past the answer with after(); settled by tests). */
+const titleSyncs = new Set<Promise<void>>();
+
+function backgroundTitleSync(store: Parameters<typeof syncProductTitle>[0], storeId: string) {
+  const p: Promise<void> = syncProductTitle(store, storeId)
+    .catch(() => undefined)
+    .finally(() => titleSyncs.delete(p));
+  titleSyncs.add(p);
+  try {
+    after(() => p);
+  } catch {
+    /* no request scope (tick, script, test): the promise still runs */
+  }
+}
+
+/** Waits for the background product-title syncs started so far (tests, scripts). */
+export async function settleProductTitleSyncs(): Promise<void> {
+  if (titleSyncs.size) await Promise.allSettled([...titleSyncs]);
+}
+
+async function createConfiguration(
+  client: Client,
+  store: Pick<Store, "whopAccountId" | "whopProductId"> & { paymentMethods?: string[] },
+  opts: Parameters<typeof createCheckoutConfiguration>[1],
+): Promise<{ id: string; purchaseUrl: string | null; paypal: boolean | null }> {
+  if (!store.whopAccountId || !store.whopProductId) throw new Error("Compte Whop non configuré");
   const base = {
     account_id: store.whopAccountId,
     currency: opts.currency.toLowerCase(),

@@ -271,8 +271,11 @@ describe.skipIf(!hasDb)("Stripe money flow (integration)", async () => {
     expect(stripeApi.retrievePaymentIntent).toHaveBeenCalledWith(expect.objectContaining({ id: store.id }), piId);
     // The order was created after the answer, through the Stripe gateway.
     expect(row.shopifyOrderId ?? (await db.checkoutSession.findUniqueOrThrow({ where: { id: session.id } })).shopifyOrderId).toBeTruthy();
-    const input = shopify.createPaidOrder.mock.calls.find((c) => c[1].sessionId === session.id)![1];
+    const mainCall = shopify.createPaidOrder.mock.calls.find((c) => c[1].sessionId === session.id)!;
+    const input = mainCall[1];
     expect(input.provider).toBe("stripe");
+    // The checkout's own order keeps Shopify's confirmation (default options).
+    expect(mainCall[2]).toBeUndefined();
     const order = buildOrderCreateInput(input) as { transactions: { gateway: string; authorizationCode: string }[]; tags: string[]; note: string };
     expect(order.transactions[0]).toMatchObject({ gateway: "Stripe", authorizationCode: piId });
     expect(order.tags).toEqual(expect.arrayContaining(["whop-checkout", "stripe-checkout", `wp-${piId}`]));
@@ -431,9 +434,12 @@ describe.skipIf(!hasDb)("Stripe money flow (integration)", async () => {
       expect(scoped).toMatchObject({ id: store.id, testMode: true });
       expect(charge).toMatchObject({ status: "PAID", provider: "stripe", whopFeeCents: 180 });
       expect(charge.whopPaymentId).toMatch(/^pi_sm_up_/);
-      const input = shopify.createPaidOrder.mock.calls.find((x) => x[1].sessionId === `upsell-${charge.id}`)![1];
+      const call = shopify.createPaidOrder.mock.calls.find((x) => x[1].sessionId === `upsell-${charge.id}`)!;
+      const input = call[1];
       expect(input.provider).toBe("stripe");
       expect(input.test).toBe(true);
+      // A separate offer order is a separate charge: Shopify's confirmation is sent (default options).
+      expect(call[2]?.sendReceipt ?? true).toBe(true);
     });
 
     it("authentication_required (3-D Secure asked): the offer fails gracefully, nothing charged, buyer told", async () => {

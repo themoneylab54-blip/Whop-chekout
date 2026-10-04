@@ -22,7 +22,7 @@ import {
   type Theme,
 } from "@/lib/layout";
 import { ensureScriptTag, installUrl, normalizeShopDomain, removeScriptTag } from "@/lib/shopify";
-import { OPTIONAL_PAYMENT_METHOD_IDS, refundPayment, registerApplePayDomain, setupWhop, statementDescriptor, teardownWhop } from "@/lib/whop";
+import { OPTIONAL_PAYMENT_METHOD_IDS, refundPayment, registerApplePayDomain, setupWhop, setWhopCustomerEmails, statementDescriptor, teardownWhop } from "@/lib/whop";
 import { testConversions } from "@/lib/conversions";
 import { draftDesign, hasPublished, publishedDesign, sameDesign } from "@/lib/design";
 import { log, recordEvent } from "@/lib/log";
@@ -1854,6 +1854,46 @@ export async function reactivatePaypalAction(storeId: string) {
   if (cleared) await recordEvent({ storeId, kind: "paypal.reactivated", message: "PayPal express réactivé depuis le dashboard : Whop sera de nouveau consulté au prochain checkout." });
   revalidatePath(storePath(storeId), "layout");
   back(storePath(storeId, "whop"), { ok: cleared ? "PayPal réactivé : Whop sera de nouveau consulté au prochain checkout." : "PayPal n'était pas masqué." });
+}
+
+/**
+ * Turns Whop's own buyer e-mails off (or back on). Owner only and always explicit: the setting
+ * covers the WHOLE Whop account (its other products too), so the app never changes it by itself.
+ * Journaled either way; Whop's refusal sends the owner to the step-by-step on the Whop page.
+ */
+export async function setWhopCustomerEmailsAction(storeId: string, send: boolean) {
+  const store = await getStore(storeId, "owner");
+  const path = storePath(storeId, "whop");
+  if (!store.whopApiKey) back(path, { error: "Connectez Whop d'abord" });
+  try {
+    await setWhopCustomerEmails(store, send);
+  } catch (err) {
+    await recordEvent({
+      storeId,
+      level: "warn",
+      kind: "whop.customer_emails_refused",
+      message: `Whop a refusé de ${send ? "réactiver" : "couper"} ses e-mails aux clients (réglage du compte Whop) : ${errorMessage(err)}`,
+      data: { send },
+      err,
+    });
+    redirect(
+      flashUrl(`${path}?emails=refused`, { error: `Whop a refusé de ${send ? "réactiver" : "couper"} ses e-mails : ${errorMessage(err)}. Suivez les étapes ci-dessous.` }, "#whop-emails"),
+    );
+  }
+  await recordEvent({
+    storeId,
+    kind: "whop.customer_emails",
+    message: send
+      ? "E-mails Whop aux clients réactivés depuis le dashboard (réglage de tout le compte Whop)."
+      : "E-mails Whop aux clients coupés depuis le dashboard (réglage de tout le compte Whop) : seuls les e-mails de Shopify partent.",
+    data: { send, accountId: store.whopAccountId },
+  });
+  revalidatePath(path);
+  back(path, {
+    ok: send
+      ? "E-mails Whop réactivés : Whop envoie de nouveau son reçu aux acheteurs de tout votre compte Whop."
+      : "E-mails Whop coupés : vos clients ne reçoivent plus que la confirmation de Shopify.",
+  });
 }
 
 /**

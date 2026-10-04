@@ -19,8 +19,12 @@ import { geoCountryOf } from "@/lib/geo";
 import { sessionCart, startCartRead } from "@/lib/cart-session";
 import { resolveVisitor, signVisitorId, verifyVisitorId } from "@/lib/visitor";
 import { anyProviderConnected } from "@/lib/payment-provider";
+import { prepareAhead } from "@/lib/early-prepare";
 
 export const OPTIONS = preflight;
+
+/** The early prepare (after() the answer) may wait on Whop: the function's budget covers it, as /prepare's. */
+export const maxDuration = 60;
 
 /** Size caps (JSON characters) of one line's properties / the cart attributes, and of all lines' properties. */
 const MAX_PROPERTIES_BYTES = 16_000;
@@ -214,6 +218,10 @@ async function handle(req: Request) {
   }
   // After the response: ad "InitiateCheckout" event (never slows the buyer down).
   after(() => sendCheckoutConversions(session.id).catch(() => undefined));
+  // After the response too: the Whop checkout prepared while the page loads, with the input of the
+  // page's first /prepare (same IP country and locale), which then reuses it (express buttons sooner).
+  const ahead = { ipCountry: geoCountryOf(req.headers), acceptLanguage: req.headers.get("accept-language") };
+  after(() => prepareAhead(session.id, ahead));
   // The loader keeps the signed id in its cookie (the next checkout of this visitor gets the same arms).
   return json({ id: session.id, url: `${checkoutBaseUrl(store)}/c/${session.id}`, visitorId: visitor.token }, { cors: true });
 }

@@ -1,6 +1,8 @@
 "use client";
 
 import {
+  Suspense,
+  use,
   useCallback,
   useEffect,
   useMemo,
@@ -39,7 +41,8 @@ import {
   StyledBlock,
   type ContentContext,
 } from "./blocks";
-import { countryName, DEFAULT_COUNTRIES, errorText, labelsFor, localeOf, type Labels } from "./i18n";
+import { countryName, errorText, labelsFor, localeOf, type Labels } from "./i18n";
+import { checkoutCountries, pickFirstCountry } from "@/lib/first-country";
 import { localizeDeliveryTime, localizeLayout, localizeTheme } from "./localize";
 import { suggestEmail } from "./emailSuggest";
 import { LanguageSwitcher } from "./LanguageSwitcher";
@@ -54,6 +57,8 @@ import { cartProductsOf } from "@/lib/reviews-import";
 import {
   ExpressCheckout,
   ExpressPreview,
+  StripeExpressPlaceholder,
+  ExpressUnavailable,
   PaymentPanel,
   PaymentPreview,
   PaymentSkeleton,
@@ -79,7 +84,7 @@ const StripePanel = dynamic(() => import("./StripePanel").then((m) => m.StripePa
     </div>
   ),
 });
-const StripeExpress = dynamic(() => import("./StripePanel").then((m) => m.StripeExpress), { ssr: false, loading: () => <div className="min-h-[76px]" aria-hidden /> });
+const StripeExpress = dynamic(() => import("./StripePanel").then((m) => m.StripeExpress), { ssr: false, loading: () => <StripeExpressPlaceholder /> });
 
 export type AddOnView = {
   id: string;
@@ -116,9 +121,10 @@ type Props = {
   initialEligibleAddOnIds?: string[] | null;
   /**
    * "Complétez votre commande": the block's products priced live by Shopify (server-side).
-   * Null/empty in live mode hides the block (Shopify unreachable or nothing available).
+   * Null/empty in live mode hides the block (Shopify unreachable or nothing available). Live, a
+   * promise (streamed by the server page: Shopify's answer never holds the page), shown once it lands.
    */
-  recommendations?: RecommendationView[] | null;
+  recommendations?: RecommendationView[] | null | Promise<RecommendationView[] | null>;
   /** Checkout currency → local currency multipliers (ECB), for the "≈ 52,30 CHF" line. */
   localRates?: LocalRates | null;
   /**
@@ -130,6 +136,15 @@ type Props = {
   localeCountry?: string | null;
   /** "Déjà client ? Recevez un code par e-mail" is on for the store (live checkout only). */
   returningCode?: boolean;
+  /**
+   * Live: the express PayPal button shows from the first paint (Whop pays, the merchant allows it,
+   * Whop's last word isn't "off"); the first /prepare's answer confirms or hides it.
+   */
+  initialPaypal?: boolean;
+  /** Live: the processor the first /prepare is expected to use (its express row is drawn meanwhile). */
+  initialProvider?: "whop" | "stripe" | null;
+  /** Live, paying with Stripe: Stripe.js is loaded while the first /prepare runs. */
+  stripeWarm?: { publishableKey: string; stripeAccount: string } | null;
 };
 
 type Address = {
@@ -403,7 +418,6 @@ const EMPTY_ADDRESS: Address = {
   phone: "",
 };
 
-const LANG_COUNTRY: Record<string, string> = { fr: "FR", en: "GB", de: "DE", es: "ES", it: "IT", nl: "NL" };
 
 /* ---------- page structure rules ---------- */
 
@@ -556,6 +570,17 @@ export type PaypalChoiceReset = { mode: false; prepared: null; doneSig: null; au
  * checkout (its prepare's signature forgotten too) and never auto-submits a stale embed. Only
  * "Pay another way" clears the PayPal message; a withdrawal keeps its "PayPal isn't available". Pure.
  */
+/** The page's silent /prepare retries stop this long after its first attempt (then « réessayer »). */
+export const PREPARE_RETRY_MAX_MS = 30_000;
+
+/**
+ * Whether a failed /prepare is retried silently: a server error (5xx), except Whop unavailable with
+ * no switch possible (503 whop_unavailable: the server already waited its longest for it). Pure.
+ */
+export function prepareRetryable(status: number, code: unknown): boolean {
+  return status >= 500 && code !== "whop_unavailable";
+}
+
 export function paypalChoiceReset({ keepError }: { keepError: boolean }): PaypalChoiceReset {
   const reset = { mode: false, prepared: null, doneSig: null, autoSubmit: false, notice: null } as const;
   return keepError ? reset : { ...reset, error: null };
@@ -631,12 +656,28 @@ export function CheckoutView({
   initialCountry,
   cartUrl,
   initialEligibleAddOnIds,
-  recommendations,
+  recommendations: recommendationsProp,
   localRates,
   primaryCountry,
   localeCountry,
   returningCode,
+  initialPaypal = false,
+  initialProvider = null,
+  stripeWarm = null,
 }: Props) {
+  // "Complétez votre commande" streamed by the server (a promise): none until it lands.
+  const recommendationsStream = isPromise(recommendationsProp) ? recommendationsProp : null;
+  const [streamedRecommendations, setStreamedRecommendations] = useState<RecommendationView[] | null>(null);
+  const recommendations = recommendationsStream ? streamedRecommendations : (recommendationsProp as RecommendationView[] | null | undefined);
+  // Paying with Stripe: its code (and Stripe.js itself) loads while the first /prepare runs.
+  useEffect(() => {
+    if (initialProvider !== "stripe") return;
+    void import("./StripePanel")
+      .then((m) => (stripeWarm ? m.stripeInstance(stripeWarm.publishableKey, stripeWarm.stripeAccount) : null))
+      .catch(() => undefined);
+    // Once per page.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // Buyer-language copy: merchant translations, then shipped French defaults translated.
   const theme = useMemo(() => localizeTheme(themeProp), [themeProp]);
   const layout = useMemo(() => localizeLayout(layoutProp, themeProp.language), [layoutProp, themeProp.language]);
@@ -649,16 +690,8 @@ export function CheckoutView({
     [currency, theme.language],
   );
 
-  const countries = useMemo(() => {
-    const active = rates.filter((r) => r.active);
-    const all = active.some((r) => r.countries.length === 0);
-    const list = all
-      ? DEFAULT_COUNTRIES
-      : [...new Set(active.flatMap((r) => r.countries))];
-    return (list.length ? list : DEFAULT_COUNTRIES)
-      .map((c) => ({ code: c, name: countryName(c, theme.language) }))
-      .sort((a, b) => a.name.localeCompare(b.name, theme.language));
-  }, [rates, theme.language]);
+  // Shared with the early prepare (lib/early-prepare): its first quote must be this page's.
+  const countries = useMemo(() => checkoutCountries(rates.map((r) => ({ countries: r.countries, active: !!r.active })), theme.language), [rates, theme.language]);
 
   const [email, setEmail] = useState(initialEmail ?? "");
   // "Did you mean …@gmail.com?" after the e-mail field is left with a likely typo.
@@ -680,14 +713,11 @@ export function CheckoutView({
     ...EMPTY_ADDRESS,
     // Visitor's country (from their IP) when we ship there, else their browser locale's
     // country (de-DE → Germany), else the store's main market, else the language's country —
-    // never just the alphabetically first country.
-    countryCode:
-      countries.find((c) => c.code === initialCountry)?.code ??
-      countries.find((c) => c.code === localeCountry)?.code ??
-      countries.find((c) => c.code === primaryCountry)?.code ??
-      countries.find((c) => c.code === LANG_COUNTRY[theme.language])?.code ??
-      countries[0]?.code ??
-      "FR",
+    // never just the alphabetically first country. The early prepare picks it the same way.
+    countryCode: pickFirstCountry(
+      countries.map((c) => c.code),
+      { initialCountry, localeCountry, primaryCountry, language: theme.language },
+    ),
   }));
   const [rateId, setRateId] = useState<string | null>(null);
   const [codeInput, setCodeInput] = useState("");
@@ -735,7 +765,7 @@ export function CheckoutView({
   const thankYouUrlRef = useRef("#");
   // Express PayPal: whether Whop offers PayPal here (from prepare), the buyer chose it (the
   // payment panel then shows a PayPal-only checkout), and that checkout's own state.
-  const [paypalOffered, setPaypalOffered] = useState(false);
+  const [paypalOffered, setPaypalOffered] = useState(initialPaypal);
   const [paypalMode, setPaypalMode] = useState(false);
   const [paypalPrepared, setPaypalPrepared] = useState<Prepared | null>(null);
   // Whop refused PayPal for this session, by charged currency (a refusal may name only one; the
@@ -1039,9 +1069,17 @@ export function CheckoutView({
     !!quote &&
     (!!quote.discountError ||
       (quote.rates.length === 0 && displayLines.some((l) => l.requiresShipping)));
+  // The page's first prepare goes out at once (the express buttons wait on it; the server most often
+  // prepared it already, at the session's creation); the buyer's later changes are debounced.
+  const firstPrepare = useRef(true);
+  // The inputs a prepare sends, and those of the last one that succeeded: different = the checkout on
+  // screen charges a previous total (from the buyer's change, through the debounce, until the answer).
+  const prepareKey = JSON.stringify([address.countryCode, rateId, appliedCode, addOnIds, protection ?? null, confirmedKey]);
+  const [preparedKey, setPreparedKey] = useState<string | null>(null);
   useEffect(() => {
     if (!liveSessionId || quoteBlocking) return;
     const ctrl = new AbortController();
+    const sentKey = prepareKey;
     const wait = (ms: number) =>
       new Promise<void>((resolve, reject) => {
         const id = setTimeout(resolve, ms);
@@ -1051,10 +1089,14 @@ export function CheckoutView({
         });
       });
     const t = setTimeout(async () => {
+      firstPrepare.current = false;
       setPreparing(true);
       // Network hiccups and 5xx are retried silently (0.8 s, 2 s, 4 s) before the buyer
-      // sees anything: a red error on a page they haven't touched yet feels broken.
+      // sees anything: a red error on a page they haven't touched yet feels broken. Never past
+      // PREPARE_RETRY_MAX_MS since the first attempt (a hanging processor makes each one slow), and
+      // never Whop's "unavailable" (the server already waited its longest): « réessayer » instead.
       const delays = [800, 2000, 4000];
+      const firstAt = Date.now();
       for (let attempt = 0; ; attempt++) {
         try {
           const res = await fetch(`/api/public/sessions/${liveSessionId}/prepare`, {
@@ -1083,8 +1125,9 @@ export function CheckoutView({
           // waits for it (polling the status), never a new form under it.
           if (body?.code === "payment_in_flight") setInFlightAtLoad(true);
           if (!res.ok) {
-            const err = new Error(errorText(L, body)) as Error & { retry?: boolean; ref?: string | null };
-            err.retry = res.status >= 500;
+            // Whop unavailable: the payment section's « paiement indisponible / réessayer » state.
+            const err = new Error(body?.code === "whop_unavailable" ? L.errors.init_failed : errorText(L, body)) as Error & { retry?: boolean; ref?: string | null };
+            err.retry = prepareRetryable(res.status, body?.code);
             err.ref = (typeof body?.requestId === "string" && body.requestId) || res.headers.get("x-request-id");
             throw err;
           }
@@ -1104,6 +1147,7 @@ export function CheckoutView({
           stripeClientFailed.current = false;
           preparedRef.current = next;
           setPrepared((p) => (samePrepared(p, next) ? p : next));
+          setPreparedKey(sentKey);
           // Switched to the other processor at this prepare (the first one failed, or its form
           // couldn't load here): said above the form, as after a switch at the click.
           if (body.switchedFrom) setProviderSwitched(true);
@@ -1111,7 +1155,7 @@ export function CheckoutView({
         } catch (err) {
           if (ctrl.signal.aborted) return;
           const retry = !(err instanceof Error) || (err as Error & { retry?: boolean }).retry !== false;
-          if (retry && attempt < delays.length) {
+          if (retry && attempt < delays.length && Date.now() - firstAt + delays[attempt] < PREPARE_RETRY_MAX_MS) {
             try {
               await wait(delays[attempt]);
             } catch {
@@ -1125,7 +1169,7 @@ export function CheckoutView({
         }
       }
       if (!ctrl.signal.aborted) setPreparing(false);
-    }, 500);
+    }, firstPrepare.current ? 0 : 500);
     return () => {
       clearTimeout(t);
       ctrl.abort();
@@ -1146,7 +1190,11 @@ export function CheckoutView({
     qtyTouched,
     retryKey,
     L,
+    prepareKey,
   ]);
+  // Re-pricing: a prepare running or due (inputs changed since the last good one), or quantities
+  // pending. The wallet buttons on screen then charge the previous total: locked until the new one.
+  const repricing = preparing || qtyPending || (!!prepared && preparedKey !== null && preparedKey !== prepareKey);
 
   const q = live ? (quote ?? localQuote) : localQuote;
   const totals = q.totals;
@@ -1287,7 +1335,7 @@ export function CheckoutView({
           const body = await res.json().catch(() => ({}));
           if (!res.ok) {
             // One silent retry on a 5xx; PayPal refused by Whop drops the choice (the card form stays).
-            if (res.status >= 500 && attempt === 0) continue;
+            if (prepareRetryable(res.status, body?.code) && attempt === 0) continue;
             if (body?.code === "paypal_unavailable") {
               paypalRefused.current.add(chargeCurrencyRef.current);
               setPaypalOffered(false);
@@ -1610,10 +1658,17 @@ export function CheckoutView({
   function stopPaypal() {
     endPaypal(paypalChoiceReset({ keepError: false }));
   }
+  // The express PayPal button is on the page before the first /prepare answers: a click on a complete
+  // form waits for it there (spinner on the button, see ExpressPaypal.ready), then goes on as usual
+  // (startPaypal); an incomplete form is pointed out at once (nothing to wait for).
   const expressPaypal =
-    paypalOffered && prepared && expressShown.paypal
+    paypalOffered && expressShown.paypal
       ? {
           onClick: startPaypal,
+          // Waits for the checkout of the current total (first one, or a re-prepare after a change of
+          // rate, add-on, country…), like the wallets; a failed prepare doesn't hold the click (PayPal
+          // prepares its own checkout and says what goes wrong).
+          ready: (!!prepared && !repricing) || invalidFields.length > 0 || (!!prepareError && !preparing),
           busy: paypalAutoSubmit || panelLock === "busy",
           // Until the form is complete (then the Pay area offers "Continue with PayPal").
           // Only the terms box left: that is what the notice says (it follows the form as the buyer fills it).
@@ -1669,20 +1724,22 @@ export function CheckoutView({
   const recoBlock = arranged.recommendations;
   // A cart fixed as a whole (app prices, Shopify automatic discounts) takes no suggested product.
   const cartLocked = !!quote?.cartLocked || serverLines.some((l) => !!l.appPrice);
-  const recoItems = recoBlock && !(live && cartLocked)
-    ? visibleRecommendations(
-        live ? (recommendations ?? []) : sampleRecommendations(recoBlock.props.items, ["Produit recommandé", "Accessoire assorti"]),
-        live ? displayLines : [],
-        recoBlock.props.hideIfInCart,
-      )
-    : [];
-  const recoNode = (idPrefix: string) =>
-    recoBlock && recoItems.length > 0
+  const recoItemsOf = (list: RecommendationView[] | null | undefined) =>
+    recoBlock && !(live && cartLocked)
+      ? visibleRecommendations(
+          live ? (list ?? []) : sampleRecommendations(recoBlock.props.items, ["Produit recommandé", "Accessoire assorti"]),
+          live ? displayLines : [],
+          recoBlock.props.hideIfInCart,
+        )
+      : [];
+  const recoBlockNode = (idPrefix: string, list: RecommendationView[] | null | undefined) => {
+    const items = recoItemsOf(list);
+    return recoBlock && items.length > 0
       ? wrap(
           recoBlock,
           <Recommendations
             title={recoBlock.props.title || L.recoTitle}
-            items={recoItems}
+            items={items}
             labels={L}
             money={money}
             showImages={theme.summaryImages}
@@ -1692,6 +1749,17 @@ export function CheckoutView({
           idPrefix,
         )
       : null;
+  };
+  // Streamed by the server page (a promise): rendered inside <Suspense> with use(), so a quick Shopify
+  // answer is already in the server HTML; a slow one fills in when it lands (nothing shown meanwhile).
+  const recoNode = (idPrefix: string) =>
+    recoBlock && recommendationsStream && !(live && cartLocked) ? (
+      <Suspense key={`reco-${idPrefix}`} fallback={null}>
+        <StreamedRecommendations promise={recommendationsStream} onLoad={setStreamedRecommendations} render={(list) => recoBlockNode(idPrefix, list)} />
+      </Suspense>
+    ) : (
+      recoBlockNode(idPrefix, recommendations)
+    );
   const recoMobile = recoNode("p-");
   const estimate = localEstimate(totals.totalCents, address.countryCode, currency, localRates, theme.language);
 
@@ -1769,6 +1837,11 @@ export function CheckoutView({
     </div>
   ) : null;
 
+  // The first /prepare failed (its error and « réessayer » are in the payment section): no express
+  // button to offer, the row keeps its place with a short message (ExpressUnavailable), and a PayPal
+  // click waiting for that checkout is dropped with it said aloud (ExpressCheckout's `unavailable`).
+  const firstFailed = mode.kind === "live" && !prepared && !!prepareError && !preparing;
+
   function renderSection(block: Block): ReactNode {
     switch (block.type) {
       case "express":
@@ -1776,8 +1849,11 @@ export function CheckoutView({
         if (!block.props.enabled || !theme.expressCheckout) return null;
         // Paying with Stripe (its primary, the store's secours, or this buyer's switch): Stripe's own
         // express buttons (its sheet collects the shipping address), never Whop's nor our PayPal flow.
-        if (mode.kind === "live" && prepared?.provider === "stripe") {
+        // Before the first /prepare answers, the processor the server expects draws the row's place.
+        if (mode.kind === "live" && (prepared ? prepared.provider === "stripe" : initialProvider === "stripe")) {
           if (!stripeExpressAny(theme.expressMethods) || pickupSelected) return null;
+          if (firstFailed) return <ExpressUnavailable labels={L} title={block.props.title} dividerLabel={block.props.dividerLabel} />;
+          if (!prepared) return <StripeExpressPlaceholder labels={L} title={block.props.title} dividerLabel={block.props.dividerLabel} />;
           return (
             <StripeExpress
               key={prepared.configId}
@@ -1791,7 +1867,7 @@ export function CheckoutView({
               country={address.countryCode}
               // Locked while a payment is under way below, and while the total is being re-priced
               // (a prepare or a quantity change pending): never a wallet paying the old total.
-              lock={panelLock ?? (preparing || qtyPending ? "busy" : null)}
+              lock={panelLock ?? (repricing ? "busy" : null)}
               onBusy={setExpressBusy}
               title={block.props.title}
               dividerLabel={block.props.dividerLabel}
@@ -1801,8 +1877,8 @@ export function CheckoutView({
         }
         // Every express button switched off by the merchant (or none for this cart): no section, no "OR".
         if (!expressShown.wallets.length && !expressShown.paypal) return null;
-        // Nothing to show until the Whop checkout exists (no empty gap above Contact).
-        if (mode.kind === "live" && !prepared) return null;
+        // Before the Whop checkout exists: our PayPal button already works (a click waits for it), and
+        // the wallets keep their place (placeholders the live buttons replace in place).
         // Wallets ship to the wallet's address: they would skip the relay point choice (PayPal goes
         // through the form, relay point included: it stays).
         if (mode.kind === "live" && pickupSelected && !expressPaypal) return null;
@@ -1812,6 +1888,9 @@ export function CheckoutView({
             paypal={expressPaypal}
             // Every express button locked while the panel is (even with the PayPal button gone).
             lock={panelLock}
+            // A change of total not prepared yet: the wallet buttons on screen (old total) stay locked.
+            stale={repricing}
+            unavailable={firstFailed}
             wallets={!pickupSelected}
             // The merchant's wallets; Google Pay only when nothing ships unless set to "always"
             // (Whop's Google Pay express button collects no shipping address).
@@ -2599,6 +2678,31 @@ export function CheckoutView({
 }
 
 const noopSubscribe = () => () => {};
+
+function isPromise<T>(v: unknown): v is Promise<T> {
+  return !!v && typeof (v as { then?: unknown }).then === "function";
+}
+
+/**
+ * "Complétez votre commande" from the server's streamed promise: rendered with use() (inside the
+ * caller's <Suspense>, so in the server HTML when Shopify answered in time), and handed to the page
+ * (onLoad) for the lines the buyer adds from it.
+ */
+function StreamedRecommendations({
+  promise,
+  onLoad,
+  render,
+}: {
+  promise: Promise<RecommendationView[] | null>;
+  onLoad: (r: RecommendationView[] | null) => void;
+  render: (r: RecommendationView[] | null) => ReactNode;
+}) {
+  const value = use(promise);
+  useEffect(() => {
+    onLoad(value);
+  }, [value, onLoad]);
+  return <>{render(value)}</>;
+}
 
 /**
  * Product photo of a summary line, or a neutral placeholder of the same size (no photo,

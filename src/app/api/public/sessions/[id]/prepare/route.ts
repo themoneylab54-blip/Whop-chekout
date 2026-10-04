@@ -2,7 +2,7 @@ import { clientIp, rateLimit } from "@/lib/ratelimit";
 import { db } from "@/lib/db";
 import { isForeignCheckoutHost } from "@/lib/checkout-domain-check";
 import { json, readJson } from "@/lib/http";
-import { CheckoutError, journalCheckoutFailure, paymentPayload, prepareAfterClientFailure, prepareWithFailover, quoteSchema } from "@/lib/checkout";
+import { failureResponse, journalCheckoutFailure, paymentPayload, prepareAfterClientFailure, prepareWithFailover, quoteSchema } from "@/lib/checkout";
 import { route } from "@/lib/route";
 
 /** A processor slow to answer, then the other one tried in the same request: more than the default budget. */
@@ -15,6 +15,8 @@ export const maxDuration = 60;
  * request when it is usable and nothing is in flight (prepareWithFailover).
  */
 async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  // The request's start: a wait for another request's checkout is bounded from it (prepareSession).
+  const startedAt = Date.now();
   const { id } = await ctx.params;
   if (!(await rateLimit(`prepare:ip:${clientIp(req)}`, 40)) || !(await rateLimit(`prepare:s:${id}`, 30))) return json({ error: "Trop de requêtes, réessayez dans une minute.", code: "rate_limited" }, { status: 429 });
   const raw = await readJson(req);
@@ -27,14 +29,16 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
   // Another store's checkout domain never serves this session (see isForeignCheckoutHost).
   if (!session || (await isForeignCheckoutHost(req, session.store))) return json({ error: "Session introuvable" }, { status: 404 });
   try {
-    const opts = { host: req.headers.get("host") };
+    const opts = { host: req.headers.get("host"), startedAt };
     const prepared = clientFailed ? await prepareAfterClientFailure(session, parsed.data, opts) : await prepareWithFailover(session, parsed.data, opts);
     // `paypal`: whether Whop offers PayPal on this store's checkout (the express PayPal button hides otherwise).
     return json({ ...paymentPayload(prepared, session.store), totals: prepared.totals, paypal: prepared.paypal, method: parsed.data.method ?? null });
   } catch (err) {
     await journalCheckoutFailure(session, "prepare", err);
-    if (err instanceof CheckoutError) return json({ error: err.message, code: err.code }, { status: 400 });
-    return json({ error: "Le paiement n'a pas pu être initialisé. Rechargez la page.", code: "init_failed" }, { status: 502 });
+    // A refusal (400), Whop unavailable with no switch possible (503 whop_unavailable: the page stops
+    // retrying), the session changing in another tab (503, retried), else a processor failure (502).
+    const failed = failureResponse(err, "Le paiement n'a pas pu être initialisé. Rechargez la page.");
+    return json(failed.body, { status: failed.status });
   }
 }
 

@@ -5,7 +5,8 @@ import { missingStripeEnv, stripeConfigured, stripeEnv } from "@/lib/stripe-conf
 import { peekStripeStateStore, sameOrigin, signStripeState, stripeNonceCookie, STRIPE_STATE_TTL_MS, verifyStripeState } from "@/lib/stripe-state";
 import { consentAllows } from "@/lib/conversions";
 import { disconnectBlockMessage, parsePastAccounts, sessionStripeAccount, stripeConnectionMode } from "@/lib/stripe-connection";
-import { centsToStripeAmount, oauthAuthorizeUrl, paymentInfoFromStripe, stripeAmountToCents, stripeFeeCents, stripeMethodType } from "@/lib/stripe";
+import { centsToStripeAmount, oauthAuthorizeUrl, paymentInfoFromStripe, STRIPE_EMAIL_SETTINGS_URL, stripeAmountToCents, stripeFeeCents, stripeMethodType } from "@/lib/stripe";
+import { readFileSync } from "node:fs";
 import { hostDecision } from "@/lib/host-guard";
 
 const LIVE = { STRIPE_SECRET_KEY: "sk_live_x", STRIPE_PUBLISHABLE_KEY: "pk_live_x", STRIPE_CLIENT_ID: "ca_live" };
@@ -286,6 +287,12 @@ describe("paymentInfoFromStripe", () => {
     expect(withCharge.buyer?.phone).toBe("+33600000000");
   });
 
+  it("recovers the buyer's e-mail without receipt_email (no longer sent): from the charge's billing details", () => {
+    const noReceipt = { ...pi, receipt_email: null } as unknown as Stripe.PaymentIntent;
+    expect(paymentInfoFromStripe(noReceipt, charge).buyer?.email).toBe(charge.billing_details?.email);
+    expect(charge.billing_details?.email).toBeTruthy();
+  });
+
   it("fee in another settlement currency is converted back with Stripe's rate", () => {
     const usd = { ...charge, currency: "usd", amount: 10000, balance_transaction: { ...bt, currency: "eur", fee: 180, exchange_rate: 0.9 } } as unknown as Stripe.Charge;
     expect(stripeFeeCents(usd)).toBe(200);
@@ -307,5 +314,19 @@ describe("host guard", () => {
       expect(hostDecision({ host: "checkout.example.com", pathname, search: "", appUrl })).toEqual({ action: "next" });
       expect(hostDecision({ host: "pay.seyuna.com", pathname, search: "?code=x", appUrl })).toEqual({ action: "redirect", location: `${appUrl}${pathname}?code=x` });
     }
+  });
+});
+
+describe("Stripe's own receipts (double e-mail)", () => {
+  it("the Stripe page has a « Reçus Stripe » card: Paramètres → E-mails clients → Paiements réussis, with the link", () => {
+    expect(STRIPE_EMAIL_SETTINGS_URL).toBe("https://dashboard.stripe.com/settings/emails");
+    const page = readFileSync("src/app/dashboard/stores/[storeId]/(main)/stripe/page.tsx", "utf8");
+    expect(page).toContain('title="Reçus Stripe"');
+    expect(page).toMatch(/Paramètres → E-mails clients → <strong>Paiements réussis<\/strong>/);
+    expect(page).toContain("href={STRIPE_EMAIL_SETTINGS_URL}");
+    // The code never claims Stripe sends nothing: the account's setting is the merchant's.
+    const stripeSrc = readFileSync("src/lib/stripe.ts", "utf8");
+    expect(stripeSrc).not.toMatch(/Stripe's own receipt would be a second/);
+    expect(stripeSrc).toContain("Paiements réussis");
   });
 });

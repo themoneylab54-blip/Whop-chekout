@@ -325,6 +325,19 @@ export function BlockThumb({ type }: { type: BlockType }) {
           <span className="block h-2 w-full rounded-full bg-indigo-500" />
         </Frame>
       );
+    case "message":
+      return (
+        <Frame>
+          <span className="flex items-start gap-1">
+            <span className="h-4 w-4 shrink-0 rounded-full bg-rose-200" />
+            <span className="flex flex-1 flex-col gap-0.5">
+              {bar("75%", "bg-zinc-400")}
+              {bar("95%", "bg-zinc-200")}
+              {bar("55%", "bg-zinc-200")}
+            </span>
+          </span>
+        </Frame>
+      );
     case "social":
       return (
         <Frame>
@@ -540,6 +553,16 @@ function Mini({ type }: { type: BlockType }) {
       return (
         <span className="flex h-3.5 items-center justify-center rounded-[2px] border border-dashed border-amber-500 bg-amber-50">
           <span className="h-1.5 w-1/2 rounded-[1px] bg-amber-400" />
+        </span>
+      );
+    case "message":
+      return (
+        <span className="flex items-center gap-[2px]">
+          <span className="h-2 w-2 shrink-0 rounded-full bg-rose-300" />
+          <span className="flex flex-1 flex-col gap-[2px]">
+            {line("70%", "bg-zinc-400")}
+            {line("90%")}
+          </span>
         </span>
       );
     case "social":

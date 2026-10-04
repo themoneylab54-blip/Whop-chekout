@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
-import { describe, expect, it } from "vitest";
-import { buildOrderCreateInput, normalizeShopDomain, verifyOauthHmac, type PaidOrderInput } from "@/lib/shopify";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { buildOrderCreateInput, createPaidOrder, normalizeShopDomain, verifyOauthHmac, type PaidOrderInput } from "@/lib/shopify";
+import { encrypt } from "@/lib/crypto";
 import type { CartLine } from "@/lib/pricing";
 
 const line = (over: Partial<CartLine>): CartLine => ({
@@ -92,5 +93,31 @@ describe("verifyOauthHmac", () => {
     expect(verifyOauthHmac(params, secret)).toBe(true);
     params.set("code", "tampered");
     expect(verifyOauthHmac(params, secret)).toBe(false);
+  });
+});
+
+describe("createPaidOrder: Shopify's e-mails", () => {
+  const sent: { options: Record<string, unknown> }[] = [];
+  const store = { shopDomain: "receipt.myshopify.com", shopifyAccessToken: encrypt("shpat_x") };
+  beforeEach(() => {
+    sent.length = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        sent.push(JSON.parse(String(init.body)).variables);
+        return new Response(JSON.stringify({ data: { orderCreate: { order: { id: "gid://shopify/Order/1", name: "#1001" }, userErrors: [] } } }), { status: 200 });
+      }),
+    );
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("the checkout's order sends the confirmation and the shipping e-mail (default)", async () => {
+    await createPaidOrder(store, base);
+    expect(sent[0].options).toMatchObject({ sendReceipt: true, sendFulfillmentReceipt: true });
+  });
+
+  it("sendReceipt: false skips the confirmation, keeps the shipping e-mail", async () => {
+    await createPaidOrder(store, base, { sendReceipt: false });
+    expect(sent[0].options).toMatchObject({ sendReceipt: false, sendFulfillmentReceipt: true });
   });
 });

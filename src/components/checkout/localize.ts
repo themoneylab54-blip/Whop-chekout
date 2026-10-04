@@ -76,6 +76,10 @@ export const DEFAULT_TEXTS = {
     protectionClaim:
       "Colis perdu, volé ou abîmé ? Écrivez-nous dans les 14 jours suivant la livraison prévue avec votre numéro de commande (et une photo en cas de casse) : nous le renvoyons ou vous remboursons.",
     vatIncluded: "TVA incluse",
+    messageTitle: "Un mot de notre équipe",
+    messageBody:
+      "Votre commande compte énormément pour nous. Chaque colis est préparé avec **le plus grand soin**, et nous avons hâte que vous le découvriez.\n\nMerci de votre confiance, à très vite !",
+    messageRole: "L'équipe",
   },
   en: {
     securePayment: "Secure payment",
@@ -140,6 +144,10 @@ export const DEFAULT_TEXTS = {
     protectionClaim:
       "Parcel lost, stolen or damaged? Write to us within 14 days of the expected delivery date with your order number (and a photo if it's broken): we'll reship it or refund you.",
     vatIncluded: "VAT included",
+    messageTitle: "A word from our team",
+    messageBody:
+      "Your order means a lot to us. Every parcel is packed with **the greatest care**, and we can't wait for you to discover it.\n\nThank you for your trust, see you soon!",
+    messageRole: "The team",
   },
   de: {
     securePayment: "Sichere Zahlung",
@@ -204,6 +212,10 @@ export const DEFAULT_TEXTS = {
     protectionClaim:
       "Paket verloren, gestohlen oder beschädigt? Schreiben Sie uns innerhalb von 14 Tagen nach dem geplanten Liefertermin mit Ihrer Bestellnummer (und bei Bruch einem Foto): Wir senden es erneut oder erstatten Ihnen den Betrag.",
     vatIncluded: "inkl. MwSt.",
+    messageTitle: "Ein paar Worte von unserem Team",
+    messageBody:
+      "Ihre Bestellung bedeutet uns sehr viel. Jedes Paket wird mit **größter Sorgfalt** gepackt, und wir freuen uns schon darauf, dass Sie es entdecken.\n\nDanke für Ihr Vertrauen, bis bald!",
+    messageRole: "Das Team",
   },
   es: {
     securePayment: "Pago seguro",
@@ -268,6 +280,10 @@ export const DEFAULT_TEXTS = {
     protectionClaim:
       "¿Paquete perdido, robado o dañado? Escríbenos en los 14 días siguientes a la fecha de entrega prevista con tu número de pedido (y una foto si está roto): te lo reenviamos o te lo reembolsamos.",
     vatIncluded: "IVA incluido",
+    messageTitle: "Unas palabras de nuestro equipo",
+    messageBody:
+      "Tu pedido significa mucho para nosotros. Cada paquete se prepara con **el mayor cuidado**, y estamos deseando que lo descubras.\n\nGracias por tu confianza, ¡hasta pronto!",
+    messageRole: "El equipo",
   },
   it: {
     securePayment: "Pagamento sicuro",
@@ -332,6 +348,10 @@ export const DEFAULT_TEXTS = {
     protectionClaim:
       "Pacco smarrito, rubato o danneggiato? Scrivici entro 14 giorni dalla data di consegna prevista con il numero d'ordine (e una foto in caso di rottura): lo rispediamo o ti rimborsiamo.",
     vatIncluded: "IVA inclusa",
+    messageTitle: "Due parole dal nostro team",
+    messageBody:
+      "Il tuo ordine per noi conta tantissimo. Ogni pacco viene preparato con **la massima cura**, e non vediamo l'ora che tu lo scopra.\n\nGrazie per la fiducia, a presto!",
+    messageRole: "Il team",
   },
   nl: {
     securePayment: "Veilig betalen",
@@ -396,6 +416,10 @@ export const DEFAULT_TEXTS = {
     protectionClaim:
       "Pakket kwijt, gestolen of beschadigd? Schrijf ons binnen 14 dagen na de verwachte leverdatum met je bestelnummer (en een foto bij breuk): we sturen het opnieuw of betalen je terug.",
     vatIncluded: "incl. btw",
+    messageTitle: "Een woordje van ons team",
+    messageBody:
+      "Je bestelling betekent veel voor ons. Elk pakket wordt met **de grootste zorg** ingepakt, en we kunnen niet wachten tot je het ontdekt.\n\nBedankt voor je vertrouwen, tot snel!",
+    messageRole: "Het team",
   },
 } as const satisfies Record<Lang, Record<string, string>>;
 
@@ -484,6 +508,7 @@ const TEXT_PROPS: ReadonlySet<string> = new Set([
   "dividerLabel",
   "value",
   "author",
+  "signatureRole",
 ]);
 /** Nested objects whose strings are never copy (targeting rules). */
 const SKIP_OBJECTS: ReadonlySet<string> = new Set(["conditions"]);

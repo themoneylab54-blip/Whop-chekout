@@ -3,7 +3,7 @@ import { type Breakers, DeadlineError, isTimeoutError, notePartial, stopForTime 
 import type { Store } from "@prisma/client";
 import { db } from "./db";
 import { PROVIDER_STORE_SELECT, storeLive } from "./payment-provider";
-import { markPaid, syncOrder, syncOrderSafely } from "./checkout";
+import { markPaid, sweepSnapshotClaims, syncOrder, syncOrderSafely } from "./checkout";
 import { retryRefundMirrors } from "./refunds";
 import { probeFallbacks } from "./fallback";
 import { backfillAdSpend, importAdSpend } from "./adspend";
@@ -1247,7 +1247,7 @@ export const PERMANENT_WEBHOOK_MARKERS = ["refund:", "refund-skip:"];
 
 export async function cleanup(): Promise<number> {
   const day = 24 * 3600_000;
-  const [limits, events, webhooks, alerts, metrics] = await Promise.all([
+  const [limits, events, webhooks, alerts, metrics, claims] = await Promise.all([
     db.rateLimit.deleteMany({ where: { resetAt: { lt: new Date(Date.now() - 3600_000) } } }),
     db.eventLog.deleteMany({ where: { createdAt: { lt: new Date(Date.now() - 365 * day) } } }),
     // Webhook copies only: the refund / skipped-refund markers (id "refund:…", "refund-skip:…") are
@@ -1256,10 +1256,12 @@ export async function cleanup(): Promise<number> {
     db.alertOutbox.deleteMany({ where: { createdAt: { lt: new Date(Date.now() - 30 * day) } } }),
     // Provider metrics (5-min buckets): 14 days.
     purgeProviderMetrics(),
+    // Checkout-creation claims (`prep:*`) left by a crashed prepare: older than 15 min.
+    sweepSnapshotClaims(),
   ]);
   // Redacted /cart.js copies (bundle apps diagnostics): 7 days.
   const snapshots = await db.cartSnapshot.deleteMany({ where: { createdAt: { lt: new Date(Date.now() - 7 * day) } } });
-  return limits.count + events.count + webhooks.count + alerts.count + metrics + snapshots.count;
+  return limits.count + events.count + webhooks.count + alerts.count + metrics + claims + snapshots.count;
 }
 
 /** Last tick report, for the dashboard and /api/health. */

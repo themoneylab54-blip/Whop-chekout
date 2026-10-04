@@ -44,6 +44,7 @@ import { BlockIcon, ICONS, IconTile } from "@/components/icons";
 import { honestReviewItems, isSampleOnly, isSampleReview, liveReviewItems, liveStatItems, liveTextProps } from "@/lib/sample-content";
 import { errorText, localeOf, type Labels, type Lang, type ReviewsNoteSummary } from "./i18n";
 import { SafeImg } from "./SafeImg";
+import { parseSimpleText, withFirstName, type SimpleInline } from "@/lib/simple-text";
 import type { CartLine } from "@/lib/pricing";
 
 /* ------------------------------------------------------------------ */
@@ -653,6 +654,8 @@ export type ContentContext = {
    * (headerLogosBlockId). It draws a slim placeholder instead of its logos, so they aren't drawn twice.
    */
   headerLogosBlockId?: string | null;
+  /** Thank-you page: the buyer's first name, for {prénom} in a « Message personnalisé » title. */
+  firstName?: string;
 };
 
 /** Payment logos buyers see: in preview the merchant's list, live only what is really offered. */
@@ -774,6 +777,11 @@ export function isEmptyInLive(block: Block, ctx: ContentContext, now: number): b
     }
     case "survey":
       return (!ctx.survey && !ctx.demoOffers) || block.props.options.length === 0;
+    case "message": {
+      // Nothing written and no photo: no empty card for buyers.
+      const p = block.props;
+      return !p.title.trim() && !p.body.trim() && !p.photoUrl && !p.signatureName.trim() && !p.signatureRole.trim() && !p.signatureImageUrl;
+    }
     default:
       return false;
   }
@@ -1119,6 +1127,8 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
       return <UpsellOffer block={block} ctx={ctx} />;
     case "survey":
       return <Survey block={block} ctx={ctx} />;
+    case "message":
+      return <MessageNote block={block} ctx={ctx} />;
     case "social": {
       const links = [
         { url: block.props.instagram, icon: InstagramIcon, label: "Instagram" },
@@ -1150,6 +1160,113 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
     default:
       return null;
   }
+}
+
+function SimpleLink({ piece }: { piece: Extract<SimpleInline, { kind: "link" }> }) {
+  const link = (
+    <a
+      href={piece.href}
+      {...(piece.href.startsWith("mailto:") ? {} : { target: "_blank", rel: "noopener noreferrer nofollow" })}
+      className="font-medium underline underline-offset-2 hover:no-underline"
+    >
+      {piece.text}
+    </a>
+  );
+  return piece.bold ? <strong className="font-semibold">{link}</strong> : link;
+}
+
+/** **bold**, links and paragraphs of a merchant text, as React elements (never raw HTML). */
+export function SimpleText({ text, className = "", paragraphClassName = "" }: { text: string; className?: string; paragraphClassName?: string }) {
+  const paragraphs = parseSimpleText(text);
+  if (paragraphs.length === 0) return null;
+  return (
+    <div className={className}>
+      {paragraphs.map((p, i) => (
+        <p key={i} className={paragraphClassName}>
+          {p.map((piece, j) =>
+            piece.kind === "br" ? (
+              <br key={j} />
+            ) : piece.kind === "bold" ? (
+              <strong key={j} className="font-semibold">
+                {piece.text}
+              </strong>
+            ) : piece.kind === "link" ? (
+              <SimpleLink key={j} piece={piece} />
+            ) : (
+              piece.text
+            ),
+          )}
+        </p>
+      ))}
+    </div>
+  );
+}
+
+/** Thank-you « Message personnalisé »: photo, title with the first name, formatted note, signature. */
+function MessageNote({ block, ctx }: { block: BlockOf<"message">; ctx: ContentContext }) {
+  const p = block.props;
+  const title = p.title.trim() ? withFirstName(p.title, ctx.firstName) : "";
+  const top = p.layout === "top";
+  const shape = p.photoShape === "square" ? "rounded-[var(--radius)]" : "rounded-full";
+  const size = top ? "h-20 w-20" : "h-14 w-14 @sm/msg:h-16 @sm/msg:w-16";
+  // Intrinsic size = the rendered one (no layout shift), lazy: the note sits below the confirmation.
+  const px = top ? 80 : 56;
+  const photo = p.photoUrl ? (
+    <SafeImg
+      src={p.photoUrl}
+      alt={p.signatureName.trim()}
+      width={px}
+      height={px}
+      loading="lazy"
+      decoding="async"
+      className={`${size} ${shape} shrink-0 object-cover shadow-[0_1px_3px_rgba(15,23,42,.12)] ring-2 ring-white`}
+      fallback={null}
+    />
+  ) : ctx.preview ? (
+    // Builder only: where the photo goes (live, no photo = text only).
+    <span
+      aria-hidden
+      className={`${size} ${shape} flex shrink-0 items-center justify-center border-2 border-dashed border-neutral-300 text-[10px] font-medium text-neutral-500`}
+    >
+      Photo
+    </span>
+  ) : null;
+  const hasSignature = !!(p.signatureName.trim() || p.signatureRole.trim() || p.signatureImageUrl);
+  return (
+    // Plain divs: the signature sits in the text column, so it can't be the <figure>'s direct <figcaption>.
+    <div data-message-layout={p.layout} className="@container/msg">
+      <div className={top ? "flex flex-col items-center gap-3 text-center" : "flex items-start gap-4 text-left"}>
+        {photo}
+        {/* wrap-anywhere: a long address or word wraps inside the card at 360px (never a sideways scroll). */}
+        <div data-message-text="" className="min-w-0 flex-1 space-y-2 wrap-anywhere">
+          {title && (
+            <h2 data-inline-field="title" className="font-[family-name:var(--heading-font)] text-lg leading-snug font-semibold tracking-tight">
+              {title}
+            </h2>
+          )}
+          <SimpleText text={p.body} className="space-y-2.5 text-[15px] leading-relaxed opacity-90" />
+          {hasSignature && (
+            <div data-message-signature="" className={`flex flex-col gap-0.5 pt-1 ${top ? "items-center" : "items-start"}`}>
+              {p.signatureImageUrl && (
+                <SafeImg
+                  src={p.signatureImageUrl}
+                  alt=""
+                  width={180}
+                  height={40}
+                  loading="lazy"
+                  decoding="async"
+                  className="h-10 w-auto max-w-[180px] object-contain"
+                  fallback={null}
+                />
+              )}
+              {p.signatureName.trim() && <span className="text-sm font-semibold">{p.signatureName}</span>}
+              {p.signatureRole.trim() && <span className="text-xs text-[var(--muted)]">{p.signatureRole}</span>}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function InstagramIcon({ className }: { className?: string }) {

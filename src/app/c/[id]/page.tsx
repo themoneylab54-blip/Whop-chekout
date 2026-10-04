@@ -6,9 +6,12 @@ import { geoCountryOf } from "@/lib/geo";
 import { localizeRate, recordText } from "@/components/checkout/localize";
 import { after } from "next/server";
 import { db } from "@/lib/db";
-import { themeFontHrefs, loadCheckoutLayout, loadInterception, loadTheme, variantGidOf, type Layout } from "@/lib/layout";
+import { themeFontHrefs, loadCheckoutLayout, loadInterception, loadTheme, paypalExpressAllowed, variantGidOf, type Layout } from "@/lib/layout";
 import { subtotal, type CartLine } from "@/lib/pricing";
-import { addOnEligible } from "@/lib/checkout";
+import { addOnEligible, paypalOffered, providerFor } from "@/lib/checkout";
+import { stripeFor } from "@/lib/stripe";
+import { chargePlan } from "@/lib/charge";
+import type { PaymentProvider } from "@/lib/payment-provider";
 import { CheckoutView } from "@/components/checkout/CheckoutView";
 import { designFor } from "@/lib/experiments";
 import { layoutWithOverrides, overridesFor, withAddOnOverrides } from "@/lib/checkout-tests";
@@ -16,7 +19,7 @@ import { loginCodeEnabled } from "@/lib/returning";
 import { activeUpsells } from "@/lib/upsell";
 import { browserPixel } from "@/lib/conversions";
 import { AdPixels } from "@/components/checkout/AdPixels";
-import { DEFAULT_COUNTRIES, labelsFor, localeCountries } from "@/components/checkout/i18n";
+import { labelsFor } from "@/components/checkout/i18n";
 import { buyerIcons, checkoutLang, CheckoutHtmlLang } from "@/app/c/lang";
 import { keepOnCheckoutHost } from "@/app/c/host";
 import { priceCart } from "@/lib/shopify";
@@ -25,6 +28,9 @@ import { log } from "@/lib/log";
 import { localRatesFor, type LocalRates } from "@/components/checkout/localCurrency";
 import { mergeRecommendations, type RecommendationView } from "@/components/checkout/recommendations";
 import { canReadShopifyDiscounts } from "@/lib/shopify-discounts";
+// The main market: shared with the early prepare (its first quote is this page's first input).
+import { primaryCountryOf } from "@/lib/early-prepare";
+import { checkoutCountries, countryHints, pickFirstCountry } from "@/lib/first-country";
 
 export const dynamic = "force-dynamic";
 
@@ -72,29 +78,38 @@ async function loadRecommendations(
 }
 
 /**
- * The store's main market, pre-selected when the visitor's IP country is unknown or not
- * served: the most frequent shipping country of its recent paid orders, else the first
- * country of its first shipping rate. Null when neither says anything.
+ * The processor the page's first /prepare will use (see providerFor), null when none is usable or
+ * a payment in flight decides (the prepare says). Never throws.
  */
-async function primaryCountryOf(storeId: string, rates: { countries: string[] }[]): Promise<string | null> {
+function expectedProvider(session: Parameters<typeof providerFor>[0]): PaymentProvider | null {
   try {
-    const rows = await db.$queryRaw<{ c: string }[]>`
-      SELECT c FROM (
-        SELECT upper(s."shippingAddress"->>'countryCode') AS c
-        FROM "CheckoutSession" s
-        WHERE s."storeId" = ${storeId} AND s.status = 'PAID' AND s."shippingAddress" IS NOT NULL
-        ORDER BY s."createdAt" DESC
-        LIMIT 500
-      ) recent
-      WHERE c ~ '^[A-Z]{2}$'
-      GROUP BY c
-      ORDER BY count(*) DESC, c
-      LIMIT 1`;
-    if (rows[0]?.c) return rows[0].c;
-  } catch (err) {
-    log.warn("checkout.primary_country_failed", "Main market lookup failed", { storeId, err });
+    return providerFor(session);
+  } catch {
+    return null;
   }
-  return rates.find((r) => r.countries.length > 0)?.countries[0] ?? null;
+}
+
+/**
+ * Whether the express PayPal button can show before the first /prepare answers: Whop pays, the
+ * merchant allows it (as prepareSession checks it) and Whop's last word for the charged currency
+ * isn't "off". The prepare's answer stays the authority (it hides the button when it says no).
+ */
+async function paypalAtFirstPaint(
+  session: { storeId: string; currency: string; store: Parameters<typeof chargePlan>[0] },
+  provider: PaymentProvider | null,
+  design: { theme: unknown; checkoutLayout: unknown },
+  storeName: string,
+  country: string | null,
+  subtotalCents: number,
+): Promise<boolean> {
+  if (provider !== "whop") return false;
+  if (!paypalExpressAllowed(loadTheme(design.theme, storeName), loadCheckoutLayout(design.checkoutLayout))) return false;
+  try {
+    const currency = (await chargePlan(session.store, country, subtotalCents))?.currency ?? session.currency;
+    return await paypalOffered(session.storeId, currency);
+  } catch {
+    return false;
+  }
 }
 
 /** Multipliers to the buyers' local currencies (ECB, cached 12 h); null when unavailable. */
@@ -165,22 +180,61 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
   // Order bumps whose display rules match, so none flashes in before the first quote.
   const ruleCtx = { subtotalCents: subtotal(lines), productIds: lines.map((l) => l.productId), country: initialCountry };
   const layout = loadCheckoutLayout(layoutWithOverrides(design.checkoutLayout, overrides));
-  const shipsTo = (code: string) => rates.some((r) => (r.countries.length ? r.countries : DEFAULT_COUNTRIES).includes(code));
-  const served = initialCountry != null && shipsTo(initialCountry);
   // No usable IP country: the browser's locale country ("de-DE" → Germany) when shipped to,
-  // before the store's main market.
-  const localeCountry = served ? null : (localeCountries(reqHeaders.get("accept-language")).find(shipsTo) ?? null);
-  // Both are optional extras: a slow Shopify / ECB answer hides them instead of delaying the page.
-  const [recommendations, localRates, primaryCountry] = await Promise.all([
-    within(loadRecommendations(layout, store), 2500, null),
+  // before the store's main market (same rules as the early prepare: lib/first-country).
+  const { served, localeCountry } = countryHints(rates, initialCountry, reqHeaders.get("accept-language"));
+  // The processor of the first /prepare: its hosts are dialed while the page loads (Whop's iframes,
+  // Stripe.js), and the express row is drawn from the start.
+  const provider = expectedProvider(session);
+  // Rendered as <link> tags (hoisted to the head, read with the HTML): ReactDOM.preconnect() from a
+  // server component only reaches the browser with the RSC payload, once the scripts run.
+  const preconnects: { href: string; crossOrigin?: "anonymous" }[] =
+    provider === "whop"
+      ? [{ href: store.testMode ? "https://sandbox.whop.com" : "https://whop.com" }]
+      : provider === "stripe"
+        ? [{ href: "https://js.stripe.com" }, { href: "https://api.stripe.com", crossOrigin: "anonymous" }]
+        : [];
+  let stripeWarm: { publishableKey: string; stripeAccount: string } | null = null;
+  if (provider === "stripe") {
+    try {
+      const { publishableKey, stripeAccount } = stripeFor(store);
+      stripeWarm = { publishableKey, stripeAccount };
+    } catch {
+      stripeWarm = null;
+    }
+  }
+  // "Complétez votre commande" never holds the page: its Shopify prices stream in when ready (a
+  // slow answer hides the block). The ECB rates and the main market are quick optional extras.
+  // Never rejects (read with use() under <Suspense>: a rejection would reach the error boundary).
+  const recommendations = within(
+    loadRecommendations(layout, store).catch(() => null),
+    2500,
+    null,
+  );
+  // Only needed when the IP country can't be pre-selected.
+  const primaryLookup = served || localeCountry ? Promise.resolve(null) : within(primaryCountryOf(store.id, rates), 800, null);
+  // PayPal at first paint is judged in the country the page pre-selects (CheckoutView's pickFirstCountry
+  // over the same list and hints, the main market included): its charged currency is the first
+  // /prepare's, so the button doesn't show only to vanish at its answer.
+  const firstCountry = primaryLookup.then((primary) =>
+    pickFirstCountry(
+      checkoutCountries(rates.map((r) => ({ countries: r.countries, active: !!r.active })), theme.language).map((c) => c.code),
+      { initialCountry, localeCountry, primaryCountry: primary, language: theme.language },
+    ),
+  );
+  const [localRates, primaryCountry, initialPaypal, returningCode] = await Promise.all([
     within(loadLocalRates(session.currency), 1500, null),
-    // Only needed when the IP country can't be pre-selected.
-    served || localeCountry ? null : within(primaryCountryOf(store.id, rates), 800, null),
+    primaryLookup,
+    firstCountry.then((country) => paypalAtFirstPaint(session, provider, design, store.name, country, subtotal(lines))),
+    loginCodeEnabled(session.store),
   ]);
 
   return (
     <>
       <CheckoutHtmlLang lang={theme.language} />
+      {preconnects.map((p) => (
+        <link key={p.href} rel="preconnect" href={p.href} crossOrigin={p.crossOrigin} />
+      ))}
       {fonts.map((href) => (
         <link key={href} rel="stylesheet" href={href} />
       ))}
@@ -221,7 +275,10 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
         cartUrl={shopHost ? `https://${shopHost}/cart` : null}
         recommendations={recommendations}
         localRates={localRates}
-        returningCode={await loginCodeEnabled(session.store)}
+        initialPaypal={initialPaypal}
+        initialProvider={provider}
+        stripeWarm={stripeWarm}
+        returningCode={returningCode}
       />
     </>
   );

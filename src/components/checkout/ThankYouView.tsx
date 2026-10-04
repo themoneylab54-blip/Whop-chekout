@@ -11,6 +11,7 @@ import { countryName, labelsFor, localeOf, paymentMethodName, type Labels } from
 import { localizeDeliveryTime, localizeLayout, localizeTheme } from "./localize";
 import { localEstimate, type LocalRates } from "./localCurrency";
 import { ProtectionClaimForm } from "./ProtectionClaimForm";
+import { withFirstName } from "@/lib/simple-text";
 
 export type ThankYouData = {
   status: "OPEN" | "PAYING" | "PAID" | "FAILED" | "ABANDONED";
@@ -89,6 +90,30 @@ type Props = {
 };
 
 const noopSubscribe = () => () => {};
+
+/** Cards of the built-in sections: the theme's border, softened, with a hairline shadow. */
+const CARD = "rounded-[var(--radius)] border border-[color-mix(in_srgb,var(--border)_60%,white)] bg-white shadow-[0_1px_2px_rgba(15,23,42,.04)]";
+/** Small uppercase heading of a details / summary column. */
+const EYEBROW = "mb-1.5 text-xs font-semibold tracking-wide text-neutral-600 uppercase";
+
+/**
+ * The confirmation check: a soft tinted disc whose ring and tick draw themselves once
+ * (globals.css .wc-check*; shown complete, without motion, under prefers-reduced-motion).
+ */
+function AnimatedCheck() {
+  return (
+    <span
+      data-testid="wc-ty-check"
+      aria-hidden
+      className="wc-check flex h-14 w-14 shrink-0 items-center justify-center rounded-full bg-[color-mix(in_srgb,var(--accent)_10%,white)] text-[var(--accent)]"
+    >
+      <svg viewBox="0 0 52 52" className="h-14 w-14" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+        <circle className="wc-check-ring" cx="26" cy="26" r="24.5" strokeWidth="1.75" pathLength={1} transform="rotate(-90 26 26)" opacity={0.45} />
+        <path className="wc-check-mark" d="M16 26.5l6.5 6.5L36.5 19" strokeWidth="3.25" pathLength={1} />
+      </svg>
+    </span>
+  );
+}
 
 /**
  * Blocks in display order. Layouts always carry the three built-in sections once loaded;
@@ -197,6 +222,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
     demoOffers,
     offerEndsAt: preview || demoOffers ? mountedAt + OFFER_WINDOW_MS : Number.isNaN(paidAtMs) ? null : paidAtMs + OFFER_WINDOW_MS,
     lang: theme.language,
+    firstName: data.firstName,
     lowestInventory: null,
     preview: !!preview,
     subtotalCents: subtotal - data.discountCents,
@@ -303,11 +329,9 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
       </section>
     ) : (
     <div className="space-y-4">
-      <div className="flex items-center gap-4 py-2">
-        <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-[image:var(--accent-bg)] text-[var(--accent-fg)] shadow-[var(--btn-shadow)]">
-          <Check className="h-6 w-6" strokeWidth={3} aria-hidden />
-        </span>
-        <div>
+      <div className="flex items-center gap-4 py-1">
+        <AnimatedCheck />
+        <div className="min-w-0">
           <p className="text-sm text-neutral-600">
             {data.orderName ? (
               <>
@@ -322,14 +346,14 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
             // Focus target once the last offer is declined (the offer card is gone).
             data-order-heading=""
             tabIndex={-1}
-            className="rounded-sm font-[family-name:var(--heading-font)] text-2xl font-semibold tracking-tight focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus,#111827)] focus-visible:ring-offset-2"
+            className="rounded-sm font-[family-name:var(--heading-font)] text-2xl leading-tight font-semibold tracking-tight text-balance focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus,#111827)] focus-visible:ring-offset-2"
           >
-            {title ? title.replace(/\{(name|prénom|prenom)\}/gi, data.firstName).trim() : L.thankYou(data.firstName)}
+            {title ? withFirstName(title, data.firstName) : L.thankYou(data.firstName)}
           </h1>
         </div>
       </div>
 
-      <section className="rounded-[var(--radius)] border border-neutral-200 bg-white p-5" aria-live="polite">
+      <section className={`${CARD} p-5`} aria-live="polite">
         <p className="flex items-center gap-2 font-medium">
           {!confirmed && <span className="h-4 w-4 animate-spin rounded-full border-2 border-neutral-300 border-r-transparent" aria-hidden />}
           {confirmed ? L.orderConfirmed : L.orderProcessing}
@@ -340,7 +364,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
             {L.confirmationSent(data.email)}
           </p>
         )}
-        {needsShipping && <Timeline L={L} start={start} estimate={estimate} fmt={fmt} />}
+        {needsShipping && <Timeline L={L} start={start} estimate={estimate} fmt={fmt} shipped={!!data.tracking?.number} />}
       </section>
     </div>
   );
@@ -360,10 +384,10 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
   ) : null;
   const details = (title: string) =>
     data.address || data.pickup || data.shippingMethod || data.tracking || data.email || methodName || supportHref ? (
-      <section className="grid gap-5 rounded-[var(--radius)] border border-neutral-200 bg-white p-5 text-sm sm:grid-cols-2">
+      <section className={`${CARD} grid gap-5 p-5 text-sm sm:grid-cols-2`}>
         {data.pickup ? (
           <div>
-            <h2 className="mb-1 text-xs font-semibold tracking-wide text-neutral-600 uppercase">{L.pickupShipTo}</h2>
+            <h2 className={EYEBROW}>{L.pickupShipTo}</h2>
             <p className="flex items-start gap-1.5 font-medium">
               <MapPin className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent)]" aria-hidden />
               {data.pickup.name}
@@ -376,7 +400,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
           </div>
         ) : data.address && (
           <div>
-            <h2 data-inline-field="title" className="mb-1 text-xs font-semibold tracking-wide text-neutral-600 uppercase">
+            <h2 data-inline-field="title" className={EYEBROW}>
               {title || L.shipTo}
             </h2>
             <p className="font-medium">{data.address.name}</p>
@@ -389,7 +413,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
         <div className="space-y-4">
           {data.shippingMethod && (
             <div>
-              <h2 className="mb-1 text-xs font-semibold tracking-wide text-neutral-600 uppercase">{L.estimatedDelivery}</h2>
+              <h2 className={EYEBROW}>{L.estimatedDelivery}</h2>
               <p className="flex items-center gap-1.5 font-medium">
                 <Truck className="h-4 w-4 text-[var(--accent)]" aria-hidden />
                 {estimateText ?? data.shippingMethod.name}
@@ -399,7 +423,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
           )}
           {data.tracking && (
             <div>
-              <h2 className="mb-1 text-xs font-semibold tracking-wide text-neutral-600 uppercase">{L.stepShipped}</h2>
+              <h2 className={EYEBROW}>{L.stepShipped}</h2>
               <a
                 href={data.tracking.url}
                 target="_blank"
@@ -414,7 +438,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
             </div>
           )}
           <div>
-            <h2 className="mb-1 text-xs font-semibold tracking-wide text-neutral-600 uppercase">{L.paymentMethod}</h2>
+            <h2 className={EYEBROW}>{L.paymentMethod}</h2>
             <p className="flex items-center gap-1.5 font-medium">
               <CreditCard className="h-4 w-4 text-[var(--accent)]" aria-hidden />
               {methodName}
@@ -422,13 +446,13 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
           </div>
           {data.email && (
             <div>
-              <h2 className="mb-1 text-xs font-semibold tracking-wide text-neutral-600 uppercase">{L.contact}</h2>
+              <h2 className={EYEBROW}>{L.contact}</h2>
               <p className="break-all">{data.email}</p>
             </div>
           )}
           {supportHref && (
             <div>
-              <h2 className="mb-1 text-xs font-semibold tracking-wide text-neutral-600 uppercase">{L.needHelp}</h2>
+              <h2 className={EYEBROW}>{L.needHelp}</h2>
               <a
                 href={supportHref}
                 target={supportHref.startsWith("mailto:") ? undefined : "_blank"}
@@ -444,7 +468,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
       </section>
     ) : null;
   const summary = (title: string) => (
-    <section className="rounded-[var(--radius)] border border-neutral-200 bg-white p-5" aria-labelledby="ty-summary">
+    <section className={`${CARD} p-5`} aria-labelledby="ty-summary">
       <h2 id="ty-summary" data-inline-field="title" className="mb-3 text-xs font-semibold tracking-wide text-neutral-600 uppercase">
         {title || L.summary}
       </h2>
@@ -534,7 +558,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
               onClick={() => setSummaryOpen((o) => !o)}
               aria-expanded={summaryOpen}
               aria-controls="ty-summary-panel"
-              className="flex min-h-14 w-full items-center justify-between gap-3 rounded-[var(--radius)] border border-neutral-200 bg-white px-5 py-3 text-sm @4xl:hidden"
+              className={`${CARD} flex min-h-14 w-full items-center justify-between gap-3 px-5 py-3 text-sm @4xl:hidden`}
               style={{ background: theme.summaryBackground || undefined }}
             >
               <span className="flex items-center gap-1.5 font-medium text-[var(--text)]">
@@ -633,11 +657,14 @@ function Timeline({
   start,
   estimate,
   fmt,
+  shipped = false,
 }: {
   L: Labels;
   start: Date | null;
   estimate: { min: number; max: number; business: boolean } | null;
   fmt: (d: Date) => string;
+  /** A tracking number exists: the parcel has left (« Expédiée » done). */
+  shipped?: boolean;
 }) {
   const steps = [
     {
@@ -649,8 +676,9 @@ function Timeline({
     {
       icon: Package,
       title: L.stepShipped,
-      date: start && estimate ? fmt(addDays(start, Math.min(1, estimate.min), estimate.business)) : null,
-      done: false,
+      // Shipped: its status, not a predicted date.
+      date: shipped ? null : start && estimate ? fmt(addDays(start, Math.min(1, estimate.min), estimate.business)) : null,
+      done: shipped,
     },
     {
       icon: Home,
@@ -659,13 +687,20 @@ function Timeline({
       done: false,
     },
   ];
+  // The current step: the last one done.
+  const current = steps.reduce((at, st, i) => (st.done ? i : at), 0);
   return (
-    <ol className="mt-5 grid grid-cols-3">
+    <ol className="mt-5 grid grid-cols-3 border-t border-[color-mix(in_srgb,var(--border)_45%,white)] pt-5">
       {steps.map((s, i) => (
-        <li key={i} className="relative flex flex-col items-center text-center" aria-current={i === 0 ? "step" : undefined}>
-          {i > 0 && <span className="absolute top-4 right-1/2 h-0.5 w-full bg-neutral-200" aria-hidden />}
+        <li key={i} data-step-done={s.done ? "" : undefined} className="relative flex flex-col items-center text-center" aria-current={i === current ? "step" : undefined}>
+          {i > 0 && (
+            <span
+              className={`absolute top-4 right-1/2 h-0.5 w-full ${s.done ? "bg-[var(--accent)]" : "bg-[color-mix(in_srgb,var(--border)_60%,white)]"}`}
+              aria-hidden
+            />
+          )}
           <span
-            className={`relative z-10 flex h-8 w-8 items-center justify-center rounded-full ${s.done ? "bg-[image:var(--accent-bg)] text-[var(--accent-fg)]" : "border-2 border-neutral-300 bg-white text-neutral-600"}`}
+            className={`relative z-10 flex h-8 w-8 items-center justify-center rounded-full ${s.done ? "bg-[image:var(--accent-bg)] text-[var(--accent-fg)]" : "border-2 border-[color-mix(in_srgb,var(--border)_80%,white)] bg-white text-neutral-600"}`}
           >
             <s.icon className="h-4 w-4" aria-hidden />
           </span>

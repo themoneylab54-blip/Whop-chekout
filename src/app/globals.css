@@ -65,6 +65,49 @@ body {
   animation: fade-up 0.35s ease-out both;
 }
 
+/* Thank-you page: the confirmation check pops in and draws its ring and tick once. */
+@keyframes wc-check-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.7);
+  }
+  60% {
+    opacity: 1;
+    transform: scale(1.04);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes wc-check-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.wc-check {
+  animation: wc-check-pop 0.45s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+.wc-check-ring,
+.wc-check-mark {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+}
+.wc-check-ring {
+  animation: wc-check-draw 0.6s ease-out 0.1s forwards;
+}
+.wc-check-mark {
+  animation: wc-check-draw 0.35s ease-out 0.5s forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .wc-check,
+  .wc-check-ring,
+  .wc-check-mark {
+    animation: none;
+    stroke-dashoffset: 0;
+  }
+}
+
 /* ---------- Checkout inputs (theme.inputStyle) ---------- */
 .wc-input {
   width: 100%;

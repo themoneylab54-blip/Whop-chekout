@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement as h, createRef, type ComponentProps } from "react";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
@@ -120,6 +120,14 @@ describe("payment logos shown next to « Paiement »", () => {
 });
 
 describe("express row: only wallets on screen are reported", () => {
+  // Safari (Apple Pay's button is only mounted where ApplePaySession exists).
+  beforeEach(() => {
+    (window as { ApplePaySession?: unknown }).ApplePaySession = { canMakePayments: () => true };
+  });
+  afterEach(() => {
+    delete (window as { ApplePaySession?: unknown }).ApplePaySession;
+  });
+
   it("a wallet resolved while still off screen (sr-only) is not reported", async () => {
     whop.buttons.clear();
     const shown = vi.fn();

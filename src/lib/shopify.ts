@@ -614,7 +614,15 @@ const STOCK_ERROR = /stock|inventor|quantit|disponib|available/i;
  */
 export type OrderCustomer = { id: string; numberOfOrders: string | number | null; orders?: { nodes: { id: string; createdAt: string }[] } | null };
 
-export async function createPaidOrder(store: ConnectedStore, input: PaidOrderInput): Promise<{ id: string; name: string; oversold?: boolean; customer?: OrderCustomer | null }> {
+/** `sendReceipt`: Shopify's order confirmation to the buyer (default true; false for a separate offer order). */
+export type PaidOrderOptions = { sendReceipt?: boolean };
+
+export async function createPaidOrder(
+  store: ConnectedStore,
+  input: PaidOrderInput,
+  opts: PaidOrderOptions = {},
+): Promise<{ id: string; name: string; oversold?: boolean; customer?: OrderCustomer | null }> {
+  const sendReceipt = opts.sendReceipt ?? true;
   const run = async (inventoryBehaviour: "DECREMENT_OBEYING_POLICY" | "BYPASS", extraTags: string[]) => {
     const order = buildOrderCreateInput(input);
     if (extraTags.length) order.tags = [...((order.tags as string[] | undefined) ?? []), ...extraTags];
@@ -631,7 +639,7 @@ export async function createPaidOrder(store: ConnectedStore, input: PaidOrderInp
           userErrors { field message }
         }
       }`,
-      { order, options: { inventoryBehaviour, sendReceipt: true, sendFulfillmentReceipt: true } },
+      { order, options: { inventoryBehaviour, sendReceipt, sendFulfillmentReceipt: true } },
       { retry: false },
     );
   };

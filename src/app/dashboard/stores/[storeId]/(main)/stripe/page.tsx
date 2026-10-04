@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { ArrowLeftRight, FlaskConical, KeyRound, Route, Smartphone } from "lucide-react";
+import { ArrowLeftRight, FlaskConical, KeyRound, Mail, Route, Smartphone } from "lucide-react";
 import { notFound } from "next/navigation";
 import { DirtyForm } from "@/components/dashboard/DirtyForm";
 import { requireStoreAccess, roleCan } from "@/lib/access";
@@ -19,6 +19,7 @@ import {
   stripeWalletHosts,
   stripeWebhookStatus,
   stripeWebhookUrl,
+  STRIPE_EMAIL_SETTINGS_URL,
   STRIPE_PAGE_CALL,
   STRIPE_WEBHOOK_EVENTS,
   type StripeDomainState,
@@ -328,6 +329,32 @@ export default async function StripePage({ params, searchParams }: { params: Pro
               <SubmitButton variant="secondary">Enregistrer les domaines</SubmitButton>
             </form>
           )}
+        </Card>
+      )}
+
+      {connected && (
+        <Card
+          id="stripe-receipts"
+          icon={Mail}
+          iconColor="#635BFF"
+          title="Reçus Stripe"
+          description="Évitez le double e-mail : vos clients reçoivent déjà la confirmation de commande de Shopify."
+          actions={<Badge color="amber">À vérifier</Badge>}
+          className="mb-6"
+        >
+          <p className="text-sm text-zinc-700" data-testid="stripe-receipts">
+            L&apos;app ne demande jamais de reçu à Stripe. Mais si votre compte Stripe envoie ses propres reçus, vos clients payés par Stripe reçoivent un
+            second e-mail. Pour le couper, dans votre dashboard Stripe :
+          </p>
+          <p className="mt-2 text-sm font-medium text-zinc-900">
+            Paramètres → E-mails clients → <strong>Paiements réussis</strong> : désactivez.
+          </p>
+          <div className="mt-4 flex flex-wrap items-center gap-3">
+            <a href={STRIPE_EMAIL_SETTINGS_URL} target="_blank" rel="noreferrer" className={buttonClass("secondary")}>
+              Ouvrir les e-mails clients Stripe
+            </a>
+            <span className="text-xs text-zinc-500">Réglage de votre compte Stripe : l&apos;app ne peut pas le changer à votre place.</span>
+          </div>
         </Card>
       )}
 

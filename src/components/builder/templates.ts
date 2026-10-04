@@ -5,6 +5,7 @@ import {
   dedupeSingletons,
   defaultTheme,
   isFixedSection,
+  signedWithStore,
   type Block,
   type BlockStyle,
   type BlockType,
@@ -73,7 +74,8 @@ export type Template = {
   hides?: readonly BlockType[];
   /** One-line "idéal pour" tag shown on the card (« Trafic mobile », « Panier élevé »…). */
   idealFor?: string;
-  build: (current: Layout) => Layout;
+  /** `storeName` signs a message block the template creates (see signedWithStore). */
+  build: (current: Layout, ctx?: { storeName?: string }) => Layout;
 };
 
 /**
@@ -84,7 +86,7 @@ export type Template = {
  * Blocks the template doesn't list (a text, an image, a FAQ, the add-ons…) are kept too, next to
  * the block they followed (see keepOthers).
  */
-export function fromSpec(spec: Spec[], current: Layout, opts: { keepStyle?: boolean; hide?: readonly BlockType[] } = {}): Layout {
+export function fromSpec(spec: Spec[], current: Layout, opts: { keepStyle?: boolean; hide?: readonly BlockType[]; storeName?: string } = {}): Layout {
   const pool = [...current.blocks];
   const blocks = spec.map(([type, o = {}]) => {
     const at = pool.findIndex((b) => b.type === type);
@@ -97,7 +99,7 @@ export function fromSpec(spec: Spec[], current: Layout, opts: { keepStyle?: bool
       const style = opts.keepStyle ? { ...existing.style, ...o.style } : { ...defaults, ...o.style };
       return blockSchema.parse({ ...existing, placement: fresh.placement, position: fresh.position, style }) as Block;
     }
-    return blockSchema.parse({ ...fresh, style: { ...defaults, ...o.style }, props: { ...fresh.props, ...o.props } }) as Block;
+    return signedWithStore(blockSchema.parse({ ...fresh, style: { ...defaults, ...o.style }, props: { ...fresh.props, ...o.props } }) as Block, opts.storeName);
   });
   // Blocks the template leaves out of its look (Minimal: add-ons, trust badges) are hidden, never
   // deleted: their content stays, one click in the block list shows them again.
@@ -219,7 +221,7 @@ const IDEAL_FOR: Record<string, string> = {
 
 function template(t: Omit<Template, "build">): Template {
   const idealFor = t.idealFor ?? IDEAL_FOR[t.id];
-  return { ...t, ...(idealFor ? { idealFor } : {}), build: (c) => fromSpec(t.spec, c, { keepStyle: !t.style, hide: t.hides }) };
+  return { ...t, ...(idealFor ? { idealFor } : {}), build: (c, ctx) => fromSpec(t.spec, c, { keepStyle: !t.style, hide: t.hides, storeName: ctx?.storeName }) };
 }
 
 /** Visible page blocks a template hides (named in the confirmation dialog). */
@@ -700,17 +702,17 @@ export const THANK_YOU_TEMPLATES: Template[] = [
     id: "simple",
     name: "Simple",
     category: "minimal",
-    description: "Un remerciement clair et un contact support. Garde votre style.",
-    summary: "Confirmation · Texte · Adresse · Récapitulatif · Support client",
-    spec: [["ty_confirmation"], ["text"], ["ty_details"], ["ty_summary"], ["support"]],
+    description: "Un remerciement clair, un mot personnel et un contact support. Garde votre style.",
+    summary: "Confirmation · Message personnalisé · Adresse · Récapitulatif · Support client",
+    spec: [["ty_confirmation"], ["message", { style: { card: true } }], ["ty_details"], ["ty_summary"], ["support"]],
   }),
   template({
     id: "loyalty",
     name: "Fidélisation",
     category: "conversion",
     description: "Donne une raison de revenir : code promo et réseaux. Garde votre style.",
-    summary: "Confirmation · Code promo cadeau · Adresse · Récapitulatif · Réseaux sociaux · Bouton lien",
-    spec: [["ty_confirmation"], ["coupon"], ["ty_details"], ["ty_summary"], ["social"], ["button_link"]],
+    summary: "Confirmation · Message personnalisé · Code promo cadeau · Adresse · Récapitulatif · Réseaux sociaux · Bouton lien",
+    spec: [["ty_confirmation"], ["message", { style: { card: true } }], ["coupon"], ["ty_details"], ["ty_summary"], ["social"], ["button_link"]],
   }),
   template({
     id: "upsell",

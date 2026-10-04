@@ -1,4 +1,5 @@
 import "server-only";
+import { createHash } from "node:crypto";
 import { DeadlineError, notePartial } from "./deadline";
 import { z } from "zod";
 import { Prisma, type CheckoutQuote, type CheckoutSession, type Store } from "@prisma/client";
@@ -255,13 +256,13 @@ async function giftLinesFor(session: SessionWithStore, earned: GiftTier[]): Prom
 const DISCOUNT_EXHAUSTED = "Ce code promo a atteint sa limite d'utilisation";
 
 export async function quoteSession(session: SessionWithStore, input: QuoteInput): Promise<Quote> {
-  const buyerLines = await linesFor(session, session.status === "PAID" ? undefined : input.quantities);
   // The Shopify cart's own code (a /discount/CODE link, Fast Bundle's code) while the buyer has typed
   // none (null; "" = removed): looked up like a typed code, kept only when valid — else left out
   // without a buyer-facing error (journaled).
   const cartCode = input.discountCode == null ? ((session.cartContext as CartContext | null)?.discountCodes?.[0] ?? null) : null;
   const discountCode = input.discountCode || cartCode;
-  const [allRates, storeAddOns, discountRow, design, overrides] = await Promise.all([
+  // The store's settings are read while the lines are (re)priced: none of them depends on the lines.
+  const loads = Promise.all([
     db.shippingRate.findMany({ where: { storeId: session.storeId }, orderBy: { position: "asc" } }),
     db.addOn.findMany({ where: { storeId: session.storeId, active: true } }),
     discountCode
@@ -273,6 +274,11 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
     // Checkout A/B tests: arm B's tiers, order-bump prices / visibility, protection pricing.
     overridesFor(session),
   ]);
+  // Handled at once: a read failing while the lines are still priced is no unhandled rejection
+  // (still thrown by the await below; a failing line re-pricing wins, its error is the quote's).
+  loads.catch(() => undefined);
+  const buyerLines = await linesFor(session, session.status === "PAID" ? undefined : input.quantities);
+  const [allRates, storeAddOns, discountRow, design, overrides] = await loads;
   const allAddOns = withAddOnOverrides(storeAddOns, overrides);
 
   // Quantity breaks v2: percent tiers (maybe scoped to products) and free gifts.
@@ -449,6 +455,8 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
   };
   // The Shopify code as read (limits, usage count): frozen on the snapshot, never sent to the browser.
   if (shopifyCode && discountSource === "shopify") shopifyCodeOf.set(quote, shopifyCode);
+  // The design the quote was priced with: prepareSession reuses it (one read per prepare).
+  designOf.set(quote, design);
   return quote;
 }
 
@@ -480,6 +488,8 @@ async function noteCartCodeDropped(session: SessionWithStore, code: string, reas
 
 /** Shopify code behind a quote (server side only: the quote itself goes to the browser). */
 const shopifyCodeOf = new WeakMap<Quote, ShopifyCodeDiscount>();
+/** The design (theme, layouts) a quote was computed with, kept off the Quote itself. */
+const designOf = new WeakMap<Quote, Awaited<ReturnType<typeof designFor>>>();
 
 /** Snapshot columns of a Shopify code's limits (the ledger check in markPaid reads them). */
 function shopifyCodeLimits(code: ShopifyCodeDiscount | undefined) {
@@ -673,6 +683,12 @@ export async function clearPaypalRefusals(storeId: string): Promise<number> {
  * processor than the session's under a payment in flight.
  */
 export async function prepareSession(session: SessionWithStore, input: QuoteInput, opts: PrepareOptions = {}): Promise<PrepareResult> {
+  // The request's start: the wait for another request's checkout is bounded from it (SNAPSHOT_WAIT_MS).
+  const startedAt = opts.startedAt ?? Date.now();
+  // Whop's last word on PayPal, read while the quote is computed when the charged currency is known
+  // up front (the shop's; a store charging in the buyer's currency waits for the quote's).
+  const shopPaypal = session.store.chargeLocalCurrency ? null : paypalOffered(session.storeId, session.currency);
+  shopPaypal?.catch(() => undefined);
   const quote = await quoteSession(session, input);
   assertPayable(session, quote, input);
   const provider = providerFor(session, opts.provider);
@@ -680,11 +696,14 @@ export async function prepareSession(session: SessionWithStore, input: QuoteInpu
   // The currency Whop charges (buyer's when the store charges in it): PayPal is remembered per currency.
   const chargeCurrency = quote.charge?.currency ?? session.currency;
   // The merchant's choice (builder > Paiement express): PayPal off, or the express section off or
-  // hidden (where its button lives) = no PayPal-only checkout at all.
-  const design = await designFor(session.store, session);
+  // hidden (where its button lives) = no PayPal-only checkout at all. The quote's own design (one read).
+  const design = designOf.get(quote) ?? (await designFor(session.store, session));
   const paypalAllowed = paypalExpressAllowed(loadTheme(design.theme, session.store.name), loadCheckoutLayout(design.checkoutLayout));
+  // Whop's word on PayPal, read once per prepare (again only when this prepare changed it, below).
+  let paypalStored: Promise<boolean> | null = shopPaypal && chargeCurrency.toUpperCase() === session.currency.toUpperCase() ? shopPaypal : null;
+  const paypalNow = () => (paypalStored ??= paypalOffered(session.storeId, chargeCurrency));
   // PayPal-only checkouts are Whop's (the express PayPal button): Stripe offers PayPal in its own form.
-  if (method === "paypal" && (provider !== "whop" || !paypalAllowed || !(await paypalOffered(session.storeId, chargeCurrency)))) {
+  if (method === "paypal" && (provider !== "whop" || !paypalAllowed || !(await paypalNow()))) {
     throw new CheckoutError("paypal_unavailable", "PayPal n'est pas disponible pour cette commande.");
   }
   // Anything failing on the Stripe path is Stripe's side (as anything unclassified is Whop's on its
@@ -697,66 +716,276 @@ export async function prepareSession(session: SessionWithStore, input: QuoteInpu
   // Switching back from Stripe: the session's Whop configurations were deleted at the switch to
   // Stripe (deleteSessionWhopCheckouts, maybe still running): never reused, a fresh one. Those
   // deleted are also marked (their fingerprint no longer matches any quote), so never found later.
-  let snapshot =
+  const findSnapshot = () =>
     session.paymentProvider === "stripe"
-      ? null
-      : await db.checkoutQuote.findFirst({
+      ? Promise.resolve(null)
+      : db.checkoutQuote.findFirst({
           where: { sessionId: session.id, fingerprint, whopCheckoutId: { not: null } },
           orderBy: { createdAt: "desc" },
         });
+  let snapshot = await findSnapshot();
+  let remembered: Promise<void> | null = null;
   if (!snapshot) {
-    const base = await newSnapshotBase(session, quote, input);
-    const whop = await tagFailureSource(createCheckoutConfiguration(session.store, {
-      sessionId: session.id,
-      storeId: session.storeId,
-      // Buyer's currency when the store charges in it (rate frozen on the snapshot below).
-      totalCents: quote.charge?.totalCents ?? quote.totals.totalCents,
-      currency: chargeCurrency,
-      title: `Commande ${session.store.name}`,
-      redirectUrl,
-      country: input.countryCode ?? null,
-      ...(method ? { methods: [method] } : {}),
-    }).catch(async (err) => {
-      // PayPal-only checkout refused (or PayPal dropped): the button hides; the regular form stays.
-      // Only a clear refusal lands here (whop.ts rethrows 5xx/429/timeouts as is: nothing remembered).
-      // A refusal that doesn't name PayPal / the payment method: unavailable for this session only
-      // (the buyer keeps the card; nothing remembered for the store).
-      if (err instanceof MethodUnavailableError) {
-        if (err.remember) await rememberPaypal(session.storeId, chargeCurrency, false, true);
-        throw new CheckoutError("paypal_unavailable", "PayPal n'est pas disponible pour cette commande.");
+    // Another request is creating this very checkout (the early prepare at the session's creation, a
+    // second tab, a double load): its configuration is waited for and reused, never a second one.
+    let claim = await claimSnapshot(session.id, fingerprint, startedAt);
+    if (!claim.owned) {
+      // Waits while the other request is alive (its claim kept fresh), up to SNAPSHOT_WAIT_MS from this
+      // request's start (then a Whop failure: Stripe takes over when usable, else the page retries);
+      // takes the creation over atomically only once that request is gone without a snapshot.
+      const waited = await waitForSnapshot(claim.key, findSnapshot, startedAt);
+      snapshot = waited.snapshot;
+      if (waited.claim) claim = waited.claim;
+      // The other request may have saved Whop's new word on PayPal meanwhile: read afresh.
+      paypalStored = null;
+    }
+    // The claim kept fresh while Whop answers (however slow): a waiting request never mistakes this
+    // one for a crashed one, so never creates a second configuration.
+    const heartbeat = claim.held && !snapshot ? keepSnapshotClaim(claim.key) : null;
+    try {
+      if (!snapshot) {
+        const base = await newSnapshotBase(session, quote, input);
+        const whop = await tagFailureSource(createCheckoutConfiguration(session.store, {
+          sessionId: session.id,
+          storeId: session.storeId,
+          // Buyer's currency when the store charges in it (rate frozen on the snapshot below).
+          totalCents: quote.charge?.totalCents ?? quote.totals.totalCents,
+          currency: chargeCurrency,
+          title: `Commande ${session.store.name}`,
+          redirectUrl,
+          country: input.countryCode ?? null,
+          ...(method ? { methods: [method] } : {}),
+        }).catch(async (err) => {
+          // PayPal-only checkout refused (or PayPal dropped): the button hides; the regular form stays.
+          // Only a clear refusal lands here (whop.ts rethrows 5xx/429/timeouts as is: nothing remembered).
+          // A refusal that doesn't name PayPal / the payment method: unavailable for this session only
+          // (the buyer keeps the card; nothing remembered for the store).
+          if (err instanceof MethodUnavailableError) {
+            if (err.remember) await rememberPaypal(session.storeId, chargeCurrency, false, true);
+            throw new CheckoutError("paypal_unavailable", "PayPal n'est pas disponible pour cette commande.");
+          }
+          throw err;
+        }), "whop");
+        // Whether Whop offers PayPal, as this new checkout says (the express button follows it): saved
+        // alongside the snapshot, and read again afterwards.
+        if (typeof whop.paypal === "boolean") {
+          remembered = rememberPaypal(session.storeId, chargeCurrency, whop.paypal);
+          remembered.catch(() => undefined);
+          paypalStored = null;
+        }
+        snapshot = await db.checkoutQuote.create({ data: { ...base, whopCheckoutId: whop.id, fingerprint, provider: "whop" } });
       }
-      throw err;
-    }), "whop");
-    // Whether Whop offers PayPal, as this new checkout says (the express button follows it).
-    if (typeof whop.paypal === "boolean") await rememberPaypal(session.storeId, chargeCurrency, whop.paypal);
-    snapshot = await db.checkoutQuote.create({ data: { ...base, whopCheckoutId: whop.id, fingerprint, provider: "whop" } });
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
+      // Awaited (one quick delete): a waiting request sees the claim gone at once, and no claim row
+      // outlives the request (stale ones are swept by the tick anyway).
+      if (claim.held) await releaseSnapshotClaim(claim.key);
+    }
   }
+  if (!snapshot) throw new CheckoutError("init_failed", "Le paiement n'a pas pu être initialisé. Réessayez.");
   // A Whop snapshot always holds its configuration (only Stripe ones have none).
   const configId = snapshot.whopCheckoutId!;
 
   // Never over a payment that landed meanwhile (webhook during the Shopify/Whop round-trips).
-  const prepared = await db.checkoutSession.updateMany({
-    where: { id: session.id, status: { not: "PAID" } },
-    data: {
-      ...quoteFields(quote),
-      preparedTotalCents: quote.totals.totalCents,
-      whopCheckoutId: configId,
-      paymentProvider: "whop",
-      preparedAt: session.preparedAt ?? new Date(),
-    },
-  });
-  if (!prepared.count) throw new CheckoutError("already_paid", "Cette commande est déjà payée.");
+  const [prepared] = await Promise.all([
+    db.checkoutSession.updateMany({
+      // An early prepare only fills a session nothing touched since it was read: once the page's own
+      // prepare ran (preparedAt), or switched the processor / configuration, the page's wins.
+      // Any prepare only writes over the processor it read: another tab that switched the session to
+      // Stripe meanwhile is never overwritten blind (its PaymentIntent left open under a Whop checkout).
+      where: opts.early
+        ? { id: session.id, status: { not: "PAID" }, preparedAt: null, paymentProvider: session.paymentProvider, whopCheckoutId: session.whopCheckoutId }
+        : { id: session.id, status: { not: "PAID" }, paymentProvider: session.paymentProvider },
+      data: {
+        ...quoteFields(quote),
+        preparedTotalCents: quote.totals.totalCents,
+        whopCheckoutId: configId,
+        paymentProvider: "whop",
+        // An early prepare (before the page loaded) readies the checkout without marking the form shown.
+        ...(opts.early ? {} : { preparedAt: session.preparedAt ?? new Date() }),
+      },
+    }),
+    remembered,
+  ]);
+  if (!prepared.count) {
+    // The session changed under this prepare (paid, another tab's prepare or processor switch): read afresh.
+    const fresh = await db.checkoutSession.findUnique({ where: { id: session.id }, include: { store: true } });
+    // Now on Stripe: the Whop configuration just made (and any other of the session's) never stays
+    // live next to its PaymentIntent: marked deleted and deleted (after the answer), as at a switch.
+    if (fresh && fresh.status !== "PAID" && fresh.paymentProvider === "stripe") deleteSessionWhopCheckouts(fresh);
+    // The early prepare steps aside quietly: the page prepared meanwhile (its Whop snapshot stays
+    // reusable by fingerprint; the session keeps what the page set), or switched it to Stripe.
+    if (opts.early) return { provider: "whop", checkoutConfigurationId: configId, totals: quote.totals, quote, paypal: paypalAllowed && (await paypalNow()) };
+    if (!fresh || fresh.status === "PAID") throw new CheckoutError("already_paid", "Cette commande est déjà payée.");
+    // The page's prepare: once more on the session as it is now (its processor: Stripe's form after
+    // another tab's switch); changed again meanwhile → a retryable error (the page retries 5xx).
+    if (opts.reread) throw new CheckoutError(SESSION_CHANGED, "La commande vient de changer dans un autre onglet. Réessayez.");
+    return prepareSession(fresh, input, { ...opts, reread: true });
+  }
   // Switched away from Stripe (per-session switch, Stripe disconnected): its PaymentIntents still
   // open are canceled (after the answer), so a stale tab can never pay on Stripe on top of this Whop checkout.
   if (session.paymentProvider === "stripe") cancelSessionPaymentIntents(session);
-  return { provider: "whop", checkoutConfigurationId: configId, totals: quote.totals, quote, paypal: paypalAllowed && (await paypalOffered(session.storeId, chargeCurrency)) };
+  return { provider: "whop", checkoutConfigurationId: configId, totals: quote.totals, quote, paypal: paypalAllowed && (await paypalNow()) };
+}
+
+/** A claim not refreshed for this long is a crashed request's: taken over. */
+const SNAPSHOT_CLAIM_MS = 15_000;
+/** How often the creating request refreshes its claim (well within SNAPSHOT_CLAIM_MS). */
+const SNAPSHOT_HEARTBEAT_MS = 4_000;
+/**
+ * How long a request waits at most (measured from its start) for the checkout another live one is
+ * creating. Past it, a Whop failure (whop_claim_timeout): the buyer switches to Stripe when usable,
+ * well within the 60 s function, else the page retries (5xx) — never a second configuration.
+ */
+const SNAPSHOT_WAIT_MS = 22_000;
+const SNAPSHOT_POLL_MS = 150;
+/** The prepare/pay functions' budget (their maxDuration), from the request's start. */
+const PREPARE_BUDGET_MS = 60_000;
+/** A claim is taken over (Whop called by this request) only with at least this much of the budget left. */
+const TAKEOVER_MIN_LEFT_MS = 25_000;
+/** Claim rows (`prep:*`) older than this are swept by the tick (a crash between claim and release). */
+export const SNAPSHOT_CLAIM_SWEEP_MS = 15 * 60 * 1000;
+
+/** Test hooks: shorter claim timings (the slow-Whop tests). */
+export const snapshotClaimTimings = {
+  claimMs: SNAPSHOT_CLAIM_MS,
+  heartbeatMs: SNAPSHOT_HEARTBEAT_MS,
+  waitMs: SNAPSHOT_WAIT_MS,
+  pollMs: SNAPSHOT_POLL_MS,
+  budgetMs: PREPARE_BUDGET_MS,
+  takeoverMinLeftMs: TAKEOVER_MIN_LEFT_MS,
+};
+
+/** Whether enough of the request's budget is left to take a claim over (and call Whop itself). */
+function takeoverAllowed(startedAt: number): boolean {
+  return startedAt + snapshotClaimTimings.budgetMs - Date.now() >= snapshotClaimTimings.takeoverMinLeftMs;
+}
+
+/** The wait for another request's checkout ran out: Whop's failure (the per-session switch, the store's failover count). */
+function claimTimeout(): Error {
+  return withFailureSource(new Error("whop_claim_timeout"), "whop");
+}
+
+type SnapshotClaim = { key: string; owned: boolean; held: boolean };
+
+function snapshotClaimKey(sessionId: string, fingerprint: string): string {
+  return `prep:${sessionId}:${createHash("sha256").update(fingerprint).digest("base64url").slice(0, 22)}`;
+}
+
+/**
+ * Claims the creation of a session's checkout for one fingerprint (a row of AppSetting, shared by
+ * every server instance): `owned` when this request creates it, else another one is on it; `held`
+ * when the claim row is this request's (released after). A claim row is taken over atomically only
+ * when stale (its request stopped refreshing it). A database failure never blocks the checkout
+ * (owned, not held: the request goes on as without the claim).
+ */
+async function claimSnapshot(sessionId: string, fingerprint: string, startedAt: number): Promise<SnapshotClaim> {
+  return tryClaim(snapshotClaimKey(sessionId, fingerprint), { takeover: takeoverAllowed(startedAt) });
+}
+
+/**
+ * The claim itself, entirely through Prisma: every timestamp of the claim rows (written here, by the
+ * heartbeat, compared here and in waitForSnapshot) goes through the same Prisma mapping of the
+ * `timestamp` column (UTC), whatever the database session's time zone. A fresh row inserted
+ * (createMany skipDuplicates: one insert wins), else a stale one taken over (a single conditional
+ * UPDATE: Postgres re-checks `updatedAt < stale` on the locked row, so one taker wins) unless
+ * `takeover` is false. Exported for the tests.
+ */
+export async function tryClaim(key: string, opts: { takeover?: boolean } = {}): Promise<SnapshotClaim> {
+  try {
+    const now = new Date();
+    const inserted = await db.appSetting.createMany({ data: [{ key, value: "claimed", updatedAt: now }], skipDuplicates: true });
+    if (inserted.count > 0) return { key, owned: true, held: true };
+    if (opts.takeover === false) return { key, owned: false, held: false };
+    const stale = new Date(now.getTime() - snapshotClaimTimings.claimMs);
+    const taken = await db.appSetting.updateMany({ where: { key, updatedAt: { lt: stale } }, data: { value: "claimed", updatedAt: now } });
+    return { key, owned: taken.count > 0, held: taken.count > 0 };
+  } catch (err) {
+    log.warn("checkout.prepare_claim_failed", "Could not claim the checkout's creation", { key, err });
+    return { key, owned: true, held: false };
+  }
+}
+
+/** Refreshes the claim while this request waits on Whop (best effort; cleared in the finally). */
+function keepSnapshotClaim(key: string): ReturnType<typeof setInterval> {
+  const timer = setInterval(() => {
+    void db.appSetting.updateMany({ where: { key }, data: { updatedAt: new Date() } }).catch(() => undefined);
+  }, snapshotClaimTimings.heartbeatMs);
+  (timer as { unref?: () => void }).unref?.();
+  return timer;
+}
+
+/** The claim dropped. Best effort (never fails the prepare). */
+async function releaseSnapshotClaim(key: string): Promise<void> {
+  await db.appSetting.deleteMany({ where: { key } }).catch(() => undefined);
+}
+
+/** Drops claim rows left by crashed requests (tick maintenance). Returns how many. */
+export async function sweepSnapshotClaims(now = new Date()): Promise<number> {
+  const before = new Date(now.getTime() - SNAPSHOT_CLAIM_SWEEP_MS);
+  return (await db.appSetting.deleteMany({ where: { key: { startsWith: "prep:" }, updatedAt: { lt: before } } })).count;
+}
+
+/**
+ * Waits for the snapshot another request is creating: found → reused. Its claim gone without a
+ * snapshot (that request failed) or stale (crashed) → taken over atomically (`claim`: this request
+ * now creates it; another waiter that won the takeover is waited for in turn), only while enough of
+ * the request's budget is left (TAKEOVER_MIN_LEFT_MS). Still nothing SNAPSHOT_WAIT_MS after the
+ * request's start, or too late to take over → whop_claim_timeout, a Whop failure (prepareWithFailover
+ * switches the buyer to Stripe when usable, else the page retries; never a second configuration).
+ */
+async function waitForSnapshot(key: string, find: () => Promise<CheckoutQuote | null>, startedAt: number): Promise<{ snapshot: CheckoutQuote | null; claim?: SnapshotClaim }> {
+  const { waitMs, pollMs, claimMs } = snapshotClaimTimings;
+  const until = startedAt + waitMs;
+  while (Date.now() < until) {
+    await new Promise((r) => setTimeout(r, Math.max(1, Math.min(pollMs, until - Date.now()))));
+    const [found, row] = await Promise.all([find(), db.appSetting.findUnique({ where: { key }, select: { updatedAt: true } }).catch(() => undefined)]);
+    if (found) return { snapshot: found };
+    // Gone, stale or unreadable: try to take over (atomic: only one waiter wins).
+    if (row === undefined || !row || Date.now() - row.updatedAt.getTime() > claimMs) {
+      const again = await find();
+      if (again) return { snapshot: again };
+      if (!takeoverAllowed(startedAt)) throw claimTimeout();
+      const claim = await tryClaim(key);
+      if (claim.owned) return { snapshot: null, claim };
+    }
+  }
+  const last = await find();
+  if (last) return { snapshot: last };
+  throw claimTimeout();
 }
 
 export type PrepareOptions = {
   host?: string | null;
+  /** Prepared ahead of the page (at the session's creation): the session isn't marked prepared (preparedAt). */
+  early?: boolean;
   /** Forces the processor (per-session switch after a failure); see providerFor. */
   provider?: PaymentProvider | null;
+  /** When the request started (ms epoch; default: the prepare's own start): bounds the wait for another request's checkout. */
+  startedAt?: number;
+  /** Internal: already re-run once on a fresh read of the session (it changed under the first run). */
+  reread?: boolean;
 };
+
+/** Code of the error a prepare throws when the session keeps changing under it (another tab): retryable (5xx). */
+export const SESSION_CHANGED = "session_changed";
+
+/**
+ * The wait for another request's Whop checkout ran out (whop_claim_timeout) and no switch to Stripe
+ * applied: Whop is unavailable for now. Answered apart (503 whop_unavailable): the page stops its
+ * silent retries (each would wait as long again) and offers « réessayer ». Pure.
+ */
+export function isWhopUnavailable(err: unknown): boolean {
+  return err instanceof Error && !(err instanceof CheckoutError) && err.message === "whop_claim_timeout" && checkoutFailureSource(err) === "whop";
+}
+
+/** The prepare/pay routes' answer to an error other than a refusal (CheckoutError): its status and body. */
+export function failureResponse(err: unknown, fallback: string): { status: number; body: { error: string; code: string } } {
+  if (isWhopUnavailable(err)) return { status: 503, body: { error: "Le paiement est momentanément indisponible. Réessayez dans un instant.", code: "whop_unavailable" } };
+  if (err instanceof CheckoutError && err.code === SESSION_CHANGED) return { status: 503, body: { error: err.message, code: err.code } };
+  if (err instanceof CheckoutError) return { status: 400, body: { error: err.message, code: err.code } };
+  return { status: 502, body: { error: fallback, code: "init_failed" } };
+}
 
 /** What the page needs to mount Stripe's Payment Element on the connected account. */
 export type StripeClientConfig = {
@@ -823,14 +1052,14 @@ async function newSnapshotBase(session: SessionWithStore, quote: Quote, input: Q
       });
     }
   }
-  const count = await db.checkoutQuote.count({ where: { sessionId: session.id } });
-  if (count >= MAX_QUOTES_PER_SESSION) {
-    throw new CheckoutError("too_many_changes", "Trop de modifications sur cette commande. Retournez au panier pour recommencer.");
-  }
-  const [rate, addOns] = await Promise.all([
+  const [count, rate, addOns] = await Promise.all([
+    db.checkoutQuote.count({ where: { sessionId: session.id } }),
     quote.shippingRateId ? db.shippingRate.findUnique({ where: { id: quote.shippingRateId } }) : null,
     db.addOn.findMany({ where: { id: { in: quote.addOnIds } } }),
   ]);
+  if (count >= MAX_QUOTES_PER_SESSION) {
+    throw new CheckoutError("too_many_changes", "Trop de modifications sur cette commande. Retournez au panier pour recommencer.");
+  }
   return {
     sessionId: session.id,
     currency: session.currency,
@@ -1090,7 +1319,9 @@ async function prepareStripe(session: SessionWithStore, quote: Quote, input: Quo
   if (!prepared.count) throw new CheckoutError("already_paid", "Cette commande est déjà payée.");
   // Switched away from Whop (per-session switch, Whop disconnected): its checkouts are deleted (after
   // the answer), so a stale tab or Whop's express buttons can never pay on Whop on top of this PaymentIntent.
-  if (session.paymentProvider === "whop" && session.whopCheckoutId) deleteSessionWhopCheckouts(session);
+  // Not only the checkout this request read: another tab's (or the early prepare's) Whop checkout written
+  // in between is listed from the session's snapshots too (nothing to list: no Whop call).
+  if (session.paymentProvider === "whop") deleteSessionWhopCheckouts(session);
   return { provider: "stripe", totals: quote.totals, quote, paypal: false, stripe: stripeClientConfig(session, pi) };
 }
 
@@ -1135,6 +1366,8 @@ export async function prepareWithFailover(session: SessionWithStore, input: Quot
   } catch {
     attempted = null;
   }
+  // One clock for the whole request (the switch's own prepare included).
+  opts = { ...opts, startedAt: opts.startedAt ?? Date.now() };
   try {
     return await prepareSession(session, input, opts);
   } catch (err) {
@@ -1313,7 +1546,7 @@ function assertNoOtherInFlight(session: InFlightFields, method: PayInput["method
  * If the checkout the page holds doesn't charge exactly the current quote, returns
  * a fresh one instead so the buyer is never charged a stale amount.
  */
-export async function confirmSession(session: SessionWithStore, input: PayInput, opts: { host?: string | null } = {}): Promise<ConfirmOutcome> {
+export async function confirmSession(session: SessionWithStore, input: PayInput, opts: { host?: string | null; startedAt?: number } = {}): Promise<ConfirmOutcome> {
   // The processor this session pays with now (see providerFor: sticky, forced, or the store's).
   const provider = providerFor(session);
   // A payment still going through with another method or processor (e.g. a PayPal window in a
@@ -1369,8 +1602,10 @@ export async function confirmSession(session: SessionWithStore, input: PayInput,
     return notReady(await prepareWithFailover(session, quoteInput, { ...opts, stage: "pay" }));
   }
 
-  // Stripe: the buyer's Customer (the saved card of a one-click offer hangs on it), receipt e-mail
-  // and shipping go on the PaymentIntent before the page confirms it.
+  // Stripe: the buyer's Customer (the saved card of a one-click offer hangs on it) and shipping go on
+  // the PaymentIntent before the page confirms it. The app asks for no Stripe receipt (no
+  // receipt_email), but an account with « Paiements réussis » customer e-mails on still e-mails the
+  // Customer: the merchant turns it off in Stripe (dashboard Stripe page, « Reçus Stripe »).
   let stripeFields: ({ stripePaymentIntentId: string; stripeCustomerId: string } & ReturnType<typeof stripePiFields>) | null = null;
   let stripeConfig: StripeClientConfig | null = null;
   if (provider === "stripe") {

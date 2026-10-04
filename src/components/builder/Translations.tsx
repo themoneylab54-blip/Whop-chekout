@@ -32,6 +32,7 @@ const FIELD_LABELS: Record<string, string> = {
   themLabel: "Colonne « les autres »",
   dividerLabel: "Séparateur",
   value: "Valeur",
+  signatureRole: "Rôle (signature)",
 };
 const LONG_FIELDS = new Set(["body", "text", "quote", "a", "claimText"]);
 
@@ -133,13 +134,29 @@ export function TranslationsEditor({ block, baseLang, onChange }: { block: Block
             const auto = f.value.trim() ? translateDefault(f.value, lang) : (emptyTextDefault(block.type, f.path, lang) ?? "");
             const value = i18n[lang]?.[f.path] ?? "";
             const long = LONG_FIELDS.has(f.prop) || f.value.length > 70;
+            // The message title's {prénom} is replaced by the buyer's first name: a translation must keep it.
+            const hint = block.type === "message" && f.path === "title" && /\{(?:name|prénom|prenom)\}/i.test(f.value) ? "Gardez {prénom} tel quel : il est remplacé par le prénom du client." : null;
+            const hintId = hint ? `tr-hint-${block.id}-${f.path}` : undefined;
             return (
               <label key={f.path} className="block">
                 <span className="mb-1 block text-xs font-medium text-zinc-700">{fieldLabel(f)}</span>
                 {long ? (
-                  <textarea className={input} rows={2} maxLength={2000} value={value} placeholder={auto} onChange={(e) => set(f.path, e.target.value)} />
+                  <textarea
+                    className={input}
+                    rows={2}
+                    maxLength={2000}
+                    value={value}
+                    placeholder={auto}
+                    aria-describedby={hintId}
+                    onChange={(e) => set(f.path, e.target.value)}
+                  />
                 ) : (
-                  <input className={input} maxLength={2000} value={value} placeholder={auto} onChange={(e) => set(f.path, e.target.value)} />
+                  <input className={input} maxLength={2000} value={value} placeholder={auto} aria-describedby={hintId} onChange={(e) => set(f.path, e.target.value)} />
+                )}
+                {hint && (
+                  <span id={hintId} className="mt-1 block text-[11px] text-zinc-600">
+                    {hint}
+                  </span>
                 )}
               </label>
             );

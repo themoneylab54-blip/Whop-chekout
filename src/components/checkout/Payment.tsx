@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Clock3, RefreshCw } from "lucide-react";
 import { WhopCheckoutEmbed, WhopExpressCheckoutButton, useCheckoutEmbedControls } from "@whop/checkout/react";
 import { EXPRESS_WALLETS, type ExpressWallet, type Theme } from "@/lib/layout";
@@ -61,6 +61,11 @@ export type BuyerForPayment = {
  */
 export type ExpressPaypal = {
   onClick: () => void;
+  /**
+   * Whether a click can go through now (default true). Not yet (the page's Whop checkout is still
+   * being prepared): the click waits on the button (spinner), then onClick runs once it can.
+   */
+  ready?: boolean;
   /** Preparing / opening PayPal: the button shows a spinner and ignores clicks. */
   busy: boolean;
   /** "Enter your delivery details…" after a click on an incomplete form. */
@@ -147,9 +152,47 @@ export type ConfirmResult =
   /** `inFlight`: the server refused because another payment of this session is still going through (payment_in_flight). */
   | { ok: false; error?: string; refreshedConfigId?: string; inFlight?: boolean };
 
+/** Whether this browser can show Apple Pay at all (Safari's ApplePaySession); false on the server. */
+export function canShowApplePay(): boolean {
+  if (typeof window === "undefined") return false;
+  const session = (window as { ApplePaySession?: { canMakePayments?: () => boolean } }).ApplePaySession;
+  if (!session) return false;
+  try {
+    return session.canMakePayments?.() !== false;
+  } catch {
+    return false;
+  }
+}
+/**
+ * Whether Google Pay's button plausibly shows on this device (Android, or a Chromium browser on a
+ * computer): its placeholder is only drawn there. Never on iOS / iPadOS nor in Safari or Firefox,
+ * where a Google Pay placeholder would announce a button that almost never comes (the live button
+ * still answers by itself and shows if it can). False on the server.
+ */
+export function googlePayLikely(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  if (/iPhone|iPad|iPod/i.test(ua) || (/Macintosh/i.test(ua) && (navigator.maxTouchPoints ?? 0) > 1)) return false;
+  if (/Android/i.test(ua)) return true;
+  return /Chrome\/|Chromium\/|Edg\//.test(ua);
+}
+const noopSubscribe = () => () => {};
+
+/**
+ * How long a new checkout's wallet buttons may take to answer before they replace the current ones
+ * anyway (the current ones stay on screen, locked, meanwhile).
+ */
+export const EXPRESS_SWAP_MAX_MS = 6_000;
+
 /**
  * Apple Pay / Google Pay / Whop Pay in one tap, shown at the top of the checkout.
  * Hides itself entirely when no wallet is available on the device.
+ *
+ * Drawn before the Whop checkout exists (`prepared` null): our PayPal button works at once (the
+ * page waits for the checkout on a click), each wallet has a placeholder of the live button's size,
+ * which the live button replaces in place. A new checkout (another total) mounts its buttons hidden
+ * while the current ones stay on screen, locked (they charge the old total), until the new ones
+ * answered: no reload flash, no jump.
  */
 export function ExpressCheckout({
   prepared,
@@ -166,9 +209,23 @@ export function ExpressCheckout({
   wallets = true,
   walletMethods = EXPRESS_WALLETS,
   lock = null,
+  stale = false,
+  unavailable = false,
   onWalletsShown,
 }: {
   prepared: Prepared | null;
+  /**
+   * The first checkout couldn't be prepared (its error and « réessayer » are in the payment section):
+   * the row keeps its place with a short inline message, and a PayPal click waiting for that
+   * checkout is dropped with that message said aloud (never silently).
+   */
+  unavailable?: boolean;
+  /**
+   * The total is being re-priced (a change of rate, add-on, country or quantity not yet prepared):
+   * the wallet buttons on screen charge the previous total, so they stay visible but locked until
+   * the new checkout arrives. Our PayPal button waits for it too (see ExpressPaypal.ready).
+   */
+  stale?: boolean;
   theme: Theme;
   labels: Labels;
   returnUrl: string;
@@ -210,31 +267,116 @@ export function ExpressCheckout({
   const [rendered, setRendered] = useState<Partial<Record<ExpressMethod, boolean>>>({});
   // A wallet payment Whop reported as failed: said under the row (the sheet itself may just close).
   const [walletError, setWalletError] = useState(false);
-  const methods = prepared && wallets ? EXPRESS_WALLETS.filter((m) => walletMethods.includes(m)) : [];
+  // A PayPal click made before the page could take it (see ExpressPaypal.ready): run once it can, and
+  // dropped with the button. Adjusted while rendering; the click itself runs in an effect.
+  const [paypalWaiting, setPaypalWaiting] = useState(false);
+  const [paypalFire, setPaypalFire] = useState(0);
+  // A waiting PayPal click dropped because the checkout couldn't be prepared: said in the row.
+  const [paypalDropped, setPaypalDropped] = useState(false);
+  if (paypalDropped && !unavailable) setPaypalDropped(false);
+  if (paypalWaiting && unavailable) {
+    setPaypalWaiting(false);
+    setPaypalDropped(true);
+  } else if (paypalWaiting && (!paypal || paypal.ready !== false)) {
+    setPaypalWaiting(false);
+    if (paypal) setPaypalFire((n) => n + 1);
+  }
+  useEffect(() => {
+    if (paypalFire > 0) paypal?.onClick();
+    // Once per waiting click (onClick: the page's latest).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paypalFire]);
+  // No Apple Pay iframe where Safari's Apple Pay can't exist (one Whop iframe less to boot).
+  const applePay = useSyncExternalStore(noopSubscribe, canShowApplePay, () => false);
+  const methods = wallets ? EXPRESS_WALLETS.filter((m) => walletMethods.includes(m) && (m !== "apple-pay" || applePay)) : [];
+  // The checkout whose buttons are on screen, and a newer one whose buttons are still answering.
+  const [current, setCurrent] = useState<Prepared | null>(prepared);
+  // The wallets each checkout's buttons answered, per configuration: a late answer of the current
+  // (old) checkout's buttons never wipes what the newer one already answered.
+  const [answered, setAnswered] = useState<Readonly<Record<string, readonly ExpressMethod[]>>>({});
+  const incoming = prepared && current && prepared.configId !== current.configId ? prepared : null;
+  // Wallets this device can't use (answered "none") have nothing to wait for.
+  const pending = incoming ? methods.filter((m) => rendered[m] !== false && !answered[incoming.configId]?.includes(m)) : [];
+  // State following props (React's pattern, adjusted while rendering): the first checkout shows at
+  // once; a new one replaces the current one as soon as all its buttons answered.
+  if (prepared && (!current || (incoming && pending.length === 0))) setCurrent(prepared);
+  const incomingId = incoming?.configId ?? null;
+  useEffect(() => {
+    if (!incomingId) return;
+    // A wallet that never answers doesn't keep the old checkout's buttons forever.
+    const t = setTimeout(() => setAnswered((a) => ({ ...a, [incomingId]: EXPRESS_WALLETS.slice() })), EXPRESS_SWAP_MAX_MS);
+    return () => clearTimeout(t);
+  }, [incomingId]);
   const resolved = methods.every((m) => m in rendered);
   const shown = methods.filter((m) => rendered[m] !== false);
+  // Google Pay's placeholder only where its button plausibly shows (Android, Chromium).
+  const googlePay = useSyncExternalStore(noopSubscribe, googlePayLikely, () => false);
+  const placeholderFor = (m: ExpressMethod) => m !== "google-pay" || googlePay;
   // Until every wallet has answered, one cell stands for them: the first wallet not known to be
-  // unavailable (its skeleton, then its button), so the row keeps its height while the others resolve.
-  const visible = resolved ? shown : shown.slice(0, 1);
+  // unavailable whose place is worth drawing (its placeholder, then its button), so the row keeps its
+  // height while the others resolve.
+  const visible = resolved ? shown : shown.filter((m) => rendered[m] === true || placeholderFor(m)).slice(0, 1);
+  // Nothing to draw yet (only wallets unlikely here, still answering, no PayPal): the row stays off
+  // screen (mounted, so they can answer) rather than an empty heading.
+  const nothingYet = !resolved && visible.length === 0 && !paypal;
+  // The buttons on screen charge a previous total: a newer checkout is answering, or being prepared.
+  const oldTotal = !!incoming || stale;
   // Reported: only the wallets whose button is on screen (rendered and in a visible cell) — never
   // one still resolving off screen (sr-only), whose logo would announce a button buyers can't see.
-  const shownKey = visible.filter((m) => rendered[m] === true).join(",");
+  const shownKey = current ? visible.filter((m) => rendered[m] === true).join(",") : "";
   useEffect(() => {
     onWalletsShown?.(shownKey ? (shownKey.split(",") as ExpressMethod[]) : []);
     return () => onWalletsShown?.([]);
   }, [shownKey, onWalletsShown]);
-  if (!prepared) return null;
+  // Wallets still resolving next to PayPal, with room for 3+ buttons: two rows kept on a phone from
+  // the start, so the page doesn't jump down when the other wallets appear.
+  const reserveTwoRows = !resolved && !!paypal && shown.length + 1 >= 3;
+  if (unavailable) {
+    // Nothing was drawn up there (no PayPal, no wallet placeholder): nothing to keep either.
+    if (visible.length === 0 && !paypal) return null;
+    return <ExpressUnavailable labels={labels} title={title} dividerLabel={dividerLabel} alert={paypalDropped} tall={reserveTwoRows} />;
+  }
   if (resolved && shown.length === 0 && !paypal) return null;
   const cols = visible.length + (paypal ? 1 : 0);
   // Two per row even on a phone (like Shopify); an odd last button takes the whole row there.
   const lastCell = paypal ? "paypal" : visible[visible.length - 1];
   const spanLast = cols === 3 ? "col-span-2 sm:col-span-1" : "";
-  // Wallets still resolving next to PayPal, with room for 3+ buttons: two rows kept on a phone from
-  // the start, so the page doesn't jump down when the other wallets appear.
-  const reserveTwoRows = !resolved && !!paypal && shown.length + 1 >= 3;
   const locked = lock !== null;
+  // The checkouts with buttons mounted: the one on screen, and the newer one answering off screen.
+  const layers = [current, incoming].filter((p): p is Prepared => !!p);
+  const button = (p: Prepared, method: ExpressMethod) => (
+    <WhopExpressCheckoutButton
+      key={`${p.configId}-${method}`}
+      checkoutConfigurationId={p.configId}
+      environment={p.environment}
+      methods={[method]}
+      returnUrl={returnUrl}
+      theme="light"
+      locale={theme.language}
+      collectShipping
+      setupFutureUsage={saveCard ? "off_session" : undefined}
+      prefill={email ? { email } : undefined}
+      onExpressMethodResolved={({ rendered: r }) => {
+        setRendered((prev) => (prev[method] === (r !== "none") ? prev : { ...prev, [method]: r !== "none" }));
+        setAnswered((a) => (a[p.configId]?.includes(method) ? a : { ...a, [p.configId]: [...(a[p.configId] ?? []), method] }));
+      }}
+      onComplete={() => {
+        setWalletError(false);
+        onPaid();
+      }}
+      onPaymentError={() => setWalletError(true)}
+      fallback={placeholderFor(method) ? <WalletPlaceholder method={method} /> : null}
+    />
+  );
   return (
-    <section aria-label={title || labels.expressCheckout}>
+    <section
+      aria-label={title || labels.expressCheckout}
+      data-testid="wc-express"
+      aria-busy={!current || oldTotal || undefined}
+      inert={nothingYet || undefined}
+      aria-hidden={nothingYet || undefined}
+      className={nothingYet ? "sr-only" : undefined}
+    >
       <p data-inline-field="title" className="mb-3 text-center text-xs font-medium tracking-wide text-neutral-600 uppercase">
         {title || labels.expressCheckout}
       </p>
@@ -250,40 +392,43 @@ export function ExpressCheckout({
         {methods.map((method) => (
           <div
             key={method}
+            data-express-method={method}
             // Still resolving off screen: mounted (so it can answer) but out of reach of focus and screen readers.
             inert={rendered[method] !== false && !visible.includes(method) ? true : undefined}
             aria-hidden={rendered[method] !== false && !visible.includes(method) ? true : undefined}
             className={rendered[method] === false ? "hidden" : !visible.includes(method) ? "sr-only" : lastCell === method ? spanLast || undefined : undefined}
           >
-            <WhopExpressCheckoutButton
-              key={`${prepared.configId}-${method}`}
-              checkoutConfigurationId={prepared.configId}
-              environment={prepared.environment}
-              methods={[method]}
-              returnUrl={returnUrl}
-              theme="light"
-              locale={theme.language}
-              collectShipping
-              setupFutureUsage={saveCard ? "off_session" : undefined}
-              prefill={email ? { email } : undefined}
-              onExpressMethodResolved={({ rendered: r }) => setRendered((prev) => ({ ...prev, [method]: r !== "none" }))}
-              onComplete={() => {
-                setWalletError(false);
-                onPaid();
-              }}
-              onPaymentError={() => setWalletError(true)}
-              fallback={<div className="h-12 animate-pulse rounded-[var(--radius)] bg-neutral-100" />}
-            />
+            {layers.length === 0 ? (
+              placeholderFor(method) && <WalletPlaceholder method={method} />
+            ) : (
+              layers.map((p) =>
+                p === current ? (
+                  // The current checkout's button; locked while a newer total is prepared or its buttons
+                  // load (it charges the old one).
+                  <div key={p.configId} inert={oldTotal ? true : undefined} className={oldTotal ? "opacity-60 transition-opacity" : undefined}>
+                    {button(p, method)}
+                  </div>
+                ) : (
+                  // The newer checkout's button, answering off screen (a wallet this device can't use isn't asked again).
+                  rendered[method] !== false && (
+                    <div key={p.configId} className="sr-only" inert aria-hidden>
+                      {button(p, method)}
+                    </div>
+                  )
+                ),
+              )
+            )}
           </div>
         ))}
         {paypal && (
           <div className={spanLast || undefined}>
             <PaypalButton
               label={labels.payWithPaypal}
-              busy={paypal.busy}
+              busy={paypal.busy || paypalWaiting}
               onClick={() => {
                 setWalletError(false);
-                paypal.onClick();
+                if (paypal.ready === false) setPaypalWaiting(true);
+                else paypal.onClick();
               }}
             />
           </div>
@@ -304,6 +449,85 @@ export function ExpressCheckout({
         </p>
       )}
       {termsNotice}
+      <Divider label={dividerLabel || labels.or} />
+    </section>
+  );
+}
+
+/**
+ * A wallet's place while its live button loads: the button's own size and look (Apple Pay / Google
+ * Pay black buttons as in the builder preview, dimmed), never clickable nor announced.
+ */
+export function WalletPlaceholder({ method }: { method: ExpressMethod }) {
+  // Tapped before the live button arrived: a spinner says it is on its way (nothing else happens).
+  const [tapped, setTapped] = useState(false);
+  const tap = () => setTapped(true);
+  const spinner = <span data-testid="wc-wallet-placeholder-loading" className="h-4 w-4 animate-spin rounded-full border-2 border-current border-r-transparent motion-reduce:animate-none" />;
+  if (method === "whop-pay") {
+    return (
+      <div
+        data-testid="wc-wallet-placeholder"
+        aria-hidden
+        onPointerDown={tap}
+        className="flex h-12 items-center justify-center rounded-[var(--radius)] bg-neutral-100 text-neutral-500 motion-safe:animate-pulse"
+      >
+        {tapped && spinner}
+      </div>
+    );
+  }
+  return (
+    <div
+      data-testid="wc-wallet-placeholder"
+      aria-hidden
+      onPointerDown={tap}
+      className={`flex h-12 items-center justify-center gap-1 rounded-[var(--radius)] bg-black text-[15px] font-semibold text-white opacity-70 ${tapped ? "cursor-progress" : "motion-safe:animate-pulse"}`}
+    >
+      {tapped ? (
+        spinner
+      ) : (
+        <>
+          {method === "apple-pay" ? <AppleLogo /> : <GoogleG />} Pay
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Stripe's express row before its PaymentIntent exists (and while its code loads): the place of
+ * StripeExpress before its wallets are known (title and "OR" invisible, one button's height).
+ */
+export function StripeExpressPlaceholder({ labels, title, dividerLabel }: { labels?: Labels; title?: string; dividerLabel?: string }) {
+  return (
+    <section aria-hidden aria-busy data-testid="wc-stripe-express-placeholder">
+      <p className="invisible mb-3 text-center text-xs font-medium tracking-wide uppercase">{title || labels?.expressCheckout || " "}</p>
+      <div className="min-h-12" />
+      <div className="invisible">
+        <Divider label={dividerLabel || labels?.or || " "} />
+      </div>
+    </section>
+  );
+}
+
+/**
+ * The express row when the first checkout couldn't be prepared (its error and « réessayer » are in
+ * the payment section): its place kept (one button's height, two rows on a phone when that was
+ * reserved) with a short message instead of the buttons, so nothing jumps. `alert`: a click was
+ * waiting for that checkout (PayPal): the message is announced.
+ */
+export function ExpressUnavailable({ labels, title, dividerLabel, alert = false, tall = false }: { labels: Labels; title?: string; dividerLabel?: string; alert?: boolean; tall?: boolean }) {
+  return (
+    <section aria-label={title || labels.expressCheckout} data-testid="wc-express-unavailable">
+      <p data-inline-field="title" className="mb-3 text-center text-xs font-medium tracking-wide text-neutral-600 uppercase">
+        {title || labels.expressCheckout}
+      </p>
+      <div
+        className={`flex items-center justify-center rounded-[var(--radius)] border border-dashed px-3 text-center text-sm ${tall ? "min-h-[104px] sm:min-h-12" : "min-h-12"} ${
+          alert ? "border-red-200 bg-red-50 text-red-800" : "border-neutral-300 text-neutral-700"
+        }`}
+      >
+        <p role={alert ? "alert" : undefined}>{labels.paymentUnavailable}</p>
+      </div>
       <Divider label={dividerLabel || labels.or} />
     </section>
   );

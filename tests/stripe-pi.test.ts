@@ -71,6 +71,20 @@ describe("createOrUpdatePaymentIntent", () => {
     expect(r).toMatchObject({ id: "pi_new", amount: 3000, currency: "eur", offSessionSaved: true, replacedId: null });
   });
 
+  it("never asks Stripe to e-mail its own receipt (Shopify confirms the order): no receipt_email, created or updated", async () => {
+    const buyer = { email: "buyer@b.co", customerId: "cus_1" };
+    await createOrUpdatePaymentIntent(store, session, target, { buyer });
+    const [params] = api.paymentIntents.create.mock.calls[0];
+    expect(params).not.toHaveProperty("receipt_email");
+    expect(params.customer).toBe("cus_1");
+    // An existing PaymentIntent getting the buyer's details, or reused for another amount.
+    api.paymentIntents.retrieve.mockResolvedValueOnce(pi({ id: "pi_old", metadata: { fingerprint: "other" } }));
+    api.paymentIntents.update.mockResolvedValueOnce(pi({ id: "pi_old" }));
+    await createOrUpdatePaymentIntent(store, session, target, { existingId: "pi_old", reusable: true, buyer });
+    expect(api.paymentIntents.update).toHaveBeenCalledTimes(1);
+    expect(api.paymentIntents.update.mock.calls[0][1]).not.toHaveProperty("receipt_email");
+  });
+
   it("the idempotency key covers the description and statement suffix (a renamed store never replays the old key)", async () => {
     await createOrUpdatePaymentIntent(store, session, target);
     await createOrUpdatePaymentIntent({ ...store, name: "Autre Nom" }, session, target);

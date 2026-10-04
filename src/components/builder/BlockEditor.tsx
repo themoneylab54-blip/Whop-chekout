@@ -7,6 +7,7 @@ import {
   MAX_REVIEW_ITEMS,
   MEDIA_PATH_RE,
   SURVEY_KEYS,
+  MESSAGE_LIMITS,
   offerArmSchema,
   upsellSellable,
   variantGidOf,
@@ -73,8 +74,21 @@ export function Field({ label, hint, children }: { label: string; hint?: string;
 }
 
 /** `label`: accessible name when the field has no visible <label> (list items). */
-export function Text({ value, onChange, placeholder, label }: { value: string; onChange: (v: string) => void; placeholder?: string; label?: string }) {
-  return <input className={input} value={value} placeholder={placeholder} aria-label={label} onChange={(e) => onChange(e.target.value)} />;
+export function Text({
+  value,
+  onChange,
+  placeholder,
+  label,
+  maxLength,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  label?: string;
+  /** The schema's cap: a longer value would make the design fail to save. */
+  maxLength?: number;
+}) {
+  return <input className={input} value={value} placeholder={placeholder} aria-label={label} maxLength={maxLength} onChange={(e) => onChange(e.target.value)} />;
 }
 
 // An uploaded image (/api/public/media/<id>, see ./media) is the one relative address accepted.
@@ -135,8 +149,8 @@ export function UrlText({
   );
 }
 
-export function Area({ value, onChange, rows = 3 }: { value: string; onChange: (v: string) => void; rows?: number }) {
-  return <textarea className={input} rows={rows} value={value} onChange={(e) => onChange(e.target.value)} />;
+export function Area({ value, onChange, rows = 3, maxLength }: { value: string; onChange: (v: string) => void; rows?: number; maxLength?: number }) {
+  return <textarea className={input} rows={rows} value={value} maxLength={maxLength} onChange={(e) => onChange(e.target.value)} />;
 }
 
 export function Num({ value, onChange, min, max, step = 1 }: { value: number; onChange: (v: number) => void; min?: number; max?: number; step?: number }) {
@@ -1552,6 +1566,39 @@ export function BlockContentEditor({
               </span>
             </label>
           )}
+        </div>
+      );
+    case "message":
+      return (
+        <div className="space-y-3">
+          <Field label="Photo (facultatif)" hint="Votre portrait, celui de l'équipe ou votre logo.">
+            <ImageField value={block.props.photoUrl} images={images} compact onChange={(photoUrl) => props(block, { photoUrl })} />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <F label="Forme de la photo">
+              <Segmented value={block.props.photoShape} options={[["round", "Ronde"], ["square", "Carrée"]]} onChange={(photoShape) => props(block, { photoShape })} />
+            </F>
+            <F label="Disposition">
+              <Segmented value={block.props.layout} options={[["left", "À gauche"], ["top", "En haut"]]} onChange={(layout) => props(block, { layout })} />
+            </F>
+          </div>
+          <F label="Titre" hint="Facultatif : {prénom} insère le prénom du client. Le titre de la page dit déjà merci.">
+            <Text value={block.props.title} placeholder="ex. Bienvenue parmi nous, {prénom} !" maxLength={MESSAGE_LIMITS.title} onChange={(title) => props(block, { title })} />
+          </F>
+          <F label="Message" hint="Ligne vide = nouveau paragraphe. **texte** = gras. [texte](https://…) = lien.">
+            <Area value={block.props.body} rows={6} maxLength={MESSAGE_LIMITS.body} onChange={(body) => props(block, { body })} />
+          </F>
+          <div className="grid grid-cols-2 gap-3">
+            <F label="Signature : nom">
+              <Text value={block.props.signatureName} placeholder="ex. Camille Martin" maxLength={MESSAGE_LIMITS.signatureName} onChange={(signatureName) => props(block, { signatureName })} />
+            </F>
+            <F label="Rôle">
+              <Text value={block.props.signatureRole} placeholder="ex. Fondatrice" maxLength={MESSAGE_LIMITS.signatureRole} onChange={(signatureRole) => props(block, { signatureRole })} />
+            </F>
+          </div>
+          <Field label="Signature manuscrite (facultatif)" hint="Image PNG à fond transparent de préférence.">
+            <ImageField value={block.props.signatureImageUrl} compact onChange={(signatureImageUrl) => props(block, { signatureImageUrl })} />
+          </Field>
         </div>
       );
     case "social":

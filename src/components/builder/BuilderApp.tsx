@@ -28,6 +28,7 @@ import {
   Scale,
   SeparatorHorizontal,
   Share2,
+  MessageSquareHeart,
   ShieldCheck,
   Smartphone,
   Sparkles,
@@ -109,7 +110,9 @@ import {
   headerModeOf,
   isFixedSection,
   newBlockId,
+  signedWithStore,
   DEFAULT_EXPRESS_METHODS,
+  MESSAGE_LIMITS,
   expressMethodsAllOff,
   expressMethodsCartDependent,
   type Block,
@@ -192,6 +195,7 @@ export const BLOCK_META: Record<BlockType, { label: string; icon: LucideIcon; de
   survey: { label: "Sondage « Comment nous avez-vous connu ? »", icon: ClipboardList, description: "Attribution en un clic, par commande", group: "after" },
   button_link: { label: "Bouton lien", icon: MousePointerClick, description: "Suivi de commande, communauté…", group: "after" },
   social: { label: "Réseaux sociaux", icon: Share2, description: "Instagram, TikTok, Facebook, YouTube", group: "after" },
+  message: { label: "Message personnalisé", icon: MessageSquareHeart, description: "Mot du fondateur : photo, texte et signature", group: "after" },
 };
 
 
@@ -401,6 +405,8 @@ export function BuilderApp(props: {
   useEffect(() => {
     latest.current = { theme, layout, other: otherLayout };
   }, [theme, layout, otherLayout]);
+  // Name a new message block is signed with: the store name of the design, else the store's (event handlers only).
+  const storeLabel = () => latest.current.theme.storeName.trim() || props.storeName;
 
   const { save, storeId } = props;
   const doSave = useCallback((): Promise<boolean> => {
@@ -821,7 +827,8 @@ export function BuilderApp(props: {
   const add = (type: BlockType) => {
     if (isSingleton(type) && has(type)) return;
     setHoverType(null);
-    const block = createBlock(type);
+    // A new message is signed with the store name (editable, the role stays « L'équipe »).
+    const block = signedWithStore(createBlock(type), storeLabel());
     setLayout((l) => {
       const at = insertIndex(l.blocks, type);
       return { blocks: [...l.blocks.slice(0, at), block, ...l.blocks.slice(at)] };
@@ -857,13 +864,13 @@ export function BuilderApp(props: {
     const kept = blocksKeptAside(t.spec, layout).filter((b) => !hiddenBy.includes(b));
     const keptNames = [...new Set(kept.map((b) => BLOCK_META[b.type].label))].join(", ");
     const hiddenNames = [...new Set(hiddenBy.map((b) => BLOCK_META[b.type].label))].join(", ");
-    const built = t.build(layout).blocks;
+    const built = t.build(layout, { storeName: storeLabel() }).blocks;
     // The matching page (same look) can be applied in the same step: from the checkout its
     // thank-you page (proposed, checked), from the thank-you page its checkout (unchecked).
     const match = page === "checkout" ? matchingThankYou(t) : matchingCheckout(t);
     const matchLabel = page === "checkout" ? "la page de remerciement assortie" : "le checkout assorti";
     const choice = { other: page === "checkout" && !!match };
-    const builtOther = match ? match.build(otherLayout).blocks : [];
+    const builtOther = match ? match.build(otherLayout, { storeName: storeLabel() }).blocks : [];
     const otherSetup = Object.keys(setupWarnings(builtOther, setupCtx)).length;
     // Sample content and example promises of both pages the dialog may apply.
     // (the other page's count only while its checkbox is checked: TemplateApplyNotes)
@@ -930,14 +937,14 @@ export function BuilderApp(props: {
     // Remembered in the draft for the "Actuel" badge of the Modèles menu (both pages when applied together).
     const [here, there] = page === "checkout" ? (["checkout", "thankYou"] as const) : (["thankYou", "checkout"] as const);
     const appliedTemplates = { ...styled.appliedTemplates, [here]: t.id, ...(both ? { [there]: match.id } : {}) };
-    const next = { layout: t.build(latest.current.layout), theme: { ...styled, appliedTemplates } };
+    const next = { layout: t.build(latest.current.layout, { storeName: storeLabel() }), theme: { ...styled, appliedTemplates } };
     // Always its own undo step (layout, style and the matching page together), and the next
     // edit, however quick, is a step of its own too.
     lastPush.current = 0;
     sealStep.current = true;
     setLayout(next.layout);
     setTheme(next.theme);
-    if (both) setOtherLayout(match.build(latest.current.other));
+    if (both) setOtherLayout(match.build(latest.current.other, { storeName: storeLabel() }));
     setSelected(null);
     setTab("blocks");
     setPalette(false);
@@ -1103,11 +1110,14 @@ export function BuilderApp(props: {
       if (!b) return [];
       if (b.type === "text") return ["heading", "body"];
       if (b.type === "announcement") return ["text"];
+      if (b.type === "message") return ["title"];
       if (b.type === "express") return ["title", "dividerLabel"];
       if (isFixedSection(b.type) || b.type === "order_addons" || b.type === "shipping_protection") return ["title"];
       return [];
     };
     const MAX: Record<string, number> = { title: 120, heading: 200, body: 2000, text: 300, dividerLabel: 40 };
+    // The schema's cap for this block's field (the message title allows more than section titles).
+    const maxOf = (b: Block, field: string) => (b.type === "message" && field === "title" ? MESSAGE_LIMITS.title : (MAX[field] ?? 200));
     return {
       fields: (id) => fieldsOf(find(id)),
       value: (id, field) => {
@@ -1118,7 +1128,7 @@ export function BuilderApp(props: {
       commit: (id, field, value) => {
         lastPush.current = 0; // its own undo step
         setLayout((l) => ({
-          blocks: l.blocks.map((b) => (b.id === id ? ({ ...b, props: { ...b.props, [field]: value.slice(0, MAX[field] ?? 200) } } as Block) : b)),
+          blocks: l.blocks.map((b) => (b.id === id ? ({ ...b, props: { ...b.props, [field]: value.slice(0, maxOf(b, field)) } } as Block) : b)),
         }));
         setSelected(id);
       },
@@ -1146,8 +1156,8 @@ export function BuilderApp(props: {
   // Modèles menu: the hovered / focused template, drawn over the current design (not saved).
   const previewingTemplate = confirmingTemplate ?? (popover === "templates" ? templatePreview : null);
   const templateLook = useMemo(
-    () => (previewingTemplate ? { theme: applyTemplateTheme(theme, previewingTemplate), layout: previewingTemplate.build(layout) } : null),
-    [previewingTemplate, theme, layout],
+    () => (previewingTemplate ? { theme: applyTemplateTheme(theme, previewingTemplate), layout: previewingTemplate.build(layout, { storeName: theme.storeName.trim() || props.storeName }) } : null),
+    [previewingTemplate, theme, layout, props.storeName],
   );
   const shownTheme = templateLook?.theme ?? theme;
   // Fonts of the design on the canvas (a previewed template's own fonts included).

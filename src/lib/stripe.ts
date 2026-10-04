@@ -720,6 +720,14 @@ export function stripeShipping(
 }
 
 /**
+ * Where the merchant turns off Stripe's own receipts (Paramètres → E-mails clients → Paiements
+ * réussis). The PaymentIntent hangs on a Customer with the buyer's e-mail: with that setting on, the
+ * connected account e-mails a receipt on top of Shopify's confirmation. The app can't switch it (a
+ * setting of the merchant's own Stripe account): the Stripe page's « Reçus Stripe » card says how.
+ */
+export const STRIPE_EMAIL_SETTINGS_URL = "https://dashboard.stripe.com/settings/emails";
+
+/**
  * The session's Customer on the connected account (the saved card of a one-click offer hangs on it):
  * ONE per checkout session, never another buyer's found by e-mail (an e-mail typed on a checkout
  * proves nothing: reusing that Customer would attach a stranger's card to it). The one already
@@ -785,9 +793,12 @@ export async function createOrUpdatePaymentIntent(
   const amount = centsToStripeAmount(target.amountCents, currency);
   const metadata = { checkout_session_id: session.id, store_id: session.storeId, fingerprint: fingerprintTag(target.fingerprint), app_host: stripeAppHost() };
   const buyer = opts.buyer ?? {};
+  // No receipt_email: the app never asks Stripe for a receipt (Shopify confirms the order). But the
+  // PaymentIntent hangs on a Customer carrying the buyer's e-mail: a connected account with
+  // « Paiements réussis » customer e-mails on (Stripe dashboard → Paramètres → E-mails clients) still
+  // sends Stripe's receipt — only the merchant can turn it off (the Stripe page's « Reçus Stripe » card).
   const buyerParams = {
     ...(buyer.customerId ? { customer: buyer.customerId } : {}),
-    ...(buyer.email ? { receipt_email: buyer.email } : {}),
     ...(buyer.shipping ? { shipping: buyer.shipping } : {}),
   };
   let previous: Stripe.PaymentIntent | null = null;

@@ -766,6 +766,7 @@ export async function markUpsellPaid(chargeId: string, paymentId: string, storeI
         provider: charge.provider,
         // A Stripe offer is charged in the checkout payment's mode (session.test): never a real order from a test payment.
         test: charge.provider === "stripe" ? session.test : session.store.testMode,
+        // A separate charge: the buyer gets its own written confirmation (Shopify's default receipt).
       }));
     const updated = await db.upsellCharge.update({
       where: { id: charge.id },

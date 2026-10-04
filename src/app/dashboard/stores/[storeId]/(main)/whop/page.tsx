@@ -1,20 +1,28 @@
 import type { Metadata } from "next";
-import { Globe2, KeyRound, Smartphone, Wallet } from "lucide-react";
+import { Globe2, KeyRound, Mail, Smartphone, Wallet } from "lucide-react";
 import { notFound } from "next/navigation";
 import { DirtyForm } from "@/components/dashboard/DirtyForm";
 import { requireStoreAccess, roleCan } from "@/lib/access";
 import { OwnerOnlyNote } from "@/components/dashboard/OwnerOnly";
 import { daysAgo, tzOf } from "@/lib/time";
 import { db } from "@/lib/db";
-import { applePayDomainStatuses, OPTIONAL_PAYMENT_METHODS, whopWebhookUrl, WHOP_WEBHOOK_EVENTS } from "@/lib/whop";
+import { applePayDomainStatuses, OPTIONAL_PAYMENT_METHODS, whopCustomerEmailsStatus, whopEmailsControls, whopProductTitle, whopSupportEmailsMessage, whopWebhookUrl, WHOP_WEBHOOK_EVENTS } from "@/lib/whop";
 import { checkoutHostOf } from "@/lib/checkout-domain";
-import { Badge, Card, Flash, Input, Label, PageHeader, SubmitButton, Textarea, buttonClass } from "@/components/ui";
+import { Badge, Card, CopyButton, Flash, Input, Label, PageHeader, SubmitButton, Textarea, buttonClass } from "@/components/ui";
 import { CopyField } from "@/components/dashboard/CopyField";
 import { env as appEnv } from "@/lib/env";
 import { ConfirmButton } from "@/components/dashboard/ConfirmButton";
 import { formatDate, formatDateTime } from "@/components/dashboard/format";
 import { paypalHiddenLines, paypalRefusals } from "@/lib/checkout";
-import { connectWhopAction, disconnectWhopAction, reactivatePaypalAction, refreshWhopWebhookAction, savePaymentMethodsAction, setupApplePayAction } from "../../../../actions";
+import {
+  connectWhopAction,
+  disconnectWhopAction,
+  reactivatePaypalAction,
+  refreshWhopWebhookAction,
+  savePaymentMethodsAction,
+  setupApplePayAction,
+  setWhopCustomerEmailsAction,
+} from "../../../../actions";
 
 export const metadata: Metadata = { title: "Whop" };
 
@@ -23,7 +31,7 @@ export default async function WhopPage({
   searchParams,
 }: {
   params: Promise<{ storeId: string }>;
-  searchParams: Promise<{ ok?: string; error?: string; edit?: string }>;
+  searchParams: Promise<{ ok?: string; error?: string; edit?: string; emails?: string }>;
 }) {
   const { storeId } = await params;
   const { user } = await requireStoreAccess(storeId, "view");
@@ -32,22 +40,34 @@ export default async function WhopPage({
   const isOwner = roleCan(user.role, "owner");
   const canApplePayFile = isOwner && user.allStores;
   const sp = await searchParams;
-  const [store, applePayFile, methodsRejected, paypalHidden] = await Promise.all([
+  const [store, applePayFile, methodsRejected, paypalHidden, lastEmailsEvent] = await Promise.all([
     db.store.findUnique({ where: { id: storeId } }),
     db.appSetting.findUnique({ where: { key: "apple_pay_domain_association" } }),
     // Recent rejection of the optional methods (last 7 days).
     db.eventLog.findFirst({ where: { storeId, kind: "payment_methods.rejected", createdAt: { gt: daysAgo(7) } }, orderBy: { createdAt: "desc" }, select: { createdAt: true, data: true } }),
     // PayPal express hidden because Whop refused it (24 h hold) or said it's off, by currency.
     paypalRefusals(storeId),
+    // Last switch of Whop's buyer e-mails (or Whop's refusal of it), last 7 days.
+    db.eventLog.findFirst({
+      where: { storeId, kind: { in: ["whop.customer_emails", "whop.customer_emails_refused"] }, createdAt: { gt: daysAgo(7) } },
+      orderBy: { createdAt: "desc" },
+      select: { kind: true },
+    }),
   ]);
   if (!store) notFound();
   const connected = !!store.whopConnectedAt;
+  const emailsRefused = sp.emails === "refused" || lastEmailsEvent?.kind === "whop.customer_emails_refused";
   // Where buyers pay: the store's verified checkout domain (checkout.seyuna.com), else APP_URL's host.
   const appHost = new URL(appEnv.appUrl).hostname;
   const checkoutHost = checkoutHostOf(store);
   const applePayHosts = [...new Set([checkoutHost, appHost])];
-  const applePay = connected && applePayFile ? await applePayDomainStatuses(store, applePayHosts) : null;
+  const [applePay, whopEmails] = await Promise.all([
+    connected && applePayFile ? applePayDomainStatuses(store, applePayHosts) : null,
+    // Whop's own buyer e-mails (account-wide): true = Whop sends its receipt too, null = unknown (cached).
+    connected ? whopCustomerEmailsStatus(store) : null,
+  ]);
   const env = store.testMode ? "sandbox" : "production";
+  const emailsControls = whopEmailsControls(whopEmails);
 
   return (
     <>
@@ -63,9 +83,12 @@ export default async function WhopPage({
         >
           <dl className="mb-5 grid grid-cols-[minmax(0,1fr)] gap-3 text-sm sm:grid-cols-3">
             <Info k="Compte" v={store.whopAccountId} />
-            <Info k="Produit « Checkout »" v={store.whopProductId} />
+            <Info k="Produit Whop" v={store.whopProductId} />
             <Info k="Webhook" v={store.whopWebhookId} />
           </dl>
+          <p className="mb-5 text-xs text-zinc-500" data-testid="whop-product-name">
+            Le produit Whop est renommé automatiquement au nom de votre boutique Shopify (« {whopProductTitle(store.name)} ») : c&apos;est ce nom que vos clients voient sur le reçu et le relevé Whop. Il suit le nom de la boutique s&apos;il change.
+          </p>
           <div className="mb-5">
             <p id="whop-events" className="mb-1.5 text-xs text-zinc-500">
               Événements écoutés ({WHOP_WEBHOOK_EVENTS.length})
@@ -96,7 +119,7 @@ export default async function WhopPage({
               <form action={disconnectWhopAction.bind(null, store.id)}>
                 <ConfirmButton
                   title="Déconnecter Whop ?"
-                  description="Le checkout Whop sera désactivé et vos clients repasseront par le checkout Shopify. Le webhook et le produit « Checkout » seront retirés de Whop."
+                  description="Le checkout Whop sera désactivé et vos clients repasseront par le checkout Shopify. Le webhook et le produit Whop de la boutique seront retirés de Whop."
                   confirmLabel="Déconnecter"
                 >
                   Déconnecter
@@ -105,6 +128,83 @@ export default async function WhopPage({
             )}
           </div>
           {!isOwner && <OwnerOnlyNote className="mt-3">changer de clé API, mettre à jour le webhook (il utilise la clé API Whop) ou déconnecter Whop.</OwnerOnlyNote>}
+        </Card>
+      )}
+
+      {connected && (
+        <Card
+          id="whop-emails"
+          icon={Mail}
+          iconColor="#0f766e"
+          title="E-mails envoyés par Whop à vos clients"
+          description="Whop peut envoyer son propre reçu en plus de la confirmation de commande de Shopify : vos clients reçoivent alors deux e-mails."
+          actions={
+            <Badge color={whopEmails === false ? "green" : whopEmails ? "amber" : "zinc"}>{whopEmails === false ? "Coupés" : whopEmails ? "Activés" : "État inconnu"}</Badge>
+          }
+          className="mb-6"
+        >
+          <p className="text-sm text-zinc-700" data-testid="whop-emails-status">
+            {whopEmails === false
+              ? "Whop n'envoie pas d'e-mail à vos clients : ils reçoivent uniquement la confirmation de Shopify."
+              : whopEmails
+                ? "Whop envoie son reçu à vos clients, en plus de la confirmation de Shopify."
+                : "Whop n'a pas indiqué l'état de ce réglage pour l'instant (rechargez la page plus tard)."}
+          </p>
+          <p className="mt-2 text-xs text-zinc-500">Ce réglage concerne tout votre compte Whop, pas seulement cette boutique.</p>
+          {isOwner ? (
+            <div className="mt-4 flex flex-wrap items-center gap-3" data-testid="whop-emails-actions">
+              {emailsControls.main === "off" ? (
+                <form action={setWhopCustomerEmailsAction.bind(null, store.id, false)}>
+                  <ConfirmButton
+                    title="Couper les e-mails Whop ?"
+                    description="Ce réglage s'applique à tout votre compte Whop : les acheteurs de vos autres produits Whop ne recevront plus non plus les e-mails de Whop. Vos clients reçoivent déjà la confirmation de Shopify."
+                    confirmLabel="Couper les e-mails Whop"
+                    variant="secondary"
+                    tone="default"
+                  >
+                    Couper les e-mails Whop
+                  </ConfirmButton>
+                </form>
+              ) : (
+                <form action={setWhopCustomerEmailsAction.bind(null, store.id, true)}>
+                  <SubmitButton variant="secondary">Réactiver les e-mails Whop</SubmitButton>
+                </form>
+              )}
+              {emailsControls.link === "on" && (
+                // Unknown state: re-enabling stays possible, discreetly (the double e-mail is the usual problem).
+                <form action={setWhopCustomerEmailsAction.bind(null, store.id, true)}>
+                  <button type="submit" className="text-xs text-zinc-500 underline underline-offset-2 hover:text-zinc-800">
+                    Réactiver
+                  </button>
+                </form>
+              )}
+            </div>
+          ) : (
+            <OwnerOnlyNote className="mt-3">couper ou réactiver les e-mails de Whop (réglage de tout le compte Whop).</OwnerOnlyNote>
+          )}
+          {emailsRefused && whopEmails !== false && (
+            <div className="mt-4 rounded-lg bg-amber-50 px-3 py-3 text-sm text-amber-900 ring-1 ring-amber-600/20" data-testid="whop-emails-refused">
+              <p className="font-medium">Whop n&apos;a pas accepté le changement depuis l&apos;app. Deux solutions :</p>
+              <ol className="mt-2 list-decimal space-y-1.5 pl-5">
+                <li>
+                  Ouvrez{" "}
+                  <a href={store.testMode ? "https://sandbox.whop.com/dashboard" : "https://whop.com/dashboard"} target="_blank" rel="noreferrer" className="font-medium underline">
+                    votre dashboard Whop
+                  </a>{" "}
+                  → <strong>Paramètres</strong> et cherchez les e-mails envoyés aux clients (reçus de paiement) : désactivez-les.
+                </li>
+                <li>Si l&apos;option n&apos;y figure pas, écrivez au support Whop (chat en bas à droite du dashboard Whop) avec le message ci-dessous.</li>
+                <li>Une fois fait, rechargez cette page : l&apos;état passe à « Coupés » (jusqu&apos;à 10 minutes).</li>
+              </ol>
+              <div className="mt-3">
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-amber-900">Message pour le support Whop</span>
+                  <CopyButton value={whopSupportEmailsMessage(store.whopAccountId)} />
+                </div>
+                <pre className="rounded-md bg-white/70 p-2.5 font-sans text-xs whitespace-pre-wrap text-zinc-800 ring-1 ring-amber-600/15">{whopSupportEmailsMessage(store.whopAccountId)}</pre>
+              </div>
+            </div>
+          )}
         </Card>
       )}
 
@@ -244,7 +344,7 @@ export default async function WhopPage({
               <li>
                 Créez une clé <strong>Company API key</strong> avec les permissions produits, plans, checkout, paiements et webhooks.
               </li>
-              <li>Collez-la ici. On crée automatiquement le produit « Checkout » caché et le webhook : rien à configurer dans Whop.</li>
+              <li>Collez-la ici. On crée automatiquement le produit caché (renommé automatiquement au nom de votre boutique Shopify, celui que vos clients voient sur le reçu Whop) et le webhook : rien à configurer dans Whop.</li>
             </ol>
             <p className="mt-4 rounded-lg bg-zinc-50 p-3 text-xs text-zinc-600">
               La boutique est en mode <strong>{store.testMode ? "test" : "production"}</strong> : utilisez une clé{" "}
