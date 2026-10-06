@@ -351,7 +351,10 @@ describe("protection claims: photos, replacement order, decision e-mail", () => 
 describe("checkout A/B tests (breaks, bump, protection)", () => {
   it("validates arm B settings", () => {
     expect(checkTestConfig("breaks", [{ minQty: 2, percent: 10 }])).toMatchObject({ ok: true });
-    expect(checkTestConfig("breaks", [{ minQty: 2, percent: 90 }])).toMatchObject({ ok: false });
+    // Up to 90 % (TIER_LIMITS.maxPercent); beyond, or nothing off, invalid.
+    expect(checkTestConfig("breaks", [{ minQty: 2, percent: 90 }])).toMatchObject({ ok: true });
+    expect(checkTestConfig("breaks", [{ minQty: 2, percent: 91 }])).toMatchObject({ ok: false });
+    expect(checkTestConfig("breaks", [{ minQty: 2, percent: 0 }])).toMatchObject({ ok: false });
     expect(checkTestConfig("addon", { priceCents: 490 })).toMatchObject({ ok: true });
     expect(checkTestConfig("addon", {})).toMatchObject({ ok: false });
     expect(checkTestConfig("protection", { priceMode: "percent", price: 0, percent: 4, minPrice: 1, maxPrice: 0 })).toMatchObject({ ok: true });

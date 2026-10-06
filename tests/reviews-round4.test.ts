@@ -111,7 +111,7 @@ describe("2 · duplicate key: raw reviewer, raw rating; none without id and text
 /* ------------------------------------------------------------------ */
 function reviewsBlock(over: Partial<BlockOf<"reviews">["props"]> = {}): BlockOf<"reviews"> {
   const b = createBlock("reviews") as BlockOf<"reviews">;
-  return { ...b, props: { ...b.props, items: [], summary: null, ...over } };
+  return { ...b, sample: undefined, props: { ...b.props, items: [], summary: null, ...over } };
 }
 
 type SetOutside = (f: (b: Block) => Block) => void;

@@ -58,7 +58,7 @@ beforeEach(() => {
 const rv = (over: Partial<ReviewItem>): ReviewItem => ({ name: "A", text: "Un avis assez long pour compter vraiment.", stars: 5, verified: false, ...over });
 function reviewsBlock(over: Partial<BlockOf<"reviews">["props"]> = {}, id?: string): BlockOf<"reviews"> {
   const b = createBlock("reviews") as BlockOf<"reviews">;
-  return { ...b, ...(id ? { id } : {}), props: { ...b.props, items: [], summary: null, ...over } };
+  return { ...b, sample: undefined, ...(id ? { id } : {}), props: { ...b.props, items: [], summary: null, ...over } };
 }
 const rating = (v: string) => ({ value: JSON.stringify({ value: v, scale_min: "1.0", scale_max: "5.0" }) });
 const shopPage = (next: boolean, n = 1) => ({

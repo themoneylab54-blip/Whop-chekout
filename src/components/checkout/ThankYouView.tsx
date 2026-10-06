@@ -69,6 +69,8 @@ type Props = {
   layout: Layout;
   data: ThankYouData;
   sessionId?: string; // live mode: poll until the Shopify order exists
+  /** The store's id (live): the evergreen countdown remembers each visitor's timer per store. */
+  storeKey?: string | null;
   preview?: {
     selectedBlockId?: string | null;
     onSelectBlock?: (id: string) => void;
@@ -153,7 +155,7 @@ function addDays(from: Date, days: number, businessOnly: boolean) {
   return d;
 }
 
-export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initial, sessionId, preview, upsell, demoOffers = false, localRates }: Props) {
+export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initial, sessionId, storeKey, preview, upsell, demoOffers = false, localRates }: Props) {
   // Buyer-language copy: merchant translations, then shipped French defaults translated.
   const theme = localizeTheme(themeProp);
   const layout = localizeLayout(layoutProp, themeProp.language);
@@ -223,6 +225,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
     offerEndsAt: preview || demoOffers ? mountedAt + OFFER_WINDOW_MS : Number.isNaN(paidAtMs) ? null : paidAtMs + OFFER_WINDOW_MS,
     lang: theme.language,
     firstName: data.firstName,
+    storeKey,
     lowestInventory: null,
     preview: !!preview,
     subtotalCents: subtotal - data.discountCents,
@@ -321,7 +324,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
         {data.checkoutUrl && (
           <a
             href={data.checkoutUrl}
-            className="inline-flex min-h-11 items-center justify-center rounded-[var(--radius)] bg-[image:var(--accent-bg)] px-5 font-medium text-[var(--accent-fg)] shadow-[var(--btn-shadow)]"
+            className="inline-flex min-h-11 items-center justify-center rounded-[var(--radius)] bg-[image:var(--btn-bg,var(--accent-bg))] px-5 font-medium text-[var(--btn-fg,var(--accent-fg))] shadow-[var(--btn-shadow)]"
           >
             {L.backToCheckout}
           </a>
@@ -384,7 +387,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
   ) : null;
   const details = (title: string) =>
     data.address || data.pickup || data.shippingMethod || data.tracking || data.email || methodName || supportHref ? (
-      <section className={`${CARD} grid gap-5 p-5 text-sm sm:grid-cols-2`}>
+      <section className={`${CARD} grid grid-cols-1 gap-5 p-5 text-sm sm:grid-cols-2`}>
         {data.pickup ? (
           <div>
             <h2 className={EYEBROW}>{L.pickupShipTo}</h2>
@@ -534,7 +537,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
   const protectionOrder = (afterConfirmation?.type === "upsell" ? blocks.indexOf(afterConfirmation) : Math.max(0, confirmationIndex)) * 2 + 1;
   return (
     <div lang={theme.language} className="wc-checkout @container/wc-page min-h-full overflow-x-clip" style={themeVars(theme)}>
-      <StoreHeader theme={theme} homeUrl={data.continueUrl} />
+      <StoreHeader theme={theme} homeUrl={data.continueUrl} preview={!!preview} />
       {ctx.upsell && (
         // Always mounted (the declined card is gone by then); the zero-width space alternates so
         // a second "Offer declined" in a row is announced again.
@@ -636,7 +639,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
               className={`mt-2 flex min-h-12 w-full items-center justify-center rounded-[var(--btn-radius)] px-5 py-4 font-semibold transition ${
                 offerPending
                   ? "border border-[var(--border)] bg-white text-[var(--text)] hover:bg-neutral-50"
-                  : "bg-[image:var(--accent-bg)] text-[var(--accent-fg)] shadow-[var(--btn-shadow)] hover:brightness-110"
+                  : "bg-[image:var(--btn-bg,var(--accent-bg))] text-[var(--btn-fg,var(--accent-fg))] shadow-[var(--btn-shadow)] hover:brightness-110"
               }`}
             >
               {L.continueShopping}
@@ -692,7 +695,7 @@ function Timeline({
   return (
     <ol className="mt-5 grid grid-cols-3 border-t border-[color-mix(in_srgb,var(--border)_45%,white)] pt-5">
       {steps.map((s, i) => (
-        <li key={i} data-step-done={s.done ? "" : undefined} className="relative flex flex-col items-center text-center" aria-current={i === current ? "step" : undefined}>
+        <li key={i} data-step-done={s.done ? "" : undefined} className="relative flex min-w-0 flex-col items-center px-0.5 text-center" aria-current={i === current ? "step" : undefined}>
           {i > 0 && (
             <span
               className={`absolute top-4 right-1/2 h-0.5 w-full ${s.done ? "bg-[var(--accent)]" : "bg-[color-mix(in_srgb,var(--border)_60%,white)]"}`}

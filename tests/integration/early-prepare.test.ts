@@ -44,9 +44,11 @@ describe("firstLoadCountry: the country the page pre-selects (CheckoutView's rul
     primary.mockClear();
     expect(await firstLoadCountry(rates, "FR", "en-US", { language: "fr", primary })).toBe("FR");
     expect(primary).not.toHaveBeenCalled();
-    // No main market: the language's country, else the first listed (by name).
+    // No main market: a rate dedicated to one or two countries (merchant's first), else the
+    // language's country, else the most common market shipped to — never the alphabetically first.
     expect(await firstLoadCountry(rates, null, null, fr)).toBe("FR");
-    expect(await firstLoadCountry([{ countries: ["DE", "BE"] }], null, null, { language: "en" })).toBe("BE");
+    expect(await firstLoadCountry([{ countries: ["DE", "BE"] }], null, null, { language: "en" })).toBe("DE");
+    expect(await firstLoadCountry([{ countries: ["DZ", "MA", "US"] }], "FR", "fr-FR", { language: "fr", primary: async () => null })).toBe("US");
     // A failing main-market lookup never throws.
     expect(await firstLoadCountry(rates, "US", null, { language: "fr", primary: async () => Promise.reject(new Error("db")) })).toBe("FR");
     // A rate for every country: the IP country as is.

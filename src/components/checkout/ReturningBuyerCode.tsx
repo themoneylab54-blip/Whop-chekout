@@ -163,7 +163,7 @@ export function ReturningBuyerCode({
           aria-disabled={stage === "sending" || undefined}
           aria-busy={stage === "sending"}
           aria-describedby={describedBy}
-          className="mt-2 inline-flex min-h-11 items-center rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-3.5 text-sm font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)] aria-disabled:opacity-60"
+          className="mt-2 inline-flex min-h-11 items-center rounded-[var(--btn-radius)] bg-[image:var(--btn-bg,var(--accent-bg))] px-3.5 text-sm font-semibold text-[var(--btn-fg,var(--accent-fg))] shadow-[var(--btn-shadow)] aria-disabled:opacity-60"
         >
           {L.otpSend}
         </button>
@@ -204,7 +204,7 @@ export function ReturningBuyerCode({
             onClick={() => void verify()}
             aria-disabled={stage === "checking" || undefined}
             aria-busy={stage === "checking"}
-            className="inline-flex min-h-11 items-center rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-3.5 text-sm font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)] aria-disabled:opacity-60"
+            className="inline-flex min-h-11 items-center rounded-[var(--btn-radius)] bg-[image:var(--btn-bg,var(--accent-bg))] px-3.5 text-sm font-semibold text-[var(--btn-fg,var(--accent-fg))] shadow-[var(--btn-shadow)] aria-disabled:opacity-60"
           >
             {L.otpVerify}
           </button>

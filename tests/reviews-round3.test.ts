@@ -44,7 +44,7 @@ vi.mock("@/lib/shopify", () => ({ shopifyGraphql: (...args: unknown[]) => mocks.
 const rv = (over: Partial<ReviewItem>): ReviewItem => ({ name: "A", text: "Un avis assez long pour compter vraiment.", stars: 5, verified: false, ...over });
 const reviewsBlock = (items: ReviewItem[], i18n?: Block["i18n"]): BlockOf<"reviews"> => {
   const b = createBlock("reviews") as BlockOf<"reviews">;
-  return { ...b, props: { ...b.props, layout: "stack", items }, ...(i18n ? { i18n } : {}) };
+  return { ...b, sample: undefined, props: { ...b.props, layout: "stack", items }, ...(i18n ? { i18n } : {}) };
 };
 
 describe("1 · translations never land on another customer's card", () => {

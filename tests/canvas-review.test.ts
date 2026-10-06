@@ -101,7 +101,7 @@ describe("empty text block: inline editor opens blank", () => {
 describe("payment logos shown next to « Paiement »", () => {
   it("own pill, not greyed « Invisible pour vos clients »", async () => {
     const icons = createBlock("payment_icons");
-    render(canvas({ blocks: [icons], overlay: { logosInHeader: icons.id, invisible: new Set<string>() } }));
+    render(canvas({ blocks: [icons], overlay: { logosInHeader: icons.id } }));
     await frames();
     const overlay = document.querySelector(`[data-overlay-id="${icons.id}"]`)!;
     expect(overlay.querySelector("[data-pill='in-header']")?.textContent).toBe("Affichés à côté de « Paiement »");
@@ -109,13 +109,13 @@ describe("payment logos shown next to « Paiement »", () => {
     expect(overlay.getAttribute("aria-label")).toContain("logos affichés à côté de « Paiement »");
   });
 
-  it("a greyed block keeps « Invisible » only", async () => {
+  it("no block is ever greyed « Invisible pour vos clients » (the canvas shows what buyers see)", async () => {
     const icons = createBlock("payment_icons");
-    render(canvas({ blocks: [icons], overlay: { logosInHeader: null, invisible: new Set([icons.id]) } }));
+    render(canvas({ blocks: [icons], overlay: { logosInHeader: null } }));
     await frames();
     const overlay = document.querySelector(`[data-overlay-id="${icons.id}"]`)!;
     expect(overlay.querySelector("[data-pill='in-header']")).toBeNull();
-    expect(overlay.textContent).toContain("Invisible pour vos clients");
+    expect(overlay.textContent).not.toContain("Invisible pour vos clients");
   });
 });
 

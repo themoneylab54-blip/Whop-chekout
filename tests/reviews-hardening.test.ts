@@ -72,14 +72,20 @@ describe("1 · honesty: « Achat vérifié » only from a review app", () => {
   });
 });
 
-describe("10 · old untagged sample reviews never show « Achat vérifié »", () => {
+describe("10 · old untagged sample reviews never show live, nor « Achat vérifié »", () => {
   it("builder and live, untagged block", () => {
     const b = createBlock("reviews") as BlockOf<"reviews">;
-    const items = b.props.items.map((it) => ({ ...it, verified: true, source: "csv" as const }));
+    // The example reviews earlier versions shipped (new blocks start empty now).
+    const shipped = [
+      { name: "Camille R.", text: "Commande reçue en 3 jours, qualité au top. Je recommande !", stars: 5 },
+      { name: "Yanis B.", text: "Service client réactif et produit conforme aux photos.", stars: 5 },
+    ];
+    const items = shipped.map((it) => ({ ...it, verified: true, source: "csv" as const }));
     expect(items.every(isSampleReview)).toBe(true);
     const untagged = { ...b, sample: undefined, props: { ...b.props, layout: "stack" as const, items } };
-    expect(html(untagged)).toContain("Camille R.");
-    expect(html(untagged)).not.toContain("Achat vérifié");
+    // Live: the shipped example reviews never show, tagged or not (the builder still lists them).
+    expect(html(untagged)).not.toContain("Camille R.");
+    expect(html(untagged, ctx("fr", true))).toContain("Camille R.");
     expect(html(untagged, ctx("fr", true))).not.toContain("Achat vérifié");
   });
 });
@@ -154,12 +160,12 @@ describe("4 · robust decoding", () => {
 
 describe("5 · an import never drops the merchant's own reviews", () => {
   it("the import only gets the room left", () => {
-    const own = Array.from({ length: 18 }, (_, i) => rv({ name: `own${i}`, text: `Mon avis numéro ${i}`, source: "manual" }));
+    const own = Array.from({ length: MAX_REVIEW_ITEMS - 2 }, (_, i) => rv({ name: `own${i}`, text: `Mon avis numéro ${i}`, source: "manual" }));
     const picked = Array.from({ length: 5 }, (_, i) => rv({ name: `imp${i}`, text: `Importé ${i}`, source: "csv" }));
-    expect(ownReviews(own, isSampleReview)).toHaveLength(18);
+    expect(ownReviews(own, isSampleReview)).toHaveLength(MAX_REVIEW_ITEMS - 2);
     const out = mergeImported(own, picked, isSampleReview);
     expect(out).toHaveLength(MAX_REVIEW_ITEMS);
-    expect(out.filter((r) => r.source === "manual")).toHaveLength(18);
+    expect(out.filter((r) => r.source === "manual")).toHaveLength(MAX_REVIEW_ITEMS - 2);
     expect(out.filter((r) => r.source === "csv").map((r) => r.name)).toEqual(["imp0", "imp1"]);
   });
 });

@@ -589,7 +589,7 @@ function StripeForm({
         aria-busy={submitting || loading || undefined}
         aria-describedby={[serverWait > 0 ? "wc-inflight-wait" : null, hint ? "wc-pay-hint" : null].filter(Boolean).join(" ") || undefined}
         onClick={onPayClick}
-        className={`flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-5 py-4 text-base font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)] transition hover:brightness-110 active:scale-[.99] ${
+        className={`flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--btn-radius)] bg-[image:var(--pay-bg,var(--accent-bg))] px-5 py-4 text-base font-semibold text-[var(--pay-fg,var(--accent-fg))] shadow-[var(--pay-shadow,var(--btn-shadow))] transition hover:brightness-110 active:scale-[.99] ${
           blocked && incomplete.length === 0 ? "cursor-progress opacity-70" : ""
         }`}
       >

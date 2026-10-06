@@ -9,20 +9,16 @@ import {
   type BlockType,
   type ExpressMethods,
 } from "@/lib/layout";
-import { promiseWarnings, sampleWarnings } from "@/lib/sample-content";
 import { arrangeCheckout, checkoutZones, expressWalletsOn, type CheckoutZone } from "@/components/checkout/CheckoutView";
-import { headerLogosBlockId, isEmptyInLive, type ContentContext } from "@/components/checkout/blocks";
-import { labelsFor } from "@/components/checkout/i18n";
+import { headerLogosBlockId } from "@/components/checkout/blocks";
 import type { DropHint } from "./CanvasOverlays";
 
 /**
- * Merchant-only warnings per block id: a badge on the canvas, an amber mark in the block list,
- * and a list in the publish popover. Setup warnings (setupWarnings: the block stays hidden from
- * buyers until completed, sample proof included) and example promises (promiseWarnings: to
- * check, never blocking). A setup warning wins over a promise one on the same block.
+ * Merchant-only warnings per block id (canvas badge, block list, publish popover): only a product
+ * to choose (setupWarnings) and the order-bump list without an add-on (storeNotes).
  */
 export function layoutWarnings(blocks: Block[], ctx?: SetupContext): Record<string, string> {
-  return { ...promiseWarnings(blocks), ...storeNotes(blocks, ctx), ...setupWarnings(blocks, ctx) };
+  return { ...storeNotes(blocks, ctx), ...setupWarnings(blocks, ctx) };
 }
 
 export const ADDONS_NOTE = "Options : créez-en une dans « Promos & options » ou masquez ce bloc";
@@ -44,9 +40,9 @@ export function storeNotes(blocks: Block[], ctx: SetupContext = {}): Record<stri
   return out;
 }
 
-/** Example promises and store notes: listed in amber in the publish popover, never blocking. */
+/** Store notes: listed in amber in the publish popover, never blocking. */
 export function reviewNotes(blocks: Block[], ctx?: SetupContext): Record<string, string> {
-  return { ...promiseWarnings(blocks), ...storeNotes(blocks, ctx) };
+  return storeNotes(blocks, ctx);
 }
 
 export type SetupContext = {
@@ -54,7 +50,7 @@ export type SetupContext = {
   hasFreeShippingRate?: boolean;
   /** The store has at least one active add-on (order bump): without one the list shows nothing. */
   hasAddOns?: boolean;
-  /** Current time (ms), to spot a countdown already over. */
+  /** Current time (ms). No warning depends on it any more (kept so callers need no change). */
   now?: number;
   /** Theme's express checkout (Apple Pay / Google Pay buttons); unknown = on. */
   expressCheckout?: boolean;
@@ -65,57 +61,51 @@ export type SetupContext = {
 };
 
 /**
- * Blocks buyers won't see until completed: a product / a price ("Choisir un produit"), a
- * countdown end date, a free-shipping threshold, social links, a button URL, a support channel
- * (e-mail, phone or WhatsApp), sample proof to replace (sampleWarnings) — mirrors isEmptyInLive. The free-shipping bar is only checked when the caller knows the
- * store's rates (`hasFreeShippingRate` given).
+ * Blocks that need a PRODUCT chosen before they can sell: a one-click offer without its product
+ * (or price), « Complétez votre commande » without products, the order-bump list without an
+ * add-on. Nothing else is ever flagged: texts, timers, figures, promises, codes… render live as
+ * the builder shows them.
  */
 export function setupWarnings(blocks: Block[], ctx: SetupContext = {}): Record<string, string> {
-  const out: Record<string, string> = {};
-  const now = ctx.now ?? Date.now();
+  return Object.fromEntries(Object.entries(setupItems(blocks, ctx)).map(([id, item]) => [id, item.text]));
+}
+
+/** One setup item: its text, and whether it is a product to choose (else a setting: a %, a price, an option). */
+export type SetupItem = { text: string; product: boolean };
+
+/** setupWarnings with each item's kind (template cards count « produits à choisir » apart). Pure. */
+export function setupItems(blocks: Block[], ctx: SetupContext = {}): Record<string, SetupItem> {
+  const out: Record<string, SetupItem> = {};
+  const product = (id: string, text: string) => (out[id] = { text, product: true });
+  const setting = (id: string, text: string) => (out[id] = { text, product: false });
   for (const b of blocks) {
     if (b.hidden) continue;
-    if (b.type === "countdown") {
-      const end = Date.parse(b.props.endsAt);
-      if (!b.props.endsAt || Number.isNaN(end) || end <= now) out[b.id] = "Minuteur : choisir une date de fin";
-      continue;
-    }
-    if (b.type === "free_shipping_bar") {
-      if (!(b.props.threshold > 0) && ctx.hasFreeShippingRate === false)
-        out[b.id] = "Indiquer un seuil de livraison offerte (aucun tarif de livraison gratuite dès un montant)";
-      continue;
-    }
     if (b.type === "order_addons") {
       // The untouched built-in list is only an amber note (storeNotes).
-      if (ctx.hasAddOns === false && !untouchedAddons(b)) out[b.id] = "Options : créez-en une dans « Promos & options » ou masquez ce bloc";
-      continue;
-    }
-    if (b.type === "social") {
-      const p = b.props;
-      if (!p.instagram && !p.tiktok && !p.facebook && !p.youtube) out[b.id] = "Réseaux sociaux : ajouter au moins un lien";
-      continue;
-    }
-    if (b.type === "button_link") {
-      if (!b.props.url) out[b.id] = "Bouton : indiquer l'adresse du lien";
-      continue;
-    }
-    if (b.type === "support") {
-      const p = b.props;
-      if (!p.email.trim() && !p.phone.trim() && !p.whatsapp.replace(/[^\d]/g, "")) out[b.id] = "Support : indiquer un e-mail, un téléphone ou WhatsApp pour l'afficher";
+      if (ctx.hasAddOns === false && !untouchedAddons(b)) setting(b.id, "Options : créez-en une dans « Promos & options » ou masquez ce bloc");
       continue;
     }
     if (b.type === "recommendations") {
-      if (!b.props.items.some((it) => it.variantId.trim())) out[b.id] = "Choisir les produits à proposer";
+      if (!b.props.items.some((it) => it.variantId.trim())) product(b.id, "Choisir les produits à proposer");
       continue;
     }
     if (b.type !== "upsell") continue;
     if (b.props.productSource === "auto") {
-      if (!upsellSellable(b.props)) out[b.id] = "Offre automatique : indiquer un % de remise";
-    } else if (!b.props.variantId.trim()) out[b.id] = "Choisir un produit";
-    else if (!upsellSellable(b.props)) out[b.id] = "Renseigner le prix de l'offre";
-    else if (b.props.variantB?.enabled && !upsellSellable(b.props.variantB)) out[b.id] = "Variante B : choisir un produit et un prix";
+      if (!upsellSellable(b.props)) setting(b.id, "Offre automatique : indiquer un % de remise");
+    } else if (!b.props.variantId.trim()) product(b.id, "Choisir un produit");
+    else if (!upsellSellable(b.props)) setting(b.id, "Renseigner le prix de l'offre");
+    else if (b.props.variantB?.enabled && !upsellSellable(b.props.variantB)) product(b.id, "Variante B : choisir un produit et un prix");
   }
-  return { ...sampleWarnings(blocks), ...out };
+  return out;
+}
+
+/**
+ * A page's setup, as a template card says it: how many products to choose, and the other settings
+ * (a % of discount, a price, an add-on to create) as their own short notes. Pure.
+ */
+export function setupSummary(blocks: Block[], ctx: SetupContext = {}): { products: number; settings: string[] } {
+  const items = Object.values(setupItems(blocks, ctx));
+  return { products: items.filter((i) => i.product).length, settings: items.filter((i) => !i.product).map((i) => i.text) };
 }
 
 /**
@@ -157,44 +147,7 @@ export function expressRowState(
   return { off: expressMethodsAllOff(theme.expressMethods) };
 }
 
-/**
- * Visible blocks buyers won't see as the page stands (greyed on the canvas with « Invisible pour
- * vos clients »): whatever the live page skips (isEmptyInLive with preview off — sample-only
- * content, empty text, no end date, no link…) plus the order-bump list without an add-on.
- * Blocks that depend on the buyer's order (low stock, one-click offers, survey) are left out.
- */
-export function hiddenFromBuyers(blocks: Block[], ctx: SetupContext = {}): Set<string> {
-  const live: ContentContext = {
-    labels: labelsFor("fr"),
-    lang: "fr",
-    lowestInventory: null,
-    preview: false,
-    subtotalCents: 0,
-    // Only its presence counts: a free-shipping rate gives the bar its automatic threshold.
-    freeShippingThresholdCents: ctx.hasFreeShippingRate === false ? null : 1,
-    money: (c) => String(c),
-    note: "",
-    setNote: () => {},
-    // Offers and survey are shown as buyers see them (they depend on the order).
-    demoOffers: true,
-    // Checkout: wallets depend on the buyer's device, assumed shown (only certain absences are
-    // greyed). Thank-you page (no payment block): no wallet is offered there, as live.
-    offeredWallets: blocks.some((b) => b.type === "payment") ? { applePay: true, googlePay: true } : { applePay: false, googlePay: false },
-    // Checkout: the payment logos show next to the Payment title, not as a block of their own.
-    paymentLogosInHeader: blocks.some((b) => b.type === "payment" && !b.hidden),
-  };
-  const now = ctx.now ?? Date.now();
-  const out = new Set<string>();
-  // Its logos show next to the Payment title: seen by buyers (pill « Affichés à côté de « Paiement » »).
-  const inHeader = logosInPaymentHeader(blocks, ctx.expressCheckout ?? true, ctx.expressMethods, { shippable: ctx.shippable ?? true });
-  for (const b of blocks) {
-    if (b.hidden || b.type === "low_stock" || b.id === inHeader) continue;
-    if ((b.type === "order_addons" && ctx.hasAddOns === false) || isEmptyInLive(b, live, now)) out.add(b.id);
-  }
-  return out;
-}
-
-export { promiseWarnings, SAMPLE_COUPON_CODE, SAMPLE_DELIVERY_WARNING, SAMPLE_PAYMENT_ICONS_WARNING, SAMPLE_PROMISE_WARNING, sampleWarnings } from "@/lib/sample-content";
+export { SAMPLE_COUPON_CODE } from "@/lib/sample-content";
 
 /**
  * Where "Ajouter un bloc" inserts a block of `type`: after the chosen block, else before
@@ -259,4 +212,13 @@ export function zoneWording(zone: CheckoutZone): string | null {
   if (zone === "recommendations") return "sous le récapitulatif (emplacement fixe)";
   if (zone === "after") return "sous « Paiement »";
   return null;
+}
+
+/**
+ * A template card's setup line: « 2 produits à choisir », then each other setting as its own short
+ * note (never counted as a product); "" when nothing is left to do. Pure.
+ */
+export function setupText(summary: { products: number; settings: string[] }): string {
+  const products = summary.products > 0 ? `${summary.products} produit${summary.products > 1 ? "s" : ""} à choisir` : "";
+  return [products, ...summary.settings].filter(Boolean).join(" · ");
 }

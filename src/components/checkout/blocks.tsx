@@ -41,9 +41,10 @@ import {
 } from "@/lib/layout";
 import { importedReviewsOrigin, orderReviewsForCart, type CartProducts } from "@/lib/reviews-import";
 import { BlockIcon, ICONS, IconTile } from "@/components/icons";
-import { honestReviewItems, isSampleOnly, isSampleReview, liveReviewItems, liveStatItems, liveTextProps } from "@/lib/sample-content";
+import { honestReviewItems, isSampleReview, liveReviewItems, liveStatItems, liveTextParts, liveWhyUsRows } from "@/lib/sample-content";
 import { errorText, localeOf, type Labels, type Lang, type ReviewsNoteSummary } from "./i18n";
 import { SafeImg } from "./SafeImg";
+import { browserStorage, evergreenRemaining, evergreenStart, evergreenStorageKey, formatTimer, spokenTimer, splitTimerText } from "./countdown";
 import { parseSimpleText, withFirstName, type SimpleInline } from "@/lib/simple-text";
 import type { CartLine } from "@/lib/pricing";
 
@@ -230,28 +231,112 @@ function Faq({ items }: BlockOf<"faq">["props"]) {
   );
 }
 
-function Countdown({ label, endsAt, labels, preview }: BlockOf<"countdown">["props"] & { labels: Labels; preview: boolean }) {
+type CountdownProps = BlockOf<"countdown">["props"] & { blockId: string; storeKey?: string | null; labels: Labels; preview: boolean };
+
+/**
+ * The countdown band: the text with the timer at {timer} (inline), else text left and timer right.
+ * `pending`: the visitor's time isn't known yet (before mount): the digits keep their place
+ * (same width and height, no layout shift) but stay invisible, so no wrong time flashes.
+ */
+function CountdownBand({ label, timer, spoken, pending = false }: { label: string; timer: string; spoken: string; pending?: boolean }) {
+  const { before, after, inline } = splitTimerText(label);
+  // role="timer" is not announced live: its label is the spoken time only (whole minutes, so it
+  // changes at most once a minute; the merchant's text around it is read as written). The ticking
+  // digits are decorative for screen readers (aria-hidden).
+  const clock = (
+    <span
+      role="timer"
+      aria-live="off"
+      aria-atomic="true"
+      aria-label={pending ? undefined : spoken}
+      aria-hidden={pending || undefined}
+      data-countdown-pending={pending ? "" : undefined}
+      className="font-mono font-semibold whitespace-nowrap tabular-nums"
+      style={pending ? { visibility: "hidden" } : undefined}
+    >
+      <span aria-hidden="true">{timer}</span>
+    </span>
+  );
+  return (
+    <div
+      data-countdown=""
+      className={`wc-bleed flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 rounded-[var(--radius)] border border-red-200/70 bg-gradient-to-r from-red-50 to-orange-50 px-4 py-3 text-red-700 ${
+        inline ? "justify-center text-center" : "justify-between"
+      }`}
+    >
+      {inline ? (
+        <p className="flex min-w-0 items-center gap-2 text-sm font-medium">
+          <Timer className="h-4 w-4 shrink-0" aria-hidden />
+          <span className="min-w-0">
+            {before}
+            <span className="text-base">{clock}</span>
+            {after}
+          </span>
+        </p>
+      ) : (
+        <>
+          <span className="flex min-w-0 items-center gap-2 text-sm font-medium">
+            <Timer className="h-4 w-4 shrink-0" aria-hidden /> <span className="min-w-0">{before}</span>
+          </span>
+          <span className="ml-auto shrink-0 text-base">{clock}</span>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Timer per visitor: the server (and the first client render) renders the full duration, so the
+ * page hydrates without a mismatch; the visitor's own timer starts after mount. "keep": a
+ * returning visitor's time is only known in their browser, so until mount the digits hold their
+ * place invisibly (no full duration, then a jump). Time is read from the clock on every tick (and
+ * when the tab comes back), so a background tab never drifts. At zero it starts over.
+ */
+function EvergreenCountdown({ label, durationSeconds, restart, format, blockId, storeKey, labels, preview }: CountdownProps) {
+  const durationMs = durationSeconds * 1000;
+  // null until mounted: the visitor's time is only known in their browser.
+  const [remaining, setLeft] = useState<number | null>(null);
+  useEffect(() => {
+    // Builder preview: the timer runs from the full duration, nothing remembered on the merchant's browser.
+    const start = evergreenStart({
+      restart: preview ? "each_visit" : restart,
+      durationMs,
+      now: Date.now(),
+      key: evergreenStorageKey(storeKey, blockId),
+      storage: browserStorage(),
+    });
+    const tick = () => setLeft(evergreenRemaining(start, durationMs, Date.now()));
+    tick();
+    const t = setInterval(tick, 1000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [durationMs, restart, storeKey, blockId, preview]);
+  const left = remaining ?? durationMs;
+  const pending = remaining === null && restart === "keep" && !preview;
+  return <CountdownBand label={label} timer={formatTimer(left, format, labels.daysShort)} spoken={spokenTimer(left, labels.daysShort)} pending={pending} />;
+}
+
+function Countdown(props: CountdownProps) {
+  const { label, endsAt, format, labels, preview } = props;
+  const evergreen = props.mode === "evergreen";
   const end = Date.parse(endsAt);
-  const now = useNow(1000);
+  const now = useNow(evergreen ? null : 1000);
+  if (evergreen) return <EvergreenCountdown {...props} />;
   if (!endsAt || Number.isNaN(end)) {
     return preview ? <Placeholder>Minuteur : choisissez une date de fin</Placeholder> : null;
   }
-  if (now === null) return null;
+  // Before mount (server render, hydration) the time left is unknown: the band keeps its place
+  // with invisible digits, so the page doesn't shift when the timer appears.
+  if (now === null) return <CountdownBand label={label} timer={formatTimer(0, format, labels.daysShort)} spoken="" pending />;
   const left = Math.max(0, end - now);
   if (left === 0) return null; // offer over: hide, never restart
-  const s = Math.floor(left / 1000);
-  const parts = [Math.floor(s / 86400), Math.floor((s % 86400) / 3600), Math.floor((s % 3600) / 60), s % 60];
-  const text = (parts[0] ? `${parts[0]}${labels.daysShort} ` : "") + parts.slice(1).map((p) => String(p).padStart(2, "0")).join(":");
-  return (
-    <div className="wc-bleed flex items-center justify-between gap-3 rounded-[var(--radius)] border border-red-200/70 bg-gradient-to-r from-red-50 to-orange-50 px-4 py-3 text-red-700">
-      <span className="flex items-center gap-2 text-sm font-medium">
-        <Timer className="h-4 w-4" /> {label}
-      </span>
-      <span className="font-mono text-base font-semibold tabular-nums" aria-label={labels.endsIn}>
-        {text}
-      </span>
-    </div>
-  );
+  return <CountdownBand label={label} timer={formatTimer(left, format, labels.daysShort, true)} spoken={spokenTimer(left, labels.daysShort, true)} />;
 }
 
 function LowStock({ message, threshold, lowest, preview }: BlockOf<"low_stock">["props"] & { lowest: number | null; preview: boolean }) {
@@ -304,17 +389,17 @@ function DeliveryEstimate({ label, minDays, maxDays, businessDays, showTimeline,
   ];
   return (
     <div className="rounded-[var(--radius)] border border-[var(--border)] bg-white p-4">
-      <p className="flex items-center gap-2 text-sm">
-        <Truck className="h-4 w-4 text-[var(--accent)]" />
-        <span className="text-[var(--muted)]">{label} :</span>
-        <strong className="font-semibold">
+      <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-sm">
+        <Truck className="h-4 w-4 shrink-0 text-[var(--accent)]" />
+        <span className="min-w-0 text-[var(--muted)]">{label}{"\u00a0"}:</span>
+        <strong className="min-w-0 font-semibold">
           {fmt(from)} – {fmt(to)}
         </strong>
       </p>
       {showTimeline && (
         <ol className="mt-4 grid grid-cols-3">
           {steps.map((s, i) => (
-            <li key={i} className="relative flex flex-col items-center text-center">
+            <li key={i} className="relative flex min-w-0 flex-col items-center px-0.5 text-center">
               {i > 0 && <span className="absolute top-4 right-1/2 -z-0 h-0.5 w-full bg-[color-mix(in_srgb,var(--accent)_25%,transparent)]" />}
               <span className="relative z-10 flex h-8 w-8 items-center justify-center rounded-full bg-[image:var(--accent-bg)] text-[var(--accent-fg)] shadow-md">
                 <s.icon className="h-4 w-4" />
@@ -337,6 +422,10 @@ function reviewDate(date: string, lang: Lang): string {
 
 /** Reviews listed before "Show more" (list layout). */
 const REVIEWS_SHOWN = 3;
+/** Reviews each "Show more" adds (a block holds up to 300: never all at once). */
+const REVIEWS_PAGE = 10;
+/** Carousel cards in the DOM at once (the page holding the current one): 300 reviews stay light. */
+const CAROUSEL_WINDOW = 10;
 
 function ReviewCard({ r, labels, lang }: { r: ReviewItem; labels: Labels; lang: Lang }) {
   const date = r.date ? reviewDate(r.date, lang) : "";
@@ -399,6 +488,10 @@ function ReviewsCarousel({ items, labels, lang, title }: { items: ReviewItem[]; 
   const n = items.length;
   const at = state.sig === sig ? state.i % n : 0;
   const setI = (i: number) => setState({ sig, i });
+  // Only the window holding the current card is rendered (its cards share one grid cell, so the
+  // carousel keeps the tallest one's height while browsing it).
+  const from = Math.floor(at / CAROUSEL_WINDOW) * CAROUSEL_WINDOW;
+  const windowItems = items.slice(from, from + CAROUSEL_WINDOW);
   return (
     <div className="relative" role="region" aria-roledescription={labels.reviewsCarousel} aria-label={title || labels.reviewsCarousel}>
       {/* Every card sits in the same grid cell: the carousel keeps the tallest card's height (no jump). */}
@@ -406,18 +499,21 @@ function ReviewsCarousel({ items, labels, lang, title }: { items: ReviewItem[]; 
         {n > 1 ? `${labels.reviewN(at + 1)} / ${n}` : ""}
       </p>
       <div className="grid">
-        {items.map((r, k) => (
-          <div
-            key={k}
-            className={`[grid-area:1/1] ${k === at ? "" : "invisible"}`}
-            role="group"
-            aria-roledescription={labels.reviewSlide}
-            aria-label={`${k + 1} / ${n}`}
-            aria-hidden={k === at ? undefined : true}
-          >
-            <ReviewCard r={r} labels={labels} lang={lang} />
-          </div>
-        ))}
+        {windowItems.map((r, j) => {
+          const k = from + j;
+          return (
+            <div
+              key={k}
+              className={`[grid-area:1/1] ${k === at ? "" : "invisible"}`}
+              role="group"
+              aria-roledescription={labels.reviewSlide}
+              aria-label={`${k + 1} / ${n}`}
+              aria-hidden={k === at ? undefined : true}
+            >
+              <ReviewCard r={r} labels={labels} lang={lang} />
+            </div>
+          );
+        })}
       </div>
       {n > 1 && (
         <div className="mt-2.5 flex items-center justify-between">
@@ -456,8 +552,8 @@ function ReviewsCarousel({ items, labels, lang, title }: { items: ReviewItem[]; 
 }
 
 function ReviewsList({ items, labels, lang }: { items: ReviewItem[]; labels: Labels; lang: Lang }) {
-  const [all, setAll] = useState(false);
-  const shown = all ? items : items.slice(0, REVIEWS_SHOWN);
+  const [count, setCount] = useState(REVIEWS_SHOWN);
+  const shown = items.slice(0, count);
   return (
     <div>
       <ul className="space-y-2.5">
@@ -468,8 +564,8 @@ function ReviewsList({ items, labels, lang }: { items: ReviewItem[]; labels: Lab
         ))}
       </ul>
       {items.length > shown.length && (
-        <button type="button" onClick={() => setAll(true)} className="mt-1 inline-flex min-h-11 items-center text-sm font-medium underline underline-offset-2">
-          {labels.moreReviews(items.length - shown.length)}
+        <button type="button" onClick={() => setCount((c) => c + REVIEWS_PAGE)} className="mt-1 inline-flex min-h-11 items-center text-sm font-medium underline underline-offset-2">
+          {labels.moreReviews(Math.min(REVIEWS_PAGE, items.length - shown.length))}
         </button>
       )}
     </div>
@@ -533,7 +629,7 @@ function Reviews({ title, layout, items, summary, labels, lang }: BlockOf<"revie
   );
 }
 
-function Coupon({ title, text, code }: BlockOf<"coupon">["props"]) {
+function Coupon({ title, text, code, preview }: BlockOf<"coupon">["props"] & { preview?: boolean }) {
   const [copied, setCopied] = useState(false);
   return (
     <div className="relative overflow-hidden rounded-[var(--radius)] bg-[image:var(--accent-bg)] p-5 text-[var(--accent-fg)] shadow-lg">
@@ -553,6 +649,10 @@ function Coupon({ title, text, code }: BlockOf<"coupon">["props"]) {
           {code}
           {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
         </button>
+      )}
+      {!code && preview && (
+        // Builder only: live, a gift without its code shows nothing (isEmptyInLive).
+        <p className="mt-4 inline-flex rounded-lg border-2 border-dashed border-current/40 px-4 py-2 text-sm opacity-80">Saisissez votre code promo</p>
       )}
     </div>
   );
@@ -647,7 +747,7 @@ export type ContentContext = {
    * (offeredPaymentLogos). Unknown (thank-you page): card brands only.
    */
   offeredWallets?: { applePay: boolean; googlePay: boolean };
-  /** Checkout: the logos show next to the Payment title, so the block is skipped live (shown once). */
+  /** Checkout: the Payment section shows (informational; only headerLogosBlockId's block is skipped live). */
   paymentLogosInHeader?: boolean;
   /**
    * Preview: the payment-logos block whose logos the Payment title already shows
@@ -656,6 +756,8 @@ export type ContentContext = {
   headerLogosBlockId?: string | null;
   /** Thank-you page: the buyer's first name, for {prénom} in a « Message personnalisé » title. */
   firstName?: string;
+  /** The store (its id): the evergreen countdown remembers each visitor's timer per store and block. */
+  storeKey?: string | null;
 };
 
 /** Payment logos buyers see: in preview the merchant's list, live only what is really offered. */
@@ -720,6 +822,7 @@ export function offerAwaitingAnswer(root: BlockOf<"upsell">, u: UpsellContext): 
  */
 export function isEmptyInLive(block: Block, ctx: ContentContext, now: number): boolean {
   if (ctx.preview) return false;
+  // Only blocks with nothing to show are skipped: example-looking content renders as written.
   switch (block.type) {
     case "image":
       return !block.props.url;
@@ -727,24 +830,29 @@ export function isEmptyInLive(block: Block, ctx: ContentContext, now: number): b
       return !block.props.url || !videoEmbed(block.props.url);
     case "logos":
       return block.props.logos.length === 0;
-    // Shipped sample proof (reviews, figures, testimonial, coupon, announcement, placeholder
-    // text) of a block tagged `sample` never reaches buyers: the builder flags it until the
-    // merchant writes their own. Untagged blocks (published before) render as they always did.
     case "reviews":
-      return isSampleOnly(block) || liveReviewItems(block).length === 0;
+      return liveReviewItems(block).length === 0;
     case "stats":
+      // Figures added and never filled in show nothing.
+      return liveStatItems(block.props.items).length === 0;
     case "testimonial":
+      // No quote written: nothing to show (never an invented one).
+      return !block.props.quote.trim();
     case "coupon":
-    case "announcement":
-      return isSampleOnly(block);
+      // A gift without its code gives the buyer nothing to use.
+      return !block.props.code.trim();
     case "text": {
-      // Nothing left to read (both parts empty, placeholders of a tagged block included): no empty card.
-      const t = liveTextProps(block);
-      return isSampleOnly(block) || (!t.heading.trim() && !t.body.trim());
+      // Nothing to read (or only the old « Titre » / « Votre texte ici. »): no empty card.
+      const t = liveTextParts(block.props);
+      return !t.heading && !t.body;
     }
+    case "why_us":
+      // Rows never filled in show nothing; a title alone is no reason for a card.
+      return liveWhyUsRows(block.props.rows).length === 0;
     case "payment_icons":
-      // Shown once, next to the Payment title (checkout); elsewhere only the logos really offered.
-      return !!ctx.paymentLogosInHeader || livePaymentLogos(block.props.methods, ctx).length === 0;
+      // The block whose logos the Payment title shows is skipped (shown once); any other
+      // payment-logos block renders the logos really offered.
+      return (!!ctx.headerLogosBlockId && ctx.headerLogosBlockId === block.id) || livePaymentLogos(block.props.methods, ctx).length === 0;
     case "rating":
       return !ratingIsSet(block.props);
     case "social": {
@@ -759,6 +867,8 @@ export function isEmptyInLive(block: Block, ctx: ContentContext, now: number): b
     case "button_link":
       return !block.props.url;
     case "countdown": {
+      // A timer per visitor always runs (it starts over at zero); a date one ends with its date.
+      if (block.props.mode === "evergreen") return false;
       const end = Date.parse(block.props.endsAt);
       return !block.props.endsAt || Number.isNaN(end) || end <= now;
     }
@@ -790,10 +900,10 @@ export function isEmptyInLive(block: Block, ctx: ContentContext, now: number): b
 export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext }) {
   switch (block.type) {
     case "text": {
-      // Live: a placeholder part ("Titre", "Votre texte ici.") of a sample block is left out.
-      const { heading, body } = ctx.preview ? block.props : liveTextProps(block);
+      // Live: the old shipped placeholders (« Titre », « Votre texte ici. ») never show.
+      const { heading, body } = ctx.preview ? block.props : liveTextParts(block.props);
       // Builder: an empty text block stays visible and selectable (live skips it: isEmptyInLive).
-      if (ctx.preview && !heading.trim() && !body.trim()) return <Placeholder inlineField="body">Bloc texte vide</Placeholder>;
+      if (!heading.trim() && !body.trim()) return ctx.preview ? <Placeholder inlineField="body">Bloc texte vide</Placeholder> : null;
       return (
         <div className="space-y-1">
           {heading && (
@@ -812,7 +922,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
     case "image": {
       if (!block.props.url) return ctx.preview ? <Placeholder>Bloc image — ajoutez une URL</Placeholder> : null;
       // Large and full-width images are banners: edge to edge on phones (small ones stay inset).
-      const width = { sm: "max-w-[160px]", md: "max-w-[280px]", lg: "wc-bleed max-w-[420px]", full: "wc-bleed w-full" }[block.props.size];
+      const width = { sm: "max-w-[160px]", md: "max-w-[280px]", lg: "wc-bleed wc-bleed-lg max-w-[420px]", full: "wc-bleed w-full" }[block.props.size];
       return (
         <SafeImg
           src={block.props.url}
@@ -823,6 +933,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
       );
     }
     case "testimonial":
+      if (!block.props.quote.trim()) return ctx.preview ? <Placeholder inlineField="quote">Témoignage vide : collez l&apos;avis d&apos;un vrai client</Placeholder> : null;
       return (
         <figure className="flex gap-3 text-left">
           {block.props.photoUrl && (
@@ -939,19 +1050,24 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
         </div>
       );
     case "countdown":
-      return <Countdown {...block.props} labels={ctx.labels} preview={ctx.preview} />;
+      return <Countdown {...block.props} blockId={block.id} storeKey={ctx.storeKey} labels={ctx.labels} preview={ctx.preview} />;
     case "low_stock":
       return <LowStock {...block.props} lowest={ctx.lowestInventory} preview={ctx.preview} />;
     case "why_us":
       return (
         <div className="space-y-3 text-left">
           <Heading>{block.props.title}</Heading>
-          {block.props.rows.map((r, i) => (
+          {/* Live: rows left blank (or the old « Titre » / « Texte ») are skipped. */}
+          {(ctx.preview ? block.props.rows : liveWhyUsRows(block.props.rows)).map((r, i) => (
             <div key={i} className="flex items-start gap-3">
               <IconTile icon={ICONS[r.icon]} size={36} />
               <div>
-                <p className="text-sm font-semibold">{r.title}</p>
-                <p className="text-sm text-[var(--muted)]">{r.text}</p>
+                {r.title.trim() ? (
+                  <p className="text-sm font-semibold">{r.title}</p>
+                ) : ctx.preview && !r.text.trim() ? (
+                  <p className="text-sm text-[var(--muted)] italic">Ligne vide (non affichée)</p>
+                ) : null}
+                {r.text.trim() && <p className="text-sm text-[var(--muted)]">{r.text}</p>}
               </div>
             </div>
           ))}
@@ -1035,10 +1151,13 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
         </div>
       );
     case "stats": {
-      // Buyers never see the shipped example figures (the builder still shows them, flagged).
-      const items = ctx.preview ? block.props.items : liveStatItems(block);
+      // Figures added and never filled in are skipped (builder and live alike).
+      const items = liveStatItems(block.props.items);
+      if (items.length === 0) return ctx.preview ? <Placeholder>Chiffres clés vides : ajoutez vos vrais chiffres</Placeholder> : null;
+      // Up to 4 per row (8 figures wrap on two rows, 5 to 7 fill the rows evenly).
+      const perRow = items.length <= 4 ? Math.max(1, items.length) : Math.ceil(items.length / 2);
       return (
-        <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${Math.max(1, items.length)}, minmax(0, 1fr))` }}>
+        <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${perRow}, minmax(0, 1fr))` }}>
           {items.map((s, i) => (
             <div key={i} className="rounded-[var(--radius)] border border-[var(--border)] bg-white px-2 py-3 text-center">
               <p className="bg-[image:var(--accent-bg)] bg-clip-text font-[family-name:var(--heading-font)] text-xl font-bold tracking-tight text-transparent">{s.value}</p>
@@ -1054,7 +1173,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
           <Heading>{block.props.title}</Heading>
           <div className="grid gap-3" style={{ gridTemplateColumns: `repeat(${block.props.columns}, minmax(0, 1fr))` }}>
             {block.props.items.map((it, i) => (
-              <div key={i} className="flex flex-col items-center gap-2 rounded-[var(--radius)] border border-[var(--border)] bg-white p-3 text-center shadow-[0_1px_2px_rgba(15,23,42,.04)]">
+              <div key={i} className="flex min-w-0 flex-col items-center gap-2 rounded-[var(--radius)] border border-[var(--border)] bg-white px-2 py-3 text-center hyphens-auto shadow-[0_1px_2px_rgba(15,23,42,.04)] @sm/wc-page:px-3">
                 <IconTile icon={ICONS[it.icon]} size={40} />
                 <p className="text-xs font-semibold">{it.title}</p>
                 {it.text && <p className="text-[11px] leading-snug text-[var(--muted)]">{it.text}</p>}
@@ -1067,7 +1186,7 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
       return (
         <div className="flex items-center gap-3 rounded-[var(--radius)] border border-emerald-200/80 bg-gradient-to-br from-emerald-50 to-white p-3.5">
           <IconTile icon={ShieldCheck} size={38} color="#059669" />
-          <div>
+          <div className="min-w-0">
             <p className="text-sm font-semibold text-emerald-900">{block.props.text}</p>
             {block.props.subtext && <p className="text-xs text-emerald-800/80">{block.props.subtext}</p>}
           </div>
@@ -1115,14 +1234,15 @@ export function ContentBlock({ block, ctx }: { block: Block; ctx: ContentContext
         <a
           href={block.props.url}
           className={`flex w-full items-center justify-center rounded-[var(--btn-radius)] px-5 py-3.5 text-sm font-semibold transition hover:opacity-90 ${
-            block.props.variant === "solid" ? "bg-[image:var(--accent-bg)] text-[var(--accent-fg)] shadow-sm" : "border-2 border-[var(--accent)] text-[var(--accent)]"
+            block.props.variant === "solid" ? "bg-[image:var(--btn-bg,var(--accent-bg))] text-[var(--btn-fg,var(--accent-fg))] shadow-sm" : "border-2 border-[var(--btn-color,var(--accent))] text-[var(--btn-color,var(--accent))]"
           }`}
         >
           {block.props.label}
         </a>
       );
     case "coupon":
-      return <Coupon {...block.props} />;
+      if (!block.props.code.trim() && !ctx.preview) return null;
+      return <Coupon {...block.props} preview={ctx.preview} />;
     case "upsell":
       return <UpsellOffer block={block} ctx={ctx} />;
     case "survey":
@@ -1368,7 +1488,7 @@ export function Recommendations({
                 type="button"
                 onClick={onAdd ? () => onAdd(r) : undefined}
                 aria-label={L.recoAddLabel(r.title, price)}
-                className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center gap-1 rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-3.5 text-sm font-semibold text-[var(--accent-fg)] transition hover:brightness-110 motion-reduce:transition-none"
+                className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center gap-1 rounded-[var(--btn-radius)] bg-[image:var(--btn-bg,var(--accent-bg))] px-3.5 text-sm font-semibold text-[var(--btn-fg,var(--accent-fg))] transition hover:brightness-110 motion-reduce:transition-none"
               >
                 <Plus className="h-4 w-4" aria-hidden />
                 {L.recoAdd}
@@ -1681,7 +1801,7 @@ function OfferCard({ block, ctx, upsell, swapped }: { block: BlockOf<"upsell">; 
             type="button"
             disabled={busy}
             onClick={() => answer(true)}
-            className="flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-5 py-3.5 font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)] transition hover:brightness-110 disabled:opacity-60"
+            className="flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--btn-radius)] bg-[image:var(--btn-bg,var(--accent-bg))] px-5 py-3.5 font-semibold text-[var(--btn-fg,var(--accent-fg))] shadow-[var(--btn-shadow)] transition hover:brightness-110 disabled:opacity-60"
           >
             {busy && <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-r-transparent motion-reduce:animate-none" aria-hidden />}
             {p.buttonText} · {total}
@@ -1790,7 +1910,7 @@ function Survey({ block, ctx }: { block: BlockOf<"survey">; ctx: ContentContext 
           <button
             type="submit"
             disabled={busy}
-            className="min-h-11 shrink-0 rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-4 text-sm font-semibold text-[var(--accent-fg)] disabled:opacity-60"
+            className="min-h-11 shrink-0 rounded-[var(--btn-radius)] bg-[image:var(--btn-bg,var(--accent-bg))] px-4 text-sm font-semibold text-[var(--btn-fg,var(--accent-fg))] disabled:opacity-60"
           >
             {L.surveySend}
           </button>

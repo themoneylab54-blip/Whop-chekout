@@ -7,6 +7,7 @@ import { localizeRate, recordText } from "@/components/checkout/localize";
 import { after } from "next/server";
 import { db } from "@/lib/db";
 import { themeFontHrefs, loadCheckoutLayout, loadInterception, loadTheme, paypalExpressAllowed, variantGidOf, type Layout } from "@/lib/layout";
+import { liveLayoutPayload } from "@/lib/sample-content";
 import { subtotal, type CartLine } from "@/lib/pricing";
 import { addOnEligible, paypalOffered, providerFor } from "@/lib/checkout";
 import { stripeFor } from "@/lib/stripe";
@@ -30,7 +31,7 @@ import { mergeRecommendations, type RecommendationView } from "@/components/chec
 import { canReadShopifyDiscounts } from "@/lib/shopify-discounts";
 // The main market: shared with the early prepare (its first quote is this page's first input).
 import { primaryCountryOf } from "@/lib/early-prepare";
-import { checkoutCountries, countryHints, pickFirstCountry } from "@/lib/first-country";
+import { checkoutCountries, countryHints, pickFirstCountry, storeMarketOf } from "@/lib/first-country";
 
 export const dynamic = "force-dynamic";
 
@@ -219,7 +220,7 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
   const firstCountry = primaryLookup.then((primary) =>
     pickFirstCountry(
       checkoutCountries(rates.map((r) => ({ countries: r.countries, active: !!r.active })), theme.language).map((c) => c.code),
-      { initialCountry, localeCountry, primaryCountry: primary, language: theme.language },
+      { initialCountry, localeCountry, primaryCountry: primary, rateCountry: storeMarketOf(rates), language: theme.language },
     ),
   );
   const [localRates, primaryCountry, initialPaypal, returningCode] = await Promise.all([
@@ -241,7 +242,8 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
       {pixel && <AdPixels {...pixel} />}
       <CheckoutView
         theme={theme}
-        layout={layout}
+        // Live reviews only (no example / empty / hidden ones): see liveLayoutPayload.
+        layout={liveLayoutPayload(layout)}
         currency={session.currency}
         lines={lines}
         // Only what the page needs (no carrier costs in the browser).
@@ -273,6 +275,7 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
         primaryCountry={primaryCountry}
         initialEligibleAddOnIds={addOns.filter((a) => addOnEligible(a.showIf, ruleCtx)).map((a) => a.id)}
         cartUrl={shopHost ? `https://${shopHost}/cart` : null}
+        storeKey={session.storeId}
         recommendations={recommendations}
         localRates={localRates}
         initialPaypal={initialPaypal}

@@ -18,6 +18,7 @@ import { ArrowLeft, Check, ChevronDown, ChevronRight, Gift, Info, Lock, Minus, P
 import type { Block, BlockOf, BlockType, Layout, Theme } from "@/lib/layout";
 import { cartShippable, expressMethodsShown, headerModeOf, offeredWalletsFor, type ExpressWallet } from "@/lib/layout";
 import { fieldBorderColor, HEADER_PLACEHOLDER_ON_DARK } from "@/lib/contrast";
+import { buttonVars } from "@/lib/button-colors";
 import {
   breakDeal,
   computeTotals,
@@ -42,7 +43,7 @@ import {
   type ContentContext,
 } from "./blocks";
 import { countryName, errorText, labelsFor, localeOf, type Labels } from "./i18n";
-import { checkoutCountries, pickFirstCountry } from "@/lib/first-country";
+import { checkoutCountries, pickFirstCountry, storeMarketOf } from "@/lib/first-country";
 import { localizeDeliveryTime, localizeLayout, localizeTheme } from "./localize";
 import { suggestEmail } from "./emailSuggest";
 import { LanguageSwitcher } from "./LanguageSwitcher";
@@ -117,6 +118,8 @@ type Props = {
   initialCountry?: string | null;
   /** The Shopify cart ("https://shop.example/cart"): breadcrumb and "Back to cart" link. */
   cartUrl?: string | null;
+  /** The store's id (live): the evergreen countdown remembers each visitor's timer per store. */
+  storeKey?: string | null;
   /** Order bumps whose display rules match the cart, before the first quote (server-side). */
   initialEligibleAddOnIds?: string[] | null;
   /**
@@ -220,9 +223,9 @@ export function themeVars(theme: Theme): CSSProperties {
         : theme.buttonShape === "square"
           ? "0px"
           : `${theme.radius}px`,
-    "--btn-shadow": theme.buttonShadow
-      ? `0 10px 24px -10px ${theme.accentColor}b3, inset 0 1px 0 rgba(255,255,255,.18)`
-      : "none",
+    // Pay button (--pay-*), other buttons (--btn-*, incl. --btn-shadow), secondary (--btn2-*):
+    // each follows the accent unless the merchant set its own color.
+    ...buttonVars(theme),
     "--text": theme.textColor,
     // 70%: keeps secondary text above 4.5:1 on white for the default text colors
     "--muted": `color-mix(in srgb, ${theme.textColor} 70%, white)`,
@@ -264,7 +267,7 @@ function readableOn(hex: string) {
 /** Height cap of a banner shown in its own proportions (same 240 px as the fixed-height maximum). */
 export const BANNER_MAX_HEIGHT = "min(240px, 35vh)";
 
-export function StoreHeader({ theme, homeUrl = null }: { theme: Theme; homeUrl?: string | null }) {
+export function StoreHeader({ theme, homeUrl = null, preview = false }: { theme: Theme; homeUrl?: string | null; /** Builder canvas (its mobile frame is no real viewport). */ preview?: boolean }) {
   const justify = {
     left: "justify-start",
     center: "justify-center",
@@ -314,27 +317,43 @@ export function StoreHeader({ theme, homeUrl = null }: { theme: Theme; homeUrl?:
     );
   };
   if (mode !== "banner") return nameHeader(mode === "logo" && !!theme.logoUrl);
-  // Full-width banner: its box is sized before the image loads (fixed height, or the image's
-  // own proportions measured in the builder), so nothing below it moves. In proportions mode the
-  // height is capped (a square image would otherwise make a header as tall as the page is wide):
-  // beyond the cap, the image is cropped ("cover") or letterboxed ("contain").
-  const ratio = theme.bannerAuto && theme.bannerRatio ? theme.bannerRatio : null;
+  // Full-width banner: its box is sized before the image loads, so nothing below it moves.
+  // Wide pages: fixed height, or the image's own proportions (measured in the builder) capped to a
+  // banner height; beyond the cap the image is cropped ("cover") or letterboxed ("contain").
+  // Phones (wc-page under 640 px, globals.css): always full width in the shown image's own
+  // proportions (the phone image when there is one), never the desktop's fixed height, which cropped
+  // a wide banner to its middle on a narrow screen.
+  const box = bannerBox(theme);
   const alt = theme.storeName || "Ma boutique";
-  const image = (
-    <SafeImg
-      src={theme.bannerUrl}
-      alt={alt}
-      className={`block h-full w-full ${theme.bannerFit === "contain" ? "object-contain" : "object-cover"}`}
-      // Image gone (deleted, hotlink-protected): the store name instead of an empty band.
-      fallback={
-        <span
-          className="flex h-full items-center justify-center font-[family-name:var(--heading-font)] text-xl font-semibold tracking-tight"
-          style={{ color: readableOn(theme.bannerBackground || theme.headerBackground) === "#ffffff" ? "#fff" : undefined }}
-        >
-          {alt}
-        </span>
-      }
-    />
+  const fit = theme.bannerFit === "contain" ? "object-contain" : "object-cover";
+  const fallback = (
+    // Image gone (deleted, hotlink-protected): the store name instead of an empty band.
+    <span
+      className="flex h-full min-h-14 items-center justify-center font-[family-name:var(--heading-font)] text-xl font-semibold tracking-tight"
+      style={{ color: readableOn(theme.bannerBackground || theme.headerBackground) === "#ffffff" ? "#fff" : undefined }}
+    >
+      {alt}
+    </span>
+  );
+  const mobileUrl = theme.bannerUrlMobile;
+  // High priority (React also preloads it) for the one image the page shows. The builder canvas
+  // holding both images loads them lazily instead: no preload, and the hidden one is never fetched.
+  const imgProps = { alt, decoding: "async" as const, fallback, ...(preview && mobileUrl ? { loading: "lazy" as const } : { fetchPriority: "high" as const }) };
+  const image = !mobileUrl ? (
+    <SafeImg src={theme.bannerUrl} className={`block h-full w-full ${fit}`} {...imgProps} />
+  ) : preview ? (
+    // Builder canvas: its mobile frame is narrower than the browser window, so a viewport media
+    // query can't pick the image; both are in the page and the frame's width shows one (globals.css).
+    <>
+      <SafeImg src={theme.bannerUrl} className={`wc-banner-d block h-full w-full ${fit}`} {...imgProps} />
+      <SafeImg src={mobileUrl} className={`wc-banner-m hidden h-full w-full ${fit}`} {...imgProps} />
+    </>
+  ) : (
+    // Buyers: the browser downloads only the image for its screen.
+    <picture className="block h-full w-full">
+      <source media={BANNER_PHONE_MEDIA} srcSet={mobileUrl} />
+      <SafeImg src={theme.bannerUrl} className={`block h-full w-full ${fit}`} {...imgProps} />
+    </picture>
   );
   return (
     <header
@@ -342,11 +361,7 @@ export function StoreHeader({ theme, homeUrl = null }: { theme: Theme; homeUrl?:
       style={{ background: theme.bannerBackground || theme.headerBackground }}
       data-header="banner"
     >
-      <div
-        // Phones: no height cap, the image spans the full width in its own proportions (globals.css).
-        className={`relative w-full overflow-hidden ${ratio ? "wc-banner-capped" : ""}`}
-        style={ratio ? ({ aspectRatio: String(ratio), "--wc-banner-max": BANNER_MAX_HEIGHT } as CSSProperties) : { height: theme.bannerHeight }}
-      >
+      <div className="wc-banner relative w-full overflow-hidden" style={box}>
         {theme.bannerLink && homeUrl ? (
           <a href={homeUrl} className="block h-full w-full focus-visible:outline-2 focus-visible:outline-offset-[-4px] focus-visible:outline-[var(--accent)]">
             {image}
@@ -357,6 +372,23 @@ export function StoreHeader({ theme, homeUrl = null }: { theme: Theme; homeUrl?:
       </div>
     </header>
   );
+}
+
+/** Phones, as the banner's `<picture>` picks its image (the `wc-page` container switch in globals.css). */
+export const BANNER_PHONE_MEDIA = "(max-width: 639.98px)";
+
+/**
+ * The banner box's sizing variables (read by `.wc-banner`, globals.css): wide pages get the fixed
+ * height, or the image's proportions capped to BANNER_MAX_HEIGHT; phones get the proportions of
+ * the image they show (none known: the image's own height once loaded). Pure.
+ */
+export function bannerBox(theme: Pick<Theme, "bannerAuto" | "bannerRatio" | "bannerHeight" | "bannerUrlMobile" | "bannerRatioMobile">): CSSProperties {
+  const wide = theme.bannerAuto && theme.bannerRatio ? theme.bannerRatio : null;
+  const phone = theme.bannerUrlMobile ? (theme.bannerRatioMobile ?? null) : (theme.bannerRatio ?? null);
+  return {
+    ...(wide ? { "--wc-banner-ar": String(wide), "--wc-banner-max": BANNER_MAX_HEIGHT } : { "--wc-banner-h": `${theme.bannerHeight}px` }),
+    ...(phone ? { "--wc-banner-ar-m": String(phone) } : {}),
+  } as CSSProperties;
 }
 
 /** The shop's home page from its cart URL (https://shop.com/cart → https://shop.com/), or null. */
@@ -655,6 +687,7 @@ export function CheckoutView({
   initialEmail,
   initialCountry,
   cartUrl,
+  storeKey,
   initialEligibleAddOnIds,
   recommendations: recommendationsProp,
   localRates,
@@ -712,11 +745,12 @@ export function CheckoutView({
   const [address, setAddress] = useState<Address>(() => ({
     ...EMPTY_ADDRESS,
     // Visitor's country (from their IP) when we ship there, else their browser locale's
-    // country (de-DE → Germany), else the store's main market, else the language's country —
-    // never just the alphabetically first country. The early prepare picks it the same way.
+    // country (de-DE → Germany), else the store's main market (paid orders), else the language's
+    // country (English: the dedicated country first), else its shipping setup's dedicated country, else the most common market it ships to — never just
+    // the alphabetically first country. The early prepare picks it the same way.
     countryCode: pickFirstCountry(
       countries.map((c) => c.code),
-      { initialCountry, localeCountry, primaryCountry, language: theme.language },
+      { initialCountry, localeCountry, primaryCountry, rateCountry: storeMarketOf(rates), language: theme.language },
     ),
   }));
   const [rateId, setRateId] = useState<string | null>(null);
@@ -1710,6 +1744,7 @@ export function CheckoutView({
     setNote,
     noteLockedBy: priceLocked ? LOCK_NOTE_DELIVERY_ID : null,
     cartProducts: live ? cartProductsOf(serverLines) : null,
+    storeKey,
   };
   const arranged = arrangeCheckout(layout.blocks);
   // Payment title: the payment-logos block's methods, small, only those this checkout offers.
@@ -1927,7 +1962,7 @@ export function CheckoutView({
                     <button
                       type="button"
                       onClick={applySaved}
-                      className="inline-flex min-h-11 items-center rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-3.5 text-sm font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)]"
+                      className="inline-flex min-h-11 items-center rounded-[var(--btn-radius)] bg-[image:var(--btn-bg,var(--accent-bg))] px-3.5 text-sm font-semibold text-[var(--btn-fg,var(--accent-fg))] shadow-[var(--btn-shadow)]"
                     >
                       {L.useSaved}
                     </button>
@@ -2547,7 +2582,7 @@ export function CheckoutView({
       onKeyDownCapture={interacted ? undefined : () => setInteracted(true)}
     >
       <div className="@container/wc-page min-h-full overflow-x-clip" data-inputs={theme.inputStyle}>
-        <StoreHeader theme={theme} homeUrl={storeHomeUrl(cartUrl)} />
+        <StoreHeader theme={theme} homeUrl={storeHomeUrl(cartUrl)} preview={!live} />
 
         {/* Mobile summary toggle */}
         <div
@@ -2581,13 +2616,13 @@ export function CheckoutView({
         </div>
 
         <div
-          className={`grid @3xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] ${summaryLeft ? "@3xl:[direction:rtl]" : ""}`}
+          className={`grid grid-cols-[minmax(0,1fr)] @3xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] ${summaryLeft ? "@3xl:[direction:rtl]" : ""}`}
         >
           <main
-            className={`px-5 py-6 [direction:ltr] @3xl:flex @3xl:px-10 @3xl:py-10 ${live ? "pb-28 @3xl:pb-10" : ""} ${summaryLeft ? "@3xl:justify-start @3xl:border-l" : "@3xl:justify-end @3xl:border-r"} @3xl:border-[var(--border)]`}
+            className={`min-w-0 px-5 py-6 [direction:ltr] @3xl:flex @3xl:px-10 @3xl:py-10 ${live ? "pb-28 @3xl:pb-10" : ""} ${summaryLeft ? "@3xl:justify-start @3xl:border-l" : "@3xl:justify-end @3xl:border-r"} @3xl:border-[var(--border)]`}
             style={{ background: theme.formBackground || undefined }}
           >
-            <div className="wc-bleed-col mx-auto w-full space-y-4 @3xl:mx-0" style={{ maxWidth: widths.form }}>
+            <div className="wc-bleed-col mx-auto w-full min-w-0 space-y-4 @3xl:mx-0" style={{ maxWidth: widths.form }}>
               <h1 className="sr-only">
                 {theme.storeName ? `${theme.storeName} · ${L.checkoutTitle}` : L.checkoutTitle}
               </h1>
@@ -2619,7 +2654,7 @@ export function CheckoutView({
           </main>
           <aside
             aria-label={L.summary}
-            className={`hidden px-5 py-6 [direction:ltr] @3xl:flex @3xl:px-10 @3xl:py-10 ${summaryLeft ? "@3xl:justify-end" : "@3xl:justify-start"}`}
+            className={`hidden min-w-0 px-5 py-6 [direction:ltr] @3xl:flex @3xl:px-10 @3xl:py-10 ${summaryLeft ? "@3xl:justify-end" : "@3xl:justify-start"}`}
             style={{ background: theme.summaryBackground || undefined }}
           >
             <div
@@ -2666,7 +2701,7 @@ export function CheckoutView({
               type="button"
               tabIndex={paymentOffscreen ? 0 : -1}
               onClick={goToPayment}
-              className="flex min-h-12 items-center justify-center rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-5 text-sm font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)]"
+              className="flex min-h-12 items-center justify-center rounded-[var(--btn-radius)] bg-[image:var(--pay-bg,var(--accent-bg))] px-5 text-sm font-semibold text-[var(--pay-fg,var(--accent-fg))] shadow-[var(--pay-shadow,var(--btn-shadow))]"
             >
               {L.goToPayment}
             </button>
@@ -3004,7 +3039,7 @@ function OrderSummary(props: {
                   type="button"
                   onClick={() => props.onQty(props.volumeNudge!.target!, props.volumeNudge!.target!.quantity + 1)}
                   aria-label={L.volumeAddOne(props.volumeNudge.target.title)}
-                  className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-3 text-sm font-semibold text-[var(--accent-fg)]"
+                  className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-[var(--btn-radius)] bg-[image:var(--btn-bg,var(--accent-bg))] px-3 text-sm font-semibold text-[var(--btn-fg,var(--accent-fg))]"
                 >
                   +1
                 </button>
@@ -3167,7 +3202,7 @@ function PromoForm(props: PromoProps) {
           <button
             type="submit"
             disabled={props.locked || !props.codeInput.trim()}
-            className="min-h-11 shrink-0 rounded-[var(--radius)] border border-neutral-300 bg-white px-4 text-sm font-medium text-neutral-900 disabled:text-neutral-500"
+            className="min-h-11 shrink-0 rounded-[var(--radius)] border border-[var(--btn2-border,#d4d4d4)] bg-white bg-[image:var(--btn2-bg,none)] px-4 text-sm font-medium text-[var(--btn2-fg,#171717)] disabled:text-[var(--btn2-off-fg,#737373)] disabled:opacity-[var(--btn2-off-opacity,1)]"
           >
             {L.apply}
           </button>

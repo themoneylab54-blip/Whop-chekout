@@ -3,6 +3,7 @@ import { cache } from "react";
 import { notFound, redirect } from "next/navigation";
 import { db } from "@/lib/db";
 import { themeFontHrefs, loadCheckoutLayout, loadTheme, loadThankYouLayout, offerArmProps, variantGidOf, type Block, type OfferArm } from "@/lib/layout";
+import { liveLayoutPayload } from "@/lib/sample-content";
 import type { CartLine } from "@/lib/pricing";
 import type { Address } from "@/lib/shopify";
 import { ThankYouView } from "@/components/checkout/ThankYouView";
@@ -174,9 +175,10 @@ export default async function ThankYouPage({ params, searchParams }: PageProps) 
       {pixel && <AdPixels {...pixel} />}
       <ThankYouView
         theme={theme}
-        layout={shownLayout}
+        layout={liveLayoutPayload(shownLayout)}
         upsell={{ eligible, states, offerIds, arms, livePrices }}
         sessionId={session.id}
+        storeKey={session.storeId}
         localRates={localRates}
         data={{
           status: session.status === "OPEN" ? "PAYING" : session.status,

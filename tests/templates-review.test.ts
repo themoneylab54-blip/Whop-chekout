@@ -1,24 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { createBlock, loadCheckoutLayout, offeredWalletsFor, type Block, type BlockOf, type ExpressWallet } from "@/lib/layout";
-import {
-  confirmCouponCode,
-  hideVisibleSamples,
-  isSampleOnly,
-  liveReviewItems,
-  NEVER_OFFERED_LOGOS_WARNING,
-  promiseWarnings,
-  sampleWarnings,
-  tagDuplicate,
-  unconfirmCouponCode,
-  visibleSampleIds,
-} from "@/lib/sample-content";
+import { createBlock, defaultTheme, loadCheckoutLayout, offeredWalletsFor, type Block, type BlockOf, type ExpressWallet } from "@/lib/layout";
+import { liveReviewItems, NEVER_OFFERED_LOGOS_WARNING } from "@/lib/sample-content";
 import { ContentBlock, headerLogosBlockId, isEmptyInLive, livePaymentLogos, offeredPaymentLogos, PaymentHeaderLogos, type ContentContext } from "@/components/checkout/blocks";
 import { expressWalletsOn } from "@/components/checkout/CheckoutView";
 import { labelsFor } from "@/components/checkout/i18n";
-import { ADDONS_NOTE, hiddenFromBuyers, layoutWarnings, logosInPaymentHeader, reviewNotes, setupWarnings, storeNotes } from "@/components/builder/placement";
-import { CHECKOUT_TEMPLATES } from "@/components/builder/templates";
+import { ADDONS_NOTE, layoutWarnings, logosInPaymentHeader, reviewNotes, setupSummary, setupText, setupWarnings, storeNotes } from "@/components/builder/placement";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { applyTemplateTheme, CHECKOUT_TEMPLATES, THANK_YOU_TEMPLATES } from "@/components/builder/templates";
 
 const ctx = (preview: boolean, extra: Partial<ContentContext> = {}): ContentContext =>
   ({
@@ -78,40 +69,35 @@ describe("B. payment logos shown once, only those offered", () => {
   });
 
   it("skipped live when the Payment header shows them, or when none is offered", () => {
-    expect(isEmptyInLive(icons, ctx(false, { paymentLogosInHeader: true }), 0)).toBe(true);
+    expect(isEmptyInLive(icons, ctx(false, { paymentLogosInHeader: true, headerLogosBlockId: icons.id }), 0)).toBe(true);
+    // Only the block shown in the header is skipped: a second payment-logos block still shows.
+    expect(isEmptyInLive({ ...icons, id: "other-logos" }, ctx(false, { paymentLogosInHeader: true, headerLogosBlockId: icons.id }), 0)).toBe(false);
     expect(isEmptyInLive(icons, live, 0)).toBe(false);
     expect(isEmptyInLive({ ...icons, props: { ...icons.props, methods: ["sepa", "crypto"] } }, live, 0)).toBe(true);
     expect(isEmptyInLive(icons, ctx(true, { paymentLogosInHeader: true }), 0)).toBe(false);
     const checkout = loadCheckoutLayout(null).blocks;
-    // Its logos show next to « Paiement »: seen by buyers, so never greyed « Invisible pour vos clients ».
-    expect(hiddenFromBuyers([...checkout, icons]).has(icons.id)).toBe(false);
     expect(logosInPaymentHeader([...checkout, icons])).toBe(icons.id);
-    expect(hiddenFromBuyers([icons]).has(icons.id)).toBe(false);
     expect(logosInPaymentHeader([icons])).toBeNull();
   });
 
-  it("canvas: the header's logo block gets its own pill, the others are greyed; logos drawn once", () => {
+  it("canvas: the header's logo block gets its own pill; logos drawn once", () => {
     const checkout = loadCheckoutLayout(null).blocks;
     const second = createBlock("payment_icons");
-    // Only the first visible logos block feeds the header: a second one stays invisible live.
-    expect(hiddenFromBuyers([...checkout, icons, second]).has(second.id)).toBe(true);
+    // Only the first visible logos block feeds the header.
     expect(logosInPaymentHeader([...checkout, icons, second])).toBe(icons.id);
-    // None of its logos can show in the header (SEPA / crypto only): skipped live, greyed.
+    // None of its logos can show in the header (SEPA / crypto only).
     const never = { ...icons, props: { ...icons.props, methods: ["sepa", "crypto"] } } as typeof icons;
     expect(logosInPaymentHeader([...checkout, never])).toBeNull();
-    expect(hiddenFromBuyers([...checkout, never]).has(never.id)).toBe(true);
     // Wallet-only logos with the express checkout off (theme or hidden block): none in the header.
     const wallets = { ...icons, props: { ...icons.props, methods: ["applepay", "gpay"] } } as typeof icons;
     expect(logosInPaymentHeader([...checkout, wallets])).toBe(wallets.id);
     expect(logosInPaymentHeader([...checkout, wallets], false)).toBeNull();
-    expect(hiddenFromBuyers([...checkout, wallets], { expressCheckout: false }).has(wallets.id)).toBe(true);
     const hiddenExpress = checkout.map((b) => (b.type === "express" ? { ...b, hidden: true } : b));
     expect(logosInPaymentHeader([...hiddenExpress, wallets])).toBeNull();
     // The merchant's express buttons, like the page (expressMethodsShown → offeredWalletsFor):
     // Apple Pay and Google Pay both off → no wallet logo in the header.
     const noWallets = { applePay: false, googlePay: "off" as const, whopPay: true, paypal: true };
     expect(logosInPaymentHeader([...checkout, wallets], true, noWallets)).toBeNull();
-    expect(hiddenFromBuyers([...checkout, wallets], { expressMethods: noWallets }).has(wallets.id)).toBe(true);
     // Google Pay only, on "auto": hidden for a cart to ship, shown for one with nothing to ship.
     const gpayAuto = { applePay: false, googlePay: "auto" as const, whopPay: false, paypal: false };
     const gpayOnly = { ...icons, props: { ...icons.props, methods: ["gpay"] } } as typeof icons;
@@ -160,15 +146,6 @@ describe("B. payment logos shown once, only those offered", () => {
     expect(expressWalletsOn(true, checkout.map((b) => (b.type === "express" ? ({ ...b, props: { ...b.props, enabled: false } } as Block) : b)))).toBe(false);
   });
 
-  it("thank-you page (no payment block): wallet-only logos are greyed, no wallet offered there", () => {
-    const wallets = createBlock("payment_icons");
-    wallets.props.methods = ["applepay", "gpay"];
-    expect(hiddenFromBuyers([wallets]).has(wallets.id)).toBe(true);
-    const payment = loadCheckoutLayout(null).blocks.find((b) => b.type === "payment")!;
-    // Checkout without the header row: wallets assumed shown (device-dependent).
-    expect(hiddenFromBuyers([{ ...payment, hidden: true }, wallets]).has(wallets.id)).toBe(false);
-  });
-
   it("header wallets: only those whose express button really rendered (live), settings in preview", () => {
     const base = { walletsOn: true, pickupSelected: false, configured: ["apple-pay", "google-pay", "whop-pay"] as ExpressWallet[] };
     // Live, nothing resolved yet or no wallet on the device: card brands only.
@@ -184,52 +161,35 @@ describe("B. payment logos shown once, only those offered", () => {
     expect(offeredPaymentLogos(["visa", "applepay", "gpay"], offeredWalletsFor({ ...base, rendered: ["google-pay"] }))).toEqual(["visa", "gpay"]);
   });
 
-  it("SEPA / crypto selected is flagged", () => {
-    expect(promiseWarnings([icons])[icons.id]).toBe(NEVER_OFFERED_LOGOS_WARNING);
-    const cards = createBlock("payment_icons");
-    cards.props.methods = ["visa", "mastercard"];
-    expect(promiseWarnings([cards])).toEqual({});
-  });
-});
-
-describe("C. duplicating a block with example content", () => {
-  it("tags the copy when its content is still sample", () => {
-    const old = untagged(createBlock("reviews"));
-    expect(tagDuplicate(old).sample).toBe(true);
-    const own = untagged(createBlock("reviews"));
-    own.props.items = [{ name: "Léa", text: "Parfait", stars: 5, verified: false }];
-    expect(tagDuplicate(own).sample).toBeUndefined();
-    const g = createBlock("guarantee");
-    expect(tagDuplicate(g)).toBe(g);
-    const tagged = createBlock("testimonial");
-    expect(tagDuplicate(tagged)).toBe(tagged);
+  it("SEPA / crypto selected: an inline note in the editor, never a warning", () => {
+    expect(NEVER_OFFERED_LOGOS_WARNING).toMatch(/SEPA/);
+    expect(layoutWarnings([icons])).toEqual({});
   });
 });
 
 describe("D. blank reviews", () => {
-  it("are dropped only on a tagged block", () => {
+  it("are never shown; a tagged block shows no review at all", () => {
     const items = [
       { name: "Léa", text: "Parfait", stars: 5, verified: false },
       { name: "Tom", text: "  ", stars: 5, verified: false },
     ];
-    const tagged = createBlock("reviews");
+    const tagged = { ...createBlock("reviews"), sample: true as const };
     tagged.props.items = items;
-    expect(liveReviewItems(tagged).map((i) => i.name)).toEqual(["Léa"]);
-    expect(liveReviewItems(untagged(tagged)).map((i) => i.name)).toEqual(["Léa", "Tom"]);
+    expect(liveReviewItems(tagged)).toEqual([]);
+    expect(liveReviewItems(untagged(tagged)).map((i) => i.name)).toEqual(["Léa"]);
   });
 });
 
-describe("E. canvas greying", () => {
-  it("covers every block buyers won't see", () => {
+describe("E. no canvas warnings but a product to choose", () => {
+  it("countdown, text, guarantee, low stock: no warning; order bump without add-on: one", () => {
     const countdown = createBlock("countdown");
     const text = createBlock("text");
     text.props = { heading: "", body: "" };
-    const low = createBlock("low_stock");
     const bump = createBlock("order_addons");
-    const guarantee = createBlock("guarantee");
-    const set = hiddenFromBuyers([countdown, text, low, bump, guarantee, { ...createBlock("countdown"), hidden: true }], { hasAddOns: false, now: 0 });
-    expect([...set].sort()).toEqual([countdown.id, text.id, bump.id].sort());
-    expect(hiddenFromBuyers([bump], { hasAddOns: true }).size).toBe(0);
+    bump.props.title = "Ajoutez";
+    const blocks = [countdown, text, createBlock("low_stock"), bump, createBlock("guarantee")];
+    expect(Object.keys(layoutWarnings(blocks, { hasAddOns: false }))).toEqual([bump.id]);
+    expect(layoutWarnings(blocks, { hasAddOns: true })).toEqual({});
   });
 });
 
@@ -239,12 +199,18 @@ describe("F. empty text block", () => {
     t.props = { heading: " ", body: "" };
     expect(isEmptyInLive(t, live, 0)).toBe(true);
     expect(isEmptyInLive(t, ctx(true), 0)).toBe(false);
-    // Untagged placeholders render as they always did; tagged ones are hidden.
-    expect(isEmptyInLive(untagged(createBlock("text")), live, 0)).toBe(false);
+    // A new text block starts empty: nothing live until the merchant writes.
+    expect(createBlock("text").props).toEqual({ heading: "", body: "" });
     expect(isEmptyInLive(createBlock("text"), live, 0)).toBe(true);
-    const own = createBlock("text");
-    own.props.heading = "Notre histoire";
-    expect(isEmptyInLive(own, live, 0)).toBe(false);
+    // The old shipped placeholders (« Titre », « Votre texte ici. ») never show live.
+    const old = untagged(createBlock("text"));
+    old.props = { heading: "Titre", body: "Votre texte ici." };
+    expect(isEmptyInLive(old, live, 0)).toBe(true);
+    expect(isEmptyInLive(old, ctx(true), 0)).toBe(false);
+    old.props = { heading: "Titre", body: "Mon vrai texte." };
+    expect(isEmptyInLive(old, live, 0)).toBe(false);
+    expect(html(old)).toContain("Mon vrai texte.");
+    expect(html(old)).not.toContain("Titre");
   });
 
   it("shows a placeholder in the builder preview only", () => {
@@ -252,34 +218,21 @@ describe("F. empty text block", () => {
     t.props = { heading: " ", body: "" };
     expect(html(t, ctx(true))).toContain("Bloc texte vide");
     expect(html(t)).not.toContain("Bloc texte vide");
-    expect(html(createBlock("text"), ctx(true))).not.toContain("Bloc texte vide");
+    expect(html(createBlock("text"), ctx(true))).toContain("Bloc texte vide");
   });
 });
 
 describe("I. loader repair fallback", () => {
-  it("tags a sample-content block reset to its shipped defaults", () => {
+  it("resets broken props to the defaults, never tagged, and reviews never get invented ones back", () => {
     const load = (b: Record<string, unknown>) => loadCheckoutLayout({ blocks: [b] }).blocks.find((x) => x.id === b.id);
-    // Broken props (quote not a string): reset to the example testimonial, hidden from buyers.
     const t = load({ id: "t1", type: "testimonial", props: { quote: 123 } });
-    expect(t?.sample).toBe(true);
-    expect(t && isSampleOnly(t)).toBe(true);
-    // Blocks without example content stay untagged.
+    expect(t?.sample).toBeUndefined();
     const g = load({ id: "g1", type: "guarantee", props: { title: 123 } });
     expect(g).toBeDefined();
     expect(g?.sample).toBeUndefined();
-  });
-
-  it("tags a block whose missing content key is filled from the examples", () => {
-    const load = (b: Record<string, unknown>) => loadCheckoutLayout({ blocks: [b] }).blocks.find((x) => x.id === b.id);
-    // Untagged reviews without items: the example reviews come back, so buyers must not see them.
-    const r = load({ id: "r1", type: "reviews", props: { title: "Avis" } });
-    expect(r?.sample).toBe(true);
-    expect(r && isSampleOnly(r)).toBe(true);
+    const r = load({ id: "r1", type: "reviews", props: { title: "Avis" } }) as BlockOf<"reviews"> | undefined;
+    expect(r?.props.items).toEqual([]);
     expect(r && isEmptyInLive(r, live, 0)).toBe(true);
-    // Untagged coupon without its code: MERCI10 comes back, hidden from buyers.
-    const c = load({ id: "c1", type: "coupon", props: { title: "Merci" } });
-    expect(c?.sample).toBe(true);
-    expect(c && isEmptyInLive(c, live, 0)).toBe(true);
   });
 
   it("leaves the merchant's own content visible when only a setting was missing", () => {
@@ -293,80 +246,85 @@ describe("I. loader repair fallback", () => {
   });
 });
 
-describe("G. « Ce code existe dans ma boutique »", () => {
-  it("shows the example code, without warning, and can be undone", () => {
+describe("G. coupon codes", () => {
+  it("a new coupon has no invented code or discount: empty, it shows nothing live and no warning", () => {
     const coupon = createBlock("coupon") as BlockOf<"coupon">;
-    expect(isSampleOnly(coupon)).toBe(true);
-    const ok = confirmCouponCode(coupon);
-    // The tag stays: the confirmation alone makes the code real content.
-    expect(ok.sample).toBe(true);
-    expect(ok.props.codeConfirmed).toBe(true);
-    expect(isSampleOnly(ok)).toBe(false);
-    expect(isEmptyInLive(ok, live, 0)).toBe(false);
-    expect(sampleWarnings([ok])).toEqual({});
-    expect(promiseWarnings([ok])).toEqual({});
-    expect(visibleSampleIds([ok])).toEqual([]);
-    const back = unconfirmCouponCode(ok);
-    expect(back.sample).toBe(true);
-    expect(back.props.codeConfirmed).toBeUndefined();
-    expect(isSampleOnly(back)).toBe(true);
+    expect(coupon.props.code).toBe("");
+    expect(coupon.props.text).not.toMatch(/%|\d/);
+    expect(isEmptyInLive(coupon, live, 0)).toBe(true);
+    expect(html(coupon)).toBe("");
+    expect(layoutWarnings([coupon])).toEqual({});
   });
 
-  it("re-typing the example code after another one hides it again (confirmation dropped, tag kept)", () => {
-    const ok = confirmCouponCode(createBlock("coupon") as BlockOf<"coupon">);
-    // The editor drops codeConfirmed on every code change.
-    const other = { ...ok, props: { ...ok.props, code: "SOLDES", codeConfirmed: undefined } };
-    expect(isSampleOnly(other)).toBe(false);
-    const again = { ...other, props: { ...other.props, code: "MERCI10" } };
-    expect(isSampleOnly(again)).toBe(true);
-    expect(isEmptyInLive(again, live, 0)).toBe(true);
-    expect(visibleSampleIds([again])).toEqual([]);
+  it("the merchant's code shows as written, with no confirmation gate and no warning", () => {
+    const coupon = createBlock("coupon") as BlockOf<"coupon">;
+    const own = { ...coupon, props: { ...coupon.props, code: "SUMMER" } };
+    expect(isEmptyInLive(own, live, 0)).toBe(false);
+    expect(html(own)).toContain("SUMMER");
+    expect(layoutWarnings([own])).toEqual({});
   });
 
-  it("unconfirming an untagged (older) block only drops the confirmation", () => {
-    const old = untagged(createBlock("coupon")) as BlockOf<"coupon">;
-    const back = unconfirmCouponCode(confirmCouponCode(old));
-    expect(back.sample).toBeUndefined();
-    expect(back.props.codeConfirmed).toBeUndefined();
-    expect(visibleSampleIds([back])).toEqual([back.id]);
+  it("templates never put a code or a discount live", () => {
+    for (const t of [...CHECKOUT_TEMPLATES, ...THANK_YOU_TEMPLATES]) {
+      for (const b of t.build({ blocks: [] }).blocks) {
+        if (b.type !== "coupon") continue;
+        expect(b.props.code, t.id).toBe("");
+        expect(`${b.props.title} ${b.props.text}`, t.id).not.toMatch(/%|\d/);
+        expect(isEmptyInLive(b, live, 0), t.id).toBe(true);
+      }
+    }
   });
 });
 
-describe("H. « Masquer les exemples »", () => {
-  it("tags untagged blocks still showing examples, nothing else", () => {
-    const reviews = untagged(createBlock("reviews"));
-    const coupon = untagged(createBlock("coupon"));
-    const own = untagged(createBlock("testimonial"));
-    own.props.quote = "Je rachète chaque mois.";
-    const hidden = { ...untagged(createBlock("announcement")), hidden: true };
-    const g = createBlock("guarantee");
-    const blocks = [reviews, coupon, own, hidden, g];
-    expect(visibleSampleIds(blocks)).toEqual([reviews.id, coupon.id]);
-    expect(promiseWarnings(blocks)[reviews.id]).toMatch(/visibles par vos clients/);
-    const next = hideVisibleSamples(blocks);
-    expect(next.map((b) => b.sample)).toEqual([true, true, undefined, undefined, undefined]);
-    expect(next[2]).toBe(own);
-    expect(next[4]).toBe(g);
-    expect(visibleSampleIds(next)).toEqual([]);
-    expect(promiseWarnings(next)[reviews.id]).toBeUndefined();
-    expect(isEmptyInLive(next[0], live, 0)).toBe(true);
-    expect(hideVisibleSamples([own, g])).toEqual([own, g]);
-  });
-});
-
-describe("J. publish summary and coupon repair", () => {
-  it("counts « Masquer les exemples » as a change buyers will see", async () => {
-    const { diffLayout } = await import("@/components/builder/changes");
-    const published = loadCheckoutLayout(null);
-    const reviews = { ...createBlock("reviews"), sample: undefined } as Block;
-    const before = { ...published, blocks: [...published.blocks, reviews] };
-    const after = { ...before, blocks: before.blocks.map((b) => (b.id === reviews.id ? { ...b, sample: true as const } : b)) };
-    expect(diffLayout(after, before).modified).toBe(1);
-  });
-
+describe("J. coupon repair", () => {
   it("never pairs a real stored coupon code with the shipped discount text", () => {
     const c = loadCheckoutLayout({ blocks: [{ id: "c9", type: "coupon", props: { title: "Merci", code: "SUMMER" } }] }).blocks.find((b) => b.id === "c9") as BlockOf<"coupon"> | undefined;
     expect(c?.props.code).toBe("SUMMER");
     expect(c?.props.text).toBe("");
+  });
+});
+
+describe("template cards: « produits à choisir » counts only products", () => {
+  const upsell = (o: Partial<BlockOf<"upsell">["props"]>) => {
+    const b = createBlock("upsell") as BlockOf<"upsell">;
+    Object.assign(b.props, o);
+    return b;
+  };
+
+  it("a product to choose is counted; a %, a price or an add-on to create is its own note", () => {
+    const reco = createBlock("recommendations");
+    const noProduct = upsell({ productSource: "manual", variantId: "" });
+    const auto = upsell({ productSource: "auto" });
+    const bump = createBlock("order_addons");
+    bump.props.title = "Ajoutez";
+    const blocks = [reco, noProduct, auto, bump];
+    const all = setupWarnings(blocks, { hasAddOns: false });
+    const summary = setupSummary(blocks, { hasAddOns: false });
+    // Same items as the canvas warnings, split by kind.
+    expect(summary.products + summary.settings.length).toBe(Object.keys(all).length);
+    expect(summary.products).toBe(2);
+    expect(summary.settings).toContain(ADDONS_NOTE);
+    expect(setupText(summary)).toMatch(/^2 produits à choisir · /);
+    expect(setupText(summary)).toContain(ADDONS_NOTE);
+    // Settings only: no « produit » counted.
+    expect(setupText(setupSummary([bump], { hasAddOns: false }))).toBe(ADDONS_NOTE);
+    expect(setupText(setupSummary([noProduct]))).toBe("1 produit à choisir");
+    expect(setupText({ products: 0, settings: [] })).toBe("");
+  });
+
+  it("the builder's cards and the matching page use setupText (no raw warning count)", () => {
+    const src = readFileSync(join(__dirname, "..", "src/components/builder/BuilderApp.tsx"), "utf8");
+    expect(src).not.toMatch(/Object\.keys\(setupWarnings\([^)]*\)\)\.length/);
+    expect(src).toContain("setupText(setupSummary(");
+  });
+
+  it("the template dialog says button colors the merchant set are kept", () => {
+    const src = readFileSync(join(__dirname, "..", "src/components/builder/BuilderApp.tsx"), "utf8");
+    expect(src).toContain("Les couleurs de boutons que vous avez choisies vous-même");
+    // …which is true: applying a styled template leaves them as they are.
+    const t = CHECKOUT_TEMPLATES.find((x) => x.style)!;
+    const own = { payButtonColor: "#123456", payButtonColor2: "#654321", payButtonTextColor: "#ffffff", buttonColor: "#abcdef", buttonTextColor: "#000000" };
+    const theme = { ...defaultTheme("Boutique"), ...own };
+    expect(applyTemplateTheme(theme, t)).toMatchObject(own);
   });
 });

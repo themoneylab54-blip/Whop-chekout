@@ -229,11 +229,13 @@ describe("offer funnels (accept and decline chains)", () => {
   });
 
   it("stops after MAX_OFFER_DEPTH offers", () => {
-    const long = [offer("1", { acceptNextId: "2" }), offer("2", { acceptNextId: "3" }), offer("3", { acceptNextId: "4" }), offer("4")];
-    expect(MAX_OFFER_DEPTH).toBe(3);
-    expect(offerTrail(long, "1", { 1: "PAID", 2: "PAID" }, all).current).toBe("3");
-    expect(offerTrail(long, "1", { 1: "PAID", 2: "PAID", 3: "PAID" }, all)).toEqual({ accepted: ["1", "2", "3"], current: null });
-    expect(funnelDepth(long, "1")).toBe(4);
+    const ids = ["1", "2", "3", "4", "5", "6"];
+    const long = ids.map((id, i) => offer(id, ids[i + 1] ? { acceptNextId: ids[i + 1] } : {}));
+    expect(MAX_OFFER_DEPTH).toBe(5);
+    const paid = (n: number) => Object.fromEntries(ids.slice(0, n).map((id) => [id, "PAID"]));
+    expect(offerTrail(long, "1", paid(4), all).current).toBe("5");
+    expect(offerTrail(long, "1", paid(5), all)).toEqual({ accepted: ["1", "2", "3", "4", "5"], current: null });
+    expect(funnelDepth(long, "1")).toBe(6);
     expect(funnelDepth(blocks, "a")).toBe(3);
   });
 
@@ -360,14 +362,16 @@ describe("quantity breaks v2", () => {
 
   it("validates what the dashboard saves", () => {
     expect(validateQuantityTiers([{ minQty: 2, percent: 10 }, { minQty: 3, percent: 15 }]).ok).toBe(true);
-    expect(validateQuantityTiers([{ minQty: 2, percent: 10 }, { minQty: 3, percent: 5 }])).toMatchObject({ ok: false });
+    // A bigger quantity with a smaller discount is the merchant's choice: saved, with a note.
+    expect(validateQuantityTiers([{ minQty: 2, percent: 10 }, { minQty: 3, percent: 5 }]).ok).toBe(true);
     expect(validateQuantityTiers([{ minQty: 2, percent: 10 }, { minQty: 2, percent: 15 }])).toMatchObject({ ok: false });
     // Same quantity in another scope is fine.
     expect(validateQuantityTiers([{ minQty: 2, percent: 10 }, { minQty: 2, percent: 15, productIds: ["gid://shopify/Product/1"] }]).ok).toBe(true);
     expect(validateQuantityTiers([{ minQty: 2, percent: 12.55 }])).toMatchObject({ ok: false });
     expect(validateQuantityTiers([{ minQty: 1, percent: 10 }])).toMatchObject({ ok: false });
     expect(validateQuantityTiers([{ type: "gift", minQty: 2, variantId: "", title: "x" }])).toMatchObject({ ok: false });
-    expect(validateQuantityTiers([1, 2, 3, 4].map((i) => ({ type: "gift", minQty: i, variantId: String(i), title: "x" })))).toMatchObject({ ok: false });
+    expect(validateQuantityTiers(Array.from({ length: 10 }, (_, i) => ({ type: "gift", minQty: i + 1, variantId: String(i + 1), title: "x" }))).ok).toBe(true);
+    expect(validateQuantityTiers(Array.from({ length: 11 }, (_, i) => ({ type: "gift", minQty: i + 1, variantId: String(i + 1), title: "x" })))).toMatchObject({ ok: false });
     const ok = validateQuantityTiers([{ type: "gift", minSubtotalCents: 5000, variantId: "555", title: "une bougie" }]);
     expect(ok).toEqual({ ok: true, tiers: [{ type: "gift", minSubtotalCents: 5000, variantId: "gid://shopify/ProductVariant/555", title: "une bougie" }] });
     expect(validateQuantityTiers("nope")).toMatchObject({ ok: false });

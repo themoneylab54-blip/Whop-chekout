@@ -7,14 +7,15 @@ import { prepareSession, quoteSchema, type QuoteInput } from "./checkout";
 import { designFor } from "./experiments";
 import { layoutWithOverrides, overridesFor } from "./checkout-tests";
 import { loadCheckoutLayout, loadTheme } from "./layout";
-import { checkoutCountries, countryHints, pickFirstCountry } from "./first-country";
+import { checkoutCountries, countryHints, pickFirstCountry, shipsToCountry, storeMarketOf } from "./first-country";
 import { resolveCheckoutLang, type Lang } from "@/components/checkout/i18n";
 
 /**
  * The store's main market, pre-selected when the visitor's IP country is unknown or not
- * served: the most frequent shipping country of its recent paid orders, else the first
- * country of its first shipping rate. Null when neither says anything. Shared by the checkout
- * page and the early prepare (same first country).
+ * served: the most frequent shipping country of its recent paid orders that it still ships to.
+ * Null without such orders: the shipping setup's dedicated country (storeMarketOf) is then weighed
+ * by pickFirstCountry, after the language's country (before it for English). Shared by the checkout page and the early
+ * prepare (same first country).
  */
 export async function primaryCountryOf(storeId: string, rates: { countries: string[] }[]): Promise<string | null> {
   try {
@@ -29,12 +30,14 @@ export async function primaryCountryOf(storeId: string, rates: { countries: stri
       WHERE c ~ '^[A-Z]{2}$'
       GROUP BY c
       ORDER BY count(*) DESC, c
-      LIMIT 1`;
-    if (rows[0]?.c) return rows[0].c;
+      LIMIT 20`;
+    // A market the store no longer ships to would be skipped by the checkout's list anyway.
+    const served = rows.find((r) => shipsToCountry(rates, r.c));
+    if (served) return served.c;
   } catch (err) {
     log.warn("checkout.primary_country_failed", "Main market lookup failed", { storeId, err });
   }
-  return rates.find((r) => r.countries.length > 0)?.countries[0] ?? null;
+  return null;
 }
 
 /** How long the page (c/[id]/page.tsx) waits for the main market lookup before going on without it. */
@@ -53,10 +56,11 @@ export function within<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
  * The country the checkout page pre-selects for this visitor, exactly as CheckoutView picks it
  * (pickFirstCountry over the same list and hints as c/[id]/page.tsx gives it): the IP country when
  * shipped to, else the browser locale's, else the store's main market (`primary`, only asked when
- * needed), else the language's country, else the first listed. Never null.
+ * needed), else the language's country, else its shipping setup's dedicated country, else the most common
+ * market it ships to, else the first listed. Never null.
  */
 export async function firstLoadCountry(
-  rates: { countries: string[] }[],
+  rates: { countries: string[]; kind?: string | null; position?: number | null }[],
   ipCountry: string | null,
   acceptLanguage: string | null,
   opts: { language: Lang; primary?: () => Promise<string | null> },
@@ -64,7 +68,7 @@ export async function firstLoadCountry(
   const hints = countryHints(rates, ipCountry, acceptLanguage);
   const primaryCountry = hints.needsPrimary && opts.primary ? await opts.primary().catch(() => null) : null;
   const codes = checkoutCountries(rates, opts.language).map((c) => c.code);
-  return pickFirstCountry(codes, { initialCountry: ipCountry, localeCountry: hints.localeCountry, primaryCountry, language: opts.language });
+  return pickFirstCountry(codes, { initialCountry: ipCountry, localeCountry: hints.localeCountry, primaryCountry, rateCountry: storeMarketOf(rates), language: opts.language });
 }
 
 /**
@@ -96,7 +100,7 @@ export async function prepareAhead(sessionId: string, ctx: { ipCountry: string |
     if (!session || session.status !== "OPEN" || session.forcedProvider) return false;
     if (chooseProvider(session.store)?.provider !== "whop") return false;
     const [rates, design, overrides] = await Promise.all([
-      db.shippingRate.findMany({ where: { storeId: session.storeId, active: true }, orderBy: { position: "asc" }, select: { countries: true } }),
+      db.shippingRate.findMany({ where: { storeId: session.storeId, active: true }, orderBy: { position: "asc" }, select: { countries: true, kind: true, position: true } }),
       designFor(session.store, session),
       overridesFor(session),
     ]);

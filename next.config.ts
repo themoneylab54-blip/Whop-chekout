@@ -9,6 +9,12 @@ const noFraming = [
 ];
 
 const nextConfig: NextConfig = {
+  experimental: {
+    // The builder saves whole layouts through a server action (saveBuilderAction): up to 300
+    // reviews of 5 000 characters per reviews block, duplicated blocks, translations… go well past
+    // the 1 MB default. Below the proxy's 10 MB body limit (proxyClientMaxBodySize).
+    serverActions: { bodySizeLimit: "8mb" },
+  },
   async headers() {
     return [
       {

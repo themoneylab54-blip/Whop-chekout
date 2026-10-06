@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   applyTemplateTheme,
   blocksKeptAside,
+  blocksShownBy,
   CHECKOUT_TEMPLATES,
+  isCurrentTemplate,
   fromSpec,
   matchingThankYou,
   previewAfterPopover,
@@ -26,8 +28,7 @@ import { contrastFailures, contrastRatio, fieldBorderColor, mix, readableOn, the
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_TEXTS, isShippedDefault, translateDefault } from "@/components/checkout/localize";
-import { layoutWarnings, promiseWarnings, SAMPLE_DELIVERY_WARNING, SAMPLE_PROMISE_WARNING, sampleWarnings, setupWarnings } from "@/components/builder/placement";
-import { isSampleOnly } from "@/lib/sample-content";
+import { layoutWarnings, setupWarnings } from "@/components/builder/placement";
 import { isEmptyInLive, type ContentContext } from "@/components/checkout/blocks";
 import { blocksHiddenBy } from "@/components/builder/templates";
 import { arrangeCheckout } from "@/components/checkout/CheckoutView";
@@ -93,7 +94,7 @@ describe("templates: schema", () => {
   it("new blocks use the shipped (auto-translated) default texts", () => {
     const texts = (v: unknown): string[] =>
       typeof v === "string" ? [v] : Array.isArray(v) ? v.flatMap(texts) : v && typeof v === "object" ? Object.values(v).flatMap(texts) : [];
-    for (const t of CHECKOUT_TEMPLATES.filter((x) => x.style)) {
+    for (const t of [...CHECKOUT_TEMPLATES, ...THANK_YOU_TEMPLATES]) {
       for (const b of t.build({ blocks: [] }).blocks) {
         if (b.type === "reviews") continue; // names of the sample reviews
         const TEXT_KEYS = ["title", "text", "label", "message", "success", "subtext", "quote", "author", "q", "a"];
@@ -123,6 +124,27 @@ describe("templates: contrast (WCAG AA)", () => {
     const field = themeContrastChecks(theme).find((c) => c.what === "field border on form")!;
     expect(field.min).toBe(3);
     expect(field.ratio).toBeGreaterThanOrEqual(3);
+  });
+
+  it.each(THANK_YOU_TEMPLATES.filter((t) => t.style).map((t) => [t.id, t] as const))("thank-you %s: every surface of the page passes AA", (_, t: Template) => {
+    const theme = applyTemplateTheme(merchantTheme(), t);
+    expect(contrastFailures(theme).map((c) => `${c.what}: ${c.fg} on ${c.bg} = ${c.ratio.toFixed(2)}`)).toEqual([]);
+    // ThankYouView: secondary text (text-neutral-600) on the page, the summary card and white cards;
+    // icons (accent) on them; the CTA label on its button.
+    const page = theme.pageBackground || "#ffffff";
+    for (const bg of [page, theme.summaryBackground || page, "#ffffff"]) {
+      expect(contrastRatio("#525252", bg), `muted on ${bg}`).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(theme.textColor, bg), `text on ${bg}`).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(theme.accentColor, bg), `icons on ${bg}`).toBeGreaterThanOrEqual(3);
+    }
+    expect(contrastRatio(readableOn(theme.accentColor), theme.accentColor)).toBeGreaterThanOrEqual(4.5);
+    if (theme.accentColor2) expect(contrastRatio(readableOn(theme.accentColor), theme.accentColor2)).toBeGreaterThanOrEqual(4.5);
+  });
+
+  it("« Luxe noir & or » has a real gold", () => {
+    const t = CHECKOUT_TEMPLATES.find((x) => x.id === "luxury-black-gold")!;
+    expect(t.style!.borderColor).toBe("#c9a646");
+    expect(t.description).toMatch(/or\b/);
   });
 
   it("field borders: a light theme border is darkened toward the text color just enough for 3:1; a dark one is kept", () => {
@@ -185,7 +207,8 @@ describe("templates: applying keeps the merchant's content", () => {
     expect(r.id).toBe(reviews.id);
     expect(r.props).toEqual(reviews.props);
     expect(r.i18n).toEqual(reviews.i18n);
-    expect(r.placement).toBe("summary"); // placed by the template
+    expect(r.placement).toBe("form"); // the merchant's placement is kept (the template only orders it)
+    expect(r.style).toEqual(reviews.style);
     // Fixed sections are the same objects (custom titles kept)
     const payment = current.blocks.find((b) => b.type === "payment")!;
     expect(out.blocks.find((b) => b.type === "payment")).toEqual({ ...payment, hidden: false });
@@ -199,78 +222,27 @@ describe("templates: applying keeps the merchant's content", () => {
 });
 
 describe("templates: no fabricated social proof", () => {
-  it("sample reviews are never marked verified", () => {
+  it("a new reviews block holds no invented review", () => {
     const r = createBlock("reviews");
-    expect(r.props.items.length).toBeGreaterThan(0);
-    expect(r.props.items.every((it) => !it.verified)).toBe(true);
+    expect(r.props.items).toEqual([]);
+    for (const t of [...CHECKOUT_TEMPLATES, ...THANK_YOU_TEMPLATES])
+      for (const b of t.build({ blocks: [] }).blocks) if (b.type === "reviews") expect(b.props.items, t.id).toEqual([]);
   });
 
   it("no template ships the example free-shipping announcement", () => {
     for (const t of [...CHECKOUT_TEMPLATES, ...THANK_YOU_TEMPLATES]) expect(t.spec.map(([type]) => type), t.id).not.toContain("announcement");
   });
 
-  it.each(all.map(({ t, page }) => [`${page}/${t.id}`, t] as const))("%s: every sample proof it adds is flagged as to complete (hidden from buyers)", (_, t) => {
+  it.each(all.map(({ t, page }) => [`${page}/${t.id}`, t] as const))("%s: only a product to choose is flagged; nothing is tagged as an example", (_, t) => {
     const blocks = t.build({ blocks: [] }).blocks;
-    const flagged = sampleWarnings(blocks);
-    const promises = promiseWarnings(blocks);
+    const warnings = layoutWarnings(blocks, { hasAddOns: true });
     for (const b of blocks) {
-      // Fabricated proof: a setup warning, and never shown to buyers.
-      if (["reviews", "testimonial", "stats", "coupon", "text"].includes(b.type)) {
-        expect(flagged[b.id], `${t.id}/${b.type}`).toMatch(/pour (les |l')afficher$/);
-        expect(isSampleOnly(b), `${t.id}/${b.type}`).toBe(true);
-      } else expect(flagged[b.id], `${t.id}/${b.type}`).toBeUndefined();
-      // Example promises: an amber warning only.
-      if (["guarantee", "benefits", "value_props", "faq", "support", "delivery_estimate", "why_us", "comparison", "payment_icons"].includes(b.type))
-        expect(promises[b.id], `${t.id}/${b.type}`).toBeTruthy();
-      else expect(promises[b.id], `${t.id}/${b.type}`).toBeUndefined();
+      expect(b.sample, `${t.id}/${b.type}`).toBeUndefined();
+      if (!["upsell", "recommendations", "order_addons"].includes(b.type)) expect(warnings[b.id], `${t.id}/${b.type}`).toBeUndefined();
     }
-    // Shown with the other warnings (canvas badge, block list).
-    // Shown with the setup warnings (canvas badge, block list, "blocs à compléter").
-    const setup = setupWarnings(blocks);
-    for (const id of Object.keys(flagged)) expect(setup[id]).toBe(flagged[id]);
-    for (const id of Object.keys(flagged)) expect(layoutWarnings(blocks)[id]).toBe(flagged[id]);
-    // A block both incomplete and promising (support without a channel): the setup warning wins.
-    for (const id of Object.keys(promises)) expect(layoutWarnings(blocks)[id]).toBe(setup[id] ?? promises[id]);
   });
 
-  it("clears once the merchant writes real content, and ignores hidden blocks", () => {
-    const reviews = createBlock("reviews");
-    const testimonial = createBlock("testimonial");
-    const stats = createBlock("stats");
-    const coupon = createBlock("coupon");
-    const announcement = createBlock("announcement");
-    const text = createBlock("text");
-    const sample = [reviews, testimonial, stats, coupon, announcement, text];
-    expect(Object.keys(sampleWarnings(sample)).sort()).toEqual(sample.map((b) => b.id).sort());
-    expect(sampleWarnings(sample.map((b) => ({ ...b, hidden: true })))).toEqual({});
-    reviews.props.items = [{ name: "Léa M.", text: "Très bon produit.", stars: 5, verified: true }];
-    testimonial.props.quote = "Je rachète chaque mois.";
-    stats.props.items = [{ value: "2 300", label: "commandes" }];
-    coupon.props.code = "BIENVENUE";
-    announcement.props.text = "Livraison offerte dès 80 €";
-    text.props = { heading: "Fabriqué à Lyon", body: "Chaque pièce est cousue dans notre atelier." };
-    expect(sampleWarnings(sample)).toEqual({});
-    for (const b of sample) expect(isSampleOnly(b), b.type).toBe(false);
-  });
-
-  it("the example \"48 h\" figure and the placeholder text alone are enough to hide the block", () => {
-    const stats = createBlock("stats");
-    stats.props.items = [{ value: "48 h", label: "expédition" }];
-    expect(sampleWarnings([stats])[stats.id]).toMatch(/Chiffres d'exemple/);
-    const text = createBlock("text");
-    text.props.heading = "Notre histoire";
-    expect(sampleWarnings([text])[text.id]).toMatch(/Texte d'exemple/);
-    text.props.body = "Une marque familiale.";
-    expect(sampleWarnings([text])).toEqual({});
-    expect(isSampleOnly(stats)).toBe(true);
-    expect(isSampleOnly(text)).toBe(false);
-    // Reviews: the shipped ones never show, the merchant's own do.
-    const reviews = createBlock("reviews");
-    expect(isSampleOnly(reviews)).toBe(true);
-    reviews.props.items.push({ name: "Léa M.", text: "Très bon produit.", stars: 5, verified: false });
-    expect(isSampleOnly(reviews)).toBe(false);
-    expect(sampleWarnings([reviews])[reviews.id]).toBe("Avis d'exemple : remplacez-les par vos vrais avis pour les afficher");
-    // The testimonial ships without a "Client vérifié" author vouching for it.
+  it("the testimonial ships without a « Client vérifié » author vouching for it", () => {
     expect(createBlock("testimonial").props.author).toBe("");
   });
 });
@@ -306,7 +278,8 @@ describe("templates: applying keeps the merchant's other blocks", () => {
   it("keeps thank-you blocks too", () => {
     const text = createBlock("text");
     const blocks = defaultThankYouLayout().blocks;
-    const current = { blocks: [blocks[0], text, ...blocks.slice(1)] };
+    // Not next to the confirmation (that place is the old « Simple » note, reused as the message).
+    const current = { blocks: [...blocks.slice(0, 2), text, ...blocks.slice(2)] };
     const out = THANK_YOU_TEMPLATES.find((x) => x.id === "upsell")!.build(current).blocks;
     expect(out.map((b) => b.id)).toContain(text.id);
     expect(out[out.findIndex((b) => b.type === "ty_confirmation") + 1].type).toBe("upsell");
@@ -334,7 +307,7 @@ describe("templates: what is described is what renders", () => {
   it("trust-max: payment logos, secure badge and guarantee come before the reviews on mobile", () => {
     const a = arrangeCheckout(CHECKOUT_TEMPLATES.find((x) => x.id === "trust-max")!.build({ blocks: [] }).blocks);
     // CheckoutView's mobile order under the pay button: side (placed next to the payment) then summary.
-    expect([...a.side, ...a.summary].map((b) => b.type)).toEqual(["payment_icons", "secure_badge", "guarantee", "reviews", "value_props"]);
+    expect([...a.side, ...a.summary].map((b) => b.type)).toEqual(["payment_icons", "secure_badge", "guarantee", "reviews"]);
   });
 
   it("urgency-promo: low stock shows above the payment, on mobile too (form column, not under the pay button)", () => {
@@ -380,13 +353,12 @@ describe("templates: Modèles cards and the matching thank-you page", () => {
     for (const t of CHECKOUT_TEMPLATES.filter((x) => !x.style)) expect(matchingThankYou(t), t.id).toBeNull();
   });
 
-  it("counts the blocks each template leaves to complete (setup warnings, sample proof included)", () => {
+  it("counts only the products each template leaves to choose", () => {
     const t = CHECKOUT_TEMPLATES.find((x) => x.id === "urgency-promo")!;
     const blocks = t.build(defaultCheckoutLayout()).blocks;
-    const types = Object.keys(setupWarnings(blocks, { now: Date.parse("2026-06-01T00:00:00Z") })).map((id) => blocks.find((b) => b.id === id)!.type);
-    // Countdown without an end date, cross-sells without products, sample reviews (low stock
-    // shows by itself once stock is low).
-    expect(types.sort()).toEqual(["countdown", "recommendations", "reviews"]);
+    const types = Object.keys(setupWarnings(blocks)).map((id) => blocks.find((b) => b.id === id)!.type);
+    // Cross-sells without products (the countdown and the empty reviews need nothing).
+    expect(types.sort()).toEqual(["recommendations"]);
   });
 });
 
@@ -399,139 +371,47 @@ describe("templates: menu preview", () => {
   });
 });
 
-describe("templates: example promises are flagged before publishing", () => {
-  it("flags guarantee, benefits, value props, why-us, comparison, FAQ and support as promises (warning, not a publishing gate)", () => {
-    const types = ["guarantee", "benefits", "value_props", "why_us", "comparison", "faq", "support"] as const;
+describe("templates: example texts are never flagged", () => {
+  it("guarantee, benefits, value props, why-us, comparison, FAQ, support, delivery estimate, countdown, free-shipping bar, social, button: no warning", () => {
+    const types = ["guarantee", "benefits", "value_props", "why_us", "comparison", "faq", "support", "delivery_estimate", "countdown", "free_shipping_bar", "social", "button_link"] as const;
     const blocks = types.map((t) => createBlock(t));
-    const flagged = promiseWarnings(blocks);
-    for (const b of blocks) expect(flagged[b.id], b.type).toBe(SAMPLE_PROMISE_WARNING);
-    expect(SAMPLE_PROMISE_WARNING).toBe("Promesse d'exemple : vérifiez qu'elle correspond à votre politique");
-    // Promises never block publishing.
-    expect(sampleWarnings(blocks)).toEqual({});
-    expect(promiseWarnings(blocks.map((b) => ({ ...b, hidden: true })))).toEqual({});
+    expect(layoutWarnings(blocks, { hasFreeShippingRate: false, now: Date.parse("2026-06-01T12:00:00Z") })).toEqual({});
+    expect(setupWarnings(blocks)).toEqual({});
   });
 
-  it("the default checkout is promise-free: non-binding trust badges, translated in every language", () => {
+  it("the default checkout: non-binding trust badges, translated in every language, nothing flagged", () => {
     const blocks = defaultCheckoutLayout().blocks;
     const badges = blocks.find((b) => b.type === "trust_badges")!;
     expect(badges.type === "trust_badges" && badges.props.badges.map((x) => x.label)).toEqual(["Paiement sécurisé", "Données chiffrées", "Suivi de commande"]);
-    expect(promiseWarnings(blocks)).toEqual({});
-    expect(sampleWarnings(blocks)).toEqual({});
-    expect(sampleWarnings(defaultThankYouLayout().blocks)).toEqual({});
+    expect(layoutWarnings(blocks, { hasAddOns: true })).toEqual({});
+    expect(layoutWarnings(defaultThankYouLayout().blocks)).toEqual({});
     for (const lang of Object.keys(DEFAULT_TEXTS) as (keyof typeof DEFAULT_TEXTS)[]) {
       expect(translateDefault("Données chiffrées", lang), lang).toBe(DEFAULT_TEXTS[lang].encryptedData);
       expect(translateDefault("Suivi de commande", lang), lang).toBe(DEFAULT_TEXTS[lang].orderTracking);
     }
-    // A trust-badges block a merchant saved with the old example promise is still flagged.
-    const old = createBlock("trust_badges");
-    old.props.badges = [{ label: "Satisfait ou remboursé 30 jours", iconUrl: "" }];
-    expect(promiseWarnings([old])[old.id]).toBe(SAMPLE_PROMISE_WARNING);
   });
 
-  it("delivery estimate: the shipped 3–5 day delay is a promise until changed", () => {
-    const d = createBlock("delivery_estimate");
-    expect(promiseWarnings([d])[d.id]).toBe(SAMPLE_DELIVERY_WARNING);
-    expect(sampleWarnings([d])).toEqual({});
-    d.props.maxDays = 4;
-    expect(promiseWarnings([d])).toEqual({});
-  });
-
-  it("support: the shipped 24 h reply is a promise until changed", () => {
-    const s = createBlock("support");
-    expect(s.props.text).toBe(DEFAULT_TEXTS.fr.supportText);
-    expect(promiseWarnings([s])[s.id]).toBe(SAMPLE_PROMISE_WARNING);
-    s.props.text = "Écrivez-nous, nous répondons en semaine.";
-    expect(promiseWarnings([s])).toEqual({});
-  });
-
-  it("clears once the merchant writes their own policy", () => {
-    const guarantee = createBlock("guarantee");
-    guarantee.props = { title: "Retours sous 14 jours", text: "Retournez le produit sous 14 jours, frais de retour à votre charge." };
-    const values = createBlock("value_props");
-    values.props.items = [{ icon: "truck", label: "Livraison 4,90 €" }, { icon: "lock", label: "Paiement sécurisé" }];
-    const badges = createBlock("trust_badges");
-    badges.props.badges = [{ label: "Paiement sécurisé", iconUrl: "" }, { label: "Retours sous 14 jours", iconUrl: "" }];
-    const benefits = createBlock("benefits");
-    benefits.props.items = [{ icon: "truck", title: "Colissimo suivi", text: "Expédiée sous 72 h" }];
-    expect(promiseWarnings([guarantee, values, badges, benefits])).toEqual({});
-    // One shipped promise left is enough to flag the block.
-    values.props.items.push({ icon: "truck", label: "Livraison offerte" });
-    expect(promiseWarnings([values])[values.id]).toBe(SAMPLE_PROMISE_WARNING);
-  });
-});
-
-describe("templates: countdown and free-shipping bar need their settings", () => {
-  const now = Date.parse("2026-06-01T12:00:00Z");
-
-  it("countdown: an empty, invalid or past end date is a setup warning", () => {
-    const c = createBlock("countdown");
-    expect(setupWarnings([c], { now })[c.id]).toBe("Minuteur : choisir une date de fin");
-    c.props.endsAt = "pas une date";
-    expect(setupWarnings([c], { now })[c.id]).toBe("Minuteur : choisir une date de fin");
-    c.props.endsAt = "2026-05-31T12:00:00Z";
-    expect(setupWarnings([c], { now })[c.id]).toBe("Minuteur : choisir une date de fin");
-    c.props.endsAt = "2026-06-02T12:00:00Z";
-    expect(setupWarnings([c], { now })).toEqual({});
-    expect(setupWarnings([{ ...c, props: { ...c.props, endsAt: "" }, hidden: true }], { now })).toEqual({});
-  });
-
-  it("the Urgence and Conversion templates warn about their countdown until it has an end date", () => {
-    for (const id of ["urgency-promo", "conversion"]) {
-      const blocks = CHECKOUT_TEMPLATES.find((x) => x.id === id)!.build(defaultCheckoutLayout()).blocks;
-      const countdown = blocks.find((b) => b.type === "countdown")!;
-      expect(layoutWarnings(blocks, { now })[countdown.id], id).toBe("Minuteur : choisir une date de fin");
-    }
-  });
-
-  it("free-shipping bar: threshold 0 warns only when the store has no free-over rate", () => {
-    const bar = createBlock("free_shipping_bar");
-    expect(bar.props.threshold).toBe(0);
-    expect(setupWarnings([bar], { hasFreeShippingRate: false })[bar.id]).toMatch(/seuil de livraison offerte/);
-    expect(setupWarnings([bar], { hasFreeShippingRate: true })).toEqual({});
-    expect(setupWarnings([bar])).toEqual({}); // rates unknown: no guess
-    bar.props.threshold = 50;
-    expect(setupWarnings([bar], { hasFreeShippingRate: false })).toEqual({});
-  });
-});
-
-describe("templates: social, button and support blocks need their settings (hidden from buyers otherwise)", () => {
-  it("social without links, button without URL, support without any channel", () => {
-    const social = createBlock("social");
-    const button = createBlock("button_link");
-    const support = createBlock("support");
-    support.props.text = "";
-    const warnings = setupWarnings([social, button, support]);
-    expect(warnings[social.id]).toMatch(/au moins un lien/);
-    expect(warnings[button.id]).toMatch(/adresse du lien/);
-    expect(warnings[support.id]).toMatch(/Support/);
-    social.props.instagram = "https://instagram.com/maison";
-    button.props.url = "https://maison.example";
-    support.props.whatsapp = "+33 6 12 34 56 78";
-    expect(setupWarnings([social, button, support])).toEqual({});
-    // A support block needs a channel (e-mail, phone or WhatsApp): its text alone hides it live.
+  it("a support block without any channel has nothing to show live (no warning either)", () => {
     const textOnly = createBlock("support");
-    expect(setupWarnings([textOnly])[textOnly.id]).toBe("Support : indiquer un e-mail, un téléphone ou WhatsApp pour l'afficher");
     expect(isEmptyInLive(textOnly, { preview: false } as unknown as ContentContext, 0)).toBe(true);
     textOnly.props.email = "aide@maison.example";
-    expect(setupWarnings([textOnly])).toEqual({});
     expect(isEmptyInLive(textOnly, { preview: false } as unknown as ContentContext, 0)).toBe(false);
-    expect(setupWarnings([{ ...createBlock("social"), hidden: true }])).toEqual({});
   });
 });
 
-describe("templates: layout-only templates keep the blocks' own style", () => {
-  it("a reused block keeps its custom style under a layout-only template, gets the look's under a styled one", () => {
+describe("templates: the merchant's blocks keep their own style and placement", () => {
+  it("a reused block keeps its style and placement under every template; a created one takes the template's", () => {
     const badge = createBlock("secure_badge", { placement: "form" });
     badge.style = { ...badge.style, background: "brand", card: true, align: "right" };
     const current = { blocks: [...defaultCheckoutLayout().blocks, badge] };
-    for (const t of CHECKOUT_TEMPLATES.filter((x) => !x.style)) {
+    for (const t of CHECKOUT_TEMPLATES.filter((x) => x.spec.some(([type]) => type === "secure_badge"))) {
       const out = t.build(current).blocks.find((b) => b.id === badge.id)!;
       expect(out.style, t.id).toEqual(badge.style);
+      expect(out.placement, t.id).toBe("form");
     }
-    // A styled template restyles it: defaults plus its own overrides.
-    const styled = CHECKOUT_TEMPLATES.find((x) => x.id === "clean-minimal")!.build(current).blocks.find((b) => b.id === badge.id)!;
-    expect(styled.style.background).not.toBe("brand");
-    expect(styled.style.align).toBe("center");
+    // Created by the template: its own overrides.
+    const created = CHECKOUT_TEMPLATES.find((x) => x.id === "clean-minimal")!.build(defaultCheckoutLayout()).blocks.find((b) => b.type === "secure_badge")!;
+    expect(created.style.align).toBe("center");
   });
 });
 
@@ -543,14 +423,187 @@ describe("templates: minimal templates hide (never delete) the extras", () => {
       const out = t.build(current).blocks;
       for (const type of ["order_addons", "trust_badges"] as const) {
         const before = current.blocks.find((b) => b.type === type)!;
-        expect(out.find((b) => b.id === before.id), `${id}/${type}`).toEqual({ ...before, hidden: true });
+        expect(out.find((b) => b.id === before.id), `${id}/${type}`).toEqual({ ...before, hidden: true, hiddenByTemplate: id });
       }
       expect(blocksHiddenBy(t, current).map((b) => b.type).sort(), id).toEqual(["order_addons", "trust_badges"]);
       expect(blocksHiddenBy(t, { blocks: out }), id).toEqual([]);
       expect(checkoutLayoutSchema.safeParse({ blocks: out }).success).toBe(true);
     }
-    // Other templates hide nothing.
-    const out = CHECKOUT_TEMPLATES.find((x) => x.id === "trust")!.build(current).blocks;
+    // Templates without their own reassurance hide nothing.
+    const out = CHECKOUT_TEMPLATES.find((x) => x.id === "sport-performance")!.build(current).blocks;
     expect(out.filter((b) => b.hidden)).toEqual([]);
+  });
+});
+
+describe("templates: merchant rules (thank-you note, no fake or live-empty content, no duplicates)", () => {
+  const ty = (id: string) => THANK_YOU_TEMPLATES.find((x) => x.id === id)!;
+  const co = (id: string) => CHECKOUT_TEMPLATES.find((x) => x.id === id)!;
+
+  it.each(THANK_YOU_TEMPLATES.map((t) => [t.id, t] as const))("thank-you %s: exactly one message card, right after the confirmation (or its offer)", (_, t) => {
+    expect(THANK_YOU_TEMPLATES.length).toBe(15);
+    for (const base of [defaultThankYouLayout(), { blocks: [] }]) {
+      const blocks = t.build(base).blocks;
+      const messages = blocks.filter((b) => b.type === "message");
+      expect(messages).toHaveLength(1);
+      expect(messages[0].style.card).toBe(true);
+      const types = blocks.map((b) => b.type);
+      const before = types[types.indexOf("message") - 1];
+      expect(before === "ty_confirmation" || before === "upsell", before).toBe(true);
+    }
+    const types = t.spec.map(([type]) => type);
+    for (const gone of ["delivery_estimate", "support", "social", "button_link", "testimonial", "stats"]) expect(types, gone).not.toContain(gone);
+  });
+
+  it("no coupon title starts with « Merci »", () => {
+    for (const t of THANK_YOU_TEMPLATES)
+      for (const b of t.build({ blocks: [] }).blocks) if (b.type === "coupon") expect(b.props.title, t.id).not.toMatch(/^merci/i);
+  });
+
+  it("no template adds a parcel protection, an invented figure or quote, or a date countdown without its date", () => {
+    for (const t of [...CHECKOUT_TEMPLATES, ...THANK_YOU_TEMPLATES]) {
+      const blocks = t.build({ blocks: [] }).blocks;
+      expect(blocks.filter((b) => b.type === "shipping_protection" && !b.hidden), t.id).toEqual([]);
+      for (const b of blocks) {
+        expect(["stats", "testimonial", "rating"], `${t.id}/${b.type}`).not.toContain(b.type);
+        if (b.type === "countdown") expect(b.props.mode, t.id).toBe("evergreen");
+        if (b.type === "reviews") expect(b.props.items, t.id).toEqual([]);
+      }
+    }
+  });
+
+  it("example texts of created blocks make no precise promise (days, hours, free shipping)", () => {
+    for (const t of [...CHECKOUT_TEMPLATES, ...THANK_YOU_TEMPLATES]) {
+      for (const b of t.build({ blocks: [] }).blocks) {
+        if (["free_shipping_bar", "shipping_protection"].includes(b.type)) continue; // driven by the store's own rates / settings
+        const json = JSON.stringify(b.props);
+        expect(json, `${t.id}/${b.type}`).not.toMatch(/\d+\s*(jours|h\b)|livraison offerte|\+10 000|4,8/i);
+      }
+    }
+  });
+
+  it("per-visitor countdowns claim no offer end: « Votre panier est réservé pendant {timer} », translated in 6 languages", () => {
+    const withCountdown = CHECKOUT_TEMPLATES.filter((t) => t.spec.some(([type]) => type === "countdown"));
+    expect(withCountdown.length).toBeGreaterThanOrEqual(2);
+    for (const t of withCountdown) {
+      for (const b of t.build({ blocks: [] }).blocks) {
+        if (b.type !== "countdown") continue;
+        expect(b.props.label, t.id).toBe("Votre panier est réservé pendant {timer}");
+        expect(b.props.label, t.id).not.toMatch(/se termine/i);
+      }
+    }
+    expect(translateDefault("Votre panier est réservé pendant {timer}", "en")).toBe("Your cart is reserved for {timer}");
+    expect(translateDefault("Votre panier est réservé pendant {timer}", "nl")).toBe(DEFAULT_TEXTS.nl.countdownCart);
+  });
+
+  it("no contact promise the page can't keep (guarantee and FAQ texts are self-contained, translated)", () => {
+    const texts: string[] = [];
+    for (const t of [...CHECKOUT_TEMPLATES, ...THANK_YOU_TEMPLATES]) {
+      for (const b of t.build({ blocks: [] }).blocks) {
+        const json = JSON.stringify(b.props);
+        expect(json, `${t.id}/${b.type}`).not.toMatch(/écrivez-nous|contacter|une question sur votre commande/i);
+        if (b.type === "guarantee") texts.push(b.props.title, b.props.text);
+        if (b.type === "faq") texts.push(...b.props.items.flatMap((x) => [x.q, x.a]));
+      }
+    }
+    expect(texts).toContain("Commande suivie");
+    expect(texts).toContain("Quand vais-je recevoir ma confirmation ?");
+    for (const text of texts) {
+      expect(isShippedDefault(text), text).toBe(true);
+      for (const lang of ["en", "de", "es", "it", "nl"] as const) expect(translateDefault(text, lang), `${lang}: ${text}`).not.toBe(text);
+    }
+  });
+
+  it.each(CHECKOUT_TEMPLATES.map((t) => [t.id, t] as const))("%s on the default checkout: secure payment said once", (_, t) => {
+    const blocks = t.build(defaultCheckoutLayout()).blocks.filter((b) => !b.hidden);
+    const said: string[] = [];
+    for (const b of blocks) {
+      if (b.type === "trust_badges") said.push(...b.props.badges.map((x) => x.label));
+      if (b.type === "value_props") said.push(...b.props.items.map((x) => x.label));
+      if (b.type === "secure_badge") said.push(b.props.text);
+      if (b.type === "benefits") said.push(...b.props.items.map((x) => x.title));
+    }
+    expect(said.filter((x) => /paiement.*sécurisé/i.test(x)).length, said.join(" | ")).toBeLessThanOrEqual(1);
+    if (t.spec.some(([type]) => ["secure_badge", "value_props", "payment_icons"].includes(type))) {
+      expect(blocks.map((b) => b.type), t.id).not.toContain("trust_badges");
+    }
+  });
+
+  it("a template shows again what an earlier template hid, never what the merchant hid", () => {
+    const minimal = co("minimal").build(defaultCheckoutLayout());
+    expect(minimal.blocks.filter((b) => b.hidden).map((b) => b.type).sort()).toEqual(["order_addons", "trust_badges"]);
+    // Conversion lists the add-ons and has no reassurance of its own beyond the secure badge.
+    const conversion = co("conversion").build(minimal).blocks;
+    expect(conversion.find((b) => b.type === "order_addons")).toMatchObject({ hidden: false });
+    expect(conversion.find((b) => b.type === "order_addons")?.hiddenByTemplate).toBeUndefined();
+    // Sport adds no reassurance that repeats the badges: both come back.
+    const sport = co("sport-performance").build(minimal).blocks;
+    expect(sport.filter((b) => b.hidden)).toEqual([]);
+    expect(blocksShownBy(co("sport-performance"), minimal).map((b) => b.type).sort()).toEqual(["order_addons", "trust_badges"]);
+    // Hidden by the merchant (no marker): stays hidden.
+    const mine = { blocks: defaultCheckoutLayout().blocks.map((b) => (b.type === "trust_badges" ? { ...b, hidden: true } : b)) };
+    expect(co("sport-performance").build(mine).blocks.find((b) => b.type === "trust_badges")?.hidden).toBe(true);
+    expect(blocksShownBy(co("sport-performance"), mine)).toEqual([]);
+  });
+
+  it("re-applying Simple over its untouched old Text note keeps one note (the Text becomes the message, unsigned)", () => {
+    const base = defaultThankYouLayout().blocks;
+    const blank = createBlock("text", { id: "note2" });
+    blank.style = { ...blank.style, align: "center" };
+    const page = { blocks: [base[0], blank, ...base.slice(1)] };
+    const out = ty("simple").build(page, { storeName: "Maison Lune" }).blocks;
+    expect(out.filter((b) => b.type === "message" || b.type === "text")).toHaveLength(1);
+    const m = out.find((b) => b.type === "message")!;
+    expect(m.id).toBe("note2");
+    expect(m.type === "message" && m.props).toEqual(createBlock("message").props);
+    expect(m.type === "message" && m.props.signatureName).toBe("");
+    expect(m.style.align).toBe("center");
+    expect(thankYouLayoutSchema.safeParse({ blocks: out }).success).toBe(true);
+    expect(blocksKeptAside(ty("simple").spec, page)).toEqual([]);
+  });
+
+  it("a note the merchant wrote stays their Text block, whole and as written (never cut into a message)", () => {
+    const text = createBlock("text", { id: "note1" });
+    const long = "Votre colis part demain. ".repeat(400).trim();
+    text.props = { heading: "Merci !", body: long };
+    text.i18n = { en: { heading: "Thanks!", body: "Ships tomorrow." } };
+    const base = defaultThankYouLayout().blocks;
+    const out = ty("simple").build({ blocks: [base[0], text, ...base.slice(1)] }, { storeName: "Maison Lune" }).blocks;
+    const kept = out.find((b) => b.id === "note1")!;
+    expect(kept.type).toBe("text");
+    expect(kept.type === "text" && kept.props).toEqual({ heading: "Merci !", body: long });
+    expect(kept.i18n).toEqual({ en: { heading: "Thanks!", body: "Ships tomorrow." } });
+    expect(thankYouLayoutSchema.safeParse({ blocks: out }).success).toBe(true);
+  });
+
+  it("trust badges the merchant edited are never hidden by a template (untouched ones are)", () => {
+    const edited = {
+      blocks: defaultCheckoutLayout().blocks.map((b) =>
+        b.type === "trust_badges" ? { ...b, props: { badges: [{ label: "Fabriqué en France", iconUrl: "" }, ...b.props.badges.slice(1)] } } : b,
+      ),
+    };
+    const t = co("trust-max");
+    expect(t.hides).toContain("trust_badges");
+    expect(t.build(edited).blocks.find((b) => b.type === "trust_badges")?.hidden).toBe(false);
+    expect(blocksHiddenBy(t, edited).map((b) => b.type)).not.toContain("trust_badges");
+    // Untouched defaults: hidden (the template's own reassurance already says it).
+    expect(t.build(defaultCheckoutLayout()).blocks.find((b) => b.type === "trust_badges")?.hidden).toBe(true);
+  });
+
+  it("« Actuel » only while the shared style is still the template's look", () => {
+    const t = ty("clean-minimal");
+    const theme = applyTemplateTheme(themeSchema.parse({}), t);
+    expect(isCurrentTemplate(t, "clean-minimal", theme)).toBe(true);
+    expect(isCurrentTemplate(t, "apple-minimal", theme)).toBe(true);
+    // A styled checkout template applied alone changed the shared look.
+    expect(isCurrentTemplate(t, "clean-minimal", applyTemplateTheme(theme, co("dark-premium")))).toBe(false);
+    // Layout-only templates: the id alone.
+    expect(isCurrentTemplate(ty("simple"), "simple", applyTemplateTheme(theme, co("dark-premium")))).toBe(true);
+    expect(isCurrentTemplate(ty("simple"), "loyalty", theme)).toBe(false);
+  });
+
+  it("descriptions say what renders", () => {
+    expect(co("compact-mobile").description).not.toMatch(/gros boutons/);
+    expect(co("trust-max").description).not.toMatch(/protection/i);
+    for (const t of THANK_YOU_TEMPLATES) expect(t.description, t.id).not.toMatch(/étroit|support/i);
   });
 });

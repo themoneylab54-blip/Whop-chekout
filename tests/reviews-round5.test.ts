@@ -31,7 +31,7 @@ vi.mock("@/lib/ext", () => ({ extFetch: (...args: unknown[]) => mocks.fetch(...a
 vi.mock("@/lib/shopify", () => ({ shopifyGraphql: (...args: unknown[]) => mocks.graphql(...args) }));
 vi.mock("@/lib/catalog", () => ({ searchCatalog: vi.fn(async () => []), getCatalogVariant: vi.fn(async () => null) }));
 
-const { createBlock } = await import("@/lib/layout");
+const { createBlock, MAX_REVIEW_ITEMS } = await import("@/lib/layout");
 const { dedupKey, parseReviewsCsv, shopifyRatingSummary } = await import("@/lib/reviews-import");
 const { importJudgeMeAction } = await import("@/lib/reviews-actions");
 const { ReviewsImport, importNotice } = await import("@/components/builder/ReviewsImport");
@@ -46,7 +46,7 @@ afterEach(() => cleanup());
 const rv = (over: Partial<ReviewItem>): ReviewItem => ({ name: "A", text: "Un avis assez long pour compter vraiment.", stars: 5, verified: false, ...over });
 function reviewsBlock(over: Partial<BlockOf<"reviews">["props"]> = {}, id?: string): BlockOf<"reviews"> {
   const b = createBlock("reviews") as BlockOf<"reviews">;
-  return { ...b, ...(id ? { id } : {}), props: { ...b.props, items: [], summary: null, ...over } };
+  return { ...b, sample: undefined, ...(id ? { id } : {}), props: { ...b.props, items: [], summary: null, ...over } };
 }
 const ok = (json: unknown) => new Response(JSON.stringify(json), { status: 200, headers: { "content-type": "application/json" } });
 const jmReview = (i: number, over: Record<string, unknown> = {}) => ({
@@ -131,21 +131,22 @@ describe("2 · every pre-selected review is listed (even past the first 150), so
   it("a review ranked 161st but pre-selected (other product) is listed, ticked, and can be unticked", async () => {
     // 160 five-star reviews of product A, one four-star review of product B: B is ranked last but
     // pre-selected (the products are taken in turn).
-    const reviews = [...Array.from({ length: 160 }, (_, i) => jmReview(i)), jmReview(999, { rating: 4, product_handle: "produit-b", body: "Le seul avis du produit B, assez long." })];
+    // (MAX_REVIEW_ITEMS + 10 of product A: the 150 first rows, then every pre-selected one.)
+    const reviews = [...Array.from({ length: MAX_REVIEW_ITEMS + 10 }, (_, i) => jmReview(i)), jmReview(999, { rating: 4, product_handle: "produit-b", body: "Le seul avis du produit B, assez long." })];
     const { view } = await openJudgeMe(reviewsBlock(), reviews);
     const boxes = listBoxes(view.container);
-    expect(boxes).toHaveLength(151);
+    expect(boxes).toHaveLength(MAX_REVIEW_ITEMS);
     const b = boxes.find((x) => x.closest("label")!.textContent!.includes("Le seul avis du produit B"))!;
     expect(b).toBeTruthy();
     expect(b.checked).toBe(true);
-    expect(screen.getByText(/sélectionnés/).textContent).toContain("20/20");
+    expect(screen.getByText(/sélectionnés/).textContent).toContain(`${MAX_REVIEW_ITEMS}/${MAX_REVIEW_ITEMS}`);
     await act(async () => {
       fireEvent.click(b);
     });
     expect(b.checked).toBe(false);
     // Still listed (can be ticked back), counter follows.
-    expect(listBoxes(view.container)).toHaveLength(151);
-    expect(screen.getByText(/sélectionnés/).textContent).toContain("19/20");
+    expect(listBoxes(view.container)).toHaveLength(MAX_REVIEW_ITEMS);
+    expect(screen.getByText(/sélectionnés/).textContent).toContain(`${MAX_REVIEW_ITEMS - 1}/${MAX_REVIEW_ITEMS}`);
   });
 });
 
@@ -248,8 +249,8 @@ describe("6 · the notice counts what was really added; the selection follows th
   it("hand-typed reviews added while the preview is open: picked cut to the room left", async () => {
     const reviews = Array.from({ length: 30 }, (_, i) => jmReview(i, { product_handle: `p-${i}` }));
     const { view, onChange } = await openJudgeMe(reviewsBlock(), reviews);
-    expect(screen.getByText(/sélectionnés/).textContent).toContain("20/20");
-    const own = Array.from({ length: 17 }, (_, i) => rv({ name: `Own ${i}`, text: `Avis saisi à la main numéro ${i}.`, source: "manual" }));
+    expect(screen.getByText(/sélectionnés/).textContent).toContain(`30/${MAX_REVIEW_ITEMS}`);
+    const own = Array.from({ length: MAX_REVIEW_ITEMS - 3 }, (_, i) => rv({ name: `Own ${i}`, text: `Avis saisi à la main numéro ${i}.`, source: "manual" }));
     view.rerender(h(ReviewsImport, { block: reviewsBlock({ items: own }), storeId: "s1", onChange }));
     expect(screen.getByText(/sélectionnés/).textContent).toContain("3/3");
     expect(listBoxes(view.container).filter((b) => b.checked)).toHaveLength(3);
@@ -257,7 +258,7 @@ describe("6 · the notice counts what was really added; the selection follows th
       fireEvent.click(screen.getByRole("button", { name: "Ajouter 3 avis au bloc" }));
     });
     const patch = onChange.mock.calls.at(-1)![0] as { items: ReviewItem[] };
-    expect(patch.items).toHaveLength(20);
+    expect(patch.items).toHaveLength(MAX_REVIEW_ITEMS);
     expect(patch.items.filter((r) => r.source === "judgeme")).toHaveLength(3);
     expect(screen.getByText(/avis ajoutés au bloc/).textContent).toBe("3 avis ajoutés au bloc.");
   });

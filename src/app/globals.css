@@ -202,32 +202,99 @@ body {
   }
 }
 
+/* Header banner (StoreHeader, sizing variables from bannerBox): fixed height, or the image's
+   proportions capped to a banner height. */
+.wc-banner {
+  height: var(--wc-banner-h, auto);
+  aspect-ratio: var(--wc-banner-ar, auto);
+  max-height: var(--wc-banner-max, none);
+}
+
+/* ---------- Checkout / thank-you: never wider than the phone ----------
+   Safety net under the layout fixes (the page grids use minmax(0, 1fr) tracks and min-w-0 columns):
+   long words wrap instead of widening their column, media never exceed their box. Low specificity
+   (:where) so any block's own classes still win. */
+.wc-checkout {
+  overflow-wrap: break-word;
+}
+/* In the base layer: an unlayered rule beats every Tailwind utility whatever its specificity, so
+   the image block's max-w-[420px] / max-w-[280px] (layer utilities) would lose to it. */
+@layer base {
+  :where(.wc-checkout) :where(img, video, iframe, svg) {
+    max-width: 100%;
+  }
+}
+/* iOS Safari < 16 has no `overflow: clip`: the page root's overflow-x-clip would be ignored and
+   the whole page would scroll sideways. Phones only (the desktop summary is sticky, which a
+   hidden-overflow ancestor would break). */
+@supports not (overflow: clip) {
+  @media (max-width: 767.98px) {
+    .wc-checkout .overflow-x-clip,
+    .wc-checkout.overflow-x-clip {
+      overflow-x: hidden;
+    }
+  }
+}
 /* ---------- Checkout / thank-you: banners edge to edge on phones ----------
    Pages under 640 px (the `wc-page` container, so the builder's mobile preview matches):
    banner-like blocks (.wc-bleed) span the whole page width, with no side margin, rounded
    corners or side borders; a card / colored box holding one follows it. The column is
    centered so `50% - 50cqw` reaches both page edges; the page root clips any overflow.
    `cqw` resolves against the nearest container of any name: never put a `container-type`
-   wrapper above a banner block, or it stays inset. */
-.wc-banner-capped {
-  max-height: var(--wc-banner-max);
-}
+   wrapper above a banner block, or it stays inset. The width stays auto: the negative margins
+   widen the block, and where they don't apply it simply keeps the column's width (never wider
+   than the page). */
 @container wc-page (max-width: 639.98px) {
   .wc-bleed,
   .wc-boxed:has(.wc-bleed) {
-    width: 100cqw;
+    width: auto;
     max-width: none;
     margin-inline: calc(50% - 50cqw);
     border-radius: 0;
     border-inline-width: 0;
   }
+  /* Replaced elements (the image block's <img>) have no stretchy auto width: `auto` is their
+     natural pixel size (a 1600 px image overflowed the phone). They get an explicit width instead:
+     the page width, or a cap (`.wc-bleed-lg`), centered on the column (margins = what's left over,
+     so the element plus its margins is exactly the column: it never widens it). The class is
+     doubled on purpose: the rule above is compiled to `:is(.wc-bleed, .wc-boxed:has(.wc-bleed))`,
+     whose specificity is that of its strongest part (two classes), which would win otherwise. */
+  :is(img, video, iframe, picture).wc-bleed.wc-bleed {
+    width: var(--wc-bleed-w, 100cqw);
+    margin-inline: calc((100% - var(--wc-bleed-w, 100cqw)) / 2);
+  }
+  .wc-bleed-lg {
+    --wc-bleed-w: min(100cqw, 420px);
+  }
   .wc-bleed-col {
     margin-inline: auto;
   }
-  /* Header banner in its own proportions: full width, height capped to a banner shape
-     (a square or portrait image never pushes the checkout below the fold, also in landscape);
-     anything taller is cropped or letterboxed by the image's fit. */
-  .wc-banner-capped {
+  /* Header banner on phones: full width in the shown image's own proportions, whatever the
+     desktop height (a fixed height cropped a wide banner to its middle); no known ratio: the
+     image's own height once loaded. Capped to a banner shape (a square or portrait image never
+     pushes the checkout below the fold, also in landscape); beyond it the image's fit applies. */
+  .wc-banner {
+    height: auto;
+    aspect-ratio: var(--wc-banner-ar-m, auto);
     max-height: min(56cqw, 40svh);
+  }
+  /* No saved phone ratio: a banner-shaped space (6:1) is reserved until the image loads, then
+     its own proportions (`auto` first: the loaded image's ratio wins). With a known ratio the box
+     sets the height and the image fills it (this has no effect then). */
+  .wc-banner img {
+    aspect-ratio: auto 6 / 1;
+  }
+  /* No saved phone ratio either: a tall image is held to the banner cap itself (not cut at the
+     bottom by the box), so its fit (cover: cropped around its center) applies within that box. */
+  .wc-banner:not([style*="--wc-banner-ar-m"]) img {
+    max-height: min(56cqw, 40svh);
+    object-position: center;
+  }
+  /* Builder canvas with a phone image: the mobile frame shows it (buyers get a <picture>). */
+  .wc-banner .wc-banner-d {
+    display: none;
+  }
+  .wc-banner .wc-banner-m {
+    display: block;
   }
 }

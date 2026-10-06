@@ -1447,7 +1447,7 @@ export function PaymentPanel({
         aria-describedby={[serverWait > 0 && !showWait ? "wc-inflight-wait" : null, hint ? "wc-pay-hint" : null].filter(Boolean).join(" ") || undefined}
         onClick={onPayClick}
         className={`flex min-h-12 w-full items-center justify-center gap-2 rounded-[var(--btn-radius)] px-5 py-4 text-base font-semibold transition active:scale-[.99] ${
-          paypalOn ? "bg-[#FFC439] text-[#111] hover:brightness-95" : "bg-[image:var(--accent-bg)] text-[var(--accent-fg)] shadow-[var(--btn-shadow)] hover:brightness-110"
+          paypalOn ? "bg-[#FFC439] text-[#111] hover:brightness-95" : "bg-[image:var(--pay-bg,var(--accent-bg))] text-[var(--pay-fg,var(--accent-fg))] shadow-[var(--pay-shadow,var(--btn-shadow))] hover:brightness-110"
         } ${blocked && incomplete.length === 0 ? "cursor-progress opacity-70" : ""}`}
       >
         {(submitting || loading) && <span className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-current border-r-transparent" aria-hidden />}
@@ -1753,7 +1753,7 @@ export function PaymentPreview({
         </div>
       </div>
       {beforeButton}
-      <div className="flex w-full items-center justify-center rounded-[var(--btn-radius)] bg-[image:var(--accent-bg)] px-5 py-4 text-base font-semibold text-[var(--accent-fg)] shadow-[var(--btn-shadow)]">
+      <div className="flex w-full items-center justify-center rounded-[var(--btn-radius)] bg-[image:var(--pay-bg,var(--accent-bg))] px-5 py-4 text-base font-semibold text-[var(--pay-fg,var(--accent-fg))] shadow-[var(--pay-shadow,var(--btn-shadow))]">
         {payLabel}
       </div>
       <p className="flex items-center justify-center gap-1.5 text-xs text-neutral-600">

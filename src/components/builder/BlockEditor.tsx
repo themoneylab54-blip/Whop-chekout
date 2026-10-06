@@ -2,9 +2,12 @@
 
 import { useId, useRef, useState, type ReactNode } from "react";
 import {
+  COUNTDOWN_DURATION,
   ICON_KEYS,
+  LIST_LIMITS,
   MAX_RECOMMENDATIONS,
-  MAX_REVIEW_ITEMS,
+  OFFER_LIMITS,
+  TEXT_LIMITS,
   MEDIA_PATH_RE,
   SURVEY_KEYS,
   MESSAGE_LIMITS,
@@ -22,10 +25,12 @@ import { AlertTriangle, Check, FolderOpen, ImageOff, Images, Star, Trash2, Uploa
 import { formatBytes, UPLOAD_ACCEPT, useMediaLibrary, type UploadedMedia } from "./media";
 import { BlockIcon, ICON_LABELS, isIconKey } from "@/components/icons";
 import type { Lang } from "@/components/checkout/i18n";
-import { emptyTextDefault, remapListTranslations } from "@/components/checkout/localize";
-import { confirmCouponCode, NEVER_OFFERED_LOGOS_WARNING, neverOfferedLogos, SAMPLE_COUPON_CODE, unconfirmCouponCode } from "@/lib/sample-content";
+import { COUNTDOWN_EXAMPLE_KEYS, DEFAULT_TEXTS, emptyTextDefault, remapListTranslations } from "@/components/checkout/localize";
+import { NEVER_OFFERED_LOGOS_WARNING, neverOfferedLogos } from "@/lib/sample-content";
 import { EditorAccordion, UpsellQuantity, UpsellRules } from "./UpsellRules";
 import { ReviewsImport } from "./ReviewsImport";
+import { MANUAL_REVIEW_NOTE, ReviewsList } from "./ReviewsList";
+import { ReviewsPaste } from "./ReviewsPaste";
 import { ProductPicker, type PickedVariant } from "@/components/dashboard/ProductPicker";
 import { centsToField, currencySymbol, parseMoney } from "@/components/dashboard/money";
 import { decimalRangeLabel, formatCount, formatDecimalField, MAX_REVIEW_COUNT, parseCount, parseDecimal, RATING_MIN_SCORE, ratingScoreWarning } from "./decimal";
@@ -85,10 +90,35 @@ export function Text({
   onChange: (v: string) => void;
   placeholder?: string;
   label?: string;
-  /** The schema's cap: a longer value would make the design fail to save. */
+  /** The schema's cap: the field stops there (a counter shows near the end) instead of a failed save. */
   maxLength?: number;
 }) {
-  return <input className={input} value={value} placeholder={placeholder} aria-label={label} maxLength={maxLength} onChange={(e) => onChange(e.target.value)} />;
+  return (
+    <>
+      <input className={input} value={value} placeholder={placeholder} aria-label={label} maxLength={maxLength} onChange={(e) => onChange(e.target.value)} />
+      <LengthHint length={value.length} max={maxLength} />
+    </>
+  );
+}
+
+/**
+ * Characters left, shown only near the cap (last 10 %): the merchant sees the limit coming instead
+ * of a field that stops without a word. Exported for tests.
+ */
+export function lengthHintText(length: number, max: number | undefined): string | null {
+  if (!max || length < Math.floor(max * 0.9)) return null;
+  const left = Math.max(0, max - length);
+  return left === 0 ? `Maximum atteint (${max} caractères)` : `${length} / ${max} caractères — encore ${left}`;
+}
+
+function LengthHint({ length, max }: { length: number; max?: number }) {
+  const text = lengthHintText(length, max);
+  if (!text) return null;
+  return (
+    <span className={`mt-0.5 block text-[11px] ${length >= (max ?? 0) ? "text-amber-700" : "text-zinc-600"}`}>
+      {text}
+    </span>
+  );
 }
 
 // An uploaded image (/api/public/media/<id>, see ./media) is the one relative address accepted.
@@ -149,8 +179,13 @@ export function UrlText({
   );
 }
 
-export function Area({ value, onChange, rows = 3, maxLength }: { value: string; onChange: (v: string) => void; rows?: number; maxLength?: number }) {
-  return <textarea className={input} rows={rows} value={value} maxLength={maxLength} onChange={(e) => onChange(e.target.value)} />;
+export function Area({ value, onChange, rows = 3, maxLength, placeholder }: { value: string; onChange: (v: string) => void; rows?: number; maxLength?: number; placeholder?: string }) {
+  return (
+    <>
+      <textarea className={input} rows={rows} value={value} maxLength={maxLength} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />
+      <LengthHint length={value.length} max={maxLength} />
+    </>
+  );
 }
 
 export function Num({ value, onChange, min, max, step = 1 }: { value: number; onChange: (v: number) => void; min?: number; max?: number; step?: number }) {
@@ -698,8 +733,19 @@ function ListEditor<T>({
           + {addLabel}
         </button>
       )}
+      {listLimitText(items.length, max) && <p className={`text-[11px] ${items.length >= max ? "text-amber-700" : "text-zinc-600"}`}>{listLimitText(items.length, max)}</p>}
     </div>
   );
+}
+
+/**
+ * Items left in a list block, shown near its cap (from 80 %) instead of a save failing later.
+ * Exported for tests.
+ */
+export function listLimitText(count: number, max: number): string | null {
+  if (count < Math.floor(max * 0.8)) return null;
+  const left = Math.max(0, max - count);
+  return left === 0 ? `Maximum atteint : ${max} éléments` : `${count} / ${max} — encore ${left} possible${left > 1 ? "s" : ""}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -834,6 +880,7 @@ export function BlockContentEditor({
             <Text
               value={block.props.title}
               placeholder={emptyTextDefault(block.type, "title", context?.lang ?? "fr") ?? undefined}
+              maxLength={TEXT_LIMITS.title}
               onChange={(title) => props(block, { title })}
             />
           </F>
@@ -846,10 +893,10 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Titre">
-            <Text value={block.props.heading} onChange={(heading) => props(block, { heading })} />
+            <Text value={block.props.heading} placeholder="Votre titre" maxLength={TEXT_LIMITS.title} onChange={(heading) => props(block, { heading })} />
           </F>
           <F label="Texte">
-            <Area value={block.props.body} onChange={(body) => props(block, { body })} />
+            <Area value={block.props.body} rows={5} placeholder="Votre texte (vide = bloc non affiché)" maxLength={TEXT_LIMITS.body} onChange={(body) => props(block, { body })} />
           </F>
         </div>
       );
@@ -860,7 +907,7 @@ export function BlockContentEditor({
             <ImageField value={block.props.url} images={images} onChange={(url) => props(block, { url })} />
           </Field>
           <F label="Texte alternatif">
-            <Text value={block.props.alt} onChange={(alt) => props(block, { alt })} />
+            <Text value={block.props.alt} maxLength={500} onChange={(alt) => props(block, { alt })} />
           </F>
           <F label="Taille">
             <Segmented
@@ -880,10 +927,10 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Citation">
-            <Area value={block.props.quote} onChange={(quote) => props(block, { quote })} />
+            <Area value={block.props.quote} rows={4} maxLength={TEXT_LIMITS.long} onChange={(quote) => props(block, { quote })} />
           </F>
           <F label="Auteur" hint="Utilisez de vrais avis clients : les faux avis sont interdits (directive Omnibus).">
-            <Text value={block.props.author} onChange={(author) => props(block, { author })} />
+            <Text value={block.props.author} maxLength={TEXT_LIMITS.label} onChange={(author) => props(block, { author })} />
           </F>
           <Field label="Photo (facultatif)">
             <ImageField value={block.props.photoUrl} compact onChange={(photoUrl) => props(block, { photoUrl })} />
@@ -927,7 +974,7 @@ export function BlockContentEditor({
           )}
           <div className="col-span-2">
             <F label="Libellé" hint="Reprenez la note réelle de votre outil d'avis (Judge.me, Loox, Trustpilot…).">
-              <Text value={block.props.label} onChange={(label) => props(block, { label })} />
+              <Text value={block.props.label} maxLength={TEXT_LIMITS.title} onChange={(label) => props(block, { label })} />
             </F>
           </div>
         </div>
@@ -937,13 +984,13 @@ export function BlockContentEditor({
       return (
         <ListEditor
           items={block.props.badges}
-          max={8}
+          max={LIST_LIMITS.trust_badges}
           addLabel="Ajouter un badge"
           create={() => ({ label: "Nouveau badge", iconUrl: "" })}
           onChange={(badges) => props(block, { badges })}
           render={(b, set) => (
             <>
-              <Text value={b.label} label="Libellé du badge" onChange={(label) => set({ ...b, label })} />
+              <Text value={b.label} label="Libellé du badge" maxLength={TEXT_LIMITS.label} onChange={(label) => set({ ...b, label })} />
               <ImageField value={b.iconUrl} compact placeholder="Icône (URL, facultatif)" onChange={(iconUrl) => set({ ...b, iconUrl })} />
             </>
           )}
@@ -953,10 +1000,10 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Titre">
-            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+            <Text value={block.props.title} maxLength={TEXT_LIMITS.title} onChange={(title) => props(block, { title })} />
           </F>
           <F label="Texte">
-            <Area value={block.props.text} onChange={(text) => props(block, { text })} />
+            <Area value={block.props.text} rows={4} maxLength={TEXT_LIMITS.long} onChange={(text) => props(block, { text })} />
           </F>
         </div>
       );
@@ -964,14 +1011,14 @@ export function BlockContentEditor({
       return (
         <ListEditor
           items={block.props.items}
-          max={20}
+          max={LIST_LIMITS.faq}
           addLabel="Ajouter une question"
           create={() => ({ q: "Nouvelle question ?", a: "Réponse." })}
           onChange={(items) => props(block, { items })}
           render={(it, set) => (
             <>
-              <Text label="Question" value={it.q} onChange={(q) => set({ ...it, q })} />
-              <Area value={it.a} rows={2} onChange={(a) => set({ ...it, a })} />
+              <Text label="Question" value={it.q} maxLength={TEXT_LIMITS.title} onChange={(q) => set({ ...it, q })} />
+              <Area value={it.a} rows={2} maxLength={TEXT_LIMITS.long} onChange={(a) => set({ ...it, a })} />
             </>
           )}
         />
@@ -980,13 +1027,13 @@ export function BlockContentEditor({
       return (
         <ListEditor
           items={block.props.items}
-          max={8}
+          max={LIST_LIMITS.value_props}
           addLabel="Ajouter un argument"
           create={() => ({ icon: "star", label: "Argument" })}
           onChange={(items) => props(block, { items })}
           render={(it, set) => (
             <>
-              <Text label="Libellé" value={it.label} onChange={(label) => set({ ...it, label })} />
+              <Text label="Libellé" value={it.label} maxLength={TEXT_LIMITS.label} onChange={(label) => set({ ...it, label })} />
               <IconPicker value={isIconKey(it.icon) ? it.icon : ""} onChange={(icon) => set({ ...it, icon })} />
             </>
           )}
@@ -1004,7 +1051,7 @@ export function BlockContentEditor({
             label="Libellé (facultatif)"
             hint="Visible seulement sur la page de remerciement ; sur le checkout, il nomme les logos pour les lecteurs d'écran."
           >
-            <Text value={block.props.label} onChange={(label) => props(block, { label })} />
+            <Text value={block.props.label} maxLength={TEXT_LIMITS.label} onChange={(label) => props(block, { label })} />
           </F>
           {thankYouLogos ? (
             <p data-hint="thank-you-logos" className="text-[11px] leading-relaxed text-zinc-600">
@@ -1045,25 +1092,16 @@ export function BlockContentEditor({
     case "announcement":
       return (
         <F label="Texte de l'annonce">
-          <Area value={block.props.text} rows={2} onChange={(text) => props(block, { text })} />
+          <Area value={block.props.text} rows={2} maxLength={TEXT_LIMITS.text} onChange={(text) => props(block, { text })} />
         </F>
       );
     case "countdown":
-      return (
-        <div className="space-y-3">
-          <F label="Libellé">
-            <Text value={block.props.label} onChange={(label) => props(block, { label })} />
-          </F>
-          <Field label="Fin de l'offre" hint="Une vraie date de fin : le minuteur disparaît ensuite (pas de faux compte à rebours qui se relance).">
-            <EndDateInput value={block.props.endsAt} onChange={(endsAt) => props(block, { endsAt })} />
-          </Field>
-        </div>
-      );
+      return <CountdownEditor block={block} onChange={(patch) => props(block, patch)} />;
     case "low_stock":
       return (
         <div className="space-y-3">
           <F label="Message" hint="{n} = quantité restante réelle (inventaire Shopify)">
-            <Text value={block.props.message} onChange={(message) => props(block, { message })} />
+            <Text value={block.props.message} maxLength={500} onChange={(message) => props(block, { message })} />
           </F>
           <F label="Afficher quand le stock est ≤">
             <Num value={block.props.threshold} min={1} max={100} onChange={(threshold) => props(block, { threshold })} />
@@ -1074,19 +1112,20 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Titre">
-            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+            <Text value={block.props.title} maxLength={TEXT_LIMITS.title} onChange={(title) => props(block, { title })} />
           </F>
           <ListEditor
             items={block.props.rows}
-            max={8}
+            max={LIST_LIMITS.why_us}
             addLabel="Ajouter une ligne"
-            create={() => ({ icon: "check" as const, title: "Titre", text: "Texte" })}
+            // A new row starts empty (never « Titre » / « Texte » on a live page): blank rows are not shown.
+            create={() => ({ icon: "check" as const, title: "", text: "" })}
             onChange={(rows) => props(block, { rows })}
             render={(r, set) => (
               <>
                 <IconPicker value={r.icon} onChange={(icon) => set({ ...r, icon })} />
-                <Text label="Titre" value={r.title} onChange={(title) => set({ ...r, title })} />
-                <Text value={r.text} onChange={(text) => set({ ...r, text })} />
+                <Text label="Titre" value={r.title} placeholder="Titre de la ligne" maxLength={TEXT_LIMITS.label} onChange={(title) => set({ ...r, title })} />
+                <Text value={r.text} placeholder="Texte (facultatif)" maxLength={TEXT_LIMITS.text} onChange={(text) => set({ ...r, text })} />
               </>
             )}
           />
@@ -1096,10 +1135,10 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Message" hint="{amount} = montant restant">
-            <Text value={block.props.message} onChange={(message) => props(block, { message })} />
+            <Text value={block.props.message} maxLength={500} onChange={(message) => props(block, { message })} />
           </F>
           <F label="Message une fois atteint">
-            <Text value={block.props.success} onChange={(success) => props(block, { success })} />
+            <Text value={block.props.success} maxLength={500} onChange={(success) => props(block, { success })} />
           </F>
           <F label="Seuil" hint="0 = le seuil « Offert dès » de vos tarifs de livraison">
             <PriceInput value={block.props.threshold} max={100000} currency={context?.currency} onChange={(threshold) => props(block, { threshold: threshold ?? 0 })} />
@@ -1110,7 +1149,7 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Libellé">
-            <Text value={block.props.label} onChange={(label) => props(block, { label })} />
+            <Text value={block.props.label} maxLength={TEXT_LIMITS.title} onChange={(label) => props(block, { label })} />
           </F>
           <div className="grid grid-cols-2 gap-3">
             <F label="Délai min (jours)">
@@ -1154,55 +1193,12 @@ export function BlockContentEditor({
                 : undefined
             }
           />
+          <ReviewsPaste items={block.props.items} onApply={(items) => props(block, { items })} />
           <p className="text-[11px] text-zinc-600">
-            Utilisez uniquement de vrais avis clients : les faux avis sont interdits (directive Omnibus). Vous pouvez aussi en saisir à la main.
+            Utilisez uniquement de vrais avis clients : les faux avis sont interdits (directive Omnibus). Vous pouvez aussi en saisir ou en coller à la main.{" "}
+            {MANUAL_REVIEW_NOTE}
           </p>
-          <ListEditor
-            items={block.props.items}
-            max={MAX_REVIEW_ITEMS}
-            addLabel="Ajouter un avis à la main"
-            create={() => ({ name: "", text: "", stars: 5, verified: false, source: "manual" as const })}
-            onChange={(items) => props(block, { items })}
-            render={(r, set) => (
-              <>
-                {r.source === "csv" || r.source === "judgeme" ? (
-                  // An imported review is shown as the customer wrote it: it can be removed, never edited.
-                  <div className="space-y-1 text-xs text-zinc-800">
-                    <p className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                      <span className="text-amber-600" role="img" aria-label={`${r.stars} sur 5`}>
-                        {"★".repeat(r.stars)}
-                        <span className="text-zinc-300">{"★".repeat(5 - r.stars)}</span>
-                      </span>
-                      <span className="font-medium break-words text-zinc-900">{r.name || "Client"}</span>
-                      {r.verified && <span className="text-[11px] font-medium text-emerald-800">Achat vérifié</span>}
-                    </p>
-                    {r.title && <p className="font-medium break-words">{r.title}</p>}
-                    <p className="line-clamp-4 break-words whitespace-pre-line text-zinc-700">{r.text}</p>
-                    <p className="text-[11px] text-zinc-500">Avis importé : non modifiable (vous pouvez le retirer).</p>
-                  </div>
-                ) : (
-                  // Typed by the merchant: never "Achat vérifié" (only a review app can say the reviewer bought).
-                  <>
-                    <Text label="Nom du client" placeholder="Prénom N." value={r.name} onChange={(name) => set({ ...r, name, verified: false })} />
-                    <Area value={r.text} rows={2} onChange={(text) => set({ ...r, text, verified: false })} />
-                    <StarPicker value={r.stars} label={`Étoiles de l'avis de ${r.name || "ce client"}`} onChange={(stars) => set({ ...r, stars, verified: false })} />
-                  </>
-                )}
-                {(r.source === "csv" || r.source === "judgeme" || r.productTitle || r.date) && (
-                  <p className="text-[11px] text-zinc-600">
-                    {[
-                      r.source === "judgeme" ? "Importé de Judge.me" : r.source === "csv" ? "Importé (CSV)" : "",
-                      r.date ? r.date.split("-").reverse().join("/") : "",
-                      r.productTitle || r.productHandle || "",
-                      r.photoUrl ? "avec photo" : "",
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")}
-                  </p>
-                )}
-              </>
-            )}
-          />
+          <ReviewsList items={block.props.items} images={images} onChange={(items) => props(block, { items })} />
         </div>
           )}
         </FetchLock>
@@ -1211,25 +1207,25 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Titre">
-            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+            <Text value={block.props.title} maxLength={TEXT_LIMITS.title} onChange={(title) => props(block, { title })} />
           </F>
           <div className="grid grid-cols-2 gap-3">
             <F label="Colonne « nous »">
-              <Text value={block.props.usLabel} onChange={(usLabel) => props(block, { usLabel })} />
+              <Text value={block.props.usLabel} maxLength={80} onChange={(usLabel) => props(block, { usLabel })} />
             </F>
             <F label="Colonne « eux »">
-              <Text value={block.props.themLabel} onChange={(themLabel) => props(block, { themLabel })} />
+              <Text value={block.props.themLabel} maxLength={80} onChange={(themLabel) => props(block, { themLabel })} />
             </F>
           </div>
           <ListEditor
             items={block.props.rows}
-            max={12}
+            max={LIST_LIMITS.comparison}
             addLabel="Ajouter une ligne"
             create={() => ({ label: "Critère", us: true, them: false })}
             onChange={(rows) => props(block, { rows })}
             render={(r, set) => (
               <>
-                <Text label="Critère comparé" value={r.label} onChange={(label) => set({ ...r, label })} />
+                <Text label="Critère comparé" value={r.label} maxLength={TEXT_LIMITS.label} onChange={(label) => set({ ...r, label })} />
                 <div className="flex gap-4">
                   <Toggle label={block.props.usLabel || "Nous"} checked={r.us} onChange={(us) => set({ ...r, us })} />
                   <Toggle label={block.props.themLabel || "Eux"} checked={r.them} onChange={(them) => set({ ...r, them })} />
@@ -1246,7 +1242,7 @@ export function BlockContentEditor({
             <UrlText value={block.props.url} placeholder="https://youtube.com/watch?v=…" onChange={(url) => props(block, { url })} />
           </F>
           <F label="Légende (facultatif)">
-            <Text value={block.props.caption} onChange={(caption) => props(block, { caption })} />
+            <Text value={block.props.caption} maxLength={500} onChange={(caption) => props(block, { caption })} />
           </F>
         </div>
       );
@@ -1254,18 +1250,18 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Titre">
-            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+            <Text value={block.props.title} maxLength={TEXT_LIMITS.title} onChange={(title) => props(block, { title })} />
           </F>
           <ListEditor
             items={block.props.logos}
-            max={10}
+            max={LIST_LIMITS.logos}
             addLabel="Ajouter un logo"
             create={() => ({ imageUrl: "", alt: "" })}
             onChange={(logos) => props(block, { logos })}
             render={(l, set) => (
               <>
                 <ImageField value={l.imageUrl} compact placeholder="URL du logo (PNG/SVG)" onChange={(imageUrl) => set({ ...l, imageUrl })} />
-                <Text value={l.alt} placeholder="Nom du média" onChange={(alt) => set({ ...l, alt })} />
+                <Text value={l.alt} placeholder="Nom du média" maxLength={TEXT_LIMITS.label} onChange={(alt) => set({ ...l, alt })} />
               </>
             )}
           />
@@ -1275,14 +1271,18 @@ export function BlockContentEditor({
       return (
         <ListEditor
           items={block.props.items}
-          max={4}
+          max={LIST_LIMITS.stats}
           addLabel="Ajouter un chiffre"
-          create={() => ({ value: "100 %", label: "Libellé" })}
+          create={() => ({ value: "", label: "" })}
           onChange={(items) => props(block, { items })}
           render={(it, set) => (
             <div className="grid grid-cols-[90px_1fr] gap-2">
-              <Text label="Valeur" value={it.value} onChange={(value) => set({ ...it, value })} />
-              <Text label="Libellé" value={it.label} onChange={(label) => set({ ...it, label })} />
+              <div>
+                <Text label="Valeur" value={it.value} maxLength={40} onChange={(value) => set({ ...it, value })} />
+              </div>
+              <div>
+                <Text label="Libellé" value={it.label} maxLength={120} onChange={(label) => set({ ...it, label })} />
+              </div>
             </div>
           )}
         />
@@ -1291,21 +1291,21 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Titre (facultatif)">
-            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+            <Text value={block.props.title} maxLength={TEXT_LIMITS.title} onChange={(title) => props(block, { title })} />
           </F>
           <F label="Colonnes">
             <Segmented value={String(block.props.columns) as "2" | "3"} options={[["2", "2"], ["3", "3"]]} onChange={(c) => props(block, { columns: c === "2" ? 2 : 3 })} />
           </F>
           <ListEditor
             items={block.props.items}
-            max={9}
+            max={LIST_LIMITS.benefits}
             addLabel="Ajouter un avantage"
             create={() => ({ icon: "sparkles" as const, title: "Avantage", text: "" })}
             onChange={(items) => props(block, { items })}
             render={(it, set) => (
               <>
-                <Text label="Titre" value={it.title} onChange={(title) => set({ ...it, title })} />
-                <Text value={it.text} placeholder="Sous-texte (facultatif)" onChange={(text) => set({ ...it, text })} />
+                <Text label="Titre" value={it.title} maxLength={TEXT_LIMITS.label} onChange={(title) => set({ ...it, title })} />
+                <Text value={it.text} placeholder="Sous-texte (facultatif)" maxLength={TEXT_LIMITS.text} onChange={(text) => set({ ...it, text })} />
                 <IconPicker value={it.icon} onChange={(icon) => set({ ...it, icon })} />
               </>
             )}
@@ -1316,10 +1316,10 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Texte">
-            <Text value={block.props.text} onChange={(text) => props(block, { text })} />
+            <Text value={block.props.text} maxLength={TEXT_LIMITS.title} onChange={(text) => props(block, { text })} />
           </F>
           <F label="Sous-texte">
-            <Text value={block.props.subtext} onChange={(subtext) => props(block, { subtext })} />
+            <Text value={block.props.subtext} maxLength={500} onChange={(subtext) => props(block, { subtext })} />
           </F>
         </div>
       );
@@ -1327,10 +1327,10 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Titre">
-            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+            <Text value={block.props.title} maxLength={TEXT_LIMITS.title} onChange={(title) => props(block, { title })} />
           </F>
           <F label="Texte d'exemple">
-            <Text value={block.props.placeholder} onChange={(placeholder) => props(block, { placeholder })} />
+            <Text value={block.props.placeholder} maxLength={300} onChange={(placeholder) => props(block, { placeholder })} />
           </F>
           <p className="text-[11px] text-zinc-600">La note du client est ajoutée à la commande Shopify.</p>
         </div>
@@ -1339,20 +1339,20 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Titre">
-            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+            <Text value={block.props.title} maxLength={TEXT_LIMITS.title} onChange={(title) => props(block, { title })} />
           </F>
           <F label="Texte">
-            <Text value={block.props.text} onChange={(text) => props(block, { text })} />
+            <Area value={block.props.text} rows={2} maxLength={TEXT_LIMITS.text} onChange={(text) => props(block, { text })} />
           </F>
           <F label="E-mail">
-            <Text value={block.props.email} placeholder="support@maboutique.fr" onChange={(email) => props(block, { email })} />
+            <Text value={block.props.email} placeholder="support@maboutique.fr" maxLength={120} onChange={(email) => props(block, { email })} />
           </F>
           <div className="grid grid-cols-2 gap-3">
             <F label="Téléphone">
-              <Text value={block.props.phone} placeholder="01 23 45 67 89" onChange={(phone) => props(block, { phone })} />
+              <Text value={block.props.phone} placeholder="01 23 45 67 89" maxLength={40} onChange={(phone) => props(block, { phone })} />
             </F>
             <F label="WhatsApp">
-              <Text value={block.props.whatsapp} placeholder="+33 6 12 34 56 78" onChange={(whatsapp) => props(block, { whatsapp })} />
+              <Text value={block.props.whatsapp} placeholder="+33 6 12 34 56 78" maxLength={40} onChange={(whatsapp) => props(block, { whatsapp })} />
             </F>
           </div>
         </div>
@@ -1370,7 +1370,7 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Texte du bouton">
-            <Text value={block.props.label} onChange={(label) => props(block, { label })} />
+            <Text value={block.props.label} maxLength={120} onChange={(label) => props(block, { label })} />
           </F>
           <F label="Lien">
             <UrlText value={block.props.url} placeholder="https://…" onChange={(url) => props(block, { url })} />
@@ -1415,23 +1415,23 @@ export function BlockContentEditor({
           </section>
           <EditorAccordion title="Textes" summary={block.props.title || "Titre, texte, image, boutons"}>
             <F label="Bandeau">
-              <Text value={block.props.badge} onChange={(badge) => props(block, { badge })} />
+              <Text value={block.props.badge} maxLength={OFFER_LIMITS.badge} onChange={(badge) => props(block, { badge })} />
             </F>
             <F label="Titre">
-              <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+              <Text value={block.props.title} maxLength={OFFER_LIMITS.title} onChange={(title) => props(block, { title })} />
             </F>
             <F label="Texte">
-              <Area value={block.props.text} rows={3} onChange={(text) => props(block, { text })} />
+              <Area value={block.props.text} rows={3} maxLength={OFFER_LIMITS.text} onChange={(text) => props(block, { text })} />
             </F>
             <Field label="Image" hint="Vide = la photo du produit dans la commande, sinon une vignette neutre.">
               <ImageField value={block.props.imageUrl} images={images} onChange={(imageUrl) => props(block, { imageUrl })} />
             </Field>
             <div className="grid grid-cols-2 gap-2">
               <F label="Bouton">
-                <Text value={block.props.buttonText} onChange={(buttonText) => props(block, { buttonText })} />
+                <Text value={block.props.buttonText} maxLength={OFFER_LIMITS.button} onChange={(buttonText) => props(block, { buttonText })} />
               </F>
               <F label="Refus">
-                <Text value={block.props.declineText} onChange={(declineText) => props(block, { declineText })} />
+                <Text value={block.props.declineText} maxLength={OFFER_LIMITS.button} onChange={(declineText) => props(block, { declineText })} />
               </F>
             </div>
           </EditorAccordion>
@@ -1456,10 +1456,20 @@ export function BlockContentEditor({
           </p>
           {context?.protectionTest && <RunningTestNotice name={context.protectionTest} />}
           <F label="Titre" hint="Vide = « Protection colis (perte, vol, casse) », traduit.">
-            <Text value={p.title} placeholder={emptyTextDefault("shipping_protection", "title", context?.lang ?? "fr") ?? undefined} onChange={(title) => props(block, { title })} />
+            <Text
+              value={p.title}
+              placeholder={emptyTextDefault("shipping_protection", "title", context?.lang ?? "fr") ?? undefined}
+              maxLength={TEXT_LIMITS.title}
+              onChange={(title) => props(block, { title })}
+            />
           </F>
           <F label="Description" hint="Vide = texte traduit par défaut.">
-            <Text value={p.text} placeholder={emptyTextDefault("shipping_protection", "text", context?.lang ?? "fr") ?? undefined} onChange={(text) => props(block, { text })} />
+            <Text
+              value={p.text}
+              placeholder={emptyTextDefault("shipping_protection", "text", context?.lang ?? "fr") ?? undefined}
+              maxLength={TEXT_LIMITS.text}
+              onChange={(text) => props(block, { text })}
+            />
           </F>
           <F label="Prix">
             <Segmented value={p.priceMode} options={[["fixed", "Montant fixe"], ["percent", "% du panier"]]} onChange={(priceMode) => props(block, { priceMode })} />
@@ -1489,7 +1499,7 @@ export function BlockContentEditor({
             </p>
           )}
           <F label="Instructions de réclamation" hint="Affichées sur la page de remerciement quand le colis est protégé.">
-            <Area value={p.claimText} rows={4} onChange={(claimText) => props(block, { claimText })} />
+            <Area value={p.claimText} rows={4} maxLength={2000} onChange={(claimText) => props(block, { claimText })} />
           </F>
         </div>
       );
@@ -1504,7 +1514,12 @@ export function BlockContentEditor({
             Une question en un clic après l&apos;achat. La réponse est enregistrée sur la commande (une seule fois) : utile pour attribuer vos ventes au bon canal.
           </p>
           <F label="Question" hint="Vide = « Comment nous avez-vous connu ? », traduit dans la langue du client.">
-            <Text value={p.question} placeholder={emptyTextDefault("survey", "question", context?.lang ?? "fr") ?? undefined} onChange={(question) => props(block, { question })} />
+            <Text
+              value={p.question}
+              placeholder={emptyTextDefault("survey", "question", context?.lang ?? "fr") ?? undefined}
+              maxLength={TEXT_LIMITS.title}
+              onChange={(question) => props(block, { question })}
+            />
           </F>
           <fieldset className="space-y-1.5">
             <legend className="mb-1 text-xs font-medium text-zinc-700">Réponses proposées</legend>
@@ -1525,7 +1540,12 @@ export function BlockContentEditor({
             l&apos;affichage ; un produit épuisé ou brouillon n&apos;est pas proposé.
           </p>
           <F label="Titre" hint="Vide = « Complétez votre commande », traduit dans la langue du checkout.">
-            <Text value={block.props.title} placeholder={emptyTextDefault("recommendations", "title", context?.lang ?? "fr") ?? undefined} onChange={(title) => props(block, { title })} />
+            <Text
+              value={block.props.title}
+              placeholder={emptyTextDefault("recommendations", "title", context?.lang ?? "fr") ?? undefined}
+              maxLength={TEXT_LIMITS.title}
+              onChange={(title) => props(block, { title })}
+            />
           </F>
           <RecommendationItems block={block} context={context} onChange={onChange} />
           <Toggle label="Masquer les produits déjà dans le panier" checked={block.props.hideIfInCart} onChange={(hideIfInCart) => props(block, { hideIfInCart })} />
@@ -1535,37 +1555,14 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Titre">
-            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+            <Text value={block.props.title} maxLength={TEXT_LIMITS.title} onChange={(title) => props(block, { title })} />
           </F>
           <F label="Texte">
-            <Area value={block.props.text} rows={2} onChange={(text) => props(block, { text })} />
+            <Area value={block.props.text} rows={2} maxLength={TEXT_LIMITS.text} onChange={(text) => props(block, { text })} />
           </F>
-          <F label="Code" hint="Créez-le aussi dans Promos & options pour qu'il fonctionne.">
-            {/* A new code is not confirmed yet (codeConfirmed dropped). */}
-            <Text value={block.props.code} onChange={(code) => props(block, { code: code.toUpperCase(), codeConfirmed: undefined })} />
+          <F label="Code" hint="Créez-le aussi dans Promos & options pour qu'il fonctionne : vos clients voient le code tel quel.">
+            <Text value={block.props.code} maxLength={60} onChange={(code) => props(block, { code: code.toUpperCase() })} />
           </F>
-          {block.props.code.trim().toUpperCase() === SAMPLE_COUPON_CODE && (
-            <label className="flex cursor-pointer items-start gap-2 rounded-md bg-zinc-50 p-2 text-xs text-zinc-800 ring-1 ring-zinc-200">
-              <input
-                type="checkbox"
-                checked={block.props.codeConfirmed === true}
-                onChange={(e) => onChange(e.target.checked ? confirmCouponCode(block) : unconfirmCouponCode(block))}
-                className="mt-0.5 h-4 w-4 shrink-0 accent-zinc-900"
-              />
-              <span>
-                <span className="block font-medium">Ce code existe dans ma boutique</span>
-                <span className="mt-0.5 block text-[11px] text-zinc-600">
-                  {block.props.codeConfirmed
-                    ? block.sample
-                      ? "Confirmé : le bloc est affiché à vos clients. Décochez pour le masquer à nouveau."
-                      : "Confirmé : le bloc est affiché à vos clients. Décochez si ce code n'existe pas."
-                    : block.sample
-                      ? `${SAMPLE_COUPON_CODE} est le code d'exemple : il reste masqué pour vos clients tant que vous ne confirmez pas l'avoir créé.`
-                      : `${SAMPLE_COUPON_CODE} est le code d'exemple et vos clients le voient : confirmez qu'il existe, sinon remplacez-le.`}
-                </span>
-              </span>
-            </label>
-          )}
         </div>
       );
     case "message":
@@ -1605,7 +1602,7 @@ export function BlockContentEditor({
       return (
         <div className="space-y-3">
           <F label="Titre">
-            <Text value={block.props.title} onChange={(title) => props(block, { title })} />
+            <Text value={block.props.title} maxLength={TEXT_LIMITS.title} onChange={(title) => props(block, { title })} />
           </F>
           {(["instagram", "tiktok", "facebook", "youtube"] as const).map((k) => (
             <F key={k} label={k[0].toUpperCase() + k.slice(1)}>
@@ -1622,6 +1619,172 @@ export function BlockContentEditor({
  * spelled out in French ("mardi 14 octobre 2026 à 23:59") so the day/month order is never
  * ambiguous, whatever the browser's locale displays.
  */
+/** Default text of a date countdown: switching to a timer per visitor offers an example instead. */
+const COUNTDOWN_DATE_LABEL = DEFAULT_TEXTS.fr.countdown;
+
+/** Countdown settings: a real end date, or a timer per visitor that starts over at zero. */
+export function CountdownEditor({ block, onChange }: { block: BlockOf<"countdown">; onChange: (patch: Partial<BlockOf<"countdown">["props"]>) => void }) {
+  const p = block.props;
+  const evergreen = p.mode === "evergreen";
+  return (
+    <div className="space-y-3">
+      <Field label="Type de minuteur">
+        <Segmented
+          value={p.mode}
+          options={[
+            ["date", "Date de fin"],
+            ["evergreen", "Minuteur par visiteur"],
+          ]}
+          onChange={(mode) =>
+            onChange(mode === "evergreen" && p.label.trim() === COUNTDOWN_DATE_LABEL ? { mode, label: DEFAULT_TEXTS.fr[COUNTDOWN_EXAMPLE_KEYS[0]] } : { mode })
+          }
+        />
+      </Field>
+      <F label="Texte" hint="{timer} = le minuteur, placé où vous voulez (sans {timer}, il s'affiche après le texte).">
+        <Text value={p.label} maxLength={200} onChange={(label) => onChange({ label })} />
+      </F>
+      {evergreen && (
+        <Field label="Exemples" hint="Un clic remplace le texte. Traduits automatiquement pour vos clients étrangers.">
+          <div className="flex flex-wrap gap-1.5">
+            {COUNTDOWN_EXAMPLE_KEYS.map((key) => {
+              const text = DEFAULT_TEXTS.fr[key];
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  aria-pressed={p.label === text}
+                  onClick={() => onChange({ label: text })}
+                  className={`rounded-full border px-2.5 py-1 text-left text-xs ${ring} ${
+                    p.label === text ? "border-zinc-900 bg-zinc-900 text-white" : "border-zinc-300 text-zinc-700 hover:bg-zinc-50"
+                  }`}
+                >
+                  {text}
+                </button>
+              );
+            })}
+          </div>
+        </Field>
+      )}
+      {evergreen ? (
+        <>
+          <Field label="Durée" hint="Le minuteur démarre quand le client arrive. À zéro, il repart automatiquement de cette durée.">
+            <DurationInput value={p.durationSeconds} onChange={(durationSeconds) => onChange({ durationSeconds })} />
+          </Field>
+          <Field label="Quand le client revient">
+            <Segmented
+              value={p.restart}
+              options={[
+                ["keep", "Garder le temps restant"],
+                ["each_visit", "Repartir à chaque visite"],
+              ]}
+              onChange={(restart) => onChange({ restart })}
+            />
+            <span className="mt-1 block text-[11px] text-zinc-600">
+              {p.restart === "keep" ? "Le temps restant est mémorisé dans le navigateur du client." : "Le minuteur repart de la durée complète à chaque chargement de la page."}
+            </span>
+            <span data-countdown-tip="" className="mt-1 block text-[11px] text-zinc-500">
+              Astuce : un minuteur qui repart à chaque visite peut être vu comme une fausse urgence dans certains pays.
+            </span>
+          </Field>
+        </>
+      ) : (
+        <Field label="Fin de l'offre" hint="Une vraie date de fin : le minuteur disparaît ensuite.">
+          <EndDateInput value={p.endsAt} onChange={(endsAt) => onChange({ endsAt })} />
+        </Field>
+      )}
+      <F label="Affichage du temps">
+        <Pick
+          value={p.format}
+          options={[
+            ["hms", "01:59:59 (heures, minutes, secondes)"],
+            ["ms", "119:59 (minutes, secondes)"],
+            ["words", "1 h 59 min (en toutes lettres)"],
+          ]}
+          onChange={(format) => onChange({ format })}
+        />
+      </F>
+    </div>
+  );
+}
+
+/** Seconds → hours / minutes / seconds fields. */
+function splitDuration(total: number) {
+  return { h: Math.floor(total / 3600), m: Math.floor((total % 3600) / 60), s: total % 60 };
+}
+
+/**
+ * Duration typed as hours / minutes / seconds. Only a total between 1 min and 72 h is committed;
+ * outside, the fields keep what was typed and say why (never silently capped).
+ */
+export function DurationInput({ value, onChange }: { value: number; onChange: (seconds: number) => void }) {
+  const errId = useId();
+  const [draft, setDraft] = useState(() => {
+    const d = splitDuration(value);
+    return { h: String(d.h), m: String(d.m), s: String(d.s) };
+  });
+  const [seen, setSeen] = useState(value);
+  if (value !== seen) {
+    setSeen(value);
+    const d = splitDuration(value);
+    setDraft({ h: String(d.h), m: String(d.m), s: String(d.s) });
+  }
+  const num = (v: string) => (/^\d{0,5}$/.test(v.trim()) ? Number(v.trim() || 0) : NaN);
+  const totalOf = (d: typeof draft) => num(d.h) * 3600 + num(d.m) * 60 + num(d.s);
+  const total = totalOf(draft);
+  const error = Number.isNaN(total)
+    ? "Chiffres uniquement."
+    : total < COUNTDOWN_DURATION.min || total > COUNTDOWN_DURATION.max
+      ? "Entre 1 minute et 72 heures."
+      : null;
+  const set = (key: "h" | "m" | "s", v: string) => {
+    const next = { ...draft, [key]: v };
+    setDraft(next);
+    const t = totalOf(next);
+    if (!Number.isNaN(t) && t >= COUNTDOWN_DURATION.min && t <= COUNTDOWN_DURATION.max) {
+      setSeen(t);
+      onChange(t);
+    }
+  };
+  const unit = (key: "h" | "m" | "s", label: string, short: string) => (
+    <label className="flex flex-1 items-center gap-1">
+      <input
+        type="text"
+        inputMode="numeric"
+        autoComplete="off"
+        aria-label={label}
+        aria-invalid={error ? true : undefined}
+        aria-describedby={error ? errId : undefined}
+        className={`${input} text-right tabular-nums ${error ? "border-amber-400 focus:border-amber-500" : ""}`}
+        value={draft[key]}
+        onChange={(e) => set(key, e.target.value)}
+        onBlur={() => {
+          if (!error) {
+            const d = splitDuration(total);
+            setDraft({ h: String(d.h), m: String(d.m), s: String(d.s) });
+          }
+        }}
+      />
+      <span className="text-xs text-zinc-600" aria-hidden>
+        {short}
+      </span>
+    </label>
+  );
+  return (
+    <div>
+      <div className="flex gap-2">
+        {unit("h", "Heures", "h")}
+        {unit("m", "Minutes", "min")}
+        {unit("s", "Secondes", "s")}
+      </div>
+      {error && (
+        <span id={errId} role="alert" className="mt-1 block text-[11px] text-amber-700">
+          {error}
+        </span>
+      )}
+    </div>
+  );
+}
+
 function EndDateInput({ value, onChange }: { value: string; onChange: (iso: string) => void }) {
   const local = toLocalInput(value);
   const [date, time] = local ? local.split("T") : ["", ""];
@@ -1882,16 +2045,16 @@ function OfferVariantB({ block, context, images, onChange }: { block: BlockOf<"u
           <OfferProductPicker pickerId={`${block.id}-b`} label="Produit de la variante B" value={b} context={context} onChange={(patch) => set(patch)} />
           <OfferPriceFields value={b} currency={context?.currency} onChange={(patch) => set(patch)} />
           <F label="Bandeau" hint="Vide = celui de la version A">
-            <Text value={b.badge} placeholder={block.props.badge} onChange={(badge) => set({ badge })} />
+            <Text value={b.badge} placeholder={block.props.badge} maxLength={OFFER_LIMITS.badge} onChange={(badge) => set({ badge })} />
           </F>
           <F label="Titre" hint="Vide = celui de la version A">
-            <Text value={b.title} placeholder={block.props.title} onChange={(title) => set({ title })} />
+            <Text value={b.title} placeholder={block.props.title} maxLength={OFFER_LIMITS.title} onChange={(title) => set({ title })} />
           </F>
           <F label="Texte" hint="Vide = celui de la version A">
-            <Area value={b.text} rows={2} onChange={(text) => set({ text })} />
+            <Area value={b.text} rows={2} maxLength={OFFER_LIMITS.text} onChange={(text) => set({ text })} />
           </F>
           <F label="Bouton" hint="Vide = celui de la version A">
-            <Text value={b.buttonText} placeholder={block.props.buttonText} onChange={(buttonText) => set({ buttonText })} />
+            <Text value={b.buttonText} placeholder={block.props.buttonText} maxLength={OFFER_LIMITS.button} onChange={(buttonText) => set({ buttonText })} />
           </F>
           <Field label="Image" hint="Vide = la photo du produit dans la commande, sinon une vignette neutre.">
             <ImageField value={b.imageUrl} images={images} onChange={(imageUrl) => set({ imageUrl })} />
@@ -1984,7 +2147,7 @@ function RecommendationItems({ block, context, onChange }: { block: BlockOf<"rec
             </F>
           )}
           <F label="Titre affiché" hint="Vide = titre Shopify.">
-            <Text value={it.title} onChange={(title) => setItem(i, { title })} />
+            <Text value={it.title} maxLength={TEXT_LIMITS.label} onChange={(title) => setItem(i, { title })} />
           </F>
           <button
             type="button"

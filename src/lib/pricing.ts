@@ -306,8 +306,13 @@ export function giftTitle(tier: Pick<GiftTier, "title" | "i18n">, lang: string |
   return (lang && tier.i18n?.[lang]?.title) || tier.title;
 }
 
-export const MAX_PERCENT_TIERS = 5;
-export const MAX_GIFT_TIERS = 3;
+export const MAX_PERCENT_TIERS = 20;
+export const MAX_GIFT_TIERS = 10;
+/**
+ * Bounds of a tier (server validation and dashboard fields): discount up to 90 %, a tier from 2
+ * to 1 000 items (a gift from 1), "X bought" up to 100 with up to 50 free.
+ */
+export const TIER_LIMITS = { maxPercent: 90, maxQty: 1000, maxBuy: 100, maxFree: 50 } as const;
 const MAX_SCOPE_PRODUCTS = 50;
 
 /** "gid://shopify/Product/123" and "123" name the same product. */
@@ -337,20 +342,20 @@ function parseBreak(r: Record<string, unknown>): QuantityBreak | null {
   let tier: QuantityBreak;
   if (kind === "percent") {
     const percent = Number(r.percent);
-    if (!(minQty >= 2 && minQty <= 100 && percent > 0 && percent <= 50)) return null;
+    if (!(minQty >= 2 && minQty <= TIER_LIMITS.maxQty && percent > 0 && percent <= TIER_LIMITS.maxPercent)) return null;
     tier = { minQty, percent };
   } else if (kind === "amount") {
     const amountCents = Math.round(Number(r.amountCents));
     const per = r.per === "bundle" ? "bundle" : r.per === "unit" ? "unit" : null;
-    if (!(minQty >= 2 && minQty <= 100 && per && amountCents >= 1 && amountCents <= MAX_TIER_CENTS)) return null;
+    if (!(minQty >= 2 && minQty <= TIER_LIMITS.maxQty && per && amountCents >= 1 && amountCents <= MAX_TIER_CENTS)) return null;
     tier = { minQty, percent: 0, kind, amountCents, per };
   } else if (kind === "price") {
     const priceCents = Math.round(Number(r.priceCents));
-    if (!(minQty >= 2 && minQty <= 100 && priceCents >= 1 && priceCents <= MAX_TIER_CENTS)) return null;
+    if (!(minQty >= 2 && minQty <= TIER_LIMITS.maxQty && priceCents >= 1 && priceCents <= MAX_TIER_CENTS)) return null;
     tier = { minQty, percent: 0, kind, priceCents };
   } else if (kind === "bxgy") {
     const freeQty = Math.floor(Number(r.freeQty ?? 1));
-    if (!(minQty >= 1 && minQty <= 20 && freeQty >= 1 && freeQty <= 10)) return null;
+    if (!(minQty >= 1 && minQty <= TIER_LIMITS.maxBuy && freeQty >= 1 && freeQty <= TIER_LIMITS.maxFree)) return null;
     tier = { minQty, percent: 0, kind, freeQty };
   } else return null;
   const scope = scopeOf(r.productIds);
@@ -381,7 +386,7 @@ export function parseGiftTiers(raw: unknown): GiftTier[] {
     const tier: GiftTier = { type: "gift", variantId, title };
     const qty = Math.floor(Number(r.minQty));
     const cents = Math.round(Number(r.minSubtotalCents));
-    if (r.minQty != null && qty >= 1 && qty <= 100) tier.minQty = qty;
+    if (r.minQty != null && qty >= 1 && qty <= TIER_LIMITS.maxQty) tier.minQty = qty;
     else if (r.minSubtotalCents != null && cents >= 1 && cents <= 100_000_000) tier.minSubtotalCents = cents;
     else continue;
     const scope = scopeOf(r.productIds);
@@ -426,35 +431,53 @@ export function validateQuantityTiers(raw: unknown): { ok: true; tiers: (Quantit
       ok: false,
       error:
         kind === "amount"
-          ? "Palier « montant » invalide : 2 à 100 articles, un montant de plus de 0, par article ou par lot"
+          ? `Palier « montant » invalide : 2 à ${TIER_LIMITS.maxQty} articles, un montant de plus de 0, par article ou par lot`
           : kind === "price"
-            ? "Palier « prix du lot » invalide : 2 à 100 articles et un prix de plus de 0 (ex. 2 pour 49 €)"
+            ? `Palier « prix du lot » invalide : 2 à ${TIER_LIMITS.maxQty} articles et un prix de plus de 0 (ex. 2 pour 49 €)`
             : kind === "bxgy"
-              ? "Palier « X achetés, Y offerts » invalide : 1 à 20 achetés, 1 à 10 offerts"
-              : "Palier de remise invalide : 2 à 100 articles, remise de plus de 0 et au plus 50 %",
+              ? `Palier « X achetés, Y offerts » invalide : 1 à ${TIER_LIMITS.maxBuy} achetés, 1 à ${TIER_LIMITS.maxFree} offerts`
+              : `Palier de remise invalide : 2 à ${TIER_LIMITS.maxQty} articles, remise de plus de 0 et au plus ${TIER_LIMITS.maxPercent} %`,
     };
   }
   const breaks = parseQuantityBreaks(percents);
   for (const b of breaks) if (breakKind(b) === "percent" && !Number.isInteger(b.percent * 10)) return { ok: false, error: "Remise : une décimale au plus (ex. 12,5)" };
-  // Per scope: unique thresholds, and for percent tiers a bigger quantity must give a bigger discount.
-  const byScope = new Map<string, QuantityBreak[]>();
-  for (const b of breaks) {
-    const key = (b.productIds ?? []).map(productKey).sort().join(",");
-    byScope.set(key, [...(byScope.get(key) ?? []), b]);
-  }
-  for (const list of byScope.values()) {
-    const sorted = [...list].sort((a, b) => tierThreshold(a) - tierThreshold(b));
-    for (let i = 1; i < sorted.length; i++) {
-      if (tierThreshold(sorted[i]) === tierThreshold(sorted[i - 1])) return { ok: false, error: `Il y a déjà un palier dès ${tierThreshold(sorted[i])} articles` };
-    }
-    const pcts = sorted.filter((b) => breakKind(b) === "percent");
-    for (let i = 1; i < pcts.length; i++) {
-      if (pcts[i].percent <= pcts[i - 1].percent) return { ok: false, error: `Palier dès ${pcts[i].minQty} articles : la remise doit dépasser celle du palier précédent` };
+  // Per scope: unique thresholds (two tiers at one quantity: which one applies is ambiguous). A
+  // bigger quantity giving a smaller discount is the merchant's choice: tierOrderWarnings says so.
+  for (const list of tiersByScope(breaks)) {
+    for (let i = 1; i < list.length; i++) {
+      if (tierThreshold(list[i]) === tierThreshold(list[i - 1])) return { ok: false, error: `Il y a déjà un palier dès ${tierThreshold(list[i])} articles` };
     }
   }
   const gifts = parseGiftTiers(giftsRaw);
   if (gifts.length !== giftsRaw.length) return { ok: false, error: "Cadeau invalide : choisissez un produit, un nom et un seuil (articles ou montant)" };
   return { ok: true, tiers: [...breaks, ...gifts] };
+}
+
+/** Tiers grouped by product scope (same products = same group), each sorted by threshold. Pure. */
+function tiersByScope(breaks: QuantityBreak[]): QuantityBreak[][] {
+  const byScope = new Map<string, QuantityBreak[]>();
+  for (const b of breaks) {
+    const key = (b.productIds ?? []).map(productKey).sort().join(",");
+    byScope.set(key, [...(byScope.get(key) ?? []), b]);
+  }
+  return [...byScope.values()].map((list) => [...list].sort((a, b) => tierThreshold(a) - tierThreshold(b)));
+}
+
+/**
+ * Information lines (dashboard, plain grey text, never a warning): a percent tier for more items
+ * that gives no more than the tier before it (buyers who add items would not save more). Saving
+ * is never refused for it. Pure.
+ */
+export function tierOrderWarnings(breaks: QuantityBreak[]): string[] {
+  const out: string[] = [];
+  for (const list of tiersByScope(breaks)) {
+    const pcts = list.filter((b) => breakKind(b) === "percent");
+    for (let i = 1; i < pcts.length; i++) {
+      if (pcts[i].percent <= pcts[i - 1].percent)
+        out.push(`Palier dès ${pcts[i].minQty} articles : ${String(pcts[i].percent).replace(".", ",")} %, pas plus que le palier précédent (${String(pcts[i - 1].percent).replace(".", ",")} %)`);
+    }
+  }
+  return out;
 }
 
 /** The tier reached (best percent) and the next one, for "add 1 more item to save 15%". */

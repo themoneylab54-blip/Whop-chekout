@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { migrateLegacySample } from "./legacy-sample";
 
 /* ------------------------------------------------------------------ */
 /* Theme                                                               */
@@ -76,7 +77,19 @@ const imageUrl = z
   .refine((v) => v === "" || (/^https:\/\//i.test(v) && URL.canParse(v)) || MEDIA_PATH_RE.test(v), "URL https attendue");
 
 /** Text caps of the thank-you « Message personnalisé » block (schema and builder inputs). */
-export const MESSAGE_LIMITS = { title: 160, body: 2000, signatureName: 80, signatureRole: 80 } as const;
+export const MESSAGE_LIMITS = { title: 300, body: 5000, signatureName: 120, signatureRole: 120 } as const;
+
+/** Countdown block: a real end date, or a timer per visitor that starts over at zero. */
+export const COUNTDOWN_MODES = ["date", "evergreen"] as const;
+/** Evergreen timer: "keep" = the visitor's remaining time is remembered, "each_visit" = full on every load. */
+export const COUNTDOWN_RESTARTS = ["each_visit", "keep"] as const;
+/** "hms" = 01:59:59, "ms" = 119:59, "words" = 1 h 59 min. */
+export const COUNTDOWN_FORMATS = ["hms", "ms", "words"] as const;
+/** Evergreen duration (seconds): 1 min to 72 h, 15 min by default. */
+export const COUNTDOWN_DURATION = { min: 60, max: 72 * 3600, default: 15 * 60 } as const;
+export type CountdownMode = (typeof COUNTDOWN_MODES)[number];
+export type CountdownRestart = (typeof COUNTDOWN_RESTARTS)[number];
+export type CountdownFormat = (typeof COUNTDOWN_FORMATS)[number];
 
 /* ---------- Express payment buttons (top of the checkout) ---------- */
 
@@ -190,6 +203,16 @@ export const themeSchema = z.object({
   borderColor: color.default("#d4d4d8"),
   buttonShape: z.enum(["default", "pill", "square"]).default("default"),
   buttonShadow: z.boolean().default(true),
+  // Button colors (src/lib/button-colors.ts). "" = follow the accent, so older stores look the same.
+  // The Pay button (and the sticky « Continuer vers le paiement »): color, optional gradient end, text.
+  payButtonColor: optionalColor,
+  payButtonColor2: optionalColor,
+  payButtonTextColor: optionalColor,
+  // Every other primary button (Ajouter, upsell accept, button link, Continuer mes achats…).
+  buttonColor: optionalColor,
+  buttonTextColor: optionalColor,
+  // Secondary buttons (discount « Appliquer »): white outline (as before) or filled with the button color.
+  secondaryButtonStyle: z.enum(["outline", "solid"]).default("outline"),
   inputStyle: z.enum(["outlined", "filled", "underline"]).default("outlined"),
   headerBackground: color.default("#ffffff"),
   headerBorder: z.boolean().default(true),
@@ -215,6 +238,10 @@ export const themeSchema = z.object({
   bannerAuto: z.boolean().default(false),
   bannerRatio: z.number().min(1).max(20).optional(),
   bannerFit: z.enum(["cover", "contain"]).default("cover"),
+  // Phones (page under 640 px): an optional image of its own (else bannerUrl), always shown full width
+  // in its own proportions (bannerRatioMobile, measured by the builder like bannerRatio).
+  bannerUrlMobile: imageUrl.default(""),
+  bannerRatioMobile: z.number().min(0.5).max(20).optional(),
   // Behind a "contain" banner ("" = header background)
   bannerBackground: optionalColor,
   // The banner links back to the shop
@@ -316,11 +343,34 @@ export type BlockStyle = z.infer<typeof blockStyleSchema>;
  * → text. Missing or empty = the base text (automatically translated when it is a shipped
  * default). Applied at render time for the buyer's language (components/checkout/localize.ts).
  */
-export const MAX_TRANSLATED_FIELDS = 80;
+export const MAX_TRANSLATED_FIELDS = 400;
+
+/**
+ * Longest texts a block accepts (schema and builder fields: the fields stop there and count down
+ * near the end, so a save never fails on a length). title: titles and headings; label: short
+ * lines (badges, list items); text: paragraphs; long: answers, guarantees, testimonials; body: the
+ * text block.
+ */
+export const TEXT_LIMITS = { title: 300, label: 200, text: 1000, long: 5000, body: 10000 } as const;
+/** Most items per list block (schema and builder counters). Reviews: MAX_REVIEW_ITEMS. */
+export const LIST_LIMITS = {
+  faq: 50,
+  trust_badges: 50,
+  value_props: 50,
+  payment_icons: 50,
+  why_us: 50,
+  comparison: 50,
+  logos: 50,
+  benefits: 50,
+  stats: 8,
+} as const;
+/** Blocks per page (checkout or thank-you). */
+export const MAX_BLOCKS_PER_PAGE = 120;
+
 export const blockTranslationsSchema = z.partialRecord(
   z.enum(LANGUAGES),
   z
-    .record(z.string().max(80), z.string().max(2000))
+    .record(z.string().max(80), z.string().max(TEXT_LIMITS.body))
     .refine((o) => Object.keys(o).length <= MAX_TRANSLATED_FIELDS, "Trop de traductions pour ce bloc"),
 );
 export type BlockTranslations = z.infer<typeof blockTranslationsSchema>;
@@ -329,9 +379,11 @@ const base = {
   id: z.string().min(1).max(40),
   i18n: blockTranslationsSchema.optional(),
   hidden: z.boolean().default(false),
-  // Created (palette, template) with shipped example content since sample content is hidden from
-  // buyers: only such blocks have their sample proof hidden live (lib/sample-content.ts). Blocks
-  // published before carry no flag and render exactly as they did.
+  // Id of the template that hid this block (Minimal: add-ons, trust badges). Only a block still
+  // carrying it is shown again by the next template; the merchant's own show / hide clears it.
+  hiddenByTemplate: z.string().max(60).optional(),
+  // Legacy: example content tagged by an earlier version. Never set any more; the loader drops it
+  // (migrateLegacySample: the block shows as written, minus invented example reviews).
   sample: z.literal(true).optional(),
   placement: z.enum(["form", "summary"]).default("form"),
   // thank-you page only
@@ -339,7 +391,7 @@ const base = {
   style: blockStyleSchema.default(blockStyleSchema.parse({})),
 };
 
-const titled = z.object({ title: z.string().max(120).default("") });
+const titled = z.object({ title: z.string().max(TEXT_LIMITS.title).default("") });
 
 /** Post-purchase offer targeting, checked against the paid order (amounts in major units). */
 export const upsellConditionsSchema = z.object({
@@ -364,7 +416,9 @@ export const upsellConditionsSchema = z.object({
 export type UpsellConditions = z.infer<typeof upsellConditionsSchema>;
 
 /** Units a buyer may take in one click. */
-export const MAX_OFFER_QUANTITY = 10;
+export const MAX_OFFER_QUANTITY = 50;
+/** Offer texts (schema and builder fields). */
+export const OFFER_LIMITS = { badge: 120, title: TEXT_LIMITS.title, text: 2000, button: 120 } as const;
 const offerPriceMode = z.enum(["fixed", "percent"]);
 
 /** Arm B of an offer A/B test: its own product, price and texts. */
@@ -375,10 +429,10 @@ export const offerArmSchema = z.object({
   variantId: z.string().max(120).default(""),
   productId: z.string().max(120).optional(),
   imageUrl: imageUrl.default(""),
-  badge: z.string().max(60).default(""),
-  title: z.string().max(120).default(""),
-  text: z.string().max(400).default(""),
-  buttonText: z.string().max(60).default(""),
+  badge: z.string().max(OFFER_LIMITS.badge).default(""),
+  title: z.string().max(OFFER_LIMITS.title).default(""),
+  text: z.string().max(OFFER_LIMITS.text).default(""),
+  buttonText: z.string().max(OFFER_LIMITS.button).default(""),
   priceMode: offerPriceMode.default("fixed"),
   price: z.number().min(0).max(100000).default(0),
   discountPercent: z.number().min(1).max(90).default(20),
@@ -391,19 +445,21 @@ export type OfferArmProps = z.infer<typeof offerArmSchema>;
 /** Post-purchase survey answers ("Comment nous avez-vous connu ?"). */
 /* ---------- "Avis clients" (reviews) block ---------- */
 
-export const MAX_REVIEW_ITEMS = 20;
+export const MAX_REVIEW_ITEMS = 300;
+/** Longest review fields the schema accepts (the builder's fields stop there, imports cut there). */
+export const REVIEW_LIMITS = { name: 120, text: 5000, title: 300 } as const;
 /** Where a review comes from: typed in the builder, a review app's CSV export, or the Judge.me API. */
 export const REVIEW_SOURCES = ["manual", "csv", "judgeme"] as const;
 // Optional fields added after the first version: a bad value is dropped on its own
 // (.catch) instead of sending the whole block back to its sample reviews.
 const optionalText = (max: number) => z.string().max(max).optional().catch(undefined);
 export const reviewItemSchema = z.object({
-  name: z.string().max(80),
-  text: z.string().max(800),
+  name: z.string().max(REVIEW_LIMITS.name),
+  text: z.string().max(REVIEW_LIMITS.text),
   stars: z.number().int().min(1).max(5),
   /** "Achat vérifié": only when the review app says the reviewer bought the product. */
   verified: z.boolean(),
-  title: optionalText(150),
+  title: optionalText(REVIEW_LIMITS.title),
   /** Day the review was written (YYYY-MM-DD). */
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().catch(undefined),
   photoUrl: imageUrl.optional().catch(undefined),
@@ -413,6 +469,11 @@ export const reviewItemSchema = z.object({
   productId: z.string().regex(/^\d{1,20}$/).optional().catch(undefined),
   productTitle: optionalText(255),
   source: z.enum(REVIEW_SOURCES).optional().catch(undefined),
+  /**
+   * Fingerprint of the stars and text as imported (reviewSignature), set the first time the
+   * merchant edits an imported verified review: "Achat vérifié" stays only while they match.
+   */
+  importSig: z.string().regex(/^[0-9a-f]{8}$/).optional().catch(undefined),
 });
 export type ReviewItem = z.infer<typeof reviewItemSchema>;
 export const reviewSummarySchema = z.object({
@@ -434,8 +495,49 @@ export type ReviewSummary = z.infer<typeof reviewSummarySchema>;
  * "Achat vérifié" comes only from a review app (CSV export or Judge.me): a review typed in the
  * builder (source manual or none) is never shown as verified, whatever was saved.
  */
-export function honestReviewItem<T extends Pick<ReviewItem, "verified" | "source">>(item: T): T {
-  return item.verified && item.source !== "csv" && item.source !== "judgeme" ? { ...item, verified: false } : item;
+export function honestReviewItem<T extends Pick<ReviewItem, "verified" | "source"> & Partial<Pick<ReviewItem, "text" | "stars" | "importSig">>>(item: T): T {
+  if (!item.verified) return item;
+  const imported = item.source === "csv" || item.source === "judgeme";
+  // Imported then rewritten (text or stars no longer as the customer wrote them): not verified.
+  const rewritten = imported && !!item.importSig && reviewSignature({ stars: item.stars ?? 0, text: item.text ?? "" }) !== item.importSig;
+  return imported && !rewritten ? item : { ...item, verified: false };
+}
+
+/** True when the review comes from a review app (CSV export or Judge.me), edited or not. */
+export function isImportedReview(item: Pick<ReviewItem, "source">): boolean {
+  return item.source === "csv" || item.source === "judgeme";
+}
+
+/**
+ * Fingerprint (FNV-1a, 8 hex) of a review's stars and text, whitespace and line endings
+ * normalized: a fixed typo in spacing does not count as a rewrite, a changed word does.
+ */
+export function reviewSignature(item: { stars: number; text: string }): string {
+  const s = `${item.stars}|${item.text.replace(/\s+/g, " ").trim()}`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * A review after an edit in the builder. Any field can change, imported reviews included. An
+ * imported verified review keeps "Achat vérifié" while its text and stars are still the
+ * imported ones (back to them = verified again); a typed or pasted review is never verified.
+ */
+export function editReviewItem<T extends ReviewItem>(prev: T, patch: Partial<ReviewItem>): T {
+  const next = { ...prev, ...patch } as T;
+  if (!isImportedReview(next)) return next.verified ? { ...next, verified: false } : next;
+  const sig = prev.importSig ?? (prev.verified ? reviewSignature(prev) : undefined);
+  if (!sig) return next.verified ? { ...next, verified: false } : next;
+  return { ...next, importSig: sig, verified: reviewSignature(next) === sig };
+}
+
+/** True when an imported review was verified but lost the badge because its text or stars were rewritten. */
+export function reviewLostVerified(item: Pick<ReviewItem, "source" | "text" | "stars" | "importSig">): boolean {
+  return isImportedReview(item) && !!item.importSig && reviewSignature(item) !== item.importSig;
 }
 
 export const SURVEY_KEYS = ["facebook", "instagram", "tiktok", "google", "youtube", "friend", "other"] as const;
@@ -479,7 +581,7 @@ export const blockSchema = z.discriminatedUnion("type", [
     type: z.literal("express"),
     // Apple Pay / Google Pay area. `enabled` hides it without removing the section.
     props: z
-      .object({ enabled: z.boolean().default(true), title: z.string().max(120).default(""), dividerLabel: z.string().max(40).default("") })
+      .object({ enabled: z.boolean().default(true), title: z.string().max(TEXT_LIMITS.title).default(""), dividerLabel: z.string().max(120).default("") })
       .default({ enabled: true, title: "", dividerLabel: "" }),
   }),
   z.object({ ...base, type: z.literal("contact"), props: titled.default({ title: "" }) }),
@@ -496,14 +598,14 @@ export const blockSchema = z.discriminatedUnion("type", [
   z.object({
     ...base,
     type: z.literal("text"),
-    props: z.object({ heading: z.string().max(200), body: z.string().max(2000) }),
+    props: z.object({ heading: z.string().max(TEXT_LIMITS.title), body: z.string().max(TEXT_LIMITS.body) }),
   }),
   z.object({
     ...base,
     type: z.literal("image"),
     props: z.object({
       url: imageUrl,
-      alt: z.string().max(200),
+      alt: z.string().max(500),
       size: z.enum(["sm", "md", "lg", "full"]).default("full"),
     }),
   }),
@@ -511,8 +613,8 @@ export const blockSchema = z.discriminatedUnion("type", [
     ...base,
     type: z.literal("testimonial"),
     props: z.object({
-      quote: z.string().max(1000),
-      author: z.string().max(100),
+      quote: z.string().max(TEXT_LIMITS.long),
+      author: z.string().max(TEXT_LIMITS.label),
       photoUrl: imageUrl,
       stars: z.number().int().min(1).max(5),
     }),
@@ -524,7 +626,7 @@ export const blockSchema = z.discriminatedUnion("type", [
       /** null until the merchant enters their real score: the block stays off the live checkout. */
       score: z.number().min(0).max(5).nullable(),
       count: z.number().int().min(0),
-      label: z.string().max(120),
+      label: z.string().max(TEXT_LIMITS.title),
       /** Set once the merchant typed a score (tells a real 4.8 from the old invented default). */
       scoreSet: z.boolean().optional(),
     }),
@@ -533,77 +635,88 @@ export const blockSchema = z.discriminatedUnion("type", [
     ...base,
     type: z.literal("trust_badges"),
     props: z.object({
-      badges: z.array(z.object({ label: z.string().max(60), iconUrl: imageUrl })).max(8),
+      badges: z.array(z.object({ label: z.string().max(TEXT_LIMITS.label), iconUrl: imageUrl })).max(LIST_LIMITS.trust_badges),
     }),
   }),
   z.object({
     ...base,
     type: z.literal("guarantee"),
-    props: z.object({ title: z.string().max(120), text: z.string().max(1000) }),
+    props: z.object({ title: z.string().max(TEXT_LIMITS.title), text: z.string().max(TEXT_LIMITS.long) }),
   }),
   z.object({
     ...base,
     type: z.literal("faq"),
-    props: z.object({ items: z.array(z.object({ q: z.string().max(200), a: z.string().max(2000) })).max(20) }),
+    props: z.object({ items: z.array(z.object({ q: z.string().max(TEXT_LIMITS.title), a: z.string().max(TEXT_LIMITS.long) })).max(LIST_LIMITS.faq) }),
   }),
   z.object({
     ...base,
     type: z.literal("value_props"),
     // icon: an IconKey (legacy layouts may still hold an emoji, rendered as text)
-    props: z.object({ items: z.array(z.object({ icon: z.string().max(16), label: z.string().max(80) })).max(8) }),
+    props: z.object({ items: z.array(z.object({ icon: z.string().max(16), label: z.string().max(TEXT_LIMITS.label) })).max(LIST_LIMITS.value_props) }),
   }),
   z.object({
     ...base,
     type: z.literal("payment_icons"),
     props: z.object({
-      label: z.string().max(80),
-      methods: z.array(z.enum(["visa", "mastercard", "amex", "applepay", "gpay", "sepa", "crypto"])).max(8),
+      label: z.string().max(TEXT_LIMITS.label),
+      methods: z.array(z.enum(["visa", "mastercard", "amex", "applepay", "gpay", "sepa", "crypto"])).max(LIST_LIMITS.payment_icons),
     }),
   }),
   z.object({
     ...base,
     type: z.literal("announcement"),
-    props: z.object({ text: z.string().max(300) }),
+    props: z.object({ text: z.string().max(TEXT_LIMITS.text) }),
   }),
   z.object({
     ...base,
     type: z.literal("countdown"),
-    // A real end date: the block hides itself once it has passed. No fake evergreen timers.
-    props: z.object({ label: z.string().max(200), endsAt: z.string().max(40) }),
+    // "date": a real end date, the block hides itself once it has passed. "evergreen": a timer per
+    // visitor of durationSeconds, started on arrival, that starts over from the full duration at
+    // zero; "keep" remembers the visitor's remaining time (their browser), "each_visit" restarts on
+    // every page load. `label` is free text, {timer} places the timer (else it follows the text).
+    // Older layouts (label + endsAt only) load as "date", unchanged.
+    props: z.object({
+      label: z.string().max(200),
+      endsAt: z.string().max(40),
+      mode: z.enum(COUNTDOWN_MODES).default("date"),
+      durationSeconds: z.number().int().min(COUNTDOWN_DURATION.min).max(COUNTDOWN_DURATION.max).default(COUNTDOWN_DURATION.default),
+      restart: z.enum(COUNTDOWN_RESTARTS).default("keep"),
+      format: z.enum(COUNTDOWN_FORMATS).default("hms"),
+    }),
   }),
   z.object({
     ...base,
     type: z.literal("low_stock"),
     // Shown only when real Shopify inventory of a cart item is at or below the threshold.
-    props: z.object({ message: z.string().max(200), threshold: z.number().int().min(1).max(100) }),
+    props: z.object({ message: z.string().max(500), threshold: z.number().int().min(1).max(100) }),
   }),
   z.object({
     ...base,
     type: z.literal("why_us"),
     props: z.object({
-      title: z.string().max(120),
+      title: z.string().max(TEXT_LIMITS.title),
       rows: z
         .array(
           z.object({
             icon: iconKey,
-            title: z.string().max(80),
-            text: z.string().max(300),
+            title: z.string().max(TEXT_LIMITS.label),
+            text: z.string().max(TEXT_LIMITS.text),
           }),
         )
-        .max(8),
+        .max(LIST_LIMITS.why_us),
     }),
   }),
   z.object({
     ...base,
     type: z.literal("free_shipping_bar"),
     // threshold in major units; 0 = use the lowest "free over" of the shipping rates
-    props: z.object({ message: z.string().max(200), success: z.string().max(200), threshold: z.number().min(0).max(100000) }),
+    props: z.object({ message: z.string().max(500), success: z.string().max(500), threshold: z.number().min(0).max(100000) }),
   }),
   z.object({
     ...base,
     type: z.literal("delivery_estimate"),
     props: z.object({
-      label: z.string().max(120),
+      label: z.string().max(TEXT_LIMITS.title),
       minDays: z.number().int().min(0).max(60),
       maxDays: z.number().int().min(0).max(90),
       businessDays: z.boolean(),
@@ -626,53 +739,56 @@ export const blockSchema = z.discriminatedUnion("type", [
     ...base,
     type: z.literal("comparison"),
     props: z.object({
-      title: z.string().max(120),
-      usLabel: z.string().max(40),
-      themLabel: z.string().max(40),
-      rows: z.array(z.object({ label: z.string().max(80), us: z.boolean(), them: z.boolean() })).max(12),
+      title: z.string().max(TEXT_LIMITS.title),
+      usLabel: z.string().max(80),
+      themLabel: z.string().max(80),
+      rows: z.array(z.object({ label: z.string().max(TEXT_LIMITS.label), us: z.boolean(), them: z.boolean() })).max(LIST_LIMITS.comparison),
     }),
   }),
   z.object({
     ...base,
     type: z.literal("video"),
-    props: z.object({ url, caption: z.string().max(200) }),
+    props: z.object({ url, caption: z.string().max(500) }),
   }),
   z.object({
     ...base,
     type: z.literal("logos"),
-    props: z.object({ title: z.string().max(120), logos: z.array(z.object({ imageUrl, alt: z.string().max(80) })).max(10) }),
+    props: z.object({
+      title: z.string().max(TEXT_LIMITS.title),
+      logos: z.array(z.object({ imageUrl, alt: z.string().max(TEXT_LIMITS.label) })).max(LIST_LIMITS.logos),
+    }),
   }),
   z.object({
     ...base,
     type: z.literal("stats"),
-    props: z.object({ items: z.array(z.object({ value: z.string().max(20), label: z.string().max(60) })).max(4) }),
+    props: z.object({ items: z.array(z.object({ value: z.string().max(40), label: z.string().max(120) })).max(LIST_LIMITS.stats) }),
   }),
   z.object({
     ...base,
     type: z.literal("benefits"),
     props: z.object({
-      title: z.string().max(120),
+      title: z.string().max(TEXT_LIMITS.title),
       columns: z.union([z.literal(2), z.literal(3)]),
-      items: z.array(z.object({ icon: iconKey, title: z.string().max(80), text: z.string().max(200) })).max(9),
+      items: z.array(z.object({ icon: iconKey, title: z.string().max(TEXT_LIMITS.label), text: z.string().max(TEXT_LIMITS.text) })).max(LIST_LIMITS.benefits),
     }),
   }),
   z.object({
     ...base,
     type: z.literal("secure_badge"),
-    props: z.object({ text: z.string().max(120), subtext: z.string().max(160) }),
+    props: z.object({ text: z.string().max(TEXT_LIMITS.title), subtext: z.string().max(500) }),
   }),
   z.object({
     ...base,
     type: z.literal("order_note"),
     // Buyer's free text, copied into the Shopify order note
-    props: z.object({ title: z.string().max(120), placeholder: z.string().max(160) }),
+    props: z.object({ title: z.string().max(TEXT_LIMITS.title), placeholder: z.string().max(300) }),
   }),
   z.object({
     ...base,
     type: z.literal("support"),
     props: z.object({
-      title: z.string().max(120),
-      text: z.string().max(300),
+      title: z.string().max(TEXT_LIMITS.title),
+      text: z.string().max(TEXT_LIMITS.text),
       email: z.string().max(120),
       phone: z.string().max(40),
       whatsapp: z.string().max(40),
@@ -686,22 +802,28 @@ export const blockSchema = z.discriminatedUnion("type", [
   z.object({
     ...base,
     type: z.literal("button_link"),
-    props: z.object({ label: z.string().max(60), url, variant: z.enum(["solid", "outline"]) }),
+    props: z.object({ label: z.string().max(120), url, variant: z.enum(["solid", "outline"]) }),
   }),
   z.object({
     ...base,
     type: z.literal("coupon"),
-    // codeConfirmed: the merchant confirmed the example code (MERCI10) exists in their store.
-    props: z.object({ title: z.string().max(120), text: z.string().max(300), code: z.string().max(40), codeConfirmed: z.boolean().optional() }),
+    // codeConfirmed: legacy (the old « ce code existe » checkbox), kept so older layouts load
+    // unchanged; ignored (the code always shows as written).
+    props: z.object({
+      title: z.string().max(TEXT_LIMITS.title),
+      text: z.string().max(TEXT_LIMITS.text),
+      code: z.string().max(60),
+      codeConfirmed: z.boolean().optional(),
+    }),
   }),
   z.object({
     ...base,
     type: z.literal("upsell"),
     // One-click post-purchase offer, charged on the card saved during checkout
     props: z.object({
-      badge: z.string().max(60),
-      title: z.string().max(120),
-      text: z.string().max(400),
+      badge: z.string().max(OFFER_LIMITS.badge),
+      title: z.string().max(OFFER_LIMITS.title),
+      text: z.string().max(OFFER_LIMITS.text),
       variantId: z.string().max(120),
       // Shopify product of the variant (filled by the picker): "exclude if already bought".
       productId: z.string().max(120).optional(),
@@ -714,8 +836,8 @@ export const blockSchema = z.discriminatedUnion("type", [
       price: z.number().min(0).max(100000),
       discountPercent: z.number().min(1).max(90).default(20),
       compareAt: z.number().min(0).max(100000),
-      buttonText: z.string().max(60),
-      declineText: z.string().max(60),
+      buttonText: z.string().max(OFFER_LIMITS.button),
+      declineText: z.string().max(OFFER_LIMITS.button),
       // Targeting: shown only when the paid order matches (empty = always).
       conditions: upsellConditionsSchema.default({ productIds: [], countries: [] }),
       // Hidden when the offered product is already in the paid order.
@@ -736,9 +858,9 @@ export const blockSchema = z.discriminatedUnion("type", [
     // "Complétez votre commande": 1-4 Shopify variants added to the cart in one tap
     // (priced live by Shopify on the checkout page; title "" = translated default).
     props: z.object({
-      title: z.string().max(120).default(""),
+      title: z.string().max(TEXT_LIMITS.title).default(""),
       items: z
-        .array(z.object({ variantId: z.string().max(120), title: z.string().max(120).default(""), imageUrl: imageUrl.default("") }))
+        .array(z.object({ variantId: z.string().max(120), title: z.string().max(TEXT_LIMITS.label).default(""), imageUrl: imageUrl.default("") }))
         .max(MAX_RECOMMENDATIONS)
         .default([]),
       hideIfInCart: z.boolean().default(true),
@@ -749,8 +871,8 @@ export const blockSchema = z.discriminatedUnion("type", [
     type: z.literal("shipping_protection"),
     // Paid parcel protection (loss, theft, damage), an order line priced server-side.
     props: z.object({
-      title: z.string().max(120).default(""),
-      text: z.string().max(300).default(""),
+      title: z.string().max(TEXT_LIMITS.title).default(""),
+      text: z.string().max(TEXT_LIMITS.text).default(""),
       priceMode: offerPriceMode.default("fixed"),
       price: z.number().min(0).max(1000).default(2.9),
       percent: z.number().min(0).max(50).default(3),
@@ -760,7 +882,7 @@ export const blockSchema = z.discriminatedUnion("type", [
       // EU consumer law: extra paid options must not be pre-ticked (default off).
       defaultOn: z.boolean().default(false),
       // Shown on the thank-you page ("Colis protégé").
-      claimText: z.string().max(600).default(""),
+      claimText: z.string().max(2000).default(""),
     }),
   }),
   z.object({
@@ -768,7 +890,7 @@ export const blockSchema = z.discriminatedUnion("type", [
     type: z.literal("survey"),
     // Thank-you page: "Comment nous avez-vous connu ?" (one tap, stored on the order).
     props: z.object({
-      question: z.string().max(160).default(""),
+      question: z.string().max(TEXT_LIMITS.title).default(""),
       options: z.array(z.enum(SURVEY_KEYS)).max(SURVEY_KEYS.length).default([...SURVEY_KEYS]),
     }),
   }),
@@ -797,7 +919,7 @@ export const blockSchema = z.discriminatedUnion("type", [
     ...base,
     type: z.literal("social"),
     props: z.object({
-      title: z.string().max(120),
+      title: z.string().max(TEXT_LIMITS.title),
       instagram: url,
       tiktok: url,
       facebook: url,
@@ -827,31 +949,18 @@ export function isFixedSection(type: BlockType): boolean {
 
 /** Blocks that can be added from the palette, per page. */
 /**
- * Widgets that make no sense twice on one page (a second free-shipping bar or
- * reviews carousel only pushes the payment down). Duplicates are dropped on load
- * and the builder refuses to add them.
+ * Blocks a second copy would break: the order-bump list, the "Complétez votre commande" cards and
+ * the parcel protection are priced as one order line each (checkout.ts reads the first one), the
+ * survey stores one answer per order, and the order note is one Shopify note (two fields would
+ * edit the same text). Every other block can be added and duplicated freely. Duplicates of these
+ * are dropped on load and the builder refuses to add them.
  */
 export const SINGLETON_BLOCKS: ReadonlySet<BlockType> = new Set<BlockType>([
-  "announcement",
-  "countdown",
-  "free_shipping_bar",
-  "delivery_estimate",
-  "low_stock",
-  "order_note",
-  "secure_badge",
-  "payment_icons",
-  "comparison",
-  "why_us",
-  "stats",
-  "reviews",
-  "guarantee",
-  "benefits",
-  "trust_badges",
-  "coupon",
   "order_addons",
   "recommendations",
   "shipping_protection",
   "survey",
+  "order_note",
 ]);
 
 /** Keeps the first block of each singleton type. */
@@ -919,7 +1028,7 @@ export const THANK_YOU_PALETTE: BlockType[] = [
 const CHECKOUT_ONLY: ReadonlySet<BlockType> = new Set<BlockType>(["order_addons", "order_note", "recommendations", "shipping_protection"]);
 const THANK_YOU_ONLY: ReadonlySet<BlockType> = new Set<BlockType>(["survey", "message"]);
 
-export const layoutSchema = z.object({ blocks: z.array(blockSchema).max(40) });
+export const layoutSchema = z.object({ blocks: z.array(blockSchema).max(MAX_BLOCKS_PER_PAGE, `${MAX_BLOCKS_PER_PAGE} blocs au maximum par page`) });
 export type Layout = z.infer<typeof layoutSchema>;
 
 /** Checkout layouts must contain every fixed section exactly once. */
@@ -956,10 +1065,12 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
   ty_details: { title: "" },
   ty_summary: { title: "" },
   order_addons: { title: "" },
-  text: { heading: "Titre", body: "Votre texte ici." },
+  // Starts empty (the builder shows placeholders; nothing shows live until the merchant writes).
+  text: { heading: "", body: "" },
   image: { url: "", alt: "", size: "full" },
   testimonial: {
-    quote: "Livraison rapide et produit conforme, je recommande.",
+    // No invented quote: the merchant pastes a real customer's words (empty = nothing shown live).
+    quote: "",
     // No default author: "Client vérifié" would vouch for a quote the merchant wrote.
     author: "",
     photoUrl: "",
@@ -993,7 +1104,14 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
   },
   payment_icons: { label: "Moyens de paiement acceptés", methods: ["visa", "mastercard", "amex", "applepay", "gpay"] },
   announcement: { text: "Livraison offerte dès 50 € d'achat" },
-  countdown: { label: "L'offre se termine dans :", endsAt: "" },
+  countdown: {
+    label: "L'offre se termine dans :",
+    endsAt: "",
+    mode: "date",
+    durationSeconds: COUNTDOWN_DURATION.default,
+    restart: "keep",
+    format: "hms",
+  },
   low_stock: { message: "Plus que {n} en stock", threshold: 10 },
   why_us: {
     title: "Pourquoi nous ?",
@@ -1009,14 +1127,11 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
     threshold: 0,
   },
   delivery_estimate: { label: "Livraison estimée", minDays: 3, maxDays: 5, businessDays: true, showTimeline: true },
-  // Sample reviews: never marked "verified" (the builder asks to replace them before publishing).
   reviews: {
     title: "Ce que disent nos clients",
     layout: "auto",
-    items: [
-      { name: "Camille R.", text: "Commande reçue en 3 jours, qualité au top. Je recommande !", stars: 5, verified: false },
-      { name: "Yanis B.", text: "Service client réactif et produit conforme aux photos.", stars: 5, verified: false },
-    ],
+    // Never invented reviews: the merchant pastes or imports theirs (empty = nothing shown live).
+    items: [],
   },
   comparison: {
     title: "Pourquoi nous choisir",
@@ -1030,13 +1145,8 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
   },
   video: { url: "", caption: "" },
   logos: { title: "Ils parlent de nous", logos: [] },
-  stats: {
-    items: [
-      { value: "+10 000", label: "clients satisfaits" },
-      { value: "4,8/5", label: "note moyenne" },
-      { value: "48 h", label: "expédition" },
-    ],
-  },
+  // No invented figures: the merchant adds theirs (empty = nothing shown live).
+  stats: { items: [] },
   benefits: {
     title: "",
     columns: 3,
@@ -1051,7 +1161,8 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
   support: { title: "Besoin d'aide ?", text: "Notre équipe vous répond en moins de 24 h.", email: "", phone: "", whatsapp: "" },
   spacer: { size: 24, line: false },
   button_link: { label: "Continuer mes achats", url: "", variant: "solid" },
-  coupon: { title: "Merci ! Voici un cadeau", text: "Profitez de -10 % sur votre prochaine commande.", code: "MERCI10" },
+  // No invented code or discount: the merchant types a code that exists (empty code = nothing shown live).
+  coupon: { title: "Un cadeau pour votre prochaine commande", text: "À utiliser lors de votre prochaine commande.", code: "" },
   recommendations: { title: "", items: [], hideIfInCart: true },
   social: { title: "Suivez-nous", instagram: "", tiktok: "", facebook: "", youtube: "" },
   upsell: {
@@ -1098,9 +1209,6 @@ const DEFAULT_PROPS: { [T in BlockType]: BlockOf<T>["props"] } = {
 /** Where a new block goes by default: cross-sell cards sit in the summary, the rest in the form. */
 const DEFAULT_PLACEMENT: Partial<Record<BlockType, Block["placement"]>> = { recommendations: "summary" };
 
-/** Blocks shipped with example proof (reviews, figures, testimonial, coupon, announcement, text). */
-export const SAMPLE_CONTENT_BLOCKS: ReadonlySet<BlockType> = new Set<BlockType>(["reviews", "stats", "testimonial", "coupon", "announcement", "text"]);
-
 /**
  * Style a new block starts with (palette, template), on top of the shared defaults: the thank-you
  * message reads as a card. Only applies at creation: saved blocks keep their own style.
@@ -1114,7 +1222,6 @@ export function createBlock<T extends BlockType>(type: T, overrides: Partial<Blo
     props: structuredClone(DEFAULT_PROPS[type]),
     ...(DEFAULT_PLACEMENT[type] ? { placement: DEFAULT_PLACEMENT[type] } : {}),
     ...(DEFAULT_STYLE[type] ? { style: { ...DEFAULT_STYLE[type] } } : {}),
-    ...(SAMPLE_CONTENT_BLOCKS.has(type) ? { sample: true } : {}),
     ...overrides,
   }) as BlockOf<T>;
 }
@@ -1223,23 +1330,15 @@ function migrateBlock(b: Block): Block {
 
 /** Keeps every valid block (repairing props/style when possible) and drops only broken ones. */
 function loadBlocks(raw: unknown): Block[] {
-  return loadRawBlocks(raw).map(migrateBlock);
+  // migrateLegacySample: a block tagged `sample` by an earlier version loads untagged and shows as
+  // written, without the invented example reviews.
+  return loadRawBlocks(raw).map(migrateLegacySample).map(migrateBlock);
 }
-
-/** Props holding a sample-content block's example content (see SAMPLE_CONTENT_BLOCKS). */
-const SAMPLE_CONTENT_KEYS: Partial<Record<BlockType, readonly string[]>> = {
-  reviews: ["items"],
-  stats: ["items"],
-  testimonial: ["quote"],
-  coupon: ["code", "text"],
-  announcement: ["text"],
-  text: ["heading", "body"],
-};
 
 function loadRawBlocks(raw: unknown): Block[] {
   const list = raw && typeof raw === "object" && Array.isArray((raw as { blocks?: unknown }).blocks) ? (raw as { blocks: unknown[] }).blocks : [];
   const blocks: Block[] = [];
-  for (const item of list.slice(0, 40)) {
+  for (const item of list.slice(0, MAX_BLOCKS_PER_PAGE)) {
     const direct = blockSchema.safeParse(item);
     if (direct.success) {
       blocks.push(direct.data);
@@ -1253,23 +1352,17 @@ function loadRawBlocks(raw: unknown): Block[] {
     const props = { ...structuredClone(DEFAULT_PROPS[type]), ...stored };
     // A real coupon code must never be paired with the shipped "-10 %" promise.
     if (type === "coupon" && "code" in stored && !("text" in stored)) (props as Record<string, unknown>).text = "";
-    // A content key filled from the shipped defaults brings example content back (reviews,
-    // figures, MERCI10…): tag the block so buyers never see it. Settings keys (layout, title…)
-    // filled from defaults leave the merchant's own content, and its tag, untouched.
-    const filledContent = (SAMPLE_CONTENT_KEYS[type] ?? []).some((k) => !(k in stored));
-    const sample = b.sample === true || filledContent ? true : undefined;
-    // Last resort: the content is reset to the shipped defaults, i.e. example content again
-    // (tagged so buyers never see it, whatever the stored tag was).
+    // Missing keys come from the defaults (reviews: an empty list, never example reviews); the
+    // merchant's content is never re-tagged. Last resort: the props reset to the defaults.
     const repaired =
-      blockSchema.safeParse({ ...b, props, sample }).data ??
-      blockSchema.safeParse({ ...b, props, sample, style: undefined }).data ??
+      blockSchema.safeParse({ ...b, props }).data ??
+      blockSchema.safeParse({ ...b, props, style: undefined }).data ??
       blockSchema.safeParse({
         id: b.id ?? newBlockId(),
         type,
         hidden: b.hidden,
         placement: b.placement,
         position: b.position,
-        sample: b.sample === true || SAMPLE_CONTENT_BLOCKS.has(type) ? true : undefined,
         props: DEFAULT_PROPS[type],
       }).data;
     if (repaired) blocks.push(repaired);
@@ -1323,8 +1416,8 @@ export function loadThankYouLayout(raw: unknown): Layout {
 /* Post-purchase funnels: "Yes" → acceptNextId, "No thanks" → declineNextId */
 /* ------------------------------------------------------------------ */
 
-/** Offers one buyer can see in a row in one slot (the root and two follow-ups). */
-export const MAX_OFFER_DEPTH = 3;
+/** Offers one buyer can see in a row in one slot (the root and four follow-ups). */
+export const MAX_OFFER_DEPTH = 5;
 
 type UpsellLike = { id: string; type: string; props: object };
 const declineOf = (b: UpsellLike) => (b.props as { declineNextId?: string }).declineNextId || undefined;

@@ -2,11 +2,10 @@ import { describe, expect, it } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createBlock, loadCheckoutLayout, loadThankYouLayout, themeSchema, type Block, type BlockOf } from "@/lib/layout";
-import { isSampleOnly, isSampleReview, isSampleStat, promiseWarnings, sampleWarnings, SAMPLE_PROMISE_WARNING } from "@/lib/sample-content";
+import { isSampleReview, liveReviewItems } from "@/lib/sample-content";
 import { ContentBlock, isEmptyInLive, offeredPaymentLogos, type ContentContext } from "@/components/checkout/blocks";
 import { labelsFor } from "@/components/checkout/i18n";
-import { localizeBlock } from "@/components/checkout/localize";
-import { setupWarnings } from "@/components/builder/placement";
+import { layoutWarnings, reviewNotes, setupWarnings } from "@/components/builder/placement";
 import { canonicalTemplateId, CHECKOUT_TEMPLATES, matchingCheckout, matchingThankYou, THANK_YOU_TEMPLATES } from "@/components/builder/templates";
 import { diffTheme } from "@/components/builder/changes";
 
@@ -24,7 +23,6 @@ const ctx = (preview: boolean): ContentContext =>
     cartProducts: null,
   }) as ContentContext;
 const live = ctx(false);
-const preview = ctx(true);
 const html = (b: Block, c = live) => renderToStaticMarkup(createElement(ContentBlock, { block: b, ctx: c }));
 
 /** Blocks as published before sample content was hidden (HEAD defaults, no `sample` tag). */
@@ -50,96 +48,108 @@ const OLD_CHECKOUT = {
 const OLD_THANK_YOU = {
   blocks: [{ id: "cp1", type: "coupon", props: { title: "Merci ! Voici un cadeau", text: "Profitez de -10 % sur votre prochaine commande.", code: "MERCI10" } }],
 };
+const SAMPLE_REVIEW_1 = { name: "Camille R.", text: "Commande reçue en 3 jours, qualité au top. Je recommande !", stars: 5, verified: false };
 
-describe("sample content: live pages never change on deploy", () => {
-  it("an old published layout with MERCI10, the announcement, sample reviews / figures renders unchanged", () => {
+describe("what the builder shows is what buyers see", () => {
+  it("an old untagged layout (MERCI10, announcement, figures) renders unchanged, without any warning; the old placeholder text loads empty", () => {
     const blocks = [...loadCheckoutLayout(OLD_CHECKOUT).blocks, ...loadThankYouLayout(OLD_THANK_YOU).blocks];
     const byId = (id: string) => blocks.find((b) => b.id === id)!;
-    for (const id of ["ann1", "rev1", "st1", "tx1", "cp1"]) {
-      expect(byId(id).sample, id).toBeUndefined();
-      expect(isSampleOnly(byId(id)), id).toBe(false);
-      expect(isEmptyInLive(byId(id), live, 0), id).toBe(false);
-    }
+    for (const id of ["ann1", "rev1", "st1", "tx1", "cp1"]) expect(byId(id).sample, id).toBeUndefined();
+    for (const id of ["ann1", "st1", "cp1"]) expect(isEmptyInLive(byId(id), live, 0), id).toBe(false);
+    // « Titre » / « Votre texte ici. » (exact old placeholders): emptied, so nothing shows live.
+    expect(byId("tx1").props).toMatchObject({ heading: "", body: "" });
+    expect(isEmptyInLive(byId("tx1"), live, 0)).toBe(true);
+    // The untouched example reviews (invented customers) never reach buyers.
+    expect(isEmptyInLive(byId("rev1"), live, 0)).toBe(true);
     expect(html(byId("ann1"))).toContain("Livraison offerte dès 50 €");
     expect(html(byId("cp1"))).toContain("MERCI10");
-    const reviews = html(byId("rev1"));
-    expect(reviews).toContain("Camille R.");
-    expect(reviews).toContain("Yanis B.");
-    const stats = html(byId("st1"));
-    expect(stats).toContain("+10 000");
-    expect(stats).toContain("48 h");
-    expect(html(byId("tx1"))).toContain("Votre texte ici.");
-    // Not a hidden-block setup warning: an amber "visible par vos clients" one.
-    expect(sampleWarnings(blocks)).toEqual({});
-    const amber = promiseWarnings(blocks);
-    expect(amber.ann1).toMatch(/Annonce d'exemple .* visible par vos clients/);
-    expect(amber.cp1).toMatch(/MERCI10 visible par vos clients/);
-    expect(amber.rev1).toMatch(/Avis d'exemple visibles/);
-    expect(amber.st1).toMatch(/Chiffres d'exemple visibles/);
-    expect(amber.tx1).toMatch(/Texte d'exemple .* visible/);
-    expect(setupWarnings(blocks)).toEqual({});
+    expect(html(byId("st1"))).toContain("+10 000");
+    expect(html(byId("tx1"))).not.toContain("Votre texte ici.");
+    expect(layoutWarnings(blocks)).toEqual({});
+    expect(reviewNotes(blocks)).toEqual({});
   });
 
-  it("the tag survives a save / load round trip, and a newly added template block with sample content is hidden live", () => {
-    const t = THANK_YOU_TEMPLATES.find((x) => x.id === "loyalty")!;
-    const built = t.build(loadThankYouLayout(OLD_THANK_YOU));
-    // The page's own (untagged) coupon is reused as is: still shown.
-    expect(built.blocks.find((b) => b.id === "cp1")!.sample).toBeUndefined();
-    const fresh = t.build(loadThankYouLayout(null)).blocks.find((b) => b.type === "coupon")!;
-    expect(fresh.sample).toBe(true);
-    const reloaded = loadThankYouLayout(JSON.parse(JSON.stringify({ blocks: [fresh] }))).blocks.find((b) => b.type === "coupon")!;
-    expect(reloaded.sample).toBe(true);
-    expect(isEmptyInLive(reloaded, live, 0)).toBe(true);
-    expect(isEmptyInLive(reloaded, preview, 0)).toBe(false);
-    expect(sampleWarnings([reloaded])[reloaded.id]).toMatch(/pour l'afficher$/);
-    expect(promiseWarnings([reloaded])[reloaded.id]).toBeUndefined();
-    for (const type of ["reviews", "stats", "testimonial", "coupon", "announcement", "text"] as const) expect(createBlock(type).sample, type).toBe(true);
-    expect(createBlock("faq").sample).toBeUndefined();
+  it("new blocks are never tagged and show live as created, with no warning; new reviews start empty", () => {
+    for (const type of ["stats", "testimonial", "coupon", "announcement", "text", "guarantee", "faq", "benefits", "countdown", "social", "support", "button_link"] as const) {
+      const b = createBlock(type);
+      expect(b.sample, type).toBeUndefined();
+      expect(setupWarnings([b]), type).toEqual({});
+      expect(layoutWarnings([b]), type).toEqual({});
+    }
+    for (const type of ["announcement", "guarantee", "faq", "benefits"] as const)
+      expect(isEmptyInLive(createBlock(type), live, 0), type).toBe(false);
+    // Nothing invented: new figures, quote, gift code and text start empty and simply render nothing live.
+    for (const type of ["stats", "testimonial", "coupon", "text"] as const) {
+      expect(isEmptyInLive(createBlock(type), live, 0), type).toBe(true);
+      expect(html(createBlock(type)), type).toBe("");
+    }
+    expect(html(createBlock("coupon"))).not.toContain("MERCI10");
+    const reviews = createBlock("reviews") as BlockOf<"reviews">;
+    expect(reviews.props.items).toEqual([]);
+    // An empty reviews block simply renders nothing live.
+    expect(isEmptyInLive(reviews, live, 0)).toBe(true);
+  });
+
+  it("only a product to choose is flagged", () => {
+    const upsell = createBlock("upsell");
+    const reco = createBlock("recommendations");
+    expect(setupWarnings([upsell])[upsell.id]).toBe("Choisir un produit");
+    expect(setupWarnings([reco])[reco.id]).toBe("Choisir les produits à proposer");
+  });
+
+  it("a review is a shipped example only with the name and the text together", () => {
+    expect(isSampleReview(SAMPLE_REVIEW_1)).toBe(true);
+    expect(isSampleReview({ name: "Camille R.", text: "Super produit, je rachète." })).toBe(false);
+    expect(isSampleReview({ name: "Léa M.", text: SAMPLE_REVIEW_1.text })).toBe(false);
+    // Swapped texts are not the shipped pairs.
+    expect(isSampleReview({ name: "Yanis B.", text: SAMPLE_REVIEW_1.text })).toBe(false);
   });
 });
 
-describe("sample content: finer detection", () => {
-  it("a text block hides only its placeholder part; the whole block only when both are placeholders", () => {
-    const text = createBlock("text");
-    expect(isEmptyInLive(text, live, 0)).toBe(true);
-    text.props.heading = "Notre histoire";
-    expect(isEmptyInLive(text, live, 0)).toBe(false);
-    const out = html(text);
-    expect(out).toContain("Notre histoire");
-    expect(out).not.toContain("Votre texte ici.");
-    expect(html(text, preview)).toContain("Votre texte ici.");
-    expect(sampleWarnings([text])[text.id]).toBe("Texte d'exemple (« Votre texte ici. ») masqué pour vos clients : écrivez le vôtre pour l'afficher");
-    const bodyOnly = { ...createBlock("text"), props: { heading: "", body: "Votre texte ici." } } as Block;
-    expect(isEmptyInLive(bodyOnly, live, 0)).toBe(true);
+describe("layouts tagged `sample` by an earlier version", () => {
+  const extra = (blocks: unknown[]) => loadCheckoutLayout({ blocks }).blocks.filter((b) => !["express", "contact", "delivery", "shipping_method", "payment"].includes(b.type));
+
+  it("load untagged; untouched example content stays out of buyers' sight (hidden), example reviews are dropped", () => {
+    const [stats, text, coupon, reviews, onlySample] = extra([
+      { id: "s", type: "stats", sample: true, props: { items: [{ value: "+10 000", label: "clients satisfaits" }] } },
+      { id: "t", type: "text", sample: true, props: { heading: "Titre", body: "Votre texte ici." } },
+      { id: "c", type: "coupon", sample: true, props: { title: "Cadeau", text: "", code: "MERCI10" } },
+      {
+        id: "r",
+        type: "reviews",
+        sample: true,
+        props: { title: "Avis", layout: "stack", items: [SAMPLE_REVIEW_1, { name: "Léa", text: "Top, je recommande.", stars: 5, verified: false }, { name: "Vide", text: " ", stars: 5, verified: false }] },
+      },
+      { id: "r2", type: "reviews", sample: true, props: { title: "Avis", layout: "stack", items: [SAMPLE_REVIEW_1] } },
+    ]);
+    // Still the exact shipped example (never seen by buyers): hidden, content kept for the merchant.
+    for (const b of [stats, text, coupon]) {
+      expect(b.sample, b.id).toBeUndefined();
+      expect(b.hidden, b.id).toBe(true);
+    }
+    expect(html(stats)).toContain("+10 000");
+    expect(html(coupon)).toContain("MERCI10");
+    expect(reviews.sample).toBeUndefined();
+    expect((reviews as BlockOf<"reviews">).props.items.map((r) => r.name)).toEqual(["Léa"]);
+    expect(liveReviewItems(reviews as BlockOf<"reviews">).map((r) => r.name)).toEqual(["Léa"]);
+    // Only example reviews: nothing left, nothing shown live.
+    expect((onlySample as BlockOf<"reviews">).props.items).toEqual([]);
+    expect(isEmptyInLive(onlySample, live, 0)).toBe(true);
+    // Loading twice gives the same layout (the builder tells a real edit from a normalisation).
+    const once = extra([{ id: "r", type: "reviews", sample: true, props: { title: "Avis", layout: "stack", items: [SAMPLE_REVIEW_1] } }]);
+    expect(extra(JSON.parse(JSON.stringify(once)))).toEqual(once);
   });
 
-  it("\"48 h\" is sample only with its shipped label; a review only with the name and the text together", () => {
-    expect(isSampleStat({ value: "48 h", label: "expédition" })).toBe(true);
-    expect(isSampleStat({ value: "48 h", label: "dispatch" })).toBe(true);
-    expect(isSampleStat({ value: "48 h", label: "délai de préparation" })).toBe(false);
-    expect(isSampleStat({ value: "+10 000", label: "n'importe" })).toBe(true);
-    const stats = createBlock("stats");
-    stats.props.items = [{ value: "48 h", label: "délai de préparation" }];
-    expect(isEmptyInLive(stats, live, 0)).toBe(false);
-    expect(isSampleReview({ name: "Camille R.", text: "Commande reçue en 3 jours, qualité au top. Je recommande !" })).toBe(true);
-    expect(isSampleReview({ name: "Camille R.", text: "Super produit, je rachète." })).toBe(false);
-    expect(isSampleReview({ name: "Léa M.", text: "Commande reçue en 3 jours, qualité au top. Je recommande !" })).toBe(false);
-    // Swapped texts are not the shipped pairs.
-    expect(isSampleReview({ name: "Yanis B.", text: "Commande reçue en 3 jours, qualité au top. Je recommande !" })).toBe(false);
-  });
-
-  it("warnings also read the block's translations", () => {
-    const g = createBlock("guarantee");
-    g.props = { ...g.props, title: "Garantie maison", text: "Échange sous 14 jours." } as typeof g.props;
-    expect(promiseWarnings([g])).toEqual({});
-    const shippedEn = localizeBlock(createBlock("guarantee"), "en").props as { text: string };
-    g.i18n = { en: { text: shippedEn.text } };
-    expect(promiseWarnings([g])[g.id]).toBe(SAMPLE_PROMISE_WARNING);
-    const testimonial = createBlock("testimonial") as BlockOf<"testimonial">;
-    testimonial.props.quote = "Je rachète chaque mois.";
-    expect(sampleWarnings([testimonial])).toEqual({});
-    testimonial.i18n = { en: { quote: "Fast delivery and the product is exactly as described. I recommend it." } };
-    expect(sampleWarnings([testimonial])[testimonial.id]).toMatch(/Témoignage d'exemple/);
+  it("a repaired block keeps the merchant's content and never gets example reviews back", () => {
+    const [text, coupon, reviews] = extra([
+      { id: "t", type: "text", props: { heading: "Livraison" } },
+      { id: "c", type: "coupon", props: { title: "Cadeau", code: "VIP20" } },
+      { id: "r", type: "reviews", props: { title: "Avis" } },
+    ]);
+    expect(text.sample).toBeUndefined();
+    expect((text as BlockOf<"text">).props.heading).toBe("Livraison");
+    expect((coupon as BlockOf<"coupon">).props).toMatchObject({ code: "VIP20", text: "" });
+    expect((reviews as BlockOf<"reviews">).props.items).toEqual([]);
   });
 });
 

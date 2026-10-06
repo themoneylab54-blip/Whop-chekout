@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { blockSchema, CHECKOUT_PALETTE, createBlock, loadCheckoutLayout, LANGUAGES, type BlockOf, type ReviewItem } from "@/lib/layout";
+import { blockSchema, CHECKOUT_PALETTE, createBlock, loadCheckoutLayout, LANGUAGES, MAX_REVIEW_ITEMS, type BlockOf, type ReviewItem } from "@/lib/layout";
 import {
   cartProductsOf,
   detectDelimiter,
@@ -21,7 +21,7 @@ import {
   selectReviews,
   shopifyRatingSummary,
 } from "@/lib/reviews-import";
-import { isSampleOnly, isSampleReview } from "@/lib/sample-content";
+import { isSampleReview, liveReviewItems } from "@/lib/sample-content";
 import { ContentBlock, isEmptyInLive, type ContentContext } from "@/components/checkout/blocks";
 import { labelsFor, type Lang } from "@/components/checkout/i18n";
 import { CHECKOUT_TEMPLATES } from "@/components/builder/templates";
@@ -208,11 +208,11 @@ describe("selection", () => {
     expect(rankReviews(all, { sort: "recent" }).map((r) => r.name)).toEqual(["new5", "four", "old5", "photo"]);
     expect(rankReviews(all, { minStars: 1, withText: false })).toHaveLength(6);
   });
-  it("takes products in turn and never more than 20", () => {
-    const many = Array.from({ length: 30 }, (_, i) => rv({ name: `p1-${i}`, productHandle: "p1" }));
+  it("takes products in turn and never more than MAX_REVIEW_ITEMS", () => {
+    const many = Array.from({ length: MAX_REVIEW_ITEMS + 10 }, (_, i) => rv({ name: `p1-${i}`, productHandle: "p1" }));
     const other = [rv({ name: "p2", productHandle: "p2" }), rv({ name: "gen" })];
     const out = selectReviews([...many, ...other]);
-    expect(out).toHaveLength(20);
+    expect(out).toHaveLength(MAX_REVIEW_ITEMS);
     expect(out.slice(0, 3).map((r) => r.name).sort()).toEqual(["gen", "p1-0", "p2"].sort());
   });
   it("replaces samples and earlier imports, keeps the merchant's own typed reviews", () => {
@@ -286,14 +286,14 @@ describe("reviews block schema", () => {
   it("new blocks: sample reviews, never verified, hidden live, auto layout, first trust block of the palette", () => {
     const b = createBlock("reviews") as BlockOf<"reviews">;
     expect(b.props.layout).toBe("auto");
-    expect(b.props.items.every((r) => !r.verified)).toBe(true);
-    expect(isSampleOnly(b)).toBe(true);
+    // Starts empty: never invented reviews.
+    expect(b.props.items).toEqual([]);
     expect(CHECKOUT_PALETTE.indexOf("reviews")).toBeLessThan(CHECKOUT_PALETTE.indexOf("secure_badge"));
   });
   it("a blank review is never shown", () => {
     const b = createBlock("reviews") as BlockOf<"reviews">;
     b.props.items = [{ name: "", text: "  ", stars: 5, verified: false, source: "manual" }];
-    expect(isSampleOnly(b)).toBe(true);
+    expect(liveReviewItems(b)).toEqual([]);
   });
   it("templates with reviews in the summary include nature-eco", () => {
     const t = CHECKOUT_TEMPLATES.find((x) => x.id === "nature-eco")!;
@@ -316,7 +316,8 @@ describe("reviews block rendering", () => {
   });
   const block = (over: Partial<BlockOf<"reviews">["props"]>): BlockOf<"reviews"> => {
     const b = createBlock("reviews") as BlockOf<"reviews">;
-    return { ...b, props: { ...b.props, layout: "stack", ...over } };
+    // Edited in the builder: no longer the untouched example (Block.sample).
+    return { ...b, sample: undefined, props: { ...b.props, layout: "stack", ...over } };
   };
   const html = (b: BlockOf<"reviews">, c: ContentContext) => renderToStaticMarkup(createElement(ContentBlock, { block: b, ctx: c }));
 
@@ -344,7 +345,8 @@ describe("reviews block rendering", () => {
     expect(en).toContain("Verified purchase");
   });
   it("no summary without real data; sample reviews hidden live but visible in the builder", () => {
-    const sample = block({});
+    // Tagged by an earlier version, with its example review (a loaded layout drops both).
+    const sample = { ...block({ items: [{ name: "Camille R.", text: "Commande reçue en 3 jours, qualité au top. Je recommande !", stars: 5, verified: false }] }), sample: true as const };
     expect(isEmptyInLive(sample, ctx("fr"), NOW)).toBe(true);
     expect(html(sample, ctx("fr", true))).toContain("Camille R.");
     expect(html(block({ items: [rv({ name: "Vraie" })] }), ctx("fr"))).not.toContain("/5 ·");

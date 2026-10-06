@@ -208,7 +208,11 @@ describe("quantity-break formats", () => {
     expect(validateQuantityTiers([{ kind: "amount", minQty: 2, amountCents: 500, per: "unit" }, { kind: "price", minQty: 3, priceCents: 6000 }]).ok).toBe(true);
     expect(validateQuantityTiers([{ kind: "amount", minQty: 2, amountCents: 0, per: "unit" }])).toMatchObject({ ok: false, error: expect.stringContaining("montant") });
     expect(validateQuantityTiers([{ kind: "price", minQty: 1, priceCents: 100 }])).toMatchObject({ ok: false });
-    expect(validateQuantityTiers([{ kind: "bxgy", minQty: 2, freeQty: 20 }])).toMatchObject({ ok: false });
+    // Limits: up to 100 bought and 50 free (TIER_LIMITS); beyond, invalid.
+    expect(validateQuantityTiers([{ kind: "bxgy", minQty: 2, freeQty: 20 }]).ok).toBe(true);
+    expect(validateQuantityTiers([{ kind: "bxgy", minQty: 2, freeQty: 51 }])).toMatchObject({ ok: false });
+    expect(validateQuantityTiers([{ kind: "bxgy", minQty: 101, freeQty: 1 }])).toMatchObject({ ok: false });
+    expect(validateQuantityTiers([{ kind: "bxgy", minQty: 2, freeQty: 0 }])).toMatchObject({ ok: false });
     expect(validateQuantityTiers([{ kind: "bxgy", minQty: 2, freeQty: 1 }, { minQty: 3, percent: 10 }])).toMatchObject({ ok: false, error: expect.stringContaining("3 articles") });
     expect(validateQuantityTiers([{ kind: "nope", minQty: 2 }]).ok).toBe(false);
   });

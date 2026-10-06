@@ -27,27 +27,70 @@ export function EditorAccordion({ title, summary, defaultOpen = false, children 
   );
 }
 
+/** One-tap choices of the maximum quantity (any value up to MAX_OFFER_QUANTITY in the field below). */
+const QUICK_QUANTITIES = [1, 2, 3, 5, 10, 20].filter((n) => n <= MAX_OFFER_QUANTITY);
+
+/**
+ * The « Autre » maximum quantity typed so far: a whole number from 1, capped at
+ * MAX_OFFER_QUANTITY; null while it isn't one yet (empty, "0", "abc"…). Pure.
+ */
+export function parseOfferQuantity(text: string): number | null {
+  const t = text.trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return n >= 1 ? Math.min(MAX_OFFER_QUANTITY, n) : null;
+}
+
 /** Units the buyer may take in one click (quantity selector above 1). */
 export function UpsellQuantity({ block, onChange }: { block: Upsell; onChange: (b: Upsell) => void }) {
   const uid = useId();
+  // What the merchant is typing (null: the saved value). The field can be cleared while typing;
+  // a valid number applies at once, anything else goes back to the saved value on blur.
+  const [draft, setDraft] = useState<string | null>(null);
+  const setQuantity = (n: number) => onChange({ ...block, props: { ...block.props, maxQuantity: n } });
   return (
     <div role="group" aria-labelledby={`${uid}-qty`}>
       <span id={`${uid}-qty`} className="mb-1 block text-xs font-medium text-zinc-700">
         Quantité maximale
       </span>
-      <div className="grid grid-cols-5 gap-0.5 rounded-md border border-zinc-300 bg-white p-0.5">
-        {Array.from({ length: MAX_OFFER_QUANTITY }, (_, i) => i + 1).map((n) => (
+      <div className="grid grid-cols-6 gap-0.5 rounded-md border border-zinc-300 bg-white p-0.5">
+        {QUICK_QUANTITIES.map((n) => (
           <button
             key={n}
             type="button"
             aria-pressed={block.props.maxQuantity === n}
-            onClick={() => onChange({ ...block, props: { ...block.props, maxQuantity: n } })}
+            onClick={() => {
+              setDraft(null);
+              setQuantity(n);
+            }}
             className={`min-h-8 rounded px-2 py-1 text-xs ${ring} ${block.props.maxQuantity === n ? "bg-zinc-900 font-medium text-white" : "text-zinc-700 hover:bg-zinc-100"}`}
           >
             {n}
           </button>
         ))}
       </div>
+      <label className="mt-1.5 flex items-center gap-2 text-xs text-zinc-700">
+        Autre (1 à {MAX_OFFER_QUANTITY})
+        <input
+          type="number"
+          inputMode="numeric"
+          min={1}
+          max={MAX_OFFER_QUANTITY}
+          value={draft ?? String(block.props.maxQuantity)}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            const n = parseOfferQuantity(e.target.value);
+            if (n != null && n !== block.props.maxQuantity) setQuantity(n);
+          }}
+          onBlur={() => {
+            if (draft == null) return;
+            const n = parseOfferQuantity(draft);
+            if (n != null && n !== block.props.maxQuantity) setQuantity(n);
+            setDraft(null);
+          }}
+          className={`w-20 rounded-md border border-zinc-300 bg-white px-2 py-1 text-sm ${ring}`}
+        />
+      </label>
       <span className="mt-1 block text-[11px] text-zinc-600">Au-delà de 1, le client choisit la quantité ; le total est débité en un clic.</span>
     </div>
   );
@@ -275,7 +318,7 @@ export function UpsellRules({
       </label>
       {tooDeep && (
         <p role="alert" className="rounded-lg bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-900">
-          Un parcours dépasse {MAX_OFFER_DEPTH} offres d&apos;affilée : au-delà de la 3ᵉ, les offres ne sont pas proposées.
+          Un parcours dépasse {MAX_OFFER_DEPTH} offres d&apos;affilée : au-delà de la {MAX_OFFER_DEPTH}ᵉ, les offres ne sont pas proposées.
         </p>
       )}
     </div>

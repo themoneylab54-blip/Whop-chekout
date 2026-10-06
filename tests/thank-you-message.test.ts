@@ -105,7 +105,7 @@ describe("message block: schema", () => {
     // A stray shape / layout falls back to the default on its own.
     const stray = blockSchema.parse({ ...base, props: { photoShape: "hexagon", layout: "right" } });
     expect(stray.type === "message" && [stray.props.photoShape, stray.props.layout]).toEqual(["round", "left"]);
-    expect(blockSchema.safeParse({ ...base, props: { body: "x".repeat(2001) } }).success).toBe(false);
+    expect(blockSchema.safeParse({ ...base, props: { body: "x".repeat(5001) } }).success).toBe(false);
     // An uploaded image (relative media path) and an http address upgraded to https are accepted.
     const ok = blockSchema.parse({ ...base, props: { photoUrl: "/api/public/media/abcdef123456", signatureImageUrl: "http://cdn.example.com/sig.png" } });
     expect(ok.type === "message" && ok.props.signatureImageUrl).toBe("https://cdn.example.com/sig.png");
@@ -141,8 +141,8 @@ describe("message block: schema", () => {
     expect(signedWithStore(b, "")).toBe(b);
     const text = createBlock("text");
     expect(signedWithStore(text, "Maison Lune")).toBe(text);
-    expect(MESSAGE_LIMITS).toEqual({ title: 160, body: 2000, signatureName: 80, signatureRole: 80 });
-    expect(blockSchema.safeParse({ id: "m", type: "message", props: { title: "x".repeat(161) } }).success).toBe(false);
+    expect(MESSAGE_LIMITS).toEqual({ title: 300, body: 5000, signatureName: 120, signatureRole: 120 });
+    expect(blockSchema.safeParse({ id: "m", type: "message", props: { title: "x".repeat(301) } }).success).toBe(false);
   });
 
   it("a partly broken saved block is repaired on load, not dropped", () => {
@@ -431,9 +431,9 @@ describe("message block: builder", () => {
     const b = createBlock("message");
     const { container } = render(h(BlockContentEditor, { block: b, onChange: () => undefined }));
     const caps = (sel: string) => Array.from(container.querySelectorAll(sel)).map((el) => el.getAttribute("maxlength"));
-    expect(caps("textarea")).toEqual(["2000"]);
-    expect(caps('input:not([type]), input[type="text"]').filter(Boolean)).toEqual(expect.arrayContaining(["160", "80", "80"]));
-    expect((container.querySelector('input[placeholder="ex. Bienvenue parmi nous, {prénom} !"]') as HTMLInputElement).maxLength).toBe(160);
+    expect(caps("textarea")).toEqual(["5000"]);
+    expect(caps('input:not([type]), input[type="text"]').filter(Boolean)).toEqual(expect.arrayContaining(["300", "120", "120"]));
+    expect((container.querySelector('input[placeholder="ex. Bienvenue parmi nous, {prénom} !"]') as HTMLInputElement).maxLength).toBe(300);
   });
 
   it("the Translations tab tells to keep {prénom} in the message title only, when the title uses it", () => {

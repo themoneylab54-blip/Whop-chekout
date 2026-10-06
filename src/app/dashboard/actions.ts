@@ -926,8 +926,7 @@ export async function publishDesignAction(
     const c = checkoutLayoutSchema.safeParse(fresh.checkoutLayout);
     const y = thankYouLayoutSchema.safeParse(fresh.thankYouLayout);
     if (!t.success || !c.success || !y.success) return false;
-    // Sample reviews / figures / coupon / testimonial need no gate: the live page never shows them
-    // (isEmptyInLive → isSampleOnly, liveReviewItems), whatever gets published.
+    // No example gate: blocks publish as the builder shows them (reviews start empty, never invented).
     await tx.store.update({
       where: { id: storeId },
       data: {

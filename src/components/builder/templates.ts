@@ -4,15 +4,16 @@ import {
   createBlock,
   dedupeSingletons,
   defaultTheme,
-  isFixedSection,
   signedWithStore,
   type Block,
+  type BlockOf,
   type BlockStyle,
   type BlockType,
   type Layout,
   type Theme,
 } from "@/lib/layout";
 import { arrangeCheckout } from "@/components/checkout/CheckoutView";
+import { isPlaceholderTextBody, isPlaceholderTextHeading } from "@/lib/legacy-sample";
 
 /** Per-block settings a template may set on top of the block's defaults. */
 export type SpecOverrides = Partial<Pick<Block, "placement" | "position">> & {
@@ -70,42 +71,125 @@ export type Template = {
   category: TemplateCategory;
   /** Complete look applied with the blocks. Absent: blocks only, the style is kept. */
   style?: TemplateStyle;
-  /** Page blocks this template hides (never deletes) to stay minimal: the add-ons, the trust badges… */
+  /**
+   * Page blocks this template hides (never deletes): Minimal's add-ons, and the default trust
+   * badges wherever the template adds its own reassurance (secure badge, value props, payment logos).
+   */
   hides?: readonly BlockType[];
   /** One-line "idéal pour" tag shown on the card (« Trafic mobile », « Panier élevé »…). */
   idealFor?: string;
   /** `storeName` signs a message block the template creates (see signedWithStore). */
-  build: (current: Layout, ctx?: { storeName?: string }) => Layout;
+  build: (current: Layout, ctx?: BuildContext) => Layout;
 };
 
+/** What a template build needs from the builder: the store name signs a message it creates. */
+export type BuildContext = { storeName?: string };
+
 /**
- * Builds a layout from a spec. Blocks the page already has are reused, so what the merchant
- * wrote survives a template change: fixed sections (and their custom titles) as they are, other
- * blocks with their texts, products, translations and hidden state (the template only places and
- * styles them). Only blocks the page doesn't have are created, from their translated defaults.
- * Blocks the template doesn't list (a text, an image, a FAQ, the add-ons…) are kept too, next to
- * the block they followed (see keepOthers).
+ * The old « Simple » note as that template created it: « Titre » / « Votre texte ici. » (the
+ * loader now empties those exact placeholder words, so it loads blank).
  */
-export function fromSpec(spec: Spec[], current: Layout, opts: { keepStyle?: boolean; hide?: readonly BlockType[]; storeName?: string } = {}): Layout {
+const untouchedNote = (p: { heading: string; body: string }) =>
+  (p.heading.trim() === "" || isPlaceholderTextHeading(p.heading)) && (p.body.trim() === "" || isPlaceholderTextBody(p.body));
+
+/**
+ * The Text block an earlier « Simple » template made as its note (right after the confirmation,
+ * or right before it in the first version), only while untouched (its shipped « Titre » / « Votre
+ * texte ici. »): reused as the message so the page keeps one note. A note the merchant wrote stays
+ * their Text block, as written (never moved into a message, never cut).
+ */
+function oldNote(blocks: Block[]): BlockOf<"text"> | null {
+  const c = blocks.findIndex((b) => b.type === "ty_confirmation");
+  if (c < 0) return null;
+  for (const b of [blocks[c + 1], blocks[c - 1]]) {
+    if (b?.type === "text" && untouchedNote(b.props)) return b;
+  }
+  return null;
+}
+
+/**
+ * The untouched old note as a message block: same id, visibility, place and style, the message's
+ * own shipped texts (translated for buyers). Not signed: the note had no signature.
+ */
+function noteAsMessage(b: BlockOf<"text">): Block {
+  const { type: _t, props: _p, i18n: _i, ...rest } = b;
+  void _t;
+  void _p;
+  void _i;
+  return blockSchema.parse({ ...rest, type: "message", props: createBlock("message").props }) as Block;
+}
+
+/**
+ * The page's block each spec entry reuses (null: created), and the blocks the spec doesn't list.
+ * A thank-you page without a message reuses the old « Simple » note (oldNote) as its message.
+ */
+function matchSpec(spec: Spec[], current: Layout): { reused: (Block | null)[]; pool: Block[] } {
   const pool = [...current.blocks];
-  const blocks = spec.map(([type, o = {}]) => {
+  const reused = spec.map(([type]) => {
     const at = pool.findIndex((b) => b.type === type);
-    const existing = at >= 0 ? pool.splice(at, 1)[0] : null;
-    if (existing && isFixedSection(type)) return existing;
-    const fresh = createBlock(type, { ...(o.placement ? { placement: o.placement } : {}), ...(o.position ? { position: o.position } : {}) });
-    const defaults = blockStyleSchema.parse({});
-    if (existing) {
-      // A layout-only template ("Garde votre style") keeps the block's own style, its overrides on top.
-      const style = opts.keepStyle ? { ...existing.style, ...o.style } : { ...defaults, ...o.style };
-      return blockSchema.parse({ ...existing, placement: fresh.placement, position: fresh.position, style }) as Block;
-    }
-    return signedWithStore(blockSchema.parse({ ...fresh, style: { ...defaults, ...o.style }, props: { ...fresh.props, ...o.props } }) as Block, opts.storeName);
+    return at >= 0 ? pool.splice(at, 1)[0] : null;
   });
-  // Blocks the template leaves out of its look (Minimal: add-ons, trust badges) are hidden, never
-  // deleted: their content stays, one click in the block list shows them again.
+  const m = spec.findIndex(([type]) => type === "message");
+  if (m >= 0 && !reused[m]) {
+    const note = oldNote(current.blocks);
+    const at = note ? pool.indexOf(note) : -1;
+    if (at >= 0) reused[m] = pool.splice(at, 1)[0];
+  }
+  return { reused, pool };
+}
+
+const SHIPPED_BADGES = createBlock("trust_badges").props.badges;
+
+/**
+ * Whether a template may hide this block of a hidden type: the default trust badges only while
+ * untouched (shipped labels, no icon, no translation); badges the merchant edited stay shown.
+ */
+function templateMayHide(b: Block, hide: ReadonlySet<BlockType>): boolean {
+  if (!hide.has(b.type)) return false;
+  if (b.type !== "trust_badges") return true;
+  const badges = b.props.badges;
+  const untouched =
+    badges.length === SHIPPED_BADGES.length && badges.every((x, i) => x.label.trim() === SHIPPED_BADGES[i].label && !x.iconUrl) && !Object.keys(b.i18n ?? {}).length;
+  return untouched;
+}
+
+/** A block hidden by a template, shown again (marker dropped). */
+function shown<B extends Block>(b: B): B {
+  const { hiddenByTemplate: _h, ...rest } = b;
+  void _h;
+  return { ...rest, hidden: false } as B;
+}
+
+/**
+ * Builds a layout from a spec. Blocks the page already has are reused as the merchant left them:
+ * fixed sections (and their custom titles) as they are, other blocks with their texts, products,
+ * translations, style, placement and hidden state (the template only orders them). Only blocks
+ * the page doesn't have are created, from their translated defaults, with the template's style,
+ * placement and props. Blocks the template doesn't list (a text, an image, a FAQ, the add-ons…)
+ * are kept too, next to the block they followed (see keepOthers).
+ *
+ * `hide`: types of the unlisted blocks the template hides (never deletes), marked with its id
+ * (`hiddenByTemplate`). A block still carrying such a marker from an earlier template is shown
+ * again unless this template hides it too; a block the merchant hid stays hidden.
+ */
+export function fromSpec(spec: Spec[], current: Layout, opts: { hide?: readonly BlockType[]; templateId?: string; storeName?: string } = {}): Layout {
+  const { reused, pool } = matchSpec(spec, current);
   const hide = new Set(opts.hide ?? []);
-  for (let i = 0; i < pool.length; i++) if (hide.has(pool[i].type) && !pool[i].hidden) pool[i] = { ...pool[i], hidden: true };
-  const kept = dedupeSingletons(keepOthers(blocks, pool, current.blocks));
+  const blocks = spec.map(([type, o = {}], i) => {
+    const existing = reused[i];
+    if (existing) {
+      const b = existing.type !== type ? noteAsMessage(existing as BlockOf<"text">) : existing;
+      return b.hiddenByTemplate ? shown(b) : b;
+    }
+    const fresh = createBlock(type, { ...(o.placement ? { placement: o.placement } : {}), ...(o.position ? { position: o.position } : {}) });
+    const style = { ...blockStyleSchema.parse({}), ...fresh.style, ...o.style };
+    return signedWithStore(blockSchema.parse({ ...fresh, style, props: { ...fresh.props, ...o.props } }) as Block, opts.storeName);
+  });
+  const others = pool.map((b) => {
+    if (templateMayHide(b, hide)) return b.hidden && !b.hiddenByTemplate ? b : { ...b, hidden: true, hiddenByTemplate: opts.templateId ?? "template" };
+    return b.hiddenByTemplate ? shown(b) : b;
+  });
+  const kept = dedupeSingletons(keepOthers(blocks, others, current.blocks));
   // A reused one-click offer may point to a follow-up offer the template dropped.
   const ids = new Set(kept.map((b) => b.id));
   return {
@@ -155,12 +239,7 @@ function keepOthers(built: Block[], others: Block[], before: Block[]): Block[] {
 
 /** Page blocks a template doesn't list: kept by fromSpec (the confirmation dialog names them). */
 export function blocksKeptAside(spec: Spec[], current: Layout): Block[] {
-  const pool = [...current.blocks];
-  for (const [type] of spec) {
-    const at = pool.findIndex((b) => b.type === type);
-    if (at >= 0) pool.splice(at, 1);
-  }
-  return pool;
+  return matchSpec(spec, current).pool;
 }
 
 const COLUMNS_CACHE = new WeakMap<Spec[], { form: BlockType[]; summary: BlockType[] }>();
@@ -219,15 +298,41 @@ const IDEAL_FOR: Record<string, string> = {
   upsell: "Hausse du panier",
 };
 
+/** Reassurance blocks that repeat the default trust badges (« Paiement sécurisé »…): those are hidden. */
+const REASSURANCE: readonly BlockType[] = ["secure_badge", "value_props", "payment_icons"];
+
 function template(t: Omit<Template, "build">): Template {
   const idealFor = t.idealFor ?? IDEAL_FOR[t.id];
-  return { ...t, ...(idealFor ? { idealFor } : {}), build: (c, ctx) => fromSpec(t.spec, c, { keepStyle: !t.style, hide: t.hides, storeName: ctx?.storeName }) };
+  const ownTrust = t.spec.some(([type]) => REASSURANCE.includes(type));
+  const hides = [...new Set([...(t.hides ?? []), ...(ownTrust ? (["trust_badges"] as const) : [])])];
+  return {
+    ...t,
+    ...(idealFor ? { idealFor } : {}),
+    ...(hides.length ? { hides } : {}),
+    build: (c, ctx) => fromSpec(t.spec, c, { hide: hides, templateId: t.id, storeName: ctx?.storeName }),
+  };
 }
 
 /** Visible page blocks a template hides (named in the confirmation dialog). */
 export function blocksHiddenBy(t: Pick<Template, "spec" | "hides">, current: Layout): Block[] {
   const hide = new Set(t.hides ?? []);
-  return blocksKeptAside(t.spec, current).filter((b) => hide.has(b.type) && !b.hidden);
+  return blocksKeptAside(t.spec, current).filter((b) => templateMayHide(b, hide) && !b.hidden);
+}
+
+/** Blocks an earlier template hid that this one shows again (named in the confirmation dialog). */
+export function blocksShownBy(t: Pick<Template, "spec" | "hides">, current: Layout): Block[] {
+  const hide = new Set(t.hides ?? []);
+  const aside = new Set(blocksKeptAside(t.spec, current));
+  return current.blocks.filter((b) => b.hidden && b.hiddenByTemplate && !(aside.has(b) && templateMayHide(b, hide)));
+}
+
+/**
+ * The « Actuel » badge: the template last applied on this page, while the shared style still is
+ * its look (a styled template applied on the other page changes it for both).
+ */
+export function isCurrentTemplate(t: Pick<Template, "id" | "style">, appliedId: string | null | undefined, theme: Theme): boolean {
+  if (canonicalTemplateId(appliedId) !== t.id) return false;
+  return !t.style || TEMPLATE_STYLE_KEYS.every((k) => theme[k] === t.style![k]);
 }
 
 /** What the minimal templates leave out: paid options and a second row of reassurance. */
@@ -242,6 +347,54 @@ function look(overrides: Partial<TemplateStyle>): TemplateStyle {
 
 const TOP: Spec[] = [["express"], ["contact"], ["delivery"], ["shipping_method"]];
 const SUMMARY = { placement: "summary" } as const;
+
+/*
+ * What a template creates renders live exactly as the builder shows it, so its example texts make
+ * no precise promise (no « 30 jours », « 48 h » or « livraison offerte » the merchant didn't set):
+ * neutral wording, all shipped defaults (translated for buyers, see localize.ts DEFAULT_TEXTS).
+ * No invented figures (stats) or quotes (testimonial) either; reviews blocks start empty.
+ */
+/** The thank-you note: one per page, a card, right after the confirmation (or its offer). */
+const MESSAGE: Spec = ["message", { style: { card: true } }];
+/**
+ * No refund or returns promise the merchant didn't make, and no contact line the page gives no way
+ * to act on: what every order gets anyway (the confirmation e-mail and the tracking).
+ */
+const GUARANTEE = { props: { title: "Commande suivie", text: "Vous recevez un e-mail de confirmation et le suivi de votre colis." } };
+const VALUE_PROPS = {
+  items: [
+    { icon: "truck", label: "Suivi de commande" },
+    { icon: "lock", label: "Paiement sécurisé" },
+  ],
+};
+/** Two columns, no « Paiement sécurisé » (the page's trust badges / secure badge already say it). */
+const BENEFITS = {
+  props: {
+    columns: 2,
+    items: [
+      { icon: "truck", title: "Suivi de commande", text: "Vous recevez un e-mail de suivi dès l'expédition de votre commande." },
+      { icon: "support", title: "Service client", text: "Un souci ? Notre équipe vous répond." },
+    ],
+  },
+};
+const FAQ = {
+  props: {
+    items: [
+      { q: "Quand vais-je recevoir ma commande ?", a: "Vous recevez un e-mail de suivi dès l'expédition de votre commande." },
+      { q: "Quand vais-je recevoir ma confirmation ?", a: "Juste après le paiement, par e-mail." },
+    ],
+  },
+};
+/**
+ * A gift for the next order, without any code or discount: nothing shows live until the merchant
+ * types a code that exists (the title doesn't thank twice: the confirmation already does).
+ */
+const COUPON: Spec = ["coupon", { props: { title: "Un cadeau pour votre prochaine commande", text: "À utiliser lors de votre prochaine commande.", code: "" } }];
+/**
+ * A timer per visitor: shows live as in the builder (a date timer without its date shows nothing).
+ * Its example text claims no offer end the merchant never set: the cart is held (editable).
+ */
+const COUNTDOWN: Spec = ["countdown", { props: { mode: "evergreen", label: "Votre panier est réservé pendant {timer}" } }];
 
 /**
  * Styled templates: a checkout layout, its matching thank-you page and a look. Inspired by the
@@ -288,8 +441,8 @@ const STYLED: Styled[] = [
       spec: [...TOP, ["payment"], ["secure_badge", { style: { align: "center" } }]],
     },
     thankYou: {
-      summary: "Confirmation · Date de livraison · Adresse · Récapitulatif",
-      spec: [["ty_confirmation"], ["delivery_estimate"], ["ty_details"], ["ty_summary"]],
+      summary: "Confirmation · Message personnalisé · Adresse · Récapitulatif",
+      spec: [["ty_confirmation"], MESSAGE, ["ty_details"], ["ty_summary"]],
     },
   },
   {
@@ -317,15 +470,15 @@ const STYLED: Styled[] = [
       spec: [...TOP, ["order_addons"], ["payment"], ["payment_icons"]],
     },
     thankYou: {
-      summary: "Confirmation · Date de livraison · Adresse · Récapitulatif · Support client",
-      spec: [["ty_confirmation"], ["delivery_estimate"], ["ty_details"], ["ty_summary"], ["support"]],
+      summary: "Confirmation · Message personnalisé · Adresse · Récapitulatif",
+      spec: [["ty_confirmation"], MESSAGE, ["ty_details"], ["ty_summary"]],
     },
   },
   {
     id: "compact-mobile",
     name: "Mobile compact",
     category: "minimal",
-    description: "Colonne étroite, champs remplis et gros boutons : le paiement arrive vite sur petit écran. Pour un trafic majoritairement mobile (réseaux sociaux).",
+    description: "Colonne étroite, champs remplis et photos des produits dans le récapitulatif : le paiement arrive vite sur petit écran. Pour un trafic majoritairement mobile (réseaux sociaux).",
     style: look({
       font: "DM Sans",
       headingFont: "same",
@@ -348,8 +501,8 @@ const STYLED: Styled[] = [
       spec: [["free_shipping_bar"], ...TOP, ["payment"], ["payment_icons"]],
     },
     thankYou: {
-      summary: "Confirmation · Adresse · Récapitulatif · Code promo cadeau",
-      spec: [["ty_confirmation"], ["ty_details"], ["ty_summary"], ["coupon"]],
+      summary: "Confirmation · Message personnalisé · Adresse · Récapitulatif · Code promo cadeau",
+      spec: [["ty_confirmation"], MESSAGE, ["ty_details"], ["ty_summary"], COUPON],
     },
   },
   {
@@ -374,18 +527,18 @@ const STYLED: Styled[] = [
     }),
     checkout: {
       summary: "Paiement express · Contact · Adresse · Livraison · Paiement + badge sécurisé, garantie et avis (récapitulatif ; sous le bouton sur mobile)",
-      spec: [...TOP, ["payment"], ["secure_badge"], ["guarantee"], ["reviews", SUMMARY]],
+      spec: [...TOP, ["payment"], ["secure_badge"], ["guarantee", GUARANTEE], ["reviews", SUMMARY]],
     },
     thankYou: {
-      summary: "Confirmation · Offre post-achat · Adresse · Récapitulatif · Réseaux sociaux",
-      spec: [["ty_confirmation"], ["upsell"], ["ty_details"], ["ty_summary"], ["social"]],
+      summary: "Confirmation · Offre post-achat · Message personnalisé · Adresse · Récapitulatif",
+      spec: [["ty_confirmation"], ["upsell"], MESSAGE, ["ty_details"], ["ty_summary"]],
     },
   },
   {
     id: "luxury-black-gold",
     name: "Luxe noir & or",
     category: "premium",
-    description: "Titres à empattements, noir profond et dégradé bronze, angles droits. Pour la joaillerie, les montres, la parfumerie (logo clair conseillé).",
+    description: "Titres à empattements, noir profond, filets or et boutons noir-bronze, angles droits. Pour la joaillerie, les montres, la parfumerie (logo clair conseillé).",
     style: look({
       font: "Lato",
       headingFont: "Playfair Display",
@@ -393,7 +546,8 @@ const STYLED: Styled[] = [
       accentColor: "#111111",
       accentColor2: "#6b5220",
       textColor: "#1c1917",
-      borderColor: "#cfc3a8",
+      // Real gold lines (cards, separators); fields get a darker boundary (fieldBorderColor, 3:1).
+      borderColor: "#c9a646",
       buttonShape: "square",
       buttonShadow: false,
       headerBackground: "#0b0b0b",
@@ -403,12 +557,12 @@ const STYLED: Styled[] = [
       summaryBackground: "#f5efe3",
     }),
     checkout: {
-      summary: "Paiement express · Contact · Adresse · Livraison · Paiement + badge sécurisé, garantie et témoignage (récapitulatif ; sous le bouton sur mobile)",
-      spec: [...TOP, ["payment"], ["secure_badge", { style: { card: true } }], ["guarantee"], ["testimonial", SUMMARY]],
+      summary: "Paiement express · Contact · Adresse · Livraison · Paiement + badge sécurisé, garantie et avis (récapitulatif ; sous le bouton sur mobile)",
+      spec: [...TOP, ["payment"], ["secure_badge", { style: { card: true } }], ["guarantee", GUARANTEE], ["reviews", SUMMARY]],
     },
     thankYou: {
-      summary: "Confirmation · Adresse · Récapitulatif · Support client",
-      spec: [["ty_confirmation"], ["ty_details"], ["ty_summary"], ["support"]],
+      summary: "Confirmation · Message personnalisé · Adresse · Récapitulatif",
+      spec: [["ty_confirmation"], MESSAGE, ["ty_details"], ["ty_summary"]],
     },
   },
   {
@@ -434,18 +588,18 @@ const STYLED: Styled[] = [
     }),
     checkout: {
       summary: "Paiement express · Contact · Adresse · Livraison · Paiement + avantages (récapitulatif ; sous le bouton sur mobile)",
-      spec: [...TOP, ["payment"], ["value_props", SUMMARY]],
+      spec: [...TOP, ["payment"], ["value_props", { ...SUMMARY, props: VALUE_PROPS }]],
     },
     thankYou: {
-      summary: "Confirmation · Adresse · Récapitulatif · Réseaux sociaux",
-      spec: [["ty_confirmation"], ["ty_details"], ["ty_summary"], ["social"]],
+      summary: "Confirmation · Message personnalisé · Adresse · Récapitulatif",
+      spec: [["ty_confirmation"], MESSAGE, ["ty_details"], ["ty_summary"]],
     },
   },
   {
     id: "trust-max",
     name: "Confiance max",
     category: "conversion",
-    description: "Moyens de paiement, badge sécurisé et garantie juste sous le bouton sur mobile, avis et protection colis : pour une marque encore peu connue ou un panier élevé.",
+    description: "Moyens de paiement, badge sécurisé et garantie juste sous le bouton sur mobile, puis vos avis : pour une marque encore peu connue ou un panier élevé.",
     style: look({
       font: "Inter",
       headingFont: "same",
@@ -461,28 +615,20 @@ const STYLED: Styled[] = [
       summaryBackground: "#f1f5f9",
     }),
     checkout: {
-      summary: "Paiement express · Contact · Adresse · Livraison · Protection colis · Paiement + logos de paiement, badge sécurisé, garantie, avis et avantages (récapitulatif ; sous le bouton sur mobile)",
-      spec: [
-        ...TOP,
-        ["shipping_protection"],
-        ["payment"],
-        ["payment_icons"],
-        ["secure_badge"],
-        ["guarantee"],
-        ["reviews", SUMMARY],
-        ["value_props", SUMMARY],
-      ],
+      summary: "Paiement express · Contact · Adresse · Livraison · Paiement + logos de paiement, badge sécurisé, garantie et avis (récapitulatif ; sous le bouton sur mobile)",
+      // No parcel protection: a paid option is the merchant's choice, never added by a template.
+      spec: [...TOP, ["payment"], ["payment_icons"], ["secure_badge"], ["guarantee", GUARANTEE], ["reviews", SUMMARY]],
     },
     thankYou: {
-      summary: "Confirmation · Question « Comment nous avez-vous connu ? » · Adresse · Récapitulatif · Support client",
-      spec: [["ty_confirmation"], ["survey"], ["ty_details"], ["ty_summary"], ["support"]],
+      summary: "Confirmation · Message personnalisé · Question « Comment nous avez-vous connu ? » · Adresse · Récapitulatif",
+      spec: [["ty_confirmation"], MESSAGE, ["survey"], ["ty_details"], ["ty_summary"]],
     },
   },
   {
     id: "urgency-promo",
     name: "Urgence & promo",
     category: "conversion",
-    description: "Compte à rebours (vraie date de fin) en haut, stock réel juste au-dessus du paiement (aussi sur mobile), barre livraison offerte dans le récapitulatif. Pour les soldes, le Black Friday ou un lancement.",
+    description: "Compte à rebours par visiteur en haut, stock réel juste au-dessus du paiement (aussi sur mobile), barre livraison offerte (selon vos tarifs) dans le récapitulatif. Pour les soldes, le Black Friday ou un lancement.",
     style: look({
       font: "Poppins",
       headingFont: "same",
@@ -503,7 +649,7 @@ const STYLED: Styled[] = [
       // Low stock sits right above the payment (with the countdown, the two short banners
       // allowed there), so mobile buyers see it before the pay button, not under it.
       spec: [
-        ["countdown"],
+        COUNTDOWN,
         ...TOP,
         ["order_addons"],
         ["low_stock"],
@@ -515,15 +661,15 @@ const STYLED: Styled[] = [
       ],
     },
     thankYou: {
-      summary: "Confirmation · Offre post-achat · Code promo cadeau · Adresse · Récapitulatif",
-      spec: [["ty_confirmation"], ["upsell"], ["coupon"], ["ty_details"], ["ty_summary"]],
+      summary: "Confirmation · Offre post-achat · Message personnalisé · Code promo cadeau · Adresse · Récapitulatif",
+      spec: [["ty_confirmation"], ["upsell"], MESSAGE, COUPON, ["ty_details"], ["ty_summary"]],
     },
   },
   {
     id: "funnel-one-product",
     name: "Funnel produit unique",
     category: "conversion",
-    description: "Style tunnel de vente : order bump juste avant le paiement, bouton vert, FAQ sous le paiement ; garantie, témoignage et chiffres clés dans le récapitulatif (sous le bouton sur mobile). Pour un produit phare vendu via publicité.",
+    description: "Style tunnel de vente : order bump juste avant le paiement, bouton vert, FAQ sous le paiement ; garantie et vos avis dans le récapitulatif (sous le bouton sur mobile). Pour un produit phare vendu via publicité.",
     style: look({
       font: "Inter",
       headingFont: "Poppins",
@@ -540,20 +686,19 @@ const STYLED: Styled[] = [
     }),
     checkout: {
       summary:
-        "Paiement express · Contact · Adresse · Livraison · Order bump · Paiement · FAQ + garantie, témoignage et chiffres clés (récapitulatif ; sous le bouton sur mobile, avant la FAQ)",
+        "Paiement express · Contact · Adresse · Livraison · Order bump · Paiement · FAQ + garantie et avis (récapitulatif ; sous le bouton sur mobile, avant la FAQ)",
       spec: [
         ...TOP,
         ["order_addons", { style: { background: "brand" } }],
         ["payment"],
-        ["guarantee", { style: { card: true } }],
-        ["testimonial"],
-        ["faq"],
-        ["stats", SUMMARY],
+        ["guarantee", { ...GUARANTEE, style: { card: true } }],
+        ["faq", FAQ],
+        ["reviews", SUMMARY],
       ],
     },
     thankYou: {
-      summary: "Confirmation · Offre post-achat · Adresse · Récapitulatif · Date de livraison",
-      spec: [["ty_confirmation"], ["upsell"], ["ty_details"], ["ty_summary"], ["delivery_estimate"]],
+      summary: "Confirmation · Offre post-achat · Message personnalisé · Adresse · Récapitulatif",
+      spec: [["ty_confirmation"], ["upsell"], MESSAGE, ["ty_details"], ["ty_summary"]],
     },
   },
   {
@@ -577,11 +722,11 @@ const STYLED: Styled[] = [
     }),
     checkout: {
       summary: "Paiement express · Contact · Adresse · Livraison · Options · Paiement + avantages et avis (récapitulatif ; sous le bouton sur mobile)",
-      spec: [...TOP, ["order_addons"], ["payment"], ["benefits", SUMMARY], ["reviews", SUMMARY]],
+      spec: [...TOP, ["order_addons"], ["payment"], ["benefits", { ...SUMMARY, ...BENEFITS }], ["reviews", SUMMARY]],
     },
     thankYou: {
-      summary: "Confirmation · Adresse · Récapitulatif · Réseaux sociaux · Code promo cadeau",
-      spec: [["ty_confirmation"], ["ty_details"], ["ty_summary"], ["social"], ["coupon"]],
+      summary: "Confirmation · Message personnalisé · Adresse · Récapitulatif · Code promo cadeau",
+      spec: [["ty_confirmation"], MESSAGE, ["ty_details"], ["ty_summary"], COUPON],
     },
   },
   {
@@ -610,8 +755,8 @@ const STYLED: Styled[] = [
       spec: [["free_shipping_bar"], ...TOP, ["order_addons"], ["payment"], ["recommendations", SUMMARY], ["reviews", SUMMARY]],
     },
     thankYou: {
-      summary: "Confirmation · Code promo cadeau · Adresse · Récapitulatif · Réseaux sociaux",
-      spec: [["ty_confirmation"], ["coupon"], ["ty_details"], ["ty_summary"], ["social"]],
+      summary: "Confirmation · Message personnalisé · Code promo cadeau · Adresse · Récapitulatif",
+      spec: [["ty_confirmation"], MESSAGE, COUPON, ["ty_details"], ["ty_summary"]],
     },
   },
   {
@@ -635,12 +780,12 @@ const STYLED: Styled[] = [
       summaryBackground: "#f4f0e6",
     }),
     checkout: {
-      summary: "Paiement express · Contact · Adresse · Livraison · Paiement + date de livraison estimée, avantages, garantie et avis (récapitulatif ; sous le bouton sur mobile)",
-      spec: [...TOP, ["payment"], ["delivery_estimate"], ["benefits", SUMMARY], ["guarantee", SUMMARY], ["reviews", SUMMARY]],
+      summary: "Paiement express · Contact · Adresse · Livraison · Paiement + avantages, garantie et avis (récapitulatif ; sous le bouton sur mobile)",
+      spec: [...TOP, ["payment"], ["benefits", { ...SUMMARY, ...BENEFITS }], ["guarantee", { ...SUMMARY, ...GUARANTEE }], ["reviews", SUMMARY]],
     },
     thankYou: {
-      summary: "Confirmation · Date de livraison · Adresse · Récapitulatif · Question « Comment nous avez-vous connu ? »",
-      spec: [["ty_confirmation"], ["delivery_estimate"], ["ty_details"], ["ty_summary"], ["survey"]],
+      summary: "Confirmation · Message personnalisé · Adresse · Récapitulatif · Question « Comment nous avez-vous connu ? »",
+      spec: [["ty_confirmation"], MESSAGE, ["ty_details"], ["ty_summary"], ["survey"]],
     },
   },
 ];
@@ -666,19 +811,19 @@ const LAYOUT_ONLY_CHECKOUT: Template[] = [
       ["payment"],
       ["payment_icons"],
       ["secure_badge"],
-      ["benefits", SUMMARY],
+      ["benefits", { ...SUMMARY, ...BENEFITS }],
       ["reviews", SUMMARY],
-      ["guarantee", SUMMARY],
+      ["guarantee", { ...SUMMARY, ...GUARANTEE }],
     ],
   }),
   template({
     id: "conversion",
     name: "Conversion",
     category: "conversion",
-    description: "Pousse le panier moyen et l'urgence (avec de vraies données). Garde votre style.",
+    description: "Pousse le panier moyen et l'urgence : minuteur par visiteur, barre livraison offerte selon vos tarifs. Garde votre style.",
     summary: "Minuteur et barre livraison offerte en haut, order bump, « Complétez votre commande » + badge sécurisé et avis (récapitulatif)",
     spec: [
-      ["countdown"],
+      COUNTDOWN,
       ["free_shipping_bar"],
       ...TOP,
       ["order_addons"],
@@ -702,26 +847,26 @@ export const THANK_YOU_TEMPLATES: Template[] = [
     id: "simple",
     name: "Simple",
     category: "minimal",
-    description: "Un remerciement clair, un mot personnel et un contact support. Garde votre style.",
-    summary: "Confirmation · Message personnalisé · Adresse · Récapitulatif · Support client",
-    spec: [["ty_confirmation"], ["message", { style: { card: true } }], ["ty_details"], ["ty_summary"], ["support"]],
+    description: "Un remerciement clair et un mot personnel. Garde votre style.",
+    summary: "Confirmation · Message personnalisé · Adresse · Récapitulatif",
+    spec: [["ty_confirmation"], MESSAGE, ["ty_details"], ["ty_summary"]],
   }),
   template({
     id: "loyalty",
     name: "Fidélisation",
     category: "conversion",
-    description: "Donne une raison de revenir : code promo et réseaux. Garde votre style.",
-    summary: "Confirmation · Message personnalisé · Code promo cadeau · Adresse · Récapitulatif · Réseaux sociaux · Bouton lien",
-    spec: [["ty_confirmation"], ["message", { style: { card: true } }], ["coupon"], ["ty_details"], ["ty_summary"], ["social"], ["button_link"]],
+    description: "Donne une raison de revenir : un mot personnel et un code promo pour la prochaine commande. Garde votre style.",
+    summary: "Confirmation · Message personnalisé · Code promo cadeau · Adresse · Récapitulatif",
+    spec: [["ty_confirmation"], MESSAGE, COUPON, ["ty_details"], ["ty_summary"]],
   }),
   template({
     id: "upsell",
     name: "Upsell",
     category: "conversion",
-    description: "Offre post-achat en un clic, puis réassurance. Garde votre style.",
+    description: "Offre post-achat en un clic, puis un mot personnel. Garde votre style.",
     // The offer right after the confirmation: visible without scrolling on mobile.
-    summary: "Confirmation · Offre post-achat · Adresse · Récapitulatif · Date de livraison · Avis clients",
-    spec: [["ty_confirmation"], ["upsell"], ["ty_details"], ["ty_summary"], ["delivery_estimate"], ["reviews"]],
+    summary: "Confirmation · Offre post-achat · Message personnalisé · Adresse · Récapitulatif",
+    spec: [["ty_confirmation"], ["upsell"], MESSAGE, ["ty_details"], ["ty_summary"]],
   }),
   // The page that goes with each styled checkout template (same look, same id).
   ...STYLED.map((s) =>
@@ -729,7 +874,7 @@ export const THANK_YOU_TEMPLATES: Template[] = [
       id: s.id,
       name: s.name,
       category: s.category,
-      description: `La page de remerciement assortie au checkout « ${s.name} » (même style).`,
+      description: `La page de remerciement assortie au checkout « ${s.name} » (mêmes couleurs, polices et boutons).`,
       style: s.style,
       ...s.thankYou,
     }),

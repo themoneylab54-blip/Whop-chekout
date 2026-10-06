@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type CSSProperties, type RefObject } from "react";
-import { AlertTriangle, ArrowUpRight, EyeOff } from "lucide-react";
+import { AlertTriangle, ArrowUpRight } from "lucide-react";
 import type { Block } from "@/lib/layout";
 
 type Rect = { id: string; top: number; left: number; width: number; height: number };
@@ -37,7 +37,6 @@ export function CanvasOverlays({
   selected,
   names,
   warnings = {},
-  invisible,
   logosInHeader = null,
   onSelect,
   dropHint = null,
@@ -51,8 +50,6 @@ export function CanvasOverlays({
   names: Record<string, string>;
   /** Merchant-only setup warnings per block id, drawn as a badge on the block outline. */
   warnings?: Record<string, string>;
-  /** Blocks buyers don't see (sample content only): greyed with an "Invisible pour vos clients" pill. */
-  invisible?: ReadonlySet<string>;
   /** Payment-logos block whose logos show next to the Payment title: « Affichés à côté de « Paiement » » pill. */
   logosInHeader?: string | null;
   onSelect: (id: string) => void;
@@ -205,15 +202,14 @@ export function CanvasOverlays({
         const isSel = r.id === selected;
         const name = names[r.id] ?? "Bloc";
         const warning = warnings[r.id];
-        const hiddenLive = invisible?.has(r.id) ?? false;
-        const inHeader = !hiddenLive && r.id === logosInHeader;
+        const inHeader = r.id === logosInHeader;
         return (
           <div
             key={r.id}
             data-overlay-id={r.id}
             role="button"
             tabIndex={0}
-            aria-label={`Modifier le bloc « ${name} »${hiddenLive ? " — invisible pour vos clients" : ""}${inHeader ? " — logos affichés à côté de « Paiement »" : ""}${warning ? ` — à configurer : ${warning}` : ""}`}
+            aria-label={`Modifier le bloc « ${name} »${inHeader ? " — logos affichés à côté de « Paiement »" : ""}${warning ? ` — à configurer : ${warning}` : ""}`}
             aria-pressed={isSel}
             aria-keyshortcuts={inline?.fields(r.id).length ? "F2" : undefined}
             title={inline?.fields(r.id).length ? `${name} — double-cliquez pour modifier le texte (F2)` : name}
@@ -240,19 +236,6 @@ export function CanvasOverlays({
               isSel ? "bg-indigo-500/[.04] outline-2 outline-indigo-500 outline-solid" : "outline-1 outline-transparent outline-solid hover:bg-indigo-500/[.03] hover:outline-2 hover:outline-indigo-400"
             }`}
           >
-            {hiddenLive && (
-              <>
-                {/* Washes the block out (reduced opacity look) without touching the rendered checkout. */}
-                <span aria-hidden className="absolute inset-0 rounded-md bg-white/60" />
-                <span
-                  aria-hidden
-                  className="absolute bottom-1 left-1 flex max-w-[calc(100%-.5rem)] items-center gap-1 truncate rounded-full bg-zinc-800/90 px-2 py-0.5 text-[11px] leading-4 font-medium text-white shadow-sm"
-                >
-                  <EyeOff className="h-3 w-3 shrink-0" />
-                  Invisible pour vos clients
-                </span>
-              </>
-            )}
             {inHeader && (
               <span
                 aria-hidden

@@ -112,7 +112,9 @@ import {
   newBlockId,
   signedWithStore,
   DEFAULT_EXPRESS_METHODS,
+  MAX_BLOCKS_PER_PAGE,
   MESSAGE_LIMITS,
+  TEXT_LIMITS,
   expressMethodsAllOff,
   expressMethodsCartDependent,
   type Block,
@@ -127,9 +129,9 @@ import { ThankYouView } from "@/components/checkout/ThankYouView";
 import { LANGS } from "@/components/checkout/i18n";
 import { BlockContentEditor, ColorInput, F, Field, ImageField, Pick, Segmented, StyleEditor, Text, UrlText, type EditorContext, type ImageSource } from "./BlockEditor";
 import { MediaLibraryProvider } from "./media";
+import { ButtonColorControls } from "./ButtonColors";
 import { CanvasOverlays, type DropHint, type InlineEditing } from "./CanvasOverlays";
-import { hideVisibleSamples, tagDuplicate, visibleSampleIds } from "@/lib/sample-content";
-import { applyTemplateTheme, blocksHiddenBy, blocksKeptAside, canonicalTemplateId, CHECKOUT_TEMPLATES, matchingCheckout, matchingThankYou, previewAfterPopover, TEMPLATE_CATEGORIES, THANK_YOU_TEMPLATES, type Template, type TemplateCategory } from "./templates";
+import { applyTemplateTheme, blocksHiddenBy, blocksKeptAside, blocksShownBy, CHECKOUT_TEMPLATES, isCurrentTemplate, matchingCheckout, matchingThankYou, previewAfterPopover, TEMPLATE_CATEGORIES, THANK_YOU_TEMPLATES, type Template, type TemplateCategory } from "./templates";
 import { TranslationsEditor, untranslatedCount } from "./Translations";
 import { emptyTextDefault } from "@/components/checkout/localize";
 import { readableOn } from "@/lib/contrast";
@@ -137,16 +139,15 @@ import { EmptyState, Panel, PanelHeading, RING, Tip, useConfirm, useOutsideClick
 import { BlockThumb, TemplateThumb } from "./thumbs";
 import {
   expressRowState,
-  hiddenFromBuyers,
   logosInPaymentHeader,
   insertedZone,
   insertionHint,
   insertionIndex,
   layoutWarnings,
-  promiseWarnings,
   renderedInsertionHint,
   reviewNotes,
-  sampleWarnings,
+  setupSummary,
+  setupText,
   setupWarnings,
   zoneLabel,
   zoneWording,
@@ -166,7 +167,7 @@ export const BLOCK_META: Record<BlockType, { label: string; icon: LucideIcon; de
   recommendations: { label: "Complétez votre commande", icon: ShoppingBasket, description: "1 à 4 produits ajoutés au panier en un clic", group: "conversion" },
   free_shipping_bar: { label: "Barre livraison offerte", icon: Gauge, description: "Montant restant pour la livraison gratuite", group: "conversion" },
   delivery_estimate: { label: "Date de livraison", icon: CalendarCheck, description: "Estimation et frise commande → livraison", group: "conversion" },
-  countdown: { label: "Minuteur", icon: Timer, description: "Compte à rebours jusqu'à une vraie date", group: "conversion" },
+  countdown: { label: "Minuteur", icon: Timer, description: "Jusqu'à une date de fin, ou minuteur par visiteur", group: "conversion" },
   low_stock: { label: "Stock bas", icon: Flame, description: "Basé sur le stock réel Shopify", group: "conversion" },
   announcement: { label: "Barre d'annonce", icon: Megaphone, description: "Bandeau à la couleur de la marque", group: "conversion" },
   order_note: { label: "Note de commande", icon: StickyNote, description: "Message cadeau, instructions…", group: "conversion" },
@@ -177,7 +178,7 @@ export const BLOCK_META: Record<BlockType, { label: string; icon: LucideIcon; de
   trust_badges: { label: "Badges de confiance", icon: BadgeCheck, description: "Paiement sécurisé, garantie…", group: "trust" },
   guarantee: { label: "Garantie", icon: ShieldCheck, description: "Satisfait ou remboursé", group: "trust" },
   comparison: { label: "Comparatif", icon: Scale, description: "Nous vs les autres", group: "trust" },
-  stats: { label: "Chiffres clés", icon: TrendingUp, description: "+10 000 clients, 4,8/5…", group: "trust" },
+  stats: { label: "Chiffres clés", icon: TrendingUp, description: "Vos vrais chiffres : clients, note…", group: "trust" },
   logos: { label: "Logos presse", icon: Newspaper, description: "« Ils parlent de nous »", group: "trust" },
   payment_icons: { label: "Logos de paiement", icon: Wallet, description: "Visa, Mastercard, Apple Pay…", group: "trust" },
   benefits: { label: "Avantages", icon: LayoutGrid, description: "Grille d'icônes 3D", group: "content" },
@@ -238,9 +239,9 @@ const PALETTE_POINTERS: { key: string; label: string; target: string; path: stri
   },
 ];
 
-/** Blocks that can only appear once per page. */
+/** Blocks that can only appear once per page (a second copy would break the order: SINGLETON_BLOCKS). */
 function isSingleton(type: BlockType) {
-  return SINGLETON_BLOCKS.has(type) || type === "order_addons";
+  return SINGLETON_BLOCKS.has(type);
 }
 
 type Page = "checkout" | "thank-you";
@@ -489,7 +490,7 @@ export function BuilderApp(props: {
     // Only the banner's measured proportions filled in (a design saved before they were measured):
     // not an edit, so no autosave when the builder opens. `saved` stays behind `latest`, so the next
     // save (a real edit, or publish's doSave) still writes the ratio.
-    if (layout === saved.current.layout && otherLayout === saved.current.other && saved.current.theme.bannerRatio == null && onlyBannerRatioChanged(saved.current.theme, theme)) {
+    if (layout === saved.current.layout && otherLayout === saved.current.other && onlyBannerRatioChanged(saved.current.theme, theme)) {
       setState((s) => (s === "dirty" ? "saved" : s));
       return;
     }
@@ -755,6 +756,12 @@ export function BuilderApp(props: {
   /* ---------- block operations ---------- */
 
   const has = (type: BlockType) => layout.blocks.some((b) => b.type === type);
+  /** The page holds MAX_BLOCKS_PER_PAGE blocks: says so instead of adding one (the save would refuse it). */
+  const pageFull = () => {
+    if (layout.blocks.length < MAX_BLOCKS_PER_PAGE) return false;
+    showToast({ message: `${MAX_BLOCKS_PER_PAGE} blocs au maximum par page : supprimez-en un pour en ajouter un autre.` });
+    return true;
+  };
   const update = (b: Block) => setLayout((l) => ({ blocks: l.blocks.map((x) => (x.id === b.id ? b : x)) }));
   // Applied to the block as it is in the layout at that moment (a result landing after an await).
   const updateBlockById = (id: string, fn: (b: Block) => Block) => setLayout((l) => ({ blocks: l.blocks.map((x) => (x.id === id ? fn(x) : x)) }));
@@ -791,9 +798,11 @@ export function BuilderApp(props: {
     showToast({ message: "Bloc supprimé", action: { label: "Annuler", run: () => travel("undo") } });
   };
   const duplicate = (b: Block) => {
-    if (isSingleton(b.type)) return;
-    // A copy is a new block: tagged when it still holds example content (hidden from buyers).
-    const copy = tagDuplicate({ ...structuredClone(b), id: newBlockId() } as Block);
+    if (isSingleton(b.type) || isFixedSection(b.type)) return;
+    if (pageFull()) return;
+    // A copy is a new block with its own id; it keeps the source's tag (an untouched example stays
+    // one, the merchant's content stays theirs and shows).
+    const copy = { ...structuredClone(b), id: newBlockId() } as Block;
     setLayout((l) => {
       const i = l.blocks.findIndex((x) => x.id === b.id);
       return { blocks: [...l.blocks.slice(0, i + 1), copy, ...l.blocks.slice(i + 1)] };
@@ -826,6 +835,7 @@ export function BuilderApp(props: {
   };
   const add = (type: BlockType) => {
     if (isSingleton(type) && has(type)) return;
+    if (pageFull()) return;
     setHoverType(null);
     // A new message is signed with the store name (editable, the role stays « L'équipe »).
     const block = signedWithStore(createBlock(type), storeLabel());
@@ -864,25 +874,16 @@ export function BuilderApp(props: {
     const kept = blocksKeptAside(t.spec, layout).filter((b) => !hiddenBy.includes(b));
     const keptNames = [...new Set(kept.map((b) => BLOCK_META[b.type].label))].join(", ");
     const hiddenNames = [...new Set(hiddenBy.map((b) => BLOCK_META[b.type].label))].join(", ");
-    const built = t.build(layout, { storeName: storeLabel() }).blocks;
+    // Blocks an earlier template hid (and only those): shown again by this one.
+    const shownAgain = blocksShownBy(t, layout);
+    const shownNames = [...new Set(shownAgain.map((b) => BLOCK_META[b.type].label))].join(", ");
     // The matching page (same look) can be applied in the same step: from the checkout its
     // thank-you page (proposed, checked), from the thank-you page its checkout (unchecked).
     const match = page === "checkout" ? matchingThankYou(t) : matchingCheckout(t);
     const matchLabel = page === "checkout" ? "la page de remerciement assortie" : "le checkout assorti";
     const choice = { other: page === "checkout" && !!match };
     const builtOther = match ? match.build(otherLayout, { storeName: storeLabel() }).blocks : [];
-    const otherSetup = Object.keys(setupWarnings(builtOther, setupCtx)).length;
-    // Sample content and example promises of both pages the dialog may apply.
-    // (the other page's count only while its checkbox is checked: TemplateApplyNotes)
-    const samplesHere = Object.keys(sampleWarnings(built)).length;
-    const samplesOther = Object.keys(sampleWarnings(builtOther)).length;
-    // Example content already published (untagged, still shown to buyers) is worded by kind, apart
-    // from the example promises.
-    const visibleHere = visibleSampleIds(built);
-    const visibleOther = visibleSampleIds(builtOther);
-    const visibleKinds = (blocks: Block[], ids: string[]) => blocks.filter((b) => ids.includes(b.id)).map((b) => b.type);
-    const promisesHere = Object.keys(promiseWarnings(built)).filter((id) => !visibleHere.includes(id)).length;
-    const promisesOther = Object.keys(promiseWarnings(builtOther)).filter((id) => !visibleOther.includes(id)).length;
+    const otherSetup = setupText(setupSummary(builtOther, setupCtx));
     // A dark header behind a logo drawn for a light one (dark logo on white) may vanish.
     const darkHeaderLogo =
       !!t.style && !!theme.logoUrl && headerModeOf(theme) === "logo" && readableOn(t.style.headerBackground) === "#ffffff" && readableOn(theme.headerBackground) !== "#ffffff";
@@ -892,16 +893,17 @@ export function BuilderApp(props: {
         <>
           <span className="block">
             Les blocs du modèle sont placés sur la page {page === "checkout" ? "checkout" : "de remerciement"} ({t.summary}). Ceux que la page a déjà gardent
-            leurs textes, produits et visibilité ; les autres sont ajoutés avec un contenu d&apos;exemple.
+            leurs textes, produits, style et emplacement ; les autres sont ajoutés avec un texte par défaut, affiché tel quel aux acheteurs et modifiable.
             {kept.length > 0 && <> Vos autres blocs ({keptNames}) sont conservés.</>}
+            {shownAgain.length > 0 && <> Ce modèle réaffiche {shownNames}, masqué{shownAgain.length > 1 ? "s" : ""} par le modèle précédent.</>}
             {hiddenBy.length > 0 && (
               <> Pour rester épuré, ce modèle masque {hiddenNames} : leur contenu est gardé, réaffichez-les en un clic dans la liste des blocs.</>
             )}
           </span>
           {t.style ? (
             <span className="mt-2 block">
-              Le style (couleurs, polices, boutons, en-tête) est aussi remplacé, sur les deux pages. Votre logo, bannière, nom de boutique, taille du texte, liens légaux et
-              réglages sont conservés.
+              Le style (couleurs, polices, boutons, en-tête) est aussi remplacé, sur les deux pages. Les couleurs de boutons que vous avez choisies vous-même, votre
+              logo, bannière, nom de boutique, taille du texte, liens légaux et réglages sont conservés.
               {page === "checkout" && !match && " La page de remerciement assortie est dans ses Modèles."}
             </span>
           ) : (
@@ -917,10 +919,7 @@ export function BuilderApp(props: {
             </span>
           )}
           <TemplateApplyNotes
-            samples={{ here: samplesHere, other: samplesOther }}
-            promises={{ here: promisesHere, other: promisesOther }}
-            visibleSamples={{ here: visibleKinds(built, visibleHere), other: visibleKinds(builtOther, visibleOther) }}
-            match={match ? { label: matchLabel, summary: match.summary, setup: otherSetup } : null}
+            match={match ? { label: matchLabel, summary: match.summary, setup: otherSetup, spec: match.spec, look: match.style, page: page === "checkout" ? "thank-you" : "checkout" } : null}
             defaultOther={choice.other}
             onOtherChange={(v) => (choice.other = v)}
           />
@@ -986,27 +985,20 @@ export function BuilderApp(props: {
   // onlyBannerRatioChanged), but written by the next save / publish.
   const bannerUrl = theme.bannerUrl;
   const bannerRatio = theme.bannerRatio;
-  useEffect(() => {
-    if (!bannerUrl) return;
-    let live = true;
-    const img = new Image();
-    const setRatio = (r: number | undefined) =>
-      setTheme((t) => (t.bannerUrl !== bannerUrl || t.bannerRatio === r ? t : { ...t, bannerRatio: r }));
-    img.onload = () => {
-      if (!live || !img.naturalWidth || !img.naturalHeight) return;
-      const r = Math.min(20, Math.max(1, Math.round((img.naturalWidth / img.naturalHeight) * 1000) / 1000));
-      if (r !== bannerRatio) setRatio(r);
-    };
-    // An image that doesn't load (404, protected link) has no proportions: the previous image's
-    // ratio must not size the band (the checkout falls back to its default height).
-    img.onerror = () => {
-      if (live && bannerRatio != null) setRatio(undefined);
-    };
-    img.src = bannerUrl;
-    return () => {
-      live = false;
-    };
-  }, [bannerUrl, bannerRatio]);
+  useEffect(
+    () => measureBannerRatio(bannerUrl, bannerRatio, 1, (r) => setTheme((t) => (t.bannerUrl !== bannerUrl || t.bannerRatio === r ? t : { ...t, bannerRatio: r }))),
+    [bannerUrl, bannerRatio],
+  );
+  // The phones' banner image (optional), measured the same way.
+  const bannerUrlMobile = theme.bannerUrlMobile;
+  const bannerRatioMobile = theme.bannerRatioMobile;
+  useEffect(
+    () =>
+      measureBannerRatio(bannerUrlMobile, bannerRatioMobile, 0.5, (r) =>
+        setTheme((t) => (t.bannerUrlMobile !== bannerUrlMobile || t.bannerRatioMobile === r ? t : { ...t, bannerRatioMobile: r })),
+      ),
+    [bannerUrlMobile, bannerRatioMobile],
+  );
   // An uploaded image was deleted ("Mes images"): every field of the draft showing it is emptied,
   // in the undo / redo snapshots too (undo must never bring a deleted image back). The cleared
   // values are shared (one clearUrl per object), so the draft matches the cleared last snapshot
@@ -1040,12 +1032,6 @@ export function BuilderApp(props: {
   const warnings = useMemo(() => layoutWarnings(layout.blocks, setupCtx), [layout.blocks, setupCtx]);
   // The canvas's cart (sample lines) has goods to ship: Google Pay on "auto" stays hidden there.
   const previewShippable = props.sampleLines.some((l) => l.requiresShipping);
-  // Every block the live page would skip (sample-only content, empty text, no end date, no link,
-  // no add-on…): drawn greyed on the canvas with « Invisible pour vos clients ».
-  const invisibleToBuyers = useMemo(
-    () => hiddenFromBuyers(layout.blocks, { ...setupCtx, expressCheckout: theme.expressCheckout, expressMethods: theme.expressMethods, shippable: previewShippable }),
-    [layout.blocks, setupCtx, theme.expressCheckout, theme.expressMethods, previewShippable],
-  );
   // Checkout: the payment-logos block shown next to « Paiement » (its own pill, not greyed); the
   // same wallets as the canvas's checkout (its express settings, for the previewed cart).
   const headerLogos = useMemo(
@@ -1063,40 +1049,30 @@ export function BuilderApp(props: {
         return { id, page: where, text: `${BLOCK_META[b.type].label} — ${text.charAt(0).toLowerCase()}${text.slice(1)}` };
       });
     const both = (check: (blocks: Block[]) => Record<string, string>) => [...list(check, layout.blocks, page), ...list(check, otherLayout.blocks, otherPage)];
-    // Amber list: example promises plus store notes (the untouched add-ons list without add-ons).
+    // Amber list: store notes (the untouched add-ons list without add-ons).
     return [both((blocks) => setupWarnings(blocks, setupCtx)), both((blocks) => reviewNotes(blocks, setupCtx))];
   }, [layout.blocks, page, otherLayout.blocks, otherPage, setupCtx]);
-  // Untagged blocks (published before) still showing example content to buyers, both pages.
-  const shownSamples = useMemo(() => visibleSampleIds(layout.blocks).length + visibleSampleIds(otherLayout.blocks).length, [layout.blocks, otherLayout.blocks]);
-  // « Masquer les exemples »: tags them so their example content is hidden live (one undo step).
-  const hideExamples = () => {
-    lastPush.current = 0;
-    sealStep.current = true;
-    const next = { layout: { ...latest.current.layout, blocks: hideVisibleSamples(latest.current.layout.blocks) }, theme: latest.current.theme };
-    setLayout(next.layout);
-    setOtherLayout((l) => ({ ...l, blocks: hideVisibleSamples(l.blocks) }));
-    // "Annuler" undoes it only while it is still the latest step (like a template).
-    // « Masquer les exemples » disappears with them: focus goes to the toast's « Annuler », not to <body>.
-    showToast({ message: "Exemples masqués pour vos clients", action: { label: "Annuler", run: () => travel("undo"), while: next }, focusAction: true });
-  };
   // Modèles cards: how many blocks each template would leave to complete on this page (hidden
   // from buyers until set up: countdown date, sample reviews, offer product…).
   // Checkout: plus those of the matching thank-you page, applied with it by default.
-  const templateSetup = useMemo<Record<string, { here: number; thankYou: number }>>(
+  // Products to choose are counted; other settings (a %, a price, an add-on) are their own notes.
+  const templateSetup = useMemo<Record<string, { here: string; thankYou: string }>>(
     () =>
       popover === "templates"
         ? Object.fromEntries(
             templates.map((t) => {
-              const here = Object.keys(setupWarnings(t.build(layout).blocks, setupCtx)).length;
+              const here = setupText(setupSummary(t.build(layout).blocks, setupCtx));
               const match = page === "checkout" ? matchingThankYou(t) : null;
-              return [t.id, { here, thankYou: match ? Object.keys(setupWarnings(match.build(otherLayout).blocks, setupCtx)).length : 0 }];
+              return [t.id, { here, thankYou: match ? setupText(setupSummary(match.build(otherLayout).blocks, setupCtx)) : "" }];
             }),
           )
         : {},
     [popover, templates, layout, otherLayout, page, setupCtx],
   );
   // The template last applied on this page (saved in the draft; renamed ids mapped).
-  const currentTemplateId = canonicalTemplateId(theme.appliedTemplates?.[page === "checkout" ? "checkout" : "thankYou"]);
+  // The « Actuel » badge: only while the shared style is still that template's look.
+  const appliedTemplateId = theme.appliedTemplates?.[page === "checkout" ? "checkout" : "thankYou"];
+  const isCurrent = (t: Template) => isCurrentTemplate(t, appliedTemplateId, theme);
   const images = useMemo(
     () => (theme.logoUrl && !props.images.some((i) => i.url === theme.logoUrl) ? [...props.images, { url: theme.logoUrl, label: "Logo de la boutique" }] : props.images),
     [props.images, theme.logoUrl],
@@ -1115,7 +1091,8 @@ export function BuilderApp(props: {
       if (isFixedSection(b.type) || b.type === "order_addons" || b.type === "shipping_protection") return ["title"];
       return [];
     };
-    const MAX: Record<string, number> = { title: 120, heading: 200, body: 2000, text: 300, dividerLabel: 40 };
+    // The schema's caps (layout.ts TEXT_LIMITS): section titles, text heading / body, announcement.
+    const MAX: Record<string, number> = { title: TEXT_LIMITS.title, heading: TEXT_LIMITS.title, body: TEXT_LIMITS.body, text: TEXT_LIMITS.text, dividerLabel: 120 };
     // The schema's cap for this block's field (the message title allows more than section titles).
     const maxOf = (b: Block, field: string) => (b.type === "message" && field === "title" ? MESSAGE_LIMITS.title : (MAX[field] ?? 200));
     return {
@@ -1530,23 +1507,6 @@ export function BuilderApp(props: {
                     À vérifier (ne bloque pas la publication) :
                   </p>
                   <ul className="mt-1.5 space-y-1 text-xs">{publishPromises.map(warningLink)}</ul>
-                  <p className="mt-1.5 text-[11px] leading-relaxed text-amber-900">
-                    Remboursement, livraison offerte, délais, support : vérifiez que ces engagements correspondent à ce que vous offrez vraiment, sinon modifiez-les.
-                  </p>
-                  {shownSamples > 0 && (
-                    <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-amber-200 pt-2">
-                      <span className="text-[11px] leading-relaxed text-amber-900">
-                        {shownSamples} bloc{shownSamples > 1 ? "s" : ""} montre{shownSamples > 1 ? "nt" : ""} encore du contenu d&apos;exemple à vos clients.
-                      </span>
-                      <button
-                        type="button"
-                        onClick={hideExamples}
-                        className={`shrink-0 rounded-md bg-white px-2 py-1 text-xs font-medium text-amber-950 ring-1 ring-amber-300 hover:bg-amber-100 ${RING}`}
-                      >
-                        Masquer les exemples
-                      </button>
-                    </div>
-                  )}
                 </div>
               )}
               {publishWarnings.length > 0 && (
@@ -1671,7 +1631,7 @@ export function BuilderApp(props: {
                       onFocus={() => setTemplatePreview(t)}
                       data-template={t.id}
                       // Starts with the visible words (WCAG 2.5.3: "Appliquer" + the name).
-                      aria-label={`Appliquer le modèle ${t.name}${currentTemplateId === t.id ? " (actuel)" : ""}`}
+                      aria-label={`Appliquer le modèle ${t.name}${isCurrent(t) ? " (actuel)" : ""}`}
                       aria-describedby={`tpl-${t.id}-desc`}
                       className={`group w-full rounded-xl border bg-white p-3 text-left transition hover:border-zinc-300 hover:shadow-md ${RING} ${
                         templatePreview?.id === t.id ? "border-indigo-300 shadow-md" : "border-zinc-200"
@@ -1685,7 +1645,7 @@ export function BuilderApp(props: {
                               <span id={`tpl-${t.id}-name`} className="text-sm font-semibold">
                                 {t.name}
                               </span>
-                              {currentTemplateId === t.id && (
+                              {isCurrent(t) && (
                                 <span className="rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800 ring-1 ring-emerald-200">
                                   Actuel
                                 </span>
@@ -1706,7 +1666,7 @@ export function BuilderApp(props: {
                             </span>
                           )}
                           <span id={`tpl-${t.id}-desc`}>
-                            {(t.idealFor || (templateSetup[t.id]?.here ?? 0) + (templateSetup[t.id]?.thankYou ?? 0) > 0) && (
+                            {(t.idealFor || templateSetup[t.id]?.here || templateSetup[t.id]?.thankYou) && (
                               <span className="mt-1 flex flex-wrap items-center gap-1.5">
                                 {t.idealFor && (
                                   <span className="rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-medium text-indigo-800">
@@ -1714,16 +1674,12 @@ export function BuilderApp(props: {
                                     <span className="sr-only">.</span>
                                   </span>
                                 )}
-                                {(templateSetup[t.id]?.here ?? 0) + (templateSetup[t.id]?.thankYou ?? 0) > 0 && (
+                                {(templateSetup[t.id]?.here || templateSetup[t.id]?.thankYou) && (
                                   <span className="inline-flex items-center gap-1 text-[11px] font-medium text-amber-800">
                                     <TriangleAlert className="h-3 w-3" aria-hidden />
-                                    {templateSetup[t.id].here > 0 && (
-                                      <>
-                                        {templateSetup[t.id].here} bloc{templateSetup[t.id].here > 1 ? "s" : ""} à compléter
-                                      </>
-                                    )}
-                                    {templateSetup[t.id].thankYou > 0 &&
-                                      `${templateSetup[t.id].here > 0 ? " " : ""}+${templateSetup[t.id].thankYou}${templateSetup[t.id].here > 0 ? "" : ` bloc${templateSetup[t.id].thankYou > 1 ? "s" : ""} à compléter`} sur la page de remerciement`}
+                                    {templateSetup[t.id].here}
+                                    {templateSetup[t.id].thankYou &&
+                                      `${templateSetup[t.id].here ? " + " : ""}page de remerciement : ${templateSetup[t.id].thankYou}`}
                                     <span className="sr-only">.</span>
                                   </span>
                                 )}
@@ -1865,6 +1821,13 @@ export function BuilderApp(props: {
                 >
                   Blocs de la page
                 </PanelHeading>
+                {layout.blocks.length >= MAX_BLOCKS_PER_PAGE - 10 && (
+                  <p role="status" className="mb-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-900 ring-1 ring-amber-200">
+                    {layout.blocks.length >= MAX_BLOCKS_PER_PAGE
+                      ? `${MAX_BLOCKS_PER_PAGE} blocs : la page est pleine, supprimez-en un pour en ajouter un autre.`
+                      : `${layout.blocks.length} blocs sur ${MAX_BLOCKS_PER_PAGE} : encore ${MAX_BLOCKS_PER_PAGE - layout.blocks.length} possible${MAX_BLOCKS_PER_PAGE - layout.blocks.length > 1 ? "s" : ""}.`}
+                  </p>
+                )}
 
                 {layout.blocks.length === 0 ? (
                   <EmptyState
@@ -1902,7 +1865,7 @@ export function BuilderApp(props: {
                             first={i === 0}
                             last={i === layout.blocks.length - 1}
                             onOpen={() => setSelected(b.id)}
-                            onHide={() => update({ ...b, hidden: !b.hidden })}
+                            onHide={() => update({ ...b, hidden: !b.hidden, hiddenByTemplate: undefined })}
                             onDuplicate={() => duplicate(b)}
                             onRemove={() => remove(b.id)}
                             onMove={(d) => move(b.id, d)}
@@ -2208,7 +2171,6 @@ export function BuilderApp(props: {
                   selected={selected}
                   names={names}
                   warnings={warnings}
-                  invisible={invisibleToBuyers}
                   logosInHeader={headerLogos}
                   onSelect={selectBlock}
                   dropHint={dropHint ?? paletteHint}
@@ -2601,7 +2563,7 @@ function BlockDetail({
         </button>
         {!fixed && (
           <>
-            <button type="button" className={iconBtn} onClick={() => onChange({ ...block, hidden: !block.hidden })} aria-pressed={block.hidden}>
+            <button type="button" className={iconBtn} onClick={() => onChange({ ...block, hidden: !block.hidden, hiddenByTemplate: undefined })} aria-pressed={block.hidden}>
               {block.hidden ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />} {block.hidden ? "Afficher" : "Masquer"}
             </button>
             <Tip text={single ? "Ce bloc ne peut apparaître qu'une fois" : null} side="bottom">
@@ -2639,10 +2601,15 @@ function BlockDetail({
             />
             {block.props.enabled && expressOn && <ExpressMethodsEditor value={expressMethods} onChange={setExpressMethods} />}
             <F label="Titre" hint="Vide = « Paiement express » traduit">
-              <Text value={block.props.title} placeholder={emptyTextDefault("express", "title", context.lang ?? "fr") ?? undefined} onChange={(title) => onChange({ ...block, props: { ...block.props, title } })} />
+              <Text
+                value={block.props.title}
+                placeholder={emptyTextDefault("express", "title", context.lang ?? "fr") ?? undefined}
+                maxLength={TEXT_LIMITS.title}
+                onChange={(title) => onChange({ ...block, props: { ...block.props, title } })}
+              />
             </F>
             <F label="Texte du séparateur" hint="Vide = « OU » traduit">
-              <Text value={block.props.dividerLabel} placeholder={emptyTextDefault("express", "dividerLabel", context.lang ?? "fr") ?? undefined} onChange={(dividerLabel) => onChange({ ...block, props: { ...block.props, dividerLabel: dividerLabel.slice(0, 40) } })} />
+              <Text value={block.props.dividerLabel} placeholder={emptyTextDefault("express", "dividerLabel", context.lang ?? "fr") ?? undefined} maxLength={120} onChange={(dividerLabel) => onChange({ ...block, props: { ...block.props, dividerLabel: dividerLabel.slice(0, 120) } })} />
             </F>
             <p className="flex gap-1.5 rounded-lg bg-zinc-50 p-2.5 text-[11px] leading-relaxed text-zinc-600 ring-1 ring-zinc-200/70">
               <Info className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden />
@@ -2749,12 +2716,43 @@ function PlacementField({ block, blocks, onChange }: { block: Block; blocks: Blo
   );
 }
 
-/** Two themes that differ by the measured banner ratio alone (measured by BuilderApp, never typed). */
+/** The banner ratios BuilderApp measures (never typed by the merchant). */
+const MEASURED_BANNER_KEYS = ["bannerRatio", "bannerRatioMobile"] as const;
+
+/**
+ * Two themes that differ only by banner ratios filled in where none was saved (a design saved
+ * before they were measured): not an edit of the merchant's.
+ */
 function onlyBannerRatioChanged(a: Theme, b: Theme): boolean {
-  if (a === b || a.bannerRatio === b.bannerRatio) return false;
+  if (a === b) return false;
+  const changed = MEASURED_BANNER_KEYS.filter((k) => a[k] !== b[k]);
+  if (changed.length === 0 || changed.some((k) => a[k] != null)) return false;
   const keys = new Set([...Object.keys(a), ...Object.keys(b)] as (keyof Theme)[]);
-  for (const k of keys) if (k !== "bannerRatio" && a[k] !== b[k]) return false;
+  for (const k of keys) if (!(MEASURED_BANNER_KEYS as readonly string[]).includes(k) && a[k] !== b[k]) return false;
   return true;
+}
+
+/**
+ * Measures a banner image's proportions (width / height, rounded, clamped to [min, 20]) and hands
+ * them to `apply` when they differ from `current`; an image that doesn't load (404, protected link)
+ * has none (undefined), so a previous image's ratio never sizes the band. Returns the cleanup.
+ */
+function measureBannerRatio(url: string, current: number | undefined, min: number, apply: (r: number | undefined) => void): (() => void) | undefined {
+  if (!url) return undefined;
+  let live = true;
+  const img = new Image();
+  img.onload = () => {
+    if (!live || !img.naturalWidth || !img.naturalHeight) return;
+    const r = Math.min(20, Math.max(min, Math.round((img.naturalWidth / img.naturalHeight) * 1000) / 1000));
+    if (r !== current) apply(r);
+  };
+  img.onerror = () => {
+    if (live && current != null) apply(undefined);
+  };
+  img.src = url;
+  return () => {
+    live = false;
+  };
 }
 
 function StylePanel({
@@ -2806,9 +2804,20 @@ function StylePanel({
         {headerMode === "banner" && (
           <>
             <Field label="Image de la bannière" hint="Pleine largeur en haut du checkout et de la page de remerciement. Conseillé : 1600 × 300 px environ.">
-              <ImageField value={theme.bannerUrl} images={images} onChange={(v) => setT("bannerUrl", v)} />
+              <ImageField
+                value={theme.bannerUrl}
+                images={images}
+                // A first banner shows whole by default (its own proportions), not cropped to a fixed height.
+                onChange={(v) => {
+                  if (!theme.bannerUrl && v) setT("bannerAuto", true);
+                  setT("bannerUrl", v);
+                }}
+              />
             </Field>
-            <Field label="Hauteur" hint={theme.bannerAuto ? "Sur ordinateur, hauteur limitée à 240 px (et au tiers de l'écran) : une image plus haute est rognée ou centrée selon le cadrage. Sur mobile, l'image occupe toute la largeur, hauteur limitée à un format bannière." : undefined}>
+            <Field label="Image mobile (facultative)" hint="Sur téléphone, à la place de l'image ci-dessus : un format plus haut (ex. 1200 × 600 px) garde le texte lisible. Toujours affichée en pleine largeur, dans ses proportions.">
+              <ImageField value={theme.bannerUrlMobile} images={images} onChange={(v) => setT("bannerUrlMobile", v)} />
+            </Field>
+            <Field label="Hauteur" hint={theme.bannerAuto ? "Sur ordinateur, hauteur limitée à 240 px (et au tiers de l'écran) : une image plus haute est rognée ou centrée selon le cadrage." : "Sur ordinateur uniquement."}>
               <Segmented value={theme.bannerAuto ? "auto" : "fixed"} options={[["fixed", "Fixe"], ["auto", "Proportions de l'image"]]} onChange={(v) => setT("bannerAuto", v === "auto")} />
             </Field>
             {!theme.bannerAuto && (
@@ -2816,8 +2825,8 @@ function StylePanel({
                 <input type="range" min={60} max={240} step={4} value={theme.bannerHeight} onChange={(e) => setT("bannerHeight", Number(e.target.value))} className="w-full accent-zinc-900" />
               </F>
             )}
-            <Field label="Cadrage" hint={theme.bannerFit === "cover" ? "L'image remplit la bande (les bords peuvent être rognés)." : "L'image entière est visible, sur la couleur de fond."}>
-              <Segmented value={theme.bannerFit} options={[["cover", "Remplir"], ["contain", "Image entière"]]} onChange={(v) => setT("bannerFit", v)} />
+            <Field label="Cadrage" hint={theme.bannerFit === "cover" ? "L'image remplit la bande (les bords peuvent être rognés si la bande est plus basse que l'image)." : "L'image entière est visible, sur la couleur de fond."}>
+              <Segmented value={theme.bannerFit} options={[["contain", "Afficher toute l'image"], ["cover", "Remplir"]]} onChange={(v) => setT("bannerFit", v)} />
             </Field>
             <F label="Fond derrière la bannière" hint="Vide : fond de l'en-tête.">
               <ColorInput value={theme.bannerBackground} onChange={(v) => (v === "" || hex(v)) && setT("bannerBackground", v)} />
@@ -2884,6 +2893,7 @@ function StylePanel({
           <Segmented value={theme.buttonShape} options={[["default", "Arrondi"], ["pill", "Pilule"], ["square", "Carré"]]} onChange={(v) => setT("buttonShape", v)} />
         </F>
         <Check label="Ombre portée sur les boutons" checked={theme.buttonShadow} onChange={(v) => setT("buttonShadow", v)} />
+        <ButtonColorControls theme={theme} setT={setT} page={page} />
         <F label="Style des champs">
           <Segmented value={theme.inputStyle} options={[["outlined", "Contour"], ["filled", "Rempli"], ["underline", "Souligné"]]} onChange={(v) => setT("inputStyle", v)} />
         </F>
@@ -3140,57 +3150,19 @@ function SortableRow(props: {
   );
 }
 
-/** Example content still shown to buyers, by block kind (template dialog). */
-const VISIBLE_SAMPLE_KIND: Partial<Record<BlockType, string>> = {
-  reviews: "avis",
-  stats: "chiffres",
-  testimonial: "témoignage",
-  coupon: "code promo",
-  announcement: "annonce",
-  text: "texte",
-};
-
 /**
  * Template dialog: sample / promise notes and the "apply the matching page too" checkbox. The
  * other page's samples and promises count only while its checkbox is checked.
  */
 function TemplateApplyNotes(props: {
-  samples: { here: number; other: number };
-  promises: { here: number; other: number };
-  /** Kinds of example content already published and still shown to buyers (untagged blocks). */
-  visibleSamples: { here: BlockType[]; other: BlockType[] };
-  match: { label: string; summary: string; setup: number } | null;
+  match: { label: string; summary: string; setup: string; spec: Template["spec"]; look?: Template["style"]; page: Page } | null;
   defaultOther: boolean;
   onOtherChange: (v: boolean) => void;
 }) {
   const [other, setOther] = useState(props.defaultOther);
-  const withOther = other && !!props.match;
-  const samples = props.samples.here + (withOther ? props.samples.other : 0) > 0;
-  const promises = props.promises.here + (withOther ? props.promises.other : 0) > 0;
-  const visibleKinds = [...new Set([...props.visibleSamples.here, ...(withOther ? props.visibleSamples.other : [])])]
-    .map((t) => VISIBLE_SAMPLE_KIND[t])
-    .filter((k): k is string => !!k);
   const { match } = props;
   return (
     <>
-      {samples && (
-        <span className="mt-2 block">
-          Les avis, témoignages, chiffres, codes promo, annonces ou textes d&apos;exemple ne sont jamais montrés à vos clients : remplacez-les par les vôtres pour
-          les afficher.
-        </span>
-      )}
-      {visibleKinds.length > 0 && (
-        <span className="mt-2 block">
-          Déjà publiés, ces contenus d&apos;exemple restent visibles par vos clients : {visibleKinds.join(", ")}. Remplacez-les par les vôtres ou utilisez
-          « Masquer les exemples ».
-        </span>
-      )}
-      {promises && (
-        <span className="mt-2 block">
-          Les promesses d&apos;exemple (garantie, remboursement, livraison offerte, délais, support) sont signalées : vérifiez qu&apos;elles correspondent à votre
-          politique.
-        </span>
-      )}
       {match && (
         <label className="mt-3 flex cursor-pointer items-start gap-2 text-zinc-800">
           <input
@@ -3203,11 +3175,13 @@ function TemplateApplyNotes(props: {
             aria-describedby="tpl-match-summary"
             className="mt-0.5 h-4 w-4 shrink-0 accent-zinc-900"
           />
+          {/* The matching page as it will look (its blocks and colors). */}
+          <TemplateThumb spec={match.spec} page={match.page} look={match.look} />
           <span>
             <span className="block font-medium">Appliquer aussi {match.label}</span>
             <span id="tpl-match-summary" className="mt-0.5 block text-xs text-zinc-600">
               {match.summary}
-              {match.setup > 0 && ` · ${match.setup} bloc${match.setup > 1 ? "s" : ""} à compléter`}
+              {match.setup && ` · ${match.setup}`}
             </span>
           </span>
         </label>

@@ -3,7 +3,19 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { Gift, Layers, Plus, Trash2 } from "lucide-react";
 import { inputClass } from "@/components/ui";
-import { MAX_GIFT_TIERS, MAX_PERCENT_TIERS, breakKind, parseGiftTiers, parseQuantityBreaks, validateQuantityTiers, type BreakKind, type GiftTier } from "@/lib/pricing";
+import {
+  MAX_GIFT_TIERS,
+  MAX_PERCENT_TIERS,
+  TIER_LIMITS,
+  breakKind,
+  parseGiftTiers,
+  parseQuantityBreaks,
+  tierOrderWarnings,
+  validateQuantityTiers,
+  type BreakKind,
+  type GiftTier,
+  type QuantityBreak,
+} from "@/lib/pricing";
 import type { Lang } from "@/components/checkout/i18n";
 import { RecordTranslationsEditor } from "./RecordTranslations";
 import { ProductPicker, variantLabel } from "./ProductPicker";
@@ -56,6 +68,18 @@ function productsOf(raw: unknown, ids: string[] | undefined): PickedProduct[] {
   return (ids ?? []).map((id) => ({ id, title: typeof titles[id] === "string" ? titles[id] : `Produit #${variantNumber(id)}` }));
 }
 
+/** From this percentage a small note says the total may fall below the payment minimum. */
+export const HIGH_PERCENT_NOTE_FROM = 80;
+/**
+ * Info (never blocking) for a large percent: on a cheap item the discounted total may end below
+ * the 0,50 minimum a card payment accepts. Null under HIGH_PERCENT_NOTE_FROM. Pure.
+ */
+export function highPercentNote(percent: string, money: (v: string) => string): string | null {
+  const p = num(percent);
+  if (!Number.isFinite(p) || p < HIGH_PERCENT_NOTE_FROM || p > TIER_LIMITS.maxPercent) return null;
+  return `À −${String(p).replace(".", ",")} %, le total d'un article bon marché peut passer sous le minimum de paiement (${money("0,5")}).`;
+}
+
 /** Editor rows from the stored JSON (older stores: `[{minQty, percent}]`). */
 function toRows(raw: unknown, from = 0): Row[] {
   const list = Array.isArray(raw) ? raw : [];
@@ -101,13 +125,13 @@ function rowError(r: Row): string | null {
   if (r.kind === "percent") {
     const q = num(r.minQty);
     if (r.format === "bxgy") {
-      if (!r.minQty.trim() || !Number.isInteger(q) || q < 1 || q > 20) return "Articles achetés : entier de 1 à 20";
+      if (!r.minQty.trim() || !Number.isInteger(q) || q < 1 || q > TIER_LIMITS.maxBuy) return `Articles achetés : entier de 1 à ${TIER_LIMITS.maxBuy}`;
       const f = num(r.freeQty);
-      if (!Number.isInteger(f) || f < 1 || f > 10) return "Articles offerts : entier de 1 à 10";
-    } else if (!r.minQty.trim() || !Number.isInteger(q) || q < 2 || q > 100) return "Nombre d'articles : entier de 2 à 100";
+      if (!Number.isInteger(f) || f < 1 || f > TIER_LIMITS.maxFree) return `Articles offerts : entier de 1 à ${TIER_LIMITS.maxFree}`;
+    } else if (!r.minQty.trim() || !Number.isInteger(q) || q < 2 || q > TIER_LIMITS.maxQty) return `Nombre d'articles : entier de 2 à ${TIER_LIMITS.maxQty}`;
     if (r.format === "percent") {
       const p = num(r.percent);
-      if (!r.percent.trim() || !Number.isFinite(p) || p <= 0 || p > 50) return "Remise : plus de 0 et au plus 50 %";
+      if (!r.percent.trim() || !Number.isFinite(p) || p <= 0 || p > TIER_LIMITS.maxPercent) return `Remise : plus de 0 et au plus ${TIER_LIMITS.maxPercent} %`;
       if (!/^\d+([.,]\d)?$/.test(r.percent.trim())) return "Remise : une décimale au plus (ex. 12,5)";
     }
     if (r.format === "amount" && !(num(r.amount) > 0 && num(r.amount) <= 100_000)) return "Montant de la remise : plus de 0";
@@ -117,7 +141,7 @@ function rowError(r: Row): string | null {
     if (!r.variantId) return "Choisissez le produit offert";
     if (!r.title.trim()) return "Donnez un nom au cadeau (affiché au client)";
     const t = num(r.threshold);
-    if (r.mode === "qty" && (!Number.isInteger(t) || t < 1 || t > 100)) return "Nombre d'articles : entier de 1 à 100";
+    if (r.mode === "qty" && (!Number.isInteger(t) || t < 1 || t > TIER_LIMITS.maxQty)) return `Nombre d'articles : entier de 1 à ${TIER_LIMITS.maxQty}`;
     if (r.mode === "amount" && (!Number.isFinite(t) || t <= 0 || t > 1_000_000)) return "Montant : plus de 0";
   }
   if (r.scoped && r.products.length === 0) return "Choisissez au moins un produit, ou appliquez à tout le panier";
@@ -187,12 +211,14 @@ export function QuantityBreaksEditor({ initial, storeId, currency, baseLang = "f
   const percents = rows.filter((r) => r.kind === "percent");
   const gifts = rows.filter((r) => r.kind === "gift");
   const errors = rows.map(rowError);
-  // Whole-cart percent tiers: unique and increasing (same rule as the server).
+  // Whole-cart tiers: one per quantity (same rule as the server).
   const unscoped = percents.filter((r) => !r.scoped && !errors[rows.indexOf(r)]);
   const crossError = (() => {
     const v = validateQuantityTiers(unscoped.map((r) => (r.kind === "percent" ? tierOf(r) : {})));
     return v.ok ? null : v.error;
   })();
+  // A bigger quantity giving no bigger discount: a note only, saving is never refused for it.
+  const orderNotes = tierOrderWarnings(parseQuantityBreaks(unscoped.map((r) => (r.kind === "percent" ? tierOf(r) : {}))) as QuantityBreak[]);
   const update = (key: number, patch: Partial<Row>) => setRows((rs) => rs.map((r) => (r.key === key ? ({ ...r, ...patch } as Row) : r)));
 
   function addPercent() {
@@ -202,8 +228,8 @@ export function QuantityBreaksEditor({ initial, storeId, currency, baseLang = "f
       .filter((r) => Number.isFinite(r.q))
       .sort((a, b) => a.q - b.q)
       .pop();
-    const q = last ? Math.min(100, last.q + 1) : 2;
-    const p = last && Number.isFinite(last.p) ? Math.min(50, last.p + 5) : 10;
+    const q = last ? Math.min(TIER_LIMITS.maxQty, last.q + 1) : 2;
+    const p = last && Number.isFinite(last.p) ? Math.min(TIER_LIMITS.maxPercent, last.p + 5) : 10;
     const key = seq.current++;
     setRows((rs) => [...rs, { key, kind: "percent", format: "percent", minQty: String(q), percent: String(p), amount: "5", per: "unit", price: "", freeQty: "1", scoped: false, products: [] }]);
     setTimeout(() => document.getElementById(`${uid}-${key}-qty`)?.focus(), 0);
@@ -340,7 +366,7 @@ export function QuantityBreaksEditor({ initial, storeId, currency, baseLang = "f
                           name={`minQty-${r.key}`}
                           type="number"
                           min={1}
-                          max={20}
+                          max={TIER_LIMITS.maxBuy}
                           step={1}
                           inputMode="numeric"
                           required
@@ -359,7 +385,7 @@ export function QuantityBreaksEditor({ initial, storeId, currency, baseLang = "f
                           name={`freeQty-${r.key}`}
                           type="number"
                           min={1}
-                          max={10}
+                          max={TIER_LIMITS.maxFree}
                           step={1}
                           inputMode="numeric"
                           required
@@ -379,7 +405,7 @@ export function QuantityBreaksEditor({ initial, storeId, currency, baseLang = "f
                           name={`minQty-${r.key}`}
                           type="number"
                           min={2}
-                          max={100}
+                          max={TIER_LIMITS.maxQty}
                           step={1}
                           inputMode="numeric"
                           required
@@ -473,12 +499,21 @@ export function QuantityBreaksEditor({ initial, storeId, currency, baseLang = "f
                   </div>
                   {scopeField(r)}
                   {errorLine(r, i)}
+                  {r.format === "percent" && !errors[i] && highPercentNote(r.percent, money) && (
+                    <p className="mt-1 text-[11px] text-zinc-500">{highPercentNote(r.percent, money)}</p>
+                  )}
                 </li>
               );
             })}
           </ul>
         )}
         {crossError && touched && <p className="text-xs text-red-600">{crossError}</p>}
+        {/* Information only (the merchant's choice, saved as is): a plain grey line, no warning box. */}
+        {orderNotes.map((n) => (
+          <p key={n} className="text-[11px] text-zinc-500">
+            {n} : ajouter des articles ne fait pas économiser plus.
+          </p>
+        ))}
         <div className="flex flex-wrap items-center gap-3">
           <button
             type="button"

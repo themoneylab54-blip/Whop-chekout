@@ -3,18 +3,19 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 /*
- * publishDesignAction against a real Postgres: shipped sample proof (example reviews, key
- * figures, coupon…) no longer blocks publishing, because the live page never shows it
- * (isEmptyInLive → isSampleOnly, liveReviewItems / liveStatItems). Test data is prefixed
- * pubsample_ and deleted at the end.
+ * publishDesignAction against a real Postgres: default content never blocks publishing and
+ * buyers see it as the merchant left it; a new reviews block starts empty (no invented
+ * reviews). Test data is prefixed pubsample_ and deleted at the end.
  */
 
 const hasDb = !!process.env.DATABASE_URL;
+/** New blocks that start empty (nothing invented): they show nothing live until the merchant fills them. */
+const STARTS_EMPTY: string[] = ["reviews", "stats", "testimonial", "text"];
 
 vi.mock("next/cache", async (orig) => ({ ...(await orig<typeof import("next/cache")>()), revalidatePath: () => undefined }));
 vi.mock("@/lib/auth", async (orig) => ({ ...(await orig<typeof import("@/lib/auth")>()), requireAdmin: async () => "admin", currentUser: async () => (await import("../session-stub")).ownerUser() }));
 
-describe.skipIf(!hasDb)("publishDesignAction: sample content publishes but stays hidden from buyers (integration)", async () => {
+describe.skipIf(!hasDb)("publishDesignAction: default content publishes and is shown as written (integration)", async () => {
   const { db } = await import("@/lib/db");
   const { publishDesignAction } = await import("@/app/dashboard/actions");
   const { createBlock, defaultCheckoutLayout, defaultThankYouLayout, loadCheckoutLayout } = await import("@/lib/layout");
@@ -49,24 +50,23 @@ describe.skipIf(!hasDb)("publishDesignAction: sample content publishes but stays
     await db.store.deleteMany({ where: { id: { in: created } } });
   });
 
-  it("publishes a draft with sample proof, and the published layout hides every sample block from buyers", async () => {
+  it("publishes a draft with default content: buyers see it as written; new reviews, figures and quote start empty", async () => {
     const s = await store(withSamples());
     expect(await publishDesignAction(s.id, "v1")).toEqual({ ok: true, stripped: 0 });
     const row = await db.store.findUniqueOrThrow({ where: { id: s.id } });
     expect(row.publishedAt).not.toBeNull();
     const published = loadCheckoutLayout(row.checkoutLayout);
-    const samples = published.blocks.filter((b) => ["reviews", "stats", "testimonial", "announcement", "text"].includes(b.type));
-    expect(samples).toHaveLength(5);
-    for (const b of samples) {
-      expect(isEmptyInLive(b, live, 0), b.type).toBe(true);
-      // The builder still shows them (flagged as to complete).
-      expect(isEmptyInLive(b, preview, 0), b.type).toBe(false);
+    const added = published.blocks.filter((b) => ["reviews", "stats", "testimonial", "announcement", "text"].includes(b.type));
+    expect(added).toHaveLength(5);
+    for (const b of added) {
+      // Nothing invented: empty reviews, figures and quote show nothing; everything else is shown as written.
+      expect(isEmptyInLive(b, live, 0), b.type).toBe(STARTS_EMPTY.includes(b.type));
     }
-    // Translated for an English buyer, the shipped samples are still recognised.
-    for (const b of localizeLayout(published, "en").blocks.filter((x) => samples.some((y) => y.id === x.id))) expect(isEmptyInLive(b, live, 0), b.type).toBe(true);
+    // Translated for an English buyer, same rule.
+    for (const b of localizeLayout(published, "en").blocks.filter((x) => added.some((y) => y.id === x.id))) expect(isEmptyInLive(b, live, 0), b.type).toBe(STARTS_EMPTY.includes(b.type));
   });
 
-  it("partially edited reviews / figures: only the merchant's own entries reach buyers", () => {
+  it("reviews and figures the merchant adds reach buyers; no invented reviews", () => {
     const reviews = createBlock("reviews");
     reviews.props.items = [...reviews.props.items, { name: "Léa M.", text: "Très bon produit.", stars: 5, verified: false }];
     expect(isEmptyInLive(reviews, live, 0)).toBe(false);
@@ -77,9 +77,10 @@ describe.skipIf(!hasDb)("publishDesignAction: sample content publishes but stays
     const stats = createBlock("stats");
     stats.props.items = [{ value: "2 300", label: "commandes" }, ...stats.props.items];
     const statsHtml = renderToStaticMarkup(createElement(ContentBlock, { block: stats, ctx: live }));
+    // Figures are the merchant's to write (a new block has none): shown as written, in preview and live.
     expect(statsHtml).toContain("2 300");
     expect(statsHtml).not.toContain("+10 000");
-    expect(renderToStaticMarkup(createElement(ContentBlock, { block: stats, ctx: preview }))).toContain("+10 000");
+    expect(renderToStaticMarkup(createElement(ContentBlock, { block: stats, ctx: preview }))).toContain("2 300");
   });
 
   it("autosave can write the other page too (a template applied with its matching thank-you page)", async () => {

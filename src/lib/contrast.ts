@@ -39,6 +39,18 @@ export function readableOn(hex: string): "#111111" | "#ffffff" {
   return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6 ? "#111111" : "#ffffff";
 }
 
+/**
+ * Black or white, whichever has the higher contrast ratio on the color (on both ends of a
+ * gradient: the worse end decides). Used for the merchant's own button colors; the accent keeps
+ * readableOn (brightness rule) so stores without their own button colors look identical.
+ */
+export function bestTextOn(bg: string, bg2 = ""): "#111111" | "#ffffff" {
+  const ends = [bg, bg2].filter((c) => HEX.test(c));
+  if (ends.length === 0) return "#ffffff";
+  const worst = (fg: string) => Math.min(...ends.map((c) => contrastRatio(fg, c)));
+  return worst("#111111") >= worst("#ffffff") ? "#111111" : "#ffffff";
+}
+
 /** color-mix(in srgb, a p%, b): the checkout's --muted is the text color 70% + white. */
 export function mix(a: string, b: string, p: number): string {
   const [x, y] = [rgb(a), rgb(b)];
@@ -107,6 +119,16 @@ export function themeContrastChecks(theme: Theme): ContrastCheck[] {
     // Gradient-clipped stat numbers (large bold text)
     add("accent 2 on card", theme.accentColor2, "#ffffff", 3);
   }
+  // Own button colors (src/lib/button-colors.ts): checked only when set (else they are the accent above).
+  const own = (bg: string, bg2: string, fg: string, what: string) => {
+    const label = HEX.test(fg) ? fg : bestTextOn(bg, bg2);
+    add(`${what} text`, label, bg, 4.5);
+    if (HEX.test(bg2)) add(`${what} text on color 2`, label, bg2, 4.5);
+  };
+  if (HEX.test(theme.payButtonColor ?? "")) own(theme.payButtonColor, theme.payButtonColor2 ?? "", theme.payButtonTextColor ?? "", "pay button");
+  else if (HEX.test(theme.payButtonTextColor ?? "")) own(theme.accentColor, theme.accentColor2, theme.payButtonTextColor, "pay button");
+  if (HEX.test(theme.buttonColor ?? "")) own(theme.buttonColor, "", theme.buttonTextColor ?? "", "button");
+  else if (HEX.test(theme.buttonTextColor ?? "")) own(theme.accentColor, theme.accentColor2, theme.buttonTextColor, "button");
   // Store name in the header: white on dark headers, else the text color.
   const darkHeader = readableOn(theme.headerBackground) === "#ffffff";
   const headerText = darkHeader ? "#ffffff" : theme.textColor;

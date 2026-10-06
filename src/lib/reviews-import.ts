@@ -1,4 +1,4 @@
-import { MAX_REVIEW_ITEMS, type ReviewItem, type ReviewSummary } from "./layout";
+import { MAX_REVIEW_ITEMS, REVIEW_LIMITS, type ReviewItem, type ReviewSummary } from "./layout";
 
 /*
  * Real customer reviews for the "Avis clients" block: parsing of review apps' CSV exports
@@ -508,8 +508,8 @@ export function parseReviewsCsv(text: string, now = Date.now()): CsvImportResult
       skipped++;
       continue;
     }
-    const body = plainText(get(row, "text"), 800);
-    const title = plainText(get(row, "title"), 150);
+    const body = plainText(get(row, "text"), REVIEW_LIMITS.text);
+    const title = plainText(get(row, "title"), REVIEW_LIMITS.title);
     const name = displayName(nameOf(row));
     const date = parseReviewDate(get(row, "date"), now);
     const key = dedupKey(get(row, "id"), rawWhoOf(row), rating, body || title, date);
@@ -594,8 +594,8 @@ export function readJudgeMePage(json: unknown, now = Date.now(), seen = new Set<
     if ((r.curated === "not-yet" || r.curated === "not_yet") && r.published !== true) continue;
     const rating = parseRating(r.rating ?? null);
     if (rating == null) continue;
-    const body = plainText(r.body, 800);
-    const title = plainText(r.title, 150);
+    const body = plainText(r.body, REVIEW_LIMITS.text);
+    const title = plainText(r.title, REVIEW_LIMITS.title);
     const name = displayName(r.reviewer?.name);
     const date = parseReviewDate(r.created_at, now);
     const key = dedupKey(r.id, `${String(r.reviewer?.name ?? "").trim()}|${String(r.reviewer?.email ?? "").trim()}`, rating, body || title, date);

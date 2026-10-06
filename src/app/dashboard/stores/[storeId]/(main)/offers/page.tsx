@@ -8,7 +8,7 @@ import type { AddOn, DiscountCode } from "@prisma/client";
 import { requireStoreAccess } from "@/lib/access";
 import { db } from "@/lib/db";
 import { loadTheme } from "@/lib/layout";
-import { centsToDecimal, parseQuantityTiers } from "@/lib/pricing";
+import { centsToDecimal, MAX_GIFT_TIERS, MAX_PERCENT_TIERS, parseQuantityTiers, TIER_LIMITS } from "@/lib/pricing";
 import { QuantityBreaksEditor } from "@/components/dashboard/QuantityBreaksEditor";
 import { Badge, Card, EmptyState, Flash, Input, Label, PageHeader, Select, SubmitButton } from "@/components/ui";
 import { ConfirmButton } from "@/components/dashboard/ConfirmButton";
@@ -243,7 +243,8 @@ export default async function OffersPage({
           {running.get("breaks") && <TestRunningNotice name={running.get("breaks")!.name} what="les paliers de remise" storeId={store.id} />}
           <QuantityBreaksEditor initial={store.quantityBreaks ?? []} storeId={store.id} currency={store.shopCurrency} baseLang={baseLang} />
           <p className="text-xs leading-relaxed text-zinc-500">
-            Jusqu&apos;à 5 paliers (2 à 100 articles, remise de 50 % au plus) et 3 cadeaux. Un palier peut ne compter que certains produits : seuls
+            Jusqu&apos;à {MAX_PERCENT_TIERS} paliers (2 à {TIER_LIMITS.maxQty} articles, remise de {TIER_LIMITS.maxPercent} % au plus ; « X achetés » jusqu&apos;à{" "}
+            {TIER_LIMITS.maxBuy}, {TIER_LIMITS.maxFree} offerts au plus) et {MAX_GIFT_TIERS} cadeaux. Un palier peut ne compter que certains produits : seuls
             ceux-là sont remisés. Le palier atteint le plus avantageux s&apos;applique, puis le code promo sur le reste. Les cadeaux sont ajoutés à 0 € à la
             commande Shopify (prix réel barré au checkout) ; le montant d&apos;un cadeau se calcule sur les articles avant remise.
           </p>
