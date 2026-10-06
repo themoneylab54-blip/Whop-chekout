@@ -212,27 +212,8 @@ export async function noteCheckoutFailure(storeId: string, source: PaymentProvid
       }
       return;
     }
-    if (!store.autoFallback || client) return;
-    const startedAt = new Date();
-    const both = store.providerFailoverAt && secondary ? `${PROVIDER_NAMES[primary]} et ${PROVIDER_NAMES[secondary]}` : null;
-    const reason = `${failing} clients n'ont pas pu ouvrir le paiement ${name} en 10 min${both ? ` (${both} en échec)` : ""}`;
-    const on = await db.store.updateMany({
-      where: { id: storeId, fallbackActiveAt: null, autoFallback: true },
-      data: { fallbackActiveAt: startedAt, fallbackReason: reason },
-    });
-    if (on.count) {
-      await openFallbackPeriod(storeId, startedAt, reason);
-      await recordEvent({
-        storeId,
-        level: "error",
-        kind: "fallback.activated",
-        message: both
-          ? `${both} ne répondent plus (${failing} échecs ${name} en 10 min) : vos clients passent temporairement par le checkout Shopify. Retour automatique dès qu'un des deux fonctionne.`
-          : `${name} ne répond plus (${failing} échecs en 10 min) : vos clients passent temporairement par le checkout Shopify. Retour automatique dès que ${name} fonctionne.`,
-        data: { source, failures: failing },
-        alert: true,
-      });
-    }
+    // Never Shopify's checkout on its own: the buyers stay on ours (the merchant is alerted by the
+    // failures themselves, and the processor failover above keeps them paying when it can).
   } catch (err) {
     log.error("fallback.check_failed", "Could not evaluate the checkout fallback", { storeId, err });
   }

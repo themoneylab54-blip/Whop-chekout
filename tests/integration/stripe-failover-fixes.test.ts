@@ -272,7 +272,9 @@ describe.skipIf(!hasDb)("checkout + Stripe failover hardening (integration)", as
   it("Stripe effectively primary (Whop disconnected under « Whop principal »): its failures count", async () => {
     const store = await makeStore({ ...stripeOn, autoFallback: true });
     for (let i = 0; i < 3; i++) await journalCheckoutFailure(await makeSession(store), "prepare", stripeErr("Stripe 500"));
-    expect((await storeOf(store.id)).fallbackActiveAt).not.toBeNull();
+    expect(await db.eventLog.count({ where: { storeId: store.id, kind: "checkout.init_failed" } })).toBe(3);
+    // Counted, but never Shopify's checkout.
+    expect((await storeOf(store.id)).fallbackActiveAt).toBeNull();
   });
 
   it("during a failover, the secondary failing while the primary's sessions keep working ends the failover (not Shopify)", async () => {

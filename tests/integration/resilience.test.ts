@@ -218,15 +218,15 @@ describe.skipIf(!hasDb)("resilience (integration)", async () => {
     expect(await db.eventLog.count({ where: { storeId: store.id, kind: "reconcile.refund_healed" } })).toBe(1);
   });
 
-  it("switches the storefront to Shopify's checkout when Whop keeps failing", async () => {
+  it("never switches the storefront to Shopify's checkout, even when Whop keeps failing", async () => {
     const { journalCheckoutFailure } = await import("@/lib/checkout");
     const store = await makeStore();
     const sessions = await Promise.all([1, 2, 3].map(() => db.checkoutSession.create({ data: { storeId: store.id, currency: "EUR", lines: [line], subtotalCents: 5000 } })));
     for (const s of sessions.slice(0, 2)) await journalCheckoutFailure(s, "prepare", new Error("Whop 503"));
     expect((await db.store.findUniqueOrThrow({ where: { id: store.id } })).fallbackActiveAt).toBeNull();
     await journalCheckoutFailure(sessions[2], "prepare", new Error("Whop 503"));
-    expect((await db.store.findUniqueOrThrow({ where: { id: store.id } })).fallbackActiveAt).not.toBeNull();
-    expect(await db.eventLog.count({ where: { storeId: store.id, kind: "fallback.activated" } })).toBe(1);
+    expect((await db.store.findUniqueOrThrow({ where: { id: store.id } })).fallbackActiveAt).toBeNull();
+    expect(await db.eventLog.count({ where: { storeId: store.id, kind: "fallback.activated" } })).toBe(0);
   });
 
   it("journals one init failure per session per 10 min (retries during an outage)", async () => {

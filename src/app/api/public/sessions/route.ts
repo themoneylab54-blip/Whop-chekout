@@ -100,26 +100,36 @@ const bodySchema = z.object({
   requestKey: z.string().regex(/^[A-Za-z0-9_-]{16,64}$/).optional(),
 });
 
+/**
+ * A cart the checkout can't open. `native` marks the only carts Shopify's checkout keeps
+ * (checkout switched off, subscriptions, gift cards, excluded products): for every other refusal
+ * the loader stays on the shop with a "try again" message, never Shopify's checkout.
+ */
+function refuse(status: number, error: string, reason: string, native = false) {
+  log.warn("session.refused", "Checkout session refused", { status, reason });
+  return json({ error, reason, ...(native ? { native: true, fallback: true } : {}) }, { status, cors: true });
+}
+
 /** Called by the storefront loader with the contents of /cart.js. */
 async function handle(req: Request) {
   if (!(await rateLimit(`session:ip:${clientIp(req)}`, 20))) {
-    return json({ error: "Trop de requêtes", fallback: true }, { status: 429, cors: true });
+    return refuse(429, "Trop de requêtes", "rate_limited");
   }
   const parsed = bodySchema.safeParse(await readJson(req));
-  if (!parsed.success) return json({ error: "Panier invalide" }, { status: 400, cors: true });
+  if (!parsed.success) return refuse(400, "Panier invalide", "invalid_body");
   const { store: publicId, items, returnUrl, tracking, visitorId } = parsed.data;
   // Subscriptions (selling plans) and gift cards can't be sold here (no recurring billing, no gift
   // card issuing): the whole cart goes to Shopify's checkout.
   const unsupported = unsupportedCart(items);
-  if (unsupported) return json({ error: unsupported === "selling_plan" ? "Abonnement : checkout Shopify" : "Carte cadeau : checkout Shopify", fallback: true, reason: unsupported }, { status: 409, cors: true });
+  if (unsupported) return refuse(409, unsupported === "selling_plan" ? "Abonnement : checkout Shopify" : "Carte cadeau : checkout Shopify", unsupported, true);
 
   const store = await db.store.findUnique({ where: { publicId } });
   // At least one processor able to take the payment (Whop and/or Stripe, under the store's mode).
   if (!store?.enabled || !store.shopifyConnectedAt || !anyProviderConnected(store) || store.fallbackActiveAt) {
-    return json({ error: "Checkout désactivé", fallback: true }, { status: 409, cors: true });
+    return refuse(409, "Checkout désactivé", "disabled", true);
   }
   // Called on another store's checkout domain: unknown here (the loader then uses Shopify's checkout).
-  if (await isForeignCheckoutHost(req, store)) return json({ error: "Boutique introuvable", fallback: true }, { status: 404, cors: true });
+  if (await isForeignCheckoutHost(req, store)) return refuse(404, "Boutique introuvable", "foreign_host");
 
   // Same click already handled: that session again (the first request may also still be running,
   // see the create below).
@@ -151,15 +161,15 @@ async function handle(req: Request) {
     lines = await priceCart(store, items.map((i) => ({ variantId: i.variant_id, quantity: i.quantity })));
   } catch (err) {
     log.error("checkout.price_failed", "Could not price the cart with Shopify", { err });
-    return json({ error: "Impossible de charger le panier", fallback: true }, { status: 502, cors: true });
+    return refuse(502, "Impossible de charger le panier", "price_failed");
   }
-  if (lines.length === 0) return json({ error: "Panier vide", fallback: true }, { status: 400, cors: true });
+  if (lines.length === 0) return refuse(400, "Panier vide", "empty_cart");
   // Gift cards checked on Shopify's own data too (a storefront script could leave the flag out).
-  if (lines.some((l) => l.giftCard)) return json({ error: "Carte cadeau : checkout Shopify", fallback: true, reason: "gift_card" }, { status: 409, cors: true });
+  if (lines.some((l) => l.giftCard)) return refuse(409, "Carte cadeau : checkout Shopify", "gift_card", true);
   // Excluded products keep Shopify's checkout, whatever the storefront script did.
   const excluded = loadInterception(store.interception).excludedHandles;
   if (lines.some((l) => excluded.includes(l.productHandle))) {
-    return json({ error: "Produit géré par le checkout Shopify", fallback: true }, { status: 409, cors: true });
+    return refuse(409, "Produit géré par le checkout Shopify", "excluded", true);
   }
 
   // Touches are kept with their date ("ts"): the attribution window (1/7/28 days) is applied
@@ -173,7 +183,7 @@ async function handle(req: Request) {
   // Line properties, app prices (Cart Transform), bundle components and Shopify's automatic
   // discounts as the server re-read them; a cart that can't be represented goes to Shopify.
   const cart = await sessionCart(store, cartInput, lines, cartRead);
-  if (!cart.ok) return json({ error: "Lot ou prix d'app : checkout Shopify", fallback: true, reason: cart.reason }, { status: 409, cors: true });
+  if (!cart.ok) return refuse(409, "Panier refusé : " + cart.reason, cart.reason, cart.reason === "subscription");
   lines = cart.lines;
   const { cartDiscounts, cartContext } = cart;
 
@@ -208,7 +218,7 @@ async function handle(req: Request) {
       throw err;
     });
   // That request's session, and its conversion only.
-  if (!session) return (await replay()) ?? json({ error: "Session en cours de création", fallback: true }, { status: 409, cors: true });
+  if (!session) return (await replay()) ?? refuse(409, "Session en cours de création", "in_progress");
   // Redacted copy of a cart holding app lines (support diagnostics, purged after 7 days).
   if (cart.diagnostic) {
     const d = cart.diagnostic;

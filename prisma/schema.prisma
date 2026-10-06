@@ -219,7 +219,7 @@ model Store {
   mondialRelayKey      String? // encrypted
 
   // --- Safety net: fall back to Shopify's own checkout while Whop is failing ---
-  autoFallback             Boolean   @default(true)
+  autoFallback             Boolean   @default(false)
   // Chargeback fee charged per dispute (profit analytics), and monthly fixed costs
   disputeFeeCents          Int       @default(1500)
   fixedCostsMonthlyCents   Int       @default(0)

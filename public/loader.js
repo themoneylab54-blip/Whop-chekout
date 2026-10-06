@@ -2,8 +2,10 @@
  * Whop Checkout — storefront loader.
  * Injected automatically on the shop via a Shopify ScriptTag (or pasted once in theme.liquid).
  * Replaces the Shopify checkout with the store's Whop checkout, following the
- * interception settings from the dashboard. When anything fails it steps aside and
- * lets the native Shopify checkout run.
+ * interception settings from the dashboard. Shopify's own checkout only runs when the merchant
+ * switched ours off, for carts it can't sell (subscriptions, gift cards, excluded products) or
+ * when our server can't be reached at all; any other failure keeps the buyer on the shop with a
+ * "try again" message.
  */
 (function () {
   "use strict";
@@ -24,6 +26,7 @@
   if (!STORE) return;
 
   var config = null;
+  var configLoading = true;
   var bypass = false;
   var busy = false;
 
@@ -473,7 +476,7 @@
     }
   }
 
-  function goToCheckout(items) {
+  function goToCheckout(items, retried) {
     if (busy) return;
     busy = true;
     overlay(true);
@@ -487,10 +490,10 @@
         var cartItems = (cart.items || []).filter(function (i) {
           return i.quantity > 0;
         });
-        if (!cartItems.length) throw new Error("empty cart");
-        if (excluded(cartItems)) throw new Error("excluded product");
+        if (!cartItems.length) throw nativeError("empty cart");
+        if (excluded(cartItems)) throw nativeError("excluded product");
         // Subscriptions (selling plans) and gift cards stay on Shopify's checkout, whole cart.
-        if (unsupported(cartItems)) throw new Error("subscription or gift card");
+        if (unsupported(cartItems)) throw nativeError("subscription or gift card");
         var key = requestKey();
         return postSession({
           method: "POST",
@@ -525,7 +528,13 @@
       })
       .then(function (res) {
         return res.json().then(function (body) {
-          if (!res.ok || !body.url) throw new Error(body.error || "session failed");
+          if (!res.ok || !body.url) {
+            var err = new Error((body && body.error) || "session failed (" + res.status + ")");
+            // Only the carts Shopify keeps (checkout off, subscription, gift card, excluded).
+            err.native = !!(body && body.native);
+            err.retryable = res.status >= 500 || res.status === 429;
+            throw err;
+          }
           body.url = onAppHost(body.url);
           keepVisitorId(body.visitorId);
           log("redirect", body.url);
@@ -536,10 +545,69 @@
         });
       })
       .catch(function (err) {
-        log("fallback to Shopify checkout:", err && err.message);
         busy = false;
-        nativeCheckout(items);
+        if (err && err.native) {
+          log("Shopify checkout:", err.message);
+          nativeCheckout(items);
+          return;
+        }
+        // A network or server hiccup: once more on its own before telling the buyer.
+        if (!retried && (!err || err.retryable || err instanceof TypeError)) {
+          log("checkout failed, retrying:", err && err.message);
+          return goToCheckout(items, true);
+        }
+        log("checkout failed:", err && err.message);
+        failed(err && err.message, items);
       });
+  }
+
+  function nativeError(message) {
+    var e = new Error(message);
+    e.native = true;
+    return e;
+  }
+
+  // The checkout couldn't open: the buyer stays on the shop with a way to try again (never
+  // Shopify's checkout). With ?whopco_debug=1 the reason shows too.
+  function failed(reason, items) {
+    overlay(false);
+    if (DEBUG) badge("Whop Checkout : échec — " + (reason || "erreur inconnue"), false);
+    var id = "whopco-error";
+    var old = document.getElementById(id);
+    if (old) old.remove();
+    var el = document.createElement("div");
+    el.id = id;
+    el.setAttribute("role", "alert");
+    el.style.cssText =
+      "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:16px;font:500 15px/1.4 system-ui,sans-serif;color:#111";
+    var card = document.createElement("div");
+    card.style.cssText = "background:#fff;border-radius:12px;padding:20px;max-width:360px;width:100%;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,.2)";
+    var text = document.createElement("p");
+    text.style.cssText = "margin:0 0 16px";
+    text.textContent = /^fr/i.test(document.documentElement.lang || navigator.language || "")
+      ? "Le paiement n'a pas pu s'ouvrir. Veuillez réessayer."
+      : "The checkout couldn't open. Please try again.";
+    var retry = document.createElement("button");
+    retry.type = "button";
+    retry.textContent = /^fr/i.test(document.documentElement.lang || navigator.language || "") ? "Réessayer" : "Try again";
+    retry.style.cssText = "background:#111;color:#fff;border:0;border-radius:8px;padding:10px 18px;font:600 15px system-ui,sans-serif;cursor:pointer";
+    retry.addEventListener("click", function () {
+      el.remove();
+      goToCheckout(items);
+    });
+    var close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "×";
+    close.setAttribute("aria-label", "Fermer");
+    close.style.cssText = "background:none;border:0;font:400 22px system-ui,sans-serif;margin-left:12px;cursor:pointer;color:#555";
+    close.addEventListener("click", function () {
+      el.remove();
+    });
+    card.appendChild(text);
+    card.appendChild(retry);
+    card.appendChild(close);
+    el.appendChild(card);
+    document.body.appendChild(el);
   }
 
   function productFormItems(el) {
@@ -574,7 +642,60 @@
   /* Listeners (capture phase, before the theme's own handlers)        */
   /* ---------------------------------------------------------------- */
 
+  // Any other checkout link or button of a theme (a link to /checkout, a "checkout" button
+  // named differently, a "Checkout" / "Paiement" button in the cart or its drawer).
+  var ANY_CHECKOUT = ["a[href*='/checkout']", "[name='checkout']", "[href*='/checkouts/']"];
+  var CHECKOUT_TEXT = /^\s*(check\s*out|proceed to checkout|go to checkout|paiement|passer (à la|la) commande|commander|finaliser( la commande)?|valider( la commande| mon panier)?|payer|acheter|zur kasse|kasse|pagar|tramitar pedido|vai alla cassa|cassa|afrekenen|bestellen)\b/i;
+  var CART_CONTEXT = "cart-drawer, cart-notification, form[action*='/cart'], [id*='cart' i], [class*='cart' i], [id*='Cart'], [class*='Cart']";
+  function genericCheckout(t) {
+    if (!config || !(config.interception.cartCheckout || config.interception.cartDrawer)) return null;
+    var hit = matches(t, ANY_CHECKOUT);
+    if (hit) return hit;
+    var btn = t.closest && t.closest("button, a, input[type='submit'], [role='button']");
+    // Never a product's own "add to cart" / "buy" button.
+    if (!btn || matches(btn, BUY_NOW) || (btn.closest && btn.closest("form[action*='/cart/add'], product-form"))) return null;
+    var label = (btn.value || btn.textContent || btn.getAttribute("aria-label") || "").trim();
+    if (!label || label.length > 40 || !CHECKOUT_TEXT.test(label)) return null;
+    // Only in the cart (page, drawer or popup): "Buy" elsewhere is a product button.
+    var inCart = /^\/cart\/?$/.test(location.pathname);
+    try {
+      inCart = inCart || !!(btn.parentElement && btn.parentElement.closest(CART_CONTEXT));
+    } catch (e) {}
+    return inCart ? btn : null;
+  }
+
+  // A checkout click before the config arrived: held until it does (never Shopify's checkout).
+  var DEFAULT_CHECKOUT = CART_CHECKOUT.concat(DRAWER_CHECKOUT, ANY_CHECKOUT);
+  var waiting = [];
+  function holdUntilConfig(e) {
+    var t = e.target;
+    if (!(t instanceof Element) || !(matches(t, DEFAULT_CHECKOUT) || matches(t, BUY_NOW))) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    overlay(true);
+    waiting.push(t);
+  }
+  function releaseWaiting() {
+    var list = waiting;
+    waiting = [];
+    if (!list.length) return;
+    overlay(false);
+    list.slice(-1).forEach(function (t) {
+      if (config && config.enabled) {
+        if (config.interception.buyNow && matches(t, BUY_NOW)) {
+          var items = productFormItems(t);
+          if (items) return goToCheckout(items);
+        }
+        return goToCheckout(null);
+      }
+      // Checkout switched off (or our server unreachable): the theme's own button.
+      bypass = true;
+      if (typeof t.click === "function") t.click();
+    });
+  }
+
   function onClick(e) {
+    if (!bypass && configLoading) return holdUntilConfig(e);
     if (bypass || !config || !config.enabled) return;
     var t = e.target;
     if (!(t instanceof Element)) return;
@@ -588,7 +709,7 @@
       }
       return;
     }
-    if (matches(t, checkoutSelectors())) {
+    if (matches(t, checkoutSelectors()) || genericCheckout(t)) {
       e.preventDefault();
       e.stopImmediatePropagation();
       goToCheckout(null);
@@ -605,7 +726,7 @@
     // Cart form submitted through its "checkout" button.
     if (
       (config.interception.cartCheckout || config.interception.cartDrawer) &&
-      (/\/checkout/.test(action) || (/\/cart\/?$/.test(action) && submitter && submitter.name === "checkout"))
+      (/\/checkout/.test(action) || (/\/cart\/?$/.test(action) && submitter && (submitter.name === "checkout" || genericCheckout(submitter))))
     ) {
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -624,8 +745,9 @@
           goToCheckout(null);
         })
         .catch(function () {
+          // Shopify's own "add to cart" (its cart page, not its checkout; form.submit() fires no
+          // submit event, so later checkout clicks are still ours).
           overlay(false);
-          bypass = true;
           form.submit();
         });
     }
@@ -660,13 +782,21 @@
     document.body.appendChild(b);
   }
 
-  fetch(API + "/api/public/stores/" + encodeURIComponent(STORE) + "/config")
+  var configInit = {};
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") configInit.signal = AbortSignal.timeout(8000);
+  fetch(API + "/api/public/stores/" + encodeURIComponent(STORE) + "/config", configInit)
     .then(function (r) {
       return r.json();
     })
     .then(function (c) {
-      config = c;
+      config = c && c.interception ? c : null;
+      configLoading = false;
+      releaseWaiting();
       log("config", c);
+      if (!config) {
+        if (DEBUG) badge("Whop Checkout : configuration introuvable", false);
+        return;
+      }
       if (c && c.enabled) pingCheckoutDomain();
       if (!DEBUG) return;
       if (!c.enabled) return badge("Whop Checkout : désactivé (checkout Shopify natif)", false);
@@ -674,7 +804,12 @@
       highlight();
       new MutationObserver(highlight).observe(document.body, { childList: true, subtree: true });
     })
-    .catch(function () {
-      config = null; // native checkout
+    .catch(function (err) {
+      // Our server can't be reached at all: the shop's own checkout (nothing else can sell).
+      config = null;
+      configLoading = false;
+      log("config failed:", err && err.message);
+      if (DEBUG) badge("Whop Checkout : serveur injoignable", false);
+      releaseWaiting();
     });
 })();

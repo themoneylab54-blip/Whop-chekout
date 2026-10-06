@@ -38,7 +38,7 @@ describe.skipIf(!hasDb)("analytics round 12 (integration)", async () => {
   const { storeAnalytics, storeCohorts, dailySeries, resolveRange } = await import("@/lib/analytics");
   const { importAdSpend, backfillAdSpend, adSpendBackfillStatus, spendCoverage, BACKFILL_DAYS } = await import("@/lib/adspend");
   const { recordValueModeChange } = await import("@/lib/value-mode");
-  const { noteCheckoutFailure, probeFallbacks } = await import("@/lib/fallback");
+  const { openFallbackPeriod, probeFallbacks } = await import("@/lib/fallback");
   const { importExternalOrders, externalImportStatus, backfillShopifyCustomers, customersBackfillStatus } = await import("@/lib/shopify-history");
   const { syncOrder } = await import("@/lib/checkout");
   const { profitValueCents } = await import("@/lib/conversions");
@@ -161,7 +161,9 @@ describe.skipIf(!hasDb)("analytics round 12 (integration)", async () => {
   it("A2: logs fallback periods, flags their days, and imports the orders placed outside this checkout (resuming after the deadline)", async () => {
     const store = await makeStore({ autoFallback: true, ...connected() });
     for (let i = 0; i < 3; i++) await db.eventLog.create({ data: { storeId: store.id, sessionId: `an12fix_s${i}_${rnd()}`, level: "warn", kind: "checkout.init_failed", message: "x" } });
-    await noteCheckoutFailure(store.id);
+    // Periods opened before Shopify's checkout was removed (the history stays on the charts).
+    await db.store.update({ where: { id: store.id }, data: { fallbackActiveAt: new Date(), fallbackReason: "3 clients" } });
+    await openFallbackPeriod(store.id, new Date(), "3 clients n'ont pas pu ouvrir le paiement");
     const open = await db.fallbackPeriod.findFirstOrThrow({ where: { storeId: store.id } });
     expect(open.endedAt).toBeNull();
     expect(open.reason).toContain("3 clients");

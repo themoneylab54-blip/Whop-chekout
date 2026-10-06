@@ -336,13 +336,13 @@ describe.skipIf(!hasDb)("round 15 reliability & observability (integration)", as
     expect((await db.store.findUniqueOrThrow({ where: { id: store.id } })).fallbackActiveAt).toBeNull();
     expect(await db.eventLog.count({ where: { storeId: store.id, kind: "checkout.init_failed" } })).toBe(0);
     expect(await db.eventLog.count({ where: { storeId: store.id, kind: "checkout.shopify_failed" } })).toBe(1);
-    // Whop can't open checkouts (tagged by prepareSession): the storefront falls back.
+    // Whop can't open checkouts (tagged by prepareSession): journaled, the storefront stays ours.
     const { tagFailureSource } = await import("@/lib/checkout");
     for (const s of sessions) {
       const err = await tagFailureSource(Promise.reject(new Error("Whop 503")), "whop").catch((e: unknown) => e);
       await journalCheckoutFailure(s, "prepare", err);
     }
-    expect((await db.store.findUniqueOrThrow({ where: { id: store.id } })).fallbackActiveAt).not.toBeNull();
+    expect((await db.store.findUniqueOrThrow({ where: { id: store.id } })).fallbackActiveAt).toBeNull();
     expect(await db.eventLog.count({ where: { storeId: store.id, kind: "checkout.init_failed" } })).toBe(3);
   });
 

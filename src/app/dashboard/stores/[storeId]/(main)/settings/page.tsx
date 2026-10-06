@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
-import { AlertTriangle, BellRing, Mail, Check, Copy, LifeBuoy, Minus, PiggyBank, Settings, ShieldCheck, ShoppingCart, Store, Trash2 } from "lucide-react";
+import { BellRing, Mail, Check, Copy, Minus, PiggyBank, Settings, ShieldCheck, ShoppingCart, Store, Trash2 } from "lucide-react";
 import { notFound } from "next/navigation";
 import { DirtyForm, SaveAllWith } from "@/components/dashboard/DirtyForm";
 import { requireStoreAccess, roleCan } from "@/lib/access";
@@ -14,14 +14,11 @@ import { operatorMailer } from "@/lib/notify";
 import { MoneyInput } from "@/components/dashboard/MoneyInput";
 import { centsToField } from "@/components/dashboard/money";
 import { SectionNav, type Section } from "@/components/dashboard/SectionNav";
-import { formatDateTime } from "@/components/dashboard/format";
 import {
-  clearFallbackAction,
   cloneStoreAction,
   deleteStoreAction,
   saveAlertsAction,
   saveCheckoutOptionsAction,
-  saveFallbackAction,
   saveMarginsAction,
   saveOperatorMailAction,
   saveSettingsBatchAction,
@@ -208,40 +205,6 @@ export default async function SettingsPage({
             </Card>
           </Anchor>
 
-          <Anchor id="secours">
-            <Card
-              icon={LifeBuoy}
-              iconColor="#f59e0b"
-              title="Checkout de secours"
-              description="Si Whop ne répond plus, vos clients passent automatiquement par le checkout Shopify : aucune vente perdue."
-            >
-              {store.fallbackActiveAt && (
-                <div role="alert" className="mb-4 rounded-xl bg-amber-50 p-4 text-sm text-amber-900 ring-1 ring-amber-600/25">
-                  <p className="flex items-start gap-2 font-semibold">
-                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-                    Checkout Shopify actif depuis le {formatDateTime(store.fallbackActiveAt, false, tzOf(store))}
-                  </p>
-                  {store.fallbackReason && <p className="mt-1 pl-6 text-amber-800">{store.fallbackReason}</p>}
-                  <p className="mt-1 pl-6 text-xs text-amber-800">
-                    Le checkout Whop revient tout seul dès qu&apos;il répond. Vous pouvez aussi le réactiver maintenant si le problème est réglé.
-                  </p>
-                  <form action={clearFallbackAction.bind(null, store.id)} className="mt-3 pl-6">
-                    <SubmitButton size="sm">Réactiver maintenant</SubmitButton>
-                  </form>
-                </div>
-              )}
-              <DirtyForm label="Checkout de secours" action={saveFallbackAction.bind(null, store.id)} className="space-y-4">
-                <div className="border-y border-zinc-100">
-                  <Toggle
-                    name="autoFallback"
-                    defaultChecked={store.autoFallback}
-                    label="Basculer automatiquement sur le checkout Shopify"
-                    hint="Si 3 clients n'arrivent pas à ouvrir le paiement Whop en 10 minutes, la boutique utilise le checkout Shopify. Une vérification toutes les quelques minutes remet le checkout Whop dès qu'il fonctionne. Vous êtes prévenu par vos alertes."
-                  />
-                </div>
-              </DirtyForm>
-            </Card>
-          </Anchor>
 
           <Anchor id="marges">
             <Card
@@ -497,7 +460,6 @@ const SECTIONS: Section[] = [
   { id: "domaine", label: "Domaine du checkout" },
   { id: "checkout", label: "Options du checkout" },
   { id: "reseau", label: "Réseau" },
-  { id: "secours", label: "Checkout de secours" },
   { id: "marges", label: "Marges & coûts" },
   { id: "couts", label: "Coûts", optional: true },
   { id: "attribution", label: "Attribution" },
@@ -516,7 +478,7 @@ const CLONED = [
   "Remises par quantité",
   "Marges, coûts et TVA",
   "IDs des pixels et valeur de conversion",
-  "Alertes, checkout de secours et bouclier anti-litiges",
+  "Alertes et bouclier anti-litiges",
 ];
 const NOT_CLONED = [
   "Connexions Shopify et Whop",

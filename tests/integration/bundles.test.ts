@@ -244,13 +244,15 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
     expect(entry.data).toMatchObject({ apps: ["cart_transform"] });
   });
 
-  it("unsupported app pricing goes to Shopify's checkout, journaled", async () => {
+  it("unsupported app pricing is refused (never Shopify's checkout), journaled", async () => {
     const store = await makeStore();
     // An app's surcharge (cart price above the variant's) on a personalized line.
     stubCart({ token: "bnd-token-3", currency: "EUR", items: [{ variant_id: 11, quantity: 1, final_line_price: 3900, line_level_discount_allocations: [], properties: { Gravure: "Léa" } }] });
     const res = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1, properties: { Gravure: "Léa" } }], cartToken: "bnd-token-3" });
     expect(res.status).toBe(409);
-    expect(await res.json()).toMatchObject({ fallback: true, reason: "price_higher" });
+    const body = await res.json();
+    expect(body).toMatchObject({ reason: "price_higher" });
+    expect(body.native).toBeUndefined();
     const entry = await db.eventLog.findFirstOrThrow({ where: { storeId: store.id, kind: "cart.unsupported_app_pricing" } });
     expect(entry.message).toContain("supplément");
 

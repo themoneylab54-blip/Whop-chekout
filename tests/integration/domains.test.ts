@@ -390,7 +390,7 @@ describe.skipIf(!hasDb)("checkout domains (integration)", async () => {
       );
     const foreign = await create(theirs);
     expect(foreign.status).toBe(404);
-    expect(await foreign.json()).toMatchObject({ fallback: true });
+    expect(await foreign.json()).toMatchObject({ reason: "foreign_host" });
     expect((await create("unknown-shop.example.org")).status).toBe(404);
     for (const host of ["checkout.example.com", "localhost:5109", "whop-chekout-git-x.vercel.app", mine, retired]) {
       expect((await create(host)).status, host).toBe(200);

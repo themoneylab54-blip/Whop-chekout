@@ -76,7 +76,6 @@ export const NAV_SECTIONS: NavSection[] = [
   { label: "Fuseau horaire", page: "Réglages", path: "settings", hash: "boutique", keywords: "timezone heure" },
   { label: "Options du checkout", page: "Réglages", path: "settings", hash: "checkout", keywords: "paiement abandon" },
   { label: "Réseau", page: "Réglages", path: "settings", hash: "reseau", keywords: "operateur e-mail reseau boutiques" },
-  { label: "Checkout de secours", page: "Réglages", path: "settings", hash: "secours", keywords: "fallback panne" },
   { label: "Marges & coûts", page: "Réglages", path: "settings", hash: "marges", keywords: "frais tva marge preparation" },
   { label: "Coûts", page: "Réglages", path: "settings", hash: "couts", keywords: "cout frais" },
   { label: "Attribution", page: "Réglages", path: "settings", hash: "attribution", keywords: "utm fenetre premier dernier clic" },

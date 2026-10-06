@@ -345,7 +345,7 @@ describe.skipIf(!hasDb)("checkout on Stripe and failover (integration)", async (
     expect(stripeApi.createOrUpdatePaymentIntent).not.toHaveBeenCalled();
   });
 
-  it("store level: Whop failing → providerFailoverAt (Stripe for new sessions); Stripe failing too → Shopify's checkout", async () => {
+  it("store level: Whop failing → providerFailoverAt (Stripe for new sessions); Stripe failing too → still never Shopify's checkout", async () => {
     const store = await makeStore({ ...whopOn, ...stripeOn, autoFallback: true });
     for (let i = 0; i < 3; i++) await journalCheckoutFailure(await makeSession(store), "prepare", new Error(`Whop 503 #${i}`));
     let s = await db.store.findUniqueOrThrow({ where: { id: store.id } });
@@ -356,21 +356,20 @@ describe.skipIf(!hasDb)("checkout on Stripe and failover (integration)", async (
     expect((await prepareSession(await makeSession(store), { addOnIds: [] })).provider).toBe("stripe");
     await db.checkoutQuote.deleteMany({ where: { session: { storeId: store.id } } });
 
-    // More Whop failures change nothing more; Stripe failures reaching the threshold → Shopify.
+    // More Whop failures change nothing more; Stripe failing too never sends buyers to Shopify.
     await noteCheckoutFailure(store.id, "whop");
     expect((await db.store.findUniqueOrThrow({ where: { id: store.id } })).fallbackActiveAt).toBeNull();
     const { withFailureSource } = await import("@/lib/checkout");
     for (let i = 0; i < 3; i++) await journalCheckoutFailure(await makeSession(store), "prepare", withFailureSource(new Error(`Stripe 500 #${i}`), "stripe"));
     s = await db.store.findUniqueOrThrow({ where: { id: store.id } });
-    expect(s.fallbackActiveAt).not.toBeNull();
-    expect(s.fallbackReason).toContain("Stripe");
+    expect(s.fallbackActiveAt).toBeNull();
   });
 
-  it("store level without a usable Stripe: Shopify's checkout as before", async () => {
+  it("store level without a usable Stripe: never Shopify's checkout", async () => {
     const store = await makeStore({ ...whopOn, autoFallback: true });
     for (let i = 0; i < 3; i++) await journalCheckoutFailure(await makeSession(store), "prepare", new Error("Whop 503"));
     const s = await db.store.findUniqueOrThrow({ where: { id: store.id } });
-    expect([s.providerFailoverAt, s.fallbackActiveAt != null]).toEqual([null, true]);
+    expect([s.providerFailoverAt, s.fallbackActiveAt]).toEqual([null, null]);
   });
 
   it("recovery probe: the primary answering clears providerFailoverAt; still failing keeps it", async () => {

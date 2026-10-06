@@ -363,7 +363,7 @@ export default async function StripePage({ params, searchParams }: { params: Pro
         icon={Route}
         iconColor="#635BFF"
         title="Mode de paiement"
-        description="Quel processeur encaisse en premier. Le secours ne sert que si le premier ne répond plus ; en dernier recours, vos clients passent par le checkout Shopify."
+        description="Quel processeur encaisse en premier. Le secours ne sert que si le premier ne répond plus. Vos clients restent toujours sur votre checkout, jamais celui de Shopify."
         className="mb-6"
       >
         {store.providerFailoverAt && (
