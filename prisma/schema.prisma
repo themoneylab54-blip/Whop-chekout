@@ -106,6 +106,13 @@ model Store {
   shopifyAccessToken  String? // encrypted, offline token
   shopifyScopes       String?
   shopifyOauthState   String?
+  // Reconnection in progress (migration 0042): the shop / app credentials typed in the form wait here
+  // until Shopify's callback proves them (valid signature + token exchange); only then do they replace
+  // the active ones, so a wrong secret never breaks the working connection. Cleared on any outcome.
+  shopifyPendingShopDomain   String?
+  shopifyPendingClientId     String?
+  shopifyPendingClientSecret String? // encrypted
+  shopifyPendingAt           DateTime?
   shopCurrency        String    @default("EUR")
   // Primary storefront host (custom domain), used to validate return URLs
   storefrontHost      String?

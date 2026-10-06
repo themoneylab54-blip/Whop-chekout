@@ -1097,3 +1097,37 @@ describe("ExpressCheckout lock", () => {
     expect(screen.getByTestId("wc-paypal-express").closest("[inert]")).toBeNull();
   });
 });
+
+describe("PaymentPanel: no shipping to the chosen country", () => {
+  const failed = (noShipping: boolean) =>
+    h(PaymentPanel, {
+      prepared: null,
+      preparing: false,
+      prepareError: L.noShipping,
+      noShipping,
+      errorRef: "ref123",
+      onRetry: () => undefined,
+      theme,
+      labels: L,
+      payLabel: "Payer",
+      returnUrl: "https://x.test/merci",
+      testMode: false,
+      confirm: async () => ({ ok: true as const, buyer }),
+      onPaid: () => undefined,
+    });
+
+  it("says we don't ship there and to pick another country, with nothing to retry", () => {
+    const { container } = render(failed(true));
+    expect(container.textContent).toContain(L.noShipping);
+    expect(container.textContent).toContain(L.chooseShippableCountry);
+    expect(container.textContent).not.toContain(L.paymentUnavailable);
+    expect(container.textContent).not.toContain(L.retry);
+    expect(container.textContent).not.toContain("ref123");
+  });
+
+  it("any other failure keeps the generic title and the retry button", () => {
+    const { container } = render(failed(false));
+    expect(container.textContent).toContain(L.paymentUnavailable);
+    expect(container.textContent).toContain(L.retry);
+  });
+});

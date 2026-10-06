@@ -122,13 +122,11 @@ describe("3 · card stars floored: « 5★ uniquement » excludes a 4.5", () => 
 });
 
 describe("4 · changing the Shopify domain forgets the Judge.me token", () => {
-  it("the domainChanged reset clears judgemeApiToken", () => {
-    const src = readFileSync(new URL("../src/app/dashboard/actions.ts", import.meta.url), "utf8");
-    const start = src.indexOf("export async function startShopifyInstallAction");
-    const body = src.slice(start, src.indexOf("export async function", start + 10));
-    const from = body.indexOf("...(domainChanged");
-    const reset = body.slice(from, body.indexOf(": {}", from));
-    expect(reset).toContain("shopifyAccessToken: null");
+  it("the domainChanged reset (applied by the OAuth callback once the new shop is proven) clears judgemeApiToken", () => {
+    const src = readFileSync(new URL("../src/app/api/shopify/callback/route.ts", import.meta.url), "utf8");
+    const from = src.indexOf("...(domainChanged");
+    const reset = src.slice(from, src.indexOf(": {}", from));
+    expect(reset).toContain("enabled: false");
     expect(reset).toContain("judgemeApiToken: null");
   });
 });

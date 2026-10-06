@@ -1,7 +1,11 @@
 import type { Metadata } from "next";
-import { AlertTriangle, ArrowRight, Blocks, CheckCircle2, PackagePlus } from "lucide-react";
+import { Suspense } from "react";
+import { AlertTriangle, ArrowRight, Blocks, CheckCircle2, CircleHelp, Loader2, PackagePlus, XCircle } from "lucide-react";
+import type { Store } from "@prisma/client";
 import { notFound } from "next/navigation";
 import { DirtyForm } from "@/components/dashboard/DirtyForm";
+import { ShopifyConnectFields } from "@/components/dashboard/ShopifyConnectFields";
+import { shopifyLiveState } from "@/lib/shopify-status";
 import { requireStoreAccess, roleCan } from "@/lib/access";
 import { OwnerOnlyNote } from "@/components/dashboard/OwnerOnly";
 import { db } from "@/lib/db";
@@ -12,7 +16,7 @@ import { CopyField } from "@/components/dashboard/CopyField";
 import { ConfirmButton } from "@/components/dashboard/ConfirmButton";
 import { formatDate } from "@/components/dashboard/format";
 import { tzOf } from "@/lib/time";
-import { disconnectShopifyAction, saveOfferMergeAction, startShopifyInstallAction } from "../../../../actions";
+import { disconnectShopifyAction, reinstallScriptAction, saveOfferMergeAction, startShopifyInstallAction } from "../../../../actions";
 
 export const metadata: Metadata = { title: "Shopify" };
 
@@ -21,7 +25,7 @@ export default async function ShopifyPage({
   searchParams,
 }: {
   params: Promise<{ storeId: string }>;
-  searchParams: Promise<{ ok?: string; error?: string; connected?: string; edit?: string }>;
+  searchParams: Promise<{ ok?: string; error?: string; connected?: string; reenabled?: string; edit?: string; reason?: string }>;
 }) {
   const { storeId } = await params;
   const { user } = await requireStoreAccess(storeId, "view");
@@ -36,7 +40,20 @@ export default async function ShopifyPage({
   return (
     <>
       <PageHeader brand="shopify" title="Shopify" description="Votre boutique, où les commandes payées sont créées automatiquement." />
-      <Flash ok={sp.connected ? "Boutique connectée et script installé automatiquement." : sp.ok} error={sp.error} />
+      <Flash
+        ok={sp.connected ? `Boutique connectée et script installé automatiquement.${sp.reenabled ? " Le checkout, coupé par la désinstallation de l'app, est réactivé." : ""}` : sp.ok}
+        error={sp.error}
+      />
+
+      {connected && !store.enabled && (
+        <div className="mb-6 flex flex-wrap items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800" data-testid="checkout-off">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+          <span className="min-w-0 flex-1">Checkout désactivé : vos clients passent par le checkout Shopify. Activez-le depuis la vue d&apos;ensemble de la boutique.</span>
+          <a href={`/dashboard/stores/${store.id}`} className={buttonClass("secondary", "sm")}>
+            Activer le checkout
+          </a>
+        </div>
+      )}
 
       {connected && (
         <Card
@@ -71,10 +88,15 @@ export default async function ShopifyPage({
                 </span>
               </li>
             )}
-            <li className="flex items-start gap-2">
-              {store.scriptTagId ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" /> : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />}
-              {store.scriptTagId ? "Script d'interception installé sur la boutique" : "Script non installé — voir l'onglet Interception"}
-            </li>
+            <Suspense
+              fallback={
+                <li className="flex items-start gap-2 text-zinc-500">
+                  <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" aria-hidden /> Vérification du script sur la boutique…
+                </li>
+              }
+            >
+              <LiveStatus store={store} isOwner={isOwner} />
+            </Suspense>
             {store.storefrontHost && (
               <li className="flex items-start gap-2">
                 <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" /> Domaine de la vitrine : {store.storefrontHost}
@@ -174,35 +196,22 @@ export default async function ShopifyPage({
               <OwnerOnlyNote>seul le propriétaire peut enregistrer les identifiants de l&apos;app Shopify et installer la connexion.</OwnerOnlyNote>
             ) : (
             <DirtyForm label="Connexion Shopify" action={startShopifyInstallAction.bind(null, store.id)} className="space-y-4">
-              <div>
-                <Label htmlFor="shopDomain" hint="L'adresse en .myshopify.com (Paramètres → Domaines)">
-                  Domaine de la boutique
-                </Label>
-                <Input id="shopDomain" name="shopDomain" placeholder="ma-boutique.myshopify.com" defaultValue={store.shopDomain ?? ""} required />
-              </div>
-              <div>
-                <Label htmlFor="clientId">Client ID</Label>
-                <Input id="clientId" name="clientId" defaultValue={store.shopifyClientId ?? ""} required autoComplete="off" />
-              </div>
-              <div>
-                <Label htmlFor="clientSecret" hint={store.shopifyClientSecret ? "Laissez vide pour garder le secret enregistré" : undefined}>
-                  Client secret
-                </Label>
-                <Input
-                  id="clientSecret"
-                  name="clientSecret"
-                  type="password"
-                  autoComplete="off"
-                  required={!store.shopifyClientSecret}
-                  placeholder={store.shopifyClientSecret ? "••••••••••••" : ""}
-                />
-              </div>
+              <ShopifyConnectFields
+                defaultShop={store.shopDomain ?? store.shopifyPendingShopDomain ?? ""}
+                defaultClientId={store.shopifyClientId ?? store.shopifyPendingClientId ?? ""}
+                secretMismatch={sp.reason === "hmac"}
+                knownShopDomain={store.shopDomain}
+                storefrontHost={store.storefrontHost}
+                activeClientId={store.shopifyClientId}
+                hasStoredSecret={!!store.shopifyClientSecret}
+              />
               <SubmitButton className="w-full">
                 Enregistrer et installer sur Shopify <ArrowRight className="h-4 w-4" />
               </SubmitButton>
               <p className="text-xs text-zinc-500">
                 Le secret est chiffré (AES-256) avant d&apos;être enregistré. Après approbation, le script d&apos;interception est installé
                 automatiquement : aucune modification du thème n&apos;est nécessaire.
+                {connected && " Tant que Shopify n'a pas validé les nouveaux identifiants, la connexion actuelle reste en place."}
               </p>
             </DirtyForm>
             )}
@@ -210,5 +219,54 @@ export default async function ShopifyPage({
         </div>
       )}
     </>
+  );
+}
+
+/**
+ * What Shopify itself says (not our database): token still accepted, loader still among the shop's
+ * script tags. Streamed (Suspense): a slow Shopify never holds the page; 3 s at most, then « inconnu ».
+ */
+async function LiveStatus({ store, isOwner }: { store: Store; isOwner: boolean }) {
+  const state = await shopifyLiveState(store);
+  if (state === "active") {
+    return (
+      <li className="flex items-start gap-2" data-live-state="active">
+        <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" /> Script actif sur la boutique
+      </li>
+    );
+  }
+  if (state === "script_missing") {
+    return (
+      <li className="flex flex-wrap items-start gap-2" data-live-state="script_missing">
+        <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" />
+        <span className="min-w-0 flex-1 text-red-700">Script absent de la boutique : vos clients ne sont pas redirigés vers le checkout.</span>
+        <form action={reinstallScriptAction.bind(null, store.id)}>
+          <input type="hidden" name="from" value="shopify" />
+          <SubmitButton variant="secondary" size="sm">
+            Réinstaller le script
+          </SubmitButton>
+        </form>
+      </li>
+    );
+  }
+  if (state === "revoked") {
+    return (
+      <li className="flex flex-wrap items-start gap-2" data-live-state="revoked">
+        <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" />
+        <span className="min-w-0 flex-1 text-red-700">
+          Accès Shopify révoqué : l&apos;app a été désinstallée ou son accès retiré, le script ne tourne plus et les commandes ne sont plus créées.
+        </span>
+        {isOwner && (
+          <a href="?edit=1" className={buttonClass("secondary", "sm")}>
+            Reconnecter
+          </a>
+        )}
+      </li>
+    );
+  }
+  return (
+    <li className="flex items-start gap-2 text-zinc-600" data-live-state="unknown">
+      <CircleHelp className="mt-0.5 h-4 w-4 shrink-0 text-zinc-400" /> État inconnu : Shopify ne répond pas pour le moment (rechargez la page pour vérifier à nouveau).
+    </li>
   );
 }

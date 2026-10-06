@@ -21,7 +21,10 @@ import {
   type Layout,
   type Theme,
 } from "@/lib/layout";
-import { ensureScriptTag, installUrl, normalizeShopDomain, removeScriptTag } from "@/lib/shopify";
+import { ensureScriptTag, ensureUninstallWebhook, installUrl, removeScriptTag } from "@/lib/shopify";
+import { clearDisabledByUninstall } from "@/lib/shopify-uninstall";
+import { MIN_CLIENT_SECRET_LENGTH, resolveShopDomainInput, SECRET_TOO_SHORT } from "@/lib/shopify-connect";
+import { clearShopifyStatus } from "@/lib/shopify-status";
 import { OPTIONAL_PAYMENT_METHOD_IDS, refundPayment, registerApplePayDomain, setupWhop, setWhopCustomerEmails, statementDescriptor, teardownWhop } from "@/lib/whop";
 import { testConversions } from "@/lib/conversions";
 import { draftDesign, hasPublished, publishedDesign, sameDesign } from "@/lib/design";
@@ -397,6 +400,8 @@ export async function setEnabledAction(storeId: string, enabled: boolean) {
     back(storePath(storeId), { error: "Connectez Shopify et un moyen de paiement (Whop ou Stripe) avant d'activer le checkout." });
   }
   await db.store.update({ where: { id: storeId }, data: { enabled } });
+  // The merchant decided: a later Shopify reconnection never switches the checkout on by itself.
+  await clearDisabledByUninstall(storeId);
   // Charts show the hours the checkout was off (sales on Shopify's checkout, outside these figures).
   await recordCheckoutEnabled(storeId, store.enabled, enabled, enabled ? null : "Checkout désactivé à la main");
   revalidatePath(storePath(storeId), "layout");
@@ -412,37 +417,42 @@ export async function setEnabledAction(storeId: string, enabled: boolean) {
 export async function startShopifyInstallAction(storeId: string, fd: FormData) {
   const store = await getStore(storeId, "owner");
   const path = storePath(storeId, "shopify");
-  const shop = normalizeShopDomain(str(fd, "shopDomain"));
-  if (!shop) back(path, { error: "Domaine invalide : utilisez l'adresse en .myshopify.com", field: "shopDomain" });
+  // The storefront's own domain (colandcie.com) is mapped to the shop's known .myshopify.com address.
+  const resolved = resolveShopDomainInput(str(fd, "shopDomain"), store);
+  if (!resolved.ok) back(path, { error: resolved.error, field: "shopDomain" });
+  const shop = resolved.shop;
 
   const clientId = str(fd, "clientId") || store.shopifyClientId || "";
   const clientSecret = str(fd, "clientSecret");
   if (!clientId) back(path, { error: "Client ID manquant", field: "clientId" });
-  if (!clientSecret && !store.shopifyClientSecret) back(path, { error: "Client secret manquant", field: "clientSecret" });
+  // A blank secret reuses the stored one, only for the same app: another Client ID needs its own secret.
+  const reuseSecret = !clientSecret && !!store.shopifyClientSecret && clientId === store.shopifyClientId;
+  if (!clientSecret && !reuseSecret) {
+    back(path, {
+      error: store.shopifyClientSecret ? "Nouveau Client ID : collez aussi le Client secret de cette app (Dev Dashboard → votre app → Settings)." : "Client secret manquant",
+      field: "clientSecret",
+    });
+  }
+  if (clientSecret && clientSecret.length < MIN_CLIENT_SECRET_LENGTH) back(path, { error: SECRET_TOO_SHORT, field: "clientSecret" });
 
   const other = await db.store.findFirst({ where: { shopDomain: shop, NOT: { id: storeId } } });
   if (other) back(path, { error: `${shop} est déjà connectée à la boutique « ${other.name} ».`, field: "shopDomain" });
 
-  const encryptedSecret = clientSecret ? encryptOrBack(clientSecret, path) : null;
+  const encryptedSecret = reuseSecret ? store.shopifyClientSecret! : encryptOrBack(clientSecret, path);
   const state = `${storeId}.${randomToken()}`;
-  const domainChanged = store.shopDomain && store.shopDomain !== shop;
-  if (domainChanged && store.scriptTagId && store.shopifyAccessToken) {
-    await removeScriptTag(store, store.scriptTagId).catch(() => undefined);
-  }
+  // Nothing active changes here: the shop and credentials wait as « pending » until Shopify's callback
+  // proves them (signature + token exchange). A wrong secret or an abandoned approval then leaves the
+  // working connection (token, script, checkout) exactly as it was.
   await db.store.update({
     where: { id: storeId },
     data: {
-      shopDomain: shop,
-      shopifyClientId: clientId,
-      ...(encryptedSecret ? { shopifyClientSecret: encryptedSecret } : {}),
+      shopifyPendingShopDomain: shop,
+      shopifyPendingClientId: clientId,
+      shopifyPendingClientSecret: encryptedSecret,
+      shopifyPendingAt: new Date(),
       shopifyOauthState: state,
-      ...(domainChanged
-        ? // The Judge.me token belongs to the previous shop's .myshopify.com domain: forgotten with it.
-          { shopifyAccessToken: null, scriptTagId: null, shopifyConnectedAt: null, enabled: false, storefrontHost: null, judgemeApiToken: null }
-        : {}),
     },
   });
-  if (domainChanged) await recordCheckoutEnabled(storeId, store.enabled, false, "Boutique Shopify changée");
   redirect(installUrl(shop, clientId, state));
 }
 
@@ -456,20 +466,27 @@ export async function disconnectShopifyAction(storeId: string) {
     // The Judge.me token is tied to this shop's .myshopify.com domain: forgotten with it.
     data: { shopifyAccessToken: null, scriptTagId: null, shopifyConnectedAt: null, shopifyScopes: null, enabled: false, judgemeApiToken: null },
   });
+  clearShopifyStatus(storeId);
+  await clearDisabledByUninstall(storeId);
   await recordCheckoutEnabled(storeId, store.enabled, false, "Shopify déconnecté");
   revalidatePath(storePath(storeId), "layout");
   back(storePath(storeId, "shopify"), { ok: "Boutique déconnectée et script retiré." });
 }
 
-export async function reinstallScriptAction(storeId: string) {
+export async function reinstallScriptAction(storeId: string, fd?: FormData) {
   const store = await getStore(storeId);
+  // Sent from the Shopify page (live status) or the Interception page: back where it came from.
+  const path = storePath(storeId, fd?.get("from") === "shopify" ? "shopify" : "interception");
+  clearShopifyStatus(storeId);
   try {
     const scriptTagId = await ensureScriptTag(store);
     await db.store.update({ where: { id: storeId }, data: { scriptTagId } });
+    // Stores connected before the uninstall webhook existed get it here (best effort).
+    await ensureUninstallWebhook(store).catch((err) => log.warn("shopify.webhook_register_failed", "Could not subscribe to APP_UNINSTALLED", { storeId, err }));
   } catch (err) {
-    back(storePath(storeId, "interception"), { error: errorMessage(err) });
+    back(path, { error: errorMessage(err) });
   }
-  back(storePath(storeId, "interception"), { ok: "Script vérifié et installé sur la boutique" });
+  back(path, { ok: "Script vérifié et installé sur la boutique" });
 }
 
 /* ------------------------------------------------------------------ */

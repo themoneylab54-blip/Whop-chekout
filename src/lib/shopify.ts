@@ -42,17 +42,7 @@ export function disputeTag(provider: PaymentGatewayProvider | null | undefined):
 /* OAuth                                                               */
 /* ------------------------------------------------------------------ */
 
-const SHOP_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/;
-
-export function normalizeShopDomain(input: string): string | null {
-  const d = input
-    .trim()
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/\/.*$/, "");
-  const full = d.includes(".") ? d : `${d}.myshopify.com`;
-  return SHOP_DOMAIN.test(full) ? full : null;
-}
+export { normalizeShopDomain } from "./shopify-connect";
 
 export function oauthCallbackUrl() {
   return `${env.appUrl}/api/shopify/callback`;
@@ -79,6 +69,16 @@ export function verifyOauthHmac(query: URLSearchParams, clientSecret: string): b
     .join("&");
   const digest = createHmac("sha256", clientSecret).update(message).digest("hex");
   return safeEqual(digest, hmac);
+}
+
+/**
+ * Verifies a Shopify webhook (X-Shopify-Hmac-Sha256: base64 HMAC-SHA256 of the raw body with the
+ * app's client secret).
+ */
+export function verifyWebhookHmac(rawBody: string, hmacHeader: string | null, clientSecret: string): boolean {
+  if (!hmacHeader) return false;
+  const digest = createHmac("sha256", clientSecret).update(rawBody, "utf8").digest("base64");
+  return safeEqual(digest, hmacHeader.trim());
 }
 
 export async function exchangeCodeForToken(shop: string, clientId: string, clientSecret: string, code: string) {
@@ -241,6 +241,35 @@ export async function removeScriptTag(store: ConnectedStore, id: string) {
     { id },
   );
   assertNoUserErrors(data.scriptTagDelete.userErrors, "Suppression du script");
+}
+
+/** Where Shopify sends this app's webhooks (app/uninstalled). */
+export function shopifyWebhookUrl() {
+  return `${env.appUrl}/api/webhooks/shopify`;
+}
+
+/**
+ * Subscribes the shop to APP_UNINSTALLED (or reuses the subscription already there), so an
+ * uninstall disconnects the store at once instead of leaving a dead token and a missing script.
+ * Returns the subscription gid.
+ */
+export async function ensureUninstallWebhook(store: ConnectedStore): Promise<string> {
+  const uri = shopifyWebhookUrl();
+  const existing = await shopifyGraphql<{ webhookSubscriptions: { nodes: { id: string; uri: string }[] } }>(
+    store,
+    `query { webhookSubscriptions(first: 25, topics: [APP_UNINSTALLED]) { nodes { id uri } } }`,
+  );
+  const found = existing.webhookSubscriptions.nodes.find((n) => n.uri === uri);
+  if (found) return found.id;
+  const data = await shopifyGraphql<{
+    webhookSubscriptionCreate: { webhookSubscription: { id: string } | null; userErrors: { field: string[]; message: string }[] };
+  }>(
+    store,
+    `mutation($sub: WebhookSubscriptionInput!) { webhookSubscriptionCreate(topic: APP_UNINSTALLED, webhookSubscription: $sub) { webhookSubscription { id } userErrors { field message } } }`,
+    { sub: { uri, format: "JSON" } },
+  );
+  assertNoUserErrors(data.webhookSubscriptionCreate.userErrors, "Abonnement au webhook de désinstallation");
+  return data.webhookSubscriptionCreate.webhookSubscription!.id;
 }
 
 /* ------------------------------------------------------------------ */

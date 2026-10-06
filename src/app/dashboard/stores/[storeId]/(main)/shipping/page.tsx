@@ -272,7 +272,7 @@ function RateForm({
         <Label htmlFor={id("countries")} hint="Aucun pays sélectionné = livraison dans tous les pays.">
           Pays livrés
         </Label>
-        <CountryMultiSelect id={id("countries")} name="countries" defaultValue={rate?.countries ?? ["FR"]} />
+        <CountryMultiSelect id={id("countries")} name="countries" defaultValue={rate?.countries ?? []} />
       </div>
       <label htmlFor={id("active")} className="flex min-h-9 items-center gap-2 text-sm">
         <input id={id("active")} type="checkbox" name="active" defaultChecked={rate?.active ?? true} className="h-4 w-4 accent-indigo-600" /> Proposé au checkout

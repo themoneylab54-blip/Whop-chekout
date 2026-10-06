@@ -230,7 +230,9 @@ describe("express row before the first /prepare answers", () => {
     await sleep(50);
     expect(screen.queryByTestId("wc-express")).toBeNull();
     const row = screen.getByTestId("wc-express-unavailable");
-    expect(row.textContent).toContain(L.paymentUnavailable);
+    // "No shipping to this country" says so (never a vague "payment unavailable").
+    expect(row.textContent).toContain(L.noShipping);
+    expect(row.textContent).not.toContain(L.paymentUnavailable);
     // The row's height kept (two rows on a phone, as reserved next to PayPal), the heading and "OR" as before.
     expect(row.querySelector(".min-h-\\[104px\\].sm\\:min-h-12")).toBeTruthy();
     expect(row.textContent).toContain(L.or);
@@ -245,7 +247,19 @@ describe("express row before the first /prepare answers", () => {
     render(page({ initialProvider: "stripe", initialPaypal: false }));
     await sleep(50);
     expect(screen.queryByTestId("wc-stripe-express-placeholder")).toBeNull();
-    expect(screen.getByTestId("wc-express-unavailable").textContent).toContain(L.paymentUnavailable);
+    expect(screen.getByTestId("wc-express-unavailable").textContent).toContain(L.noShipping);
+  });
+
+  it("a first prepare failing for another reason keeps the generic \"payment unavailable\" message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => (String(url).endsWith("/prepare") ? Promise.resolve(new Response(JSON.stringify({ error: "x", code: "out_of_stock" }), { status: 400 })) : new Promise(() => undefined))),
+    );
+    render(page());
+    await sleep(50);
+    const row = screen.getByTestId("wc-express-unavailable");
+    expect(row.textContent).toContain(L.paymentUnavailable);
+    expect(row.textContent).not.toContain(L.noShipping);
   });
 
   it("paying with Stripe: Stripe's row keeps its place until its PaymentIntent exists", () => {
@@ -301,7 +315,7 @@ describe("PayPal clicked before the checkout is prepared", () => {
     });
     expect(panel.paypal?.autoSubmit ?? false).toBe(false);
     const alert = screen.getByTestId("wc-express-unavailable").querySelector("[role=alert]");
-    expect(alert?.textContent).toBe(L.paymentUnavailable);
+    expect(alert?.textContent).toBe(L.noShipping);
   });
 
   it("the checkout comes back on Stripe (switched): the waiting click is dropped, no PayPal", async () => {

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
-import { Clock3, RefreshCw } from "lucide-react";
+import { Clock3, RefreshCw, Truck } from "lucide-react";
 import { WhopCheckoutEmbed, WhopExpressCheckoutButton, useCheckoutEmbedControls } from "@whop/checkout/react";
 import { EXPRESS_WALLETS, type ExpressWallet, type Theme } from "@/lib/layout";
 import { PAYPAL_AFTER_WINDOW_MS, PAYPAL_SERVER_IN_FLIGHT_MS } from "@/lib/paypal-timing";
@@ -211,6 +211,7 @@ export function ExpressCheckout({
   lock = null,
   stale = false,
   unavailable = false,
+  unavailableMessage,
   onWalletsShown,
 }: {
   prepared: Prepared | null;
@@ -220,6 +221,8 @@ export function ExpressCheckout({
    * checkout is dropped with that message said aloud (never silently).
    */
   unavailable?: boolean;
+  /** The inline message when `unavailable` (default: payment unavailable; e.g. a country not shipped to). */
+  unavailableMessage?: string;
   /**
    * The total is being re-priced (a change of rate, add-on, country or quantity not yet prepared):
    * the wallet buttons on screen charge the previous total, so they stay visible but locked until
@@ -334,7 +337,7 @@ export function ExpressCheckout({
   if (unavailable) {
     // Nothing was drawn up there (no PayPal, no wallet placeholder): nothing to keep either.
     if (visible.length === 0 && !paypal) return null;
-    return <ExpressUnavailable labels={labels} title={title} dividerLabel={dividerLabel} alert={paypalDropped} tall={reserveTwoRows} />;
+    return <ExpressUnavailable labels={labels} title={title} dividerLabel={dividerLabel} alert={paypalDropped} tall={reserveTwoRows} message={unavailableMessage} />;
   }
   if (resolved && shown.length === 0 && !paypal) return null;
   const cols = visible.length + (paypal ? 1 : 0);
@@ -515,7 +518,21 @@ export function StripeExpressPlaceholder({ labels, title, dividerLabel }: { labe
  * reserved) with a short message instead of the buttons, so nothing jumps. `alert`: a click was
  * waiting for that checkout (PayPal): the message is announced.
  */
-export function ExpressUnavailable({ labels, title, dividerLabel, alert = false, tall = false }: { labels: Labels; title?: string; dividerLabel?: string; alert?: boolean; tall?: boolean }) {
+export function ExpressUnavailable({
+  labels,
+  title,
+  dividerLabel,
+  alert = false,
+  tall = false,
+  message,
+}: {
+  labels: Labels;
+  title?: string;
+  dividerLabel?: string;
+  alert?: boolean;
+  tall?: boolean;
+  message?: string;
+}) {
   return (
     <section aria-label={title || labels.expressCheckout} data-testid="wc-express-unavailable">
       <p data-inline-field="title" className="mb-3 text-center text-xs font-medium tracking-wide text-neutral-600 uppercase">
@@ -526,7 +543,7 @@ export function ExpressUnavailable({ labels, title, dividerLabel, alert = false,
           alert ? "border-red-200 bg-red-50 text-red-800" : "border-neutral-300 text-neutral-700"
         }`}
       >
-        <p role={alert ? "alert" : undefined}>{labels.paymentUnavailable}</p>
+        <p role={alert ? "alert" : undefined}>{message ?? labels.paymentUnavailable}</p>
       </div>
       <Divider label={dividerLabel || labels.or} />
     </section>
@@ -609,6 +626,7 @@ export function PaymentPanel({
   onRetry,
   interacted = false,
   errorRef,
+  noShipping = false,
   paypal,
   onLockChange,
   inFlightAtLoad = false,
@@ -639,6 +657,11 @@ export function PaymentPanel({
   interacted?: boolean;
   /** Support reference (request id) of the failed load, shown discreetly. */
   errorRef?: string | null;
+  /**
+   * The failed load was "no shipping to this country": the buyer picks another country above (the
+   * page prepares again by itself), so no "payment unavailable" title and nothing to retry.
+   */
+  noShipping?: boolean;
   /** PayPal chosen from the express button: the PayPal-only checkout replaces the regular one. */
   paypal?: PanelPaypal;
   /** Reports the panel's lock (see PanelLock) so the express buttons can't start a second payment. */
@@ -1260,18 +1283,22 @@ export function PaymentPanel({
             className="flex min-h-[256px] flex-col items-center justify-center gap-3 px-6 py-8 text-center"
           >
             <span className="flex h-11 w-11 items-center justify-center rounded-full bg-neutral-100 text-neutral-600">
-              <Clock3 className="h-5 w-5" aria-hidden />
+              {noShipping ? <Truck className="h-5 w-5" aria-hidden /> : <Clock3 className="h-5 w-5" aria-hidden />}
             </span>
-            <p className="text-base font-semibold text-neutral-900">{labels.paymentUnavailable}</p>
+            <p className="text-base font-semibold text-neutral-900">{noShipping ? labels.noShipping : labels.paymentUnavailable}</p>
             <p className="max-w-[340px] text-sm leading-relaxed text-neutral-600">
-              {prepareError !== labels.errors.init_failed && prepareError !== labels.error ? prepareError : labels.paymentUnavailableHint}
+              {noShipping
+                ? labels.chooseShippableCountry
+                : prepareError !== labels.errors.init_failed && prepareError !== labels.error
+                  ? prepareError
+                  : labels.paymentUnavailableHint}
             </p>
-            {errorRef && (
+            {errorRef && !noShipping && (
               <p className="font-mono text-[11px] text-neutral-500">
                 {labels.reference} {errorRef.slice(0, 8)}
               </p>
             )}
-            {onRetry && (
+            {onRetry && !noShipping && (
               <button
                 type="button"
                 onClick={onRetry}

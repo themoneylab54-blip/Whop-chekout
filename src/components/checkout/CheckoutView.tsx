@@ -793,6 +793,8 @@ export function CheckoutView({
   const [prepareError, setPrepareError] = useState<string | null>(null);
   // Support reference of the last failed prepare (x-request-id), shown discreetly.
   const [prepareRef, setPrepareRef] = useState<string | null>(null);
+  // The last failed /prepare was "no shipping to this country": the buyer changes the country, nothing to retry.
+  const [prepareNoShipping, setPrepareNoShipping] = useState(false);
   // Bumped by "Try again" to prepare the Whop checkout again without reloading.
   const [retryKey, setRetryKey] = useState(0);
   // The thank-you page (set below once known): a prepare answering "already paid" goes there.
@@ -1160,13 +1162,15 @@ export function CheckoutView({
           if (body?.code === "payment_in_flight") setInFlightAtLoad(true);
           if (!res.ok) {
             // Whop unavailable: the payment section's « paiement indisponible / réessayer » state.
-            const err = new Error(body?.code === "whop_unavailable" ? L.errors.init_failed : errorText(L, body)) as Error & { retry?: boolean; ref?: string | null };
+            const err = new Error(body?.code === "whop_unavailable" ? L.errors.init_failed : errorText(L, body)) as Error & { retry?: boolean; ref?: string | null; code?: string };
             err.retry = prepareRetryable(res.status, body?.code);
+            err.code = typeof body?.code === "string" ? body.code : undefined;
             err.ref = (typeof body?.requestId === "string" && body.requestId) || res.headers.get("x-request-id");
             throw err;
           }
           setPrepareError(null);
           setPrepareRef(null);
+          setPrepareNoShipping(false);
           // PayPal refused for this session in this currency (see the PayPal prepare below): stays hidden here.
           const offered = body.paypal !== false && !paypalRefused.current.has(chargeCurrencyRef.current);
           setPaypalOffered(offered);
@@ -1199,6 +1203,7 @@ export function CheckoutView({
           }
           setPrepareError(err instanceof Error && err.message ? err.message : L.error);
           setPrepareRef((err as { ref?: string | null }).ref ?? null);
+          setPrepareNoShipping((err as { code?: string }).code === "no_shipping");
           break;
         }
       }
@@ -1887,7 +1892,10 @@ export function CheckoutView({
         // Before the first /prepare answers, the processor the server expects draws the row's place.
         if (mode.kind === "live" && (prepared ? prepared.provider === "stripe" : initialProvider === "stripe")) {
           if (!stripeExpressAny(theme.expressMethods) || pickupSelected) return null;
-          if (firstFailed) return <ExpressUnavailable labels={L} title={block.props.title} dividerLabel={block.props.dividerLabel} />;
+          if (firstFailed)
+            return (
+              <ExpressUnavailable labels={L} title={block.props.title} dividerLabel={block.props.dividerLabel} message={prepareNoShipping ? L.noShipping : undefined} />
+            );
           if (!prepared) return <StripeExpressPlaceholder labels={L} title={block.props.title} dividerLabel={block.props.dividerLabel} />;
           return (
             <StripeExpress
@@ -1926,6 +1934,7 @@ export function CheckoutView({
             // A change of total not prepared yet: the wallet buttons on screen (old total) stay locked.
             stale={repricing}
             unavailable={firstFailed}
+            unavailableMessage={prepareNoShipping ? L.noShipping : undefined}
             wallets={!pickupSelected}
             // The merchant's wallets; Google Pay only when nothing ships unless set to "always"
             // (Whop's Google Pay express button collects no shipping address).
@@ -2385,6 +2394,7 @@ export function CheckoutView({
                 }}
                 interacted={interacted}
                 errorRef={prepareRef}
+                noShipping={prepareNoShipping}
                 onLockChange={setPanelLock}
                 inFlightAtLoad={inFlightAtLoad}
                 checkPaid={checkPaid}
@@ -2416,6 +2426,7 @@ export function CheckoutView({
                 }}
                 interacted={interacted}
                 errorRef={prepareRef}
+                noShipping={prepareNoShipping}
                 onLockChange={setPanelLock}
                 paypal={{
                   active: paypalActive,

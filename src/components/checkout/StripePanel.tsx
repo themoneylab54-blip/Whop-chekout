@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Clock3, RefreshCw } from "lucide-react";
+import { Clock3, RefreshCw, Truck } from "lucide-react";
 // The "pure" entry point: Stripe.js is only fetched when loadStripe is called (a Stripe checkout on
 // screen), never injected on import (every Whop checkout would otherwise download it).
 import { loadStripe } from "@stripe/stripe-js/pure";
@@ -241,6 +241,8 @@ type PanelProps = {
   onRetry?: () => void;
   interacted?: boolean;
   errorRef?: string | null;
+  /** The failed load was "no shipping to this country" (see PaymentPanel.noShipping). */
+  noShipping?: boolean;
   onLockChange?: (lock: PanelLock) => void;
   inFlightAtLoad?: boolean;
   checkPaid?: () => Promise<PaidCheck>;
@@ -340,6 +342,7 @@ function StripeForm({
   onRetry,
   interacted = false,
   errorRef,
+  noShipping = false,
   onLockChange,
   inFlightAtLoad = false,
   checkPaid,
@@ -510,18 +513,22 @@ function StripeForm({
         {prepareError && !ready ? (
           <div role={interacted ? "alert" : "status"} className="flex min-h-[240px] flex-col items-center justify-center gap-3 px-6 py-8 text-center">
             <span className="flex h-11 w-11 items-center justify-center rounded-full bg-neutral-100 text-neutral-600">
-              <Clock3 className="h-5 w-5" aria-hidden />
+              {noShipping ? <Truck className="h-5 w-5" aria-hidden /> : <Clock3 className="h-5 w-5" aria-hidden />}
             </span>
-            <p className="text-base font-semibold text-neutral-900">{labels.paymentUnavailable}</p>
+            <p className="text-base font-semibold text-neutral-900">{noShipping ? labels.noShipping : labels.paymentUnavailable}</p>
             <p className="max-w-[340px] text-sm leading-relaxed text-neutral-600">
-              {prepareError !== labels.errors.init_failed && prepareError !== labels.error ? prepareError : labels.paymentUnavailableHint}
+              {noShipping
+                ? labels.chooseShippableCountry
+                : prepareError !== labels.errors.init_failed && prepareError !== labels.error
+                  ? prepareError
+                  : labels.paymentUnavailableHint}
             </p>
-            {errorRef && (
+            {errorRef && !noShipping && (
               <p className="font-mono text-[11px] text-neutral-500">
                 {labels.reference} {errorRef.slice(0, 8)}
               </p>
             )}
-            {onRetry && (
+            {onRetry && !noShipping && (
               <button
                 type="button"
                 onClick={onRetry}
