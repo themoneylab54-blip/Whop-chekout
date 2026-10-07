@@ -135,16 +135,17 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
   if (session.status === "PAID") redirect(`/c/${id}/merci${(await searchParams).via === "app" ? "?via=app" : ""}`);
 
   const { store } = session;
-  const [rates, storeAddOns, discountCount, overrides] = await Promise.all([
+  // One parallel round of reads (each serial query is time the buyer waits for the page).
+  const [rates, storeAddOns, discountCount, overrides, design] = await Promise.all([
     db.shippingRate.findMany({ where: { storeId: store.id, active: true }, orderBy: { position: "asc" } }),
     db.addOn.findMany({ where: { storeId: store.id, active: true }, orderBy: { position: "asc" } }),
     db.discountCode.count({ where: { storeId: store.id, active: true } }),
     // Checkout A/B tests (arm B): bump prices / visibility and the protection's pricing, as the quote prices them.
     overridesFor(session),
+    // A/B test: variant B sessions render the tested design.
+    designFor(store, session),
   ]);
   const addOns = withAddOnOverrides(storeAddOns, overrides);
-  // A/B test: variant B sessions render the tested design.
-  const design = await designFor(store, session);
   const storeTheme = loadTheme(design.theme, store.name);
   // The buyer's language (?lang=, their earlier choice, Accept-Language), else the store's.
   const theme = { ...storeTheme, language: await checkoutLang((await searchParams).lang, storeTheme.language) };

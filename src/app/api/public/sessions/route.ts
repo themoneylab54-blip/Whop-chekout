@@ -112,18 +112,36 @@ function refuse(status: number, error: string, reason: string, native = false) {
 
 /** Called by the storefront loader with the contents of /cart.js. */
 async function handle(req: Request) {
-  if (!(await rateLimit(`session:ip:${clientIp(req)}`, 20))) {
-    return refuse(429, "Trop de requêtes", "rate_limited");
+  const t0 = Date.now();
+  // Rate limit, store and a replay of this click in one database round trip (in parallel): every
+  // serial query here is time the buyer waits after clicking « Checkout ».
+  const raw = await readJson(req);
+  // The loader's warm-up when the buyer heads for « Checkout » (hover, touch, cart opened): this
+  // function and its database connection are awake (and the CORS preflight cached) before the
+  // click. Nothing created, no rate limit spent.
+  if (raw && typeof raw === "object" && (raw as { warm?: unknown }).warm === true) {
+    await db.$queryRaw`SELECT 1`.catch(() => undefined);
+    return json({ warm: true }, { cors: true });
   }
-  const parsed = bodySchema.safeParse(await readJson(req));
-  if (!parsed.success) return refuse(400, "Panier invalide", "invalid_body");
+  const allowed = rateLimit(`session:ip:${clientIp(req)}`, 20);
+  const parsed = bodySchema.safeParse(raw);
+  if (!parsed.success) {
+    if (!(await allowed)) return refuse(429, "Trop de requêtes", "rate_limited");
+    return refuse(400, "Panier invalide", "invalid_body");
+  }
   const { store: publicId, items, returnUrl, tracking, visitorId } = parsed.data;
   // Subscriptions (selling plans) and gift cards can't be sold here (no recurring billing, no gift
   // card issuing): the whole cart goes to Shopify's checkout.
   const unsupported = unsupportedCart(items);
+  const requestKey = parsed.data.requestKey ?? null;
+  const [ok, store, earlier] = await Promise.all([
+    allowed,
+    db.store.findUnique({ where: { publicId } }),
+    requestKey ? db.checkoutSession.findFirst({ where: { requestKey, store: { publicId } }, select: { id: true, visitorId: true } }) : null,
+  ]);
+  if (!ok) return refuse(429, "Trop de requêtes", "rate_limited");
   if (unsupported) return refuse(409, unsupported === "selling_plan" ? "Abonnement : checkout Shopify" : "Carte cadeau : checkout Shopify", unsupported, true);
 
-  const store = await db.store.findUnique({ where: { publicId } });
   // At least one processor able to take the payment (Whop and/or Stripe, under the store's mode).
   if (!store?.enabled || !store.shopifyConnectedAt || !anyProviderConnected(store) || store.fallbackActiveAt) {
     return refuse(409, "Checkout désactivé", "disabled", true);
@@ -133,14 +151,12 @@ async function handle(req: Request) {
 
   // Same click already handled: that session again (the first request may also still be running,
   // see the create below).
-  const requestKey = parsed.data.requestKey ?? null;
   const replay = async () => {
     if (!requestKey) return null;
     const done = await db.checkoutSession.findUnique({ where: { storeId_requestKey: { storeId: store.id, requestKey } }, select: { id: true, visitorId: true } });
     return done ? sessionResponse(checkoutBaseUrl(store), done, visitorId) : null;
   };
-  const replayed = await replay();
-  if (replayed) return replayed;
+  if (earlier) return sessionResponse(checkoutBaseUrl(store), earlier, visitorId);
 
   // Only accept return URLs on the shop itself, never an arbitrary redirect target.
   const allowedHosts = [store.shopDomain, store.storefrontHost].filter((h): h is string => !!h);
@@ -187,6 +203,8 @@ async function handle(req: Request) {
   lines = cart.lines;
   const { cartDiscounts, cartContext } = cart;
 
+  // A/B arms of this visitor, both at once.
+  const [variantArm, testArms] = await Promise.all([assignVariant(store.id, visitor.id), assignCheckoutTests(store.id, visitor.id)]);
   const session = await db.checkoutSession
     .create({
       data: {
@@ -207,8 +225,8 @@ async function handle(req: Request) {
         cartToken,
         ...(cartDiscounts ? { cartDiscounts: cartDiscounts as unknown as Prisma.InputJsonValue } : {}),
         ...(cartContext ? { cartContext: cartContext as unknown as Prisma.InputJsonValue } : {}),
-        ...(await assignVariant(store.id, visitor.id)),
-        ...(await assignCheckoutTests(store.id, visitor.id).then((arms) => (arms ? { checkoutTestArms: arms } : {}))),
+        ...variantArm,
+        ...(testArms ? { checkoutTestArms: testArms } : {}),
         requestKey,
       },
     })
@@ -232,6 +250,7 @@ async function handle(req: Request) {
   // page's first /prepare (same IP country and locale), which then reuses it (express buttons sooner).
   const ahead = { ipCountry: geoCountryOf(req.headers), acceptLanguage: req.headers.get("accept-language") };
   after(() => prepareAhead(session.id, ahead));
+  log.info("perf.session_created", "Checkout session created", { ms: Date.now() - t0, lines: lines.length });
   // The loader keeps the signed id in its cookie (the next checkout of this visitor gets the same arms).
   return json({ id: session.id, url: `${checkoutBaseUrl(store)}/c/${session.id}`, visitorId: visitor.token }, { cors: true });
 }

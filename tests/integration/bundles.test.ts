@@ -117,6 +117,15 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
     await db.store.deleteMany({ where: { id: { in: created } } });
   });
 
+  it("the loader's warm-up answers at once: no session, no rate limit spent", async () => {
+    const before = await db.checkoutSession.count();
+    const res = await post({ warm: true });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ warm: true });
+    expect(await db.checkoutSession.count()).toBe(before);
+    expect(await db.rateLimit.count({ where: { key: `session:ip:10.77.0.${ip}` } })).toBe(0);
+  });
+
   it("app line (hidden key) + personalization: properties and cart context on the order, cart fixed; a Cart Transform price with only a hidden key goes to Shopify", async () => {
     const store = await makeStore();
     await db.shippingRate.create({ data: { storeId: store.id, name: "Poste", countries: [], priceCents: 0 } });

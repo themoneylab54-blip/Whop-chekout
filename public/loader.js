@@ -414,7 +414,7 @@
     var timeout = new Promise(function (resolve) {
       setTimeout(function () {
         resolve(false);
-      }, 3000);
+      }, 1500);
     });
     domainPing = Promise.race([ping, timeout]).then(function (ok) {
       log(ok ? "checkout domain reachable" : "checkout domain unreachable, the app's API will be used");
@@ -479,6 +479,7 @@
   function goToCheckout(items, retried) {
     if (busy) return;
     busy = true;
+    var startedAt = Date.now();
     overlay(true);
     var cartPromise = items
       ? Promise.resolve({ items: items })
@@ -537,7 +538,8 @@
           }
           body.url = onAppHost(body.url);
           keepVisitorId(body.visitorId);
-          log("redirect", body.url);
+          log("redirect", body.url, "after", Date.now() - startedAt, "ms");
+          if (DEBUG) badge("Whop Checkout : session prête en " + (Date.now() - startedAt) + " ms", true);
           try {
             sessionStorage.setItem("whopco_pending", "1");
           } catch (e) {}
@@ -756,6 +758,45 @@
   document.addEventListener("click", onClick, true);
   document.addEventListener("submit", onSubmit, true);
 
+  /*
+   * Warm-up: when the buyer heads for the checkout (pointer over or touch on a checkout button, the
+   * cart opened, the cart page), the checkout's server and its connections are woken before the
+   * click: a cold server is most of the wait after it. At most once a minute, nothing created.
+   */
+  var warmedAt = 0;
+  var CART_OPENERS = ["a[href='/cart']", "a[href$='/cart']", "cart-icon", "[aria-controls*='cart' i]", "[data-cart-toggle]", "[href='#cart']"];
+  function preconnect(href) {
+    try {
+      var origin = new URL(href).origin;
+      if (document.querySelector("link[rel='preconnect'][href='" + origin + "']")) return;
+      var l = document.createElement("link");
+      l.rel = "preconnect";
+      l.href = origin;
+      l.crossOrigin = "anonymous";
+      document.head.appendChild(l);
+    } catch (e) {}
+  }
+  function warm() {
+    if (!config || !config.enabled || Date.now() - warmedAt < 60000) return;
+    warmedAt = Date.now();
+    var endpoint = config.sessionEndpoint || sessionsUrl();
+    preconnect(endpoint);
+    preconnect(API);
+    try {
+      fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"warm":true}', keepalive: true }).catch(function () {});
+    } catch (e) {}
+    log("warm-up sent");
+  }
+  function onIntent(e) {
+    if (!config || !config.enabled) return;
+    var t = e.target;
+    if (!(t instanceof Element)) return;
+    if (matches(t, checkoutSelectors()) || matches(t, BUY_NOW) || matches(t, CART_OPENERS) || genericCheckout(t)) warm();
+  }
+  document.addEventListener("pointerover", onIntent, { capture: true, passive: true });
+  document.addEventListener("touchstart", onIntent, { capture: true, passive: true });
+  document.addEventListener("focusin", onIntent, true);
+
   /* ---------------------------------------------------------------- */
   /* Debug overlay: ?whopco_debug=1                                    */
   /* ---------------------------------------------------------------- */
@@ -798,6 +839,7 @@
         return;
       }
       if (c && c.enabled) pingCheckoutDomain();
+      if (c && c.enabled && /^\/cart\/?$/.test(location.pathname)) warm();
       if (!DEBUG) return;
       if (!c.enabled) return badge("Whop Checkout : désactivé (checkout Shopify natif)", false);
       badge("Whop Checkout : interception active ✓", true);

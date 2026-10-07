@@ -505,3 +505,31 @@ describe("paypalChoiceReset (the checkout page ending the PayPal choice)", async
     expect(drop).not.toHaveProperty("error");
   });
 });
+
+describe("createCheckoutConfiguration: a refused method list isn't asked again", () => {
+  beforeEach(() => {
+    sdk.create.mockReset();
+    store.settings.clear();
+  });
+
+  it("after Whop refused the optional methods (422), the next checkout asks the working list first (one Whop call)", async () => {
+    const memoOpts = { ...opts, storeId: "memo_store" };
+    sdk.create.mockRejectedValueOnce(Object.assign(new Error("klarna not available"), { statusCode: 422 })).mockResolvedValueOnce(config(["card", "paypal"], "ch_memo_1"));
+    await createCheckoutConfiguration(whopStore, memoOpts);
+    expect(sdk.create).toHaveBeenCalledTimes(2);
+    sdk.create.mockReset().mockResolvedValueOnce(config(["card", "paypal"], "ch_memo_2"));
+    const res = await createCheckoutConfiguration(whopStore, { ...memoOpts, sessionId: "memo_2" });
+    expect(res.id).toBe("ch_memo_2");
+    expect(sdk.create).toHaveBeenCalledTimes(1);
+    expect(sdk.create.mock.calls[0][0].payment_method_configuration.enabled).not.toContain("klarna");
+  });
+
+  it("a timeout or a 5xx is never remembered: the next checkout asks the full list again", async () => {
+    const memoOpts = { ...opts, storeId: "memo_store_5xx" };
+    sdk.create.mockRejectedValueOnce(Object.assign(new Error("upstream"), { statusCode: 503 })).mockResolvedValueOnce(config(["card", "paypal"]));
+    await createCheckoutConfiguration(whopStore, memoOpts);
+    sdk.create.mockReset().mockResolvedValueOnce(config(["card", "paypal", "klarna"]));
+    await createCheckoutConfiguration(whopStore, { ...memoOpts, sessionId: "memo_3" });
+    expect(sdk.create.mock.calls[0][0].payment_method_configuration.enabled).toContain("klarna");
+  });
+});

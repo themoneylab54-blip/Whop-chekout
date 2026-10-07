@@ -475,6 +475,10 @@ export async function settleProductTitleSyncs(): Promise<void> {
   if (titleSyncs.size) await Promise.allSettled([...titleSyncs]);
 }
 
+/** Per instance: the first create attempt worth asking for a store (see createConfiguration). */
+const attemptMemo = new Map<string, { index: number; at: number }>();
+const ATTEMPT_MEMO_MS = 60 * 60_000;
+
 async function createConfiguration(
   client: Client,
   store: Pick<Store, "whopAccountId" | "whopProductId"> & { paymentMethods?: string[] },
@@ -532,12 +536,20 @@ async function createConfiguration(
   ];
   let config;
   let lastError: unknown;
-  for (const enabled of attempts) {
+  // The attempt that worked last time for this store and these methods: the refused ones before it
+  // aren't asked again for an hour (each refusal is a Whop round trip the buyer waits for).
+  const memoKey = `${opts.storeId}:${attempts.map((a) => a.join("+")).join("|")}`;
+  const memo = attemptMemo.get(memoKey);
+  const start = memo && Date.now() - memo.at < ATTEMPT_MEMO_MS ? memo.index : 0;
+  for (const [i, enabled] of attempts.entries()) {
+    if (i < start) continue;
     try {
       config = await client.checkoutConfigurations.create({
         ...base,
         payment_method_configuration: { enabled: enabled as (typeof CHECKOUT_PAYMENT_METHODS)[number][], include_platform_defaults: true },
       });
+      // Remembered only after a clear refusal of the methods (never a timeout or a 5xx).
+      if (i > start && isMethodRefusal(lastError)) attemptMemo.set(memoKey, { index: i, at: Date.now() });
       break;
     } catch (err) {
       lastError = err;
@@ -548,6 +560,7 @@ async function createConfiguration(
     // Last resort: the account's own defaults. A method problem must never block the sale.
     config = await client.checkoutConfigurations.create(base);
     usedFallback = true;
+    if (lastError && isMethodRefusal(lastError)) attemptMemo.set(memoKey, { index: attempts.length, at: Date.now() });
   }
   // What Whop will actually offer: report any requested method it dropped (once a day).
   const effective = config.effective_payment_method_configuration?.enabled;

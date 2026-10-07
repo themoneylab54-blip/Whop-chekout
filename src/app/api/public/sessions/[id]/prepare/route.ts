@@ -4,6 +4,7 @@ import { isForeignCheckoutHost } from "@/lib/checkout-domain-check";
 import { json, readJson } from "@/lib/http";
 import { failureResponse, journalCheckoutFailure, paymentPayload, prepareAfterClientFailure, prepareWithFailover, quoteSchema } from "@/lib/checkout";
 import { route } from "@/lib/route";
+import { log } from "@/lib/log";
 
 /** A processor slow to answer, then the other one tried in the same request: more than the default budget. */
 export const maxDuration = 60;
@@ -18,19 +19,25 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
   // The request's start: a wait for another request's checkout is bounded from it (prepareSession).
   const startedAt = Date.now();
   const { id } = await ctx.params;
-  if (!(await rateLimit(`prepare:ip:${clientIp(req)}`, 40)) || !(await rateLimit(`prepare:s:${id}`, 30))) return json({ error: "Trop de requêtes, réessayez dans une minute.", code: "rate_limited" }, { status: 429 });
-  const raw = await readJson(req);
+  // Both limits and the session read in one parallel round (serial queries are time the buyer waits).
+  const [byIp, bySession, raw, session] = await Promise.all([
+    rateLimit(`prepare:ip:${clientIp(req)}`, 40),
+    rateLimit(`prepare:s:${id}`, 30),
+    readJson(req),
+    db.checkoutSession.findUnique({ where: { id }, include: { store: true } }),
+  ]);
+  if (!byIp || !bySession) return json({ error: "Trop de requêtes, réessayez dans une minute.", code: "rate_limited" }, { status: 429 });
   const parsed = quoteSchema.safeParse(raw);
   if (!parsed.success) return json({ error: "Requête invalide" }, { status: 400 });
   // Stripe's form couldn't load in this browser (Stripe.js blocked, timed out or failed): the buyer
   // is switched to Whop when it is usable (prepareAfterClientFailure).
   const clientFailed = raw && typeof raw === "object" && (raw as { clientFailed?: unknown }).clientFailed === "stripe";
-  const session = await db.checkoutSession.findUnique({ where: { id }, include: { store: true } });
   // Another store's checkout domain never serves this session (see isForeignCheckoutHost).
   if (!session || (await isForeignCheckoutHost(req, session.store))) return json({ error: "Session introuvable" }, { status: 404 });
   try {
     const opts = { host: req.headers.get("host"), startedAt };
     const prepared = clientFailed ? await prepareAfterClientFailure(session, parsed.data, opts) : await prepareWithFailover(session, parsed.data, opts);
+    log.info("perf.prepare", "Checkout prepared", { sessionId: id, ms: Date.now() - startedAt, provider: prepared.provider });
     // `paypal`: whether Whop offers PayPal on this store's checkout (the express PayPal button hides otherwise).
     return json({ ...paymentPayload(prepared, session.store), totals: prepared.totals, paypal: prepared.paypal, method: parsed.data.method ?? null });
   } catch (err) {

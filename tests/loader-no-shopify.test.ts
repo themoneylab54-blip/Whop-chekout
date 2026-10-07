@@ -20,18 +20,23 @@ const settle = async () => {
 type Reply = { status: number; body: unknown };
 const sessions: Reply[] = [];
 let sessionCalls = 0;
+let warmCalls = 0;
 let releaseConfig: () => void = () => undefined;
 const configReady = new Promise<void>((r) => (releaseConfig = r));
 
 vi.stubGlobal(
   "fetch",
-  vi.fn(async (url: string) => {
+  vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url);
     if (u.includes("/config")) {
       await configReady;
       return new Response(JSON.stringify({ enabled: true, interception: { cartCheckout: true, cartDrawer: true, buyNow: true, customSelectors: "", excludedHandles: [] }, sessionEndpoint: `${API}/api/public/sessions` }));
     }
     if (u === "/cart.js") return new Response(JSON.stringify({ token: "t", items: [{ variant_id: 1, quantity: 1, handle: "jacket" }] }));
+    if (u.endsWith("/api/public/sessions") && init?.body === '{"warm":true}') {
+      warmCalls++;
+      return new Response(JSON.stringify({ warm: true }));
+    }
     if (u.endsWith("/api/public/sessions")) {
       sessionCalls++;
       const next = sessions.shift() ?? { status: 500, body: { error: "x" } };
@@ -94,5 +99,15 @@ describe("loader: never Shopify's checkout on a failure", () => {
     await settle();
     expect(sessionCalls).toBe(5);
     expect(errorShown()).toBe(false);
+  });
+
+  it("heading for the checkout (pointer over its button) wakes the server once, before the click", async () => {
+    const over = () => document.getElementById("checkout-btn")!.dispatchEvent(new Event("pointerover", { bubbles: true }));
+    over();
+    over();
+    await settle();
+    expect(warmCalls).toBe(1);
+    expect(sessionCalls).toBe(5);
+    expect(document.querySelector("link[rel='preconnect'][href='https://app.example.com']")).toBeTruthy();
   });
 });
