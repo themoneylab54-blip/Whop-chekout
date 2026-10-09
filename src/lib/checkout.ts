@@ -256,22 +256,30 @@ async function giftLinesFor(session: SessionWithStore, earned: GiftTier[]): Prom
 
 /** A limited Shopify code whose uses (Shopify's count + this app's ledger) reached its limit. */
 const DISCOUNT_EXHAUSTED = "Ce code promo a atteint sa limite d'utilisation";
+const NOT_COMBINABLE = "Ce code ne se cumule pas avec les remises déjà appliquées : la remise la plus avantageuse est conservée";
+
+/** A code looked up for this cart: the discount it gives, or why it doesn't apply. */
+type CodeTry =
+  | { ok: true; discount: DiscountInput; source: "app" | "shopify"; shopifyCode: ShopifyCodeDiscount | null }
+  | { ok: false; error: string; errorCode: string };
 
 export async function quoteSession(session: SessionWithStore, input: QuoteInput): Promise<Quote> {
-  // The Shopify cart's own code (a /discount/CODE link, Fast Bundle's code) while the buyer has typed
-  // none (null; "" = removed): looked up like a typed code, kept only when valid — else left out
-  // without a buyer-facing error (journaled).
-  const cartCode = input.discountCode == null ? ((session.cartContext as CartContext | null)?.discountCodes?.[0] ?? null) : null;
-  const discountCode = input.discountCode || cartCode;
+  // The code the buyer typed, or — none typed (null; "" = removed) — the Shopify cart's own codes (a
+  // /discount/CODE link, Fast Bundle's code), in the cart's order, 3 at most: each looked up like a
+  // typed code, the first that applies kept. The others are left out without a field error
+  // (journaled, and said: cartCodeLost).
+  const context = session.cartContext as CartContext | null;
+  const fromCart = input.discountCode == null;
+  const candidates = input.discountCode ? [input.discountCode] : fromCart ? (context?.discountCodes ?? []).slice(0, 3) : [];
   // The store's settings are read while the lines are (re)priced: none of them depends on the lines.
   const loads = Promise.all([
     db.shippingRate.findMany({ where: { storeId: session.storeId }, orderBy: { position: "asc" } }),
     db.addOn.findMany({ where: { storeId: session.storeId, active: true } }),
-    discountCode
-      ? db.discountCode.findFirst({
-          where: { storeId: session.storeId, code: { equals: discountCode, mode: "insensitive" } },
+    candidates.length
+      ? db.discountCode.findMany({
+          where: { storeId: session.storeId, OR: candidates.map((code) => ({ code: { equals: code, mode: "insensitive" as const } })) },
         })
-      : null,
+      : [],
     designFor(session.store, session),
     // Checkout A/B tests: arm B's tiers, order-bump prices / visibility, protection pricing.
     overridesFor(session),
@@ -280,7 +288,7 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
   // (still thrown by the await below; a failing line re-pricing wins, its error is the quote's).
   loads.catch(() => undefined);
   const buyerLines = await linesFor(session, session.status === "PAID" ? undefined : input.quantities);
-  const [allRates, storeAddOns, discountRow, design, overrides] = await loads;
+  const [allRates, storeAddOns, discountRows, design, overrides] = await loads;
   const allAddOns = withAddOnOverrides(storeAddOns, overrides);
 
   // Quantity breaks v2: percent tiers (maybe scoped to products) and free gifts.
@@ -298,95 +306,108 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
   let shopifyCode: ShopifyCodeDiscount | null = null;
   let discountError: string | null = null;
   let discountErrorCode: string | null = null;
-  // A cart charged as Shopify's cart charged it, its automatic discounts already in the prices: only
-  // the cart's own codes on top (Shopify combined them with those discounts); another code can't be
-  // checked against what the cart applied.
-  const context = session.cartContext as CartContext | null;
-  const cartsOwn = (code: string) => (context?.discountCodes ?? []).some((c) => c.toUpperCase() === code.toUpperCase());
-  if (discountCode && context?.cartPriced?.discounted && !cartsOwn(discountCode)) {
-    discountError = "Les remises de votre panier sont déjà appliquées : un autre code ne peut pas s'y ajouter.";
-    discountErrorCode = "discount_cart_priced";
-  } else if (discountCode) {
-    // One message for unknown, inactive, expired or used-up codes: don't help guess private codes.
-    const invalid = "Code promo invalide ou expiré";
-    if (!discountRow && session.store.shopifyDiscountCodes && session.store.shopifyAccessToken && canReadShopifyDiscounts(session.store)) {
+  const same = (a: string, b: string) => a.toUpperCase() === b.toUpperCase();
+  const cartsOwn = (code: string) => (context?.discountCodes ?? []).some((c) => same(c, code));
+  const takenOff = context?.cartPriced?.codesTakenOff;
+  const codeCheck = context?.codeCheck;
+  // A cart code that lowered the cart (verified when the checkout opened, or taken off in a cart charged
+  // as Shopify charges it): never dropped silently, nor while Shopify can't be asked about it.
+  const required = (code: string) => (!!codeCheck && same(codeCheck.code, code)) || !!takenOff?.some((c) => same(c, code));
+
+  // One message for unknown, inactive, expired or used-up codes: don't help guess private codes.
+  const invalid = "Code promo invalide ou expiré";
+  const tryCode = async (code: string, retry: boolean): Promise<CodeTry> => {
+    const row = discountRows.find((r) => same(r.code, code));
+    if (!row && session.store.shopifyDiscountCodes && session.store.shopifyAccessToken && canReadShopifyDiscounts(session.store)) {
       // Not one of the app's codes: a code created in Shopify (amount off / free shipping).
-      // The Shopify cart's own code is asked twice when Shopify doesn't answer (never silently dropped).
-      const found = cartCode && discountCode === cartCode ? await lookupShopifyCodeWithRetry(session.store, discountCode) : await lookupShopifyCode(session.store, discountCode);
-      if (found === "unavailable") {
-        // Shopify couldn't be asked: not an invalid code, the buyer can retry.
-        discountError = "Impossible de vérifier ce code pour le moment, réessayez.";
-        discountErrorCode = "discount_unavailable";
-      } else if (typeof found === "string") {
-        discountError = invalid;
-        discountErrorCode = "discount_invalid";
-      } else {
-        const collections = needsCollections(found)
-          ? await productCollections(session.store, buyerLines.map((l) => l.productId)).catch(() => new Map<string, string[]>())
-          : new Map<string, string[]>();
-        // A limited code: this app's own paid uses count on top of Shopify's (see shopifyCodeUses).
-        const limited = found.usageLimit != null;
-        const [ledgerUses, recentLedgerUses] = limited
+      const found = retry ? await lookupShopifyCodeWithRetry(session.store, code) : await lookupShopifyCode(session.store, code);
+      // Shopify couldn't be asked: not an invalid code, the buyer can retry.
+      if (found === "unavailable") return { ok: false, error: "Impossible de vérifier ce code pour le moment, réessayez.", errorCode: "discount_unavailable" };
+      if (typeof found === "string") return { ok: false, error: invalid, errorCode: "discount_invalid" };
+      const collections = needsCollections(found)
+        ? await productCollections(session.store, buyerLines.map((l) => l.productId)).catch(() => new Map<string, string[]>())
+        : new Map<string, string[]>();
+      // A limited code: this app's own paid uses count on top of Shopify's (see shopifyCodeUses).
+      const [ledgerUses, recentLedgerUses] =
+        found.usageLimit != null
           ? await Promise.all([
               shopifyCodeLedgerUses(db, session.storeId, found.code, session.id),
               shopifyCodeLedgerUses(db, session.storeId, found.code, session.id, recentSince(found.checkedAt)),
             ])
           : [0, 0];
-        const applied = shopifyCodeAsDiscount(found, buyerLines, collections, {
-          country: input.countryCode ?? null,
-          ledgerUses,
-          recentLedgerUses,
-          countsApiOrders: session.store.shopifyCountsApiOrders ?? null,
-        });
-        if (applied.ok) {
-          discount = applied.discount;
-          discountSource = "shopify";
-          shopifyCode = found;
-        } else if (applied.reason === "exhausted") {
-          discountError = DISCOUNT_EXHAUSTED;
-          discountErrorCode = "discount_exhausted";
-        } else {
-          discountError = applied.reason === "minimum" ? "Le montant minimum pour ce code n'est pas atteint" : invalid;
-          discountErrorCode = applied.reason === "minimum" ? "discount_minimum" : "discount_invalid";
-        }
-      }
-    } else if (!discountRow) {
-      discountError = invalid;
-      discountErrorCode = "discount_invalid";
-    } else {
-      const sub = subtotal(buyerLines);
-      const check = checkDiscount(discountRow, sub);
-      if (check.ok) discount = discountRow;
-      else if (check.reason.includes("minimum")) {
-        discountError = check.reason;
-        discountErrorCode = "discount_minimum";
-      } else {
-        discountError = invalid;
-        discountErrorCode = "discount_invalid";
-      }
+      const applied = shopifyCodeAsDiscount(found, buyerLines, collections, {
+        country: input.countryCode ?? null,
+        ledgerUses,
+        recentLedgerUses,
+        countsApiOrders: session.store.shopifyCountsApiOrders ?? null,
+      });
+      if (applied.ok) return { ok: true, discount: applied.discount, source: "shopify", shopifyCode: found };
+      if (applied.reason === "exhausted") return { ok: false, error: DISCOUNT_EXHAUSTED, errorCode: "discount_exhausted" };
+      return applied.reason === "minimum"
+        ? { ok: false, error: "Le montant minimum pour ce code n'est pas atteint", errorCode: "discount_minimum" }
+        : { ok: false, error: invalid, errorCode: "discount_invalid" };
     }
-  }
+    if (!row) return { ok: false, error: invalid, errorCode: "discount_invalid" };
+    const check = checkDiscount(row, subtotal(buyerLines));
+    if (check.ok) return { ok: true, discount: row, source: "app", shopifyCode: null };
+    return check.reason.includes("minimum") ? { ok: false, error: check.reason, errorCode: "discount_minimum" } : { ok: false, error: invalid, errorCode: "discount_invalid" };
+  };
+  // A cart charged as Shopify charges it: one of its own codes (validated: limits, uses) takes off
+  // exactly what it took off in Shopify's cart (codeCents, at each line's rate), where Shopify combined
+  // it with the discounts now in the prices — an amount-off code never more than its own amount (a line
+  // raised to the variant's price scales a percentage, not a fixed amount); one that took nothing there
+  // (not combinable, its minimum…) takes nothing here either (null). A free-shipping code keeps its own rule.
+  const asCartPriced = (d: DiscountInput): DiscountInput | null => {
+    if (!context?.cartPriced || d.type === "FREE_SHIPPING" || !cartsOwn(d.code)) return d;
+    const amounts = context.cartPriced.codeCents;
+    const cents = amounts?.[d.code.toUpperCase()];
+    if (cents && cents > 0) return { ...d, type: "FIXED", value: d.type === "FIXED" ? Math.min(cents, d.value) : cents, scopeShare: undefined, eligibleVariantIds: undefined };
+    // Money off there without amounts kept (a checkout opened before they were): its own computation.
+    return !amounts && takenOff?.some((c) => same(c, d.code)) ? d : null;
+  };
 
-  // A cart charged as Shopify charges it: one of its own codes (validated above: limits, uses) takes
-  // off exactly what it took off in Shopify's cart, where Shopify combined it with the discounts now in
-  // the prices; one that took nothing there (not combinable, its minimum…) takes nothing here either.
-  // A free-shipping code keeps its own rule; another currency's cart keeps the code's own computation.
-  const pricedCodes = context?.cartPriced?.codeCents;
-  const takenOff = context?.cartPriced?.codesTakenOff;
-  if (discount && context?.cartPriced && discount.type !== "FREE_SHIPPING" && cartsOwn(discount.code)) {
-    const key = discount.code.toUpperCase();
-    const cents = pricedCodes?.[key];
-    if (cents && cents > 0) discount = { ...discount, type: "FIXED", value: cents, scopeShare: undefined, eligibleVariantIds: undefined };
-    else if (!takenOff || !takenOff.includes(key)) {
-      // It took nothing in Shopify's cart: nothing here either (typed again: said).
-      discount = null;
-      shopifyCode = null;
-      if (input.discountCode) {
-        discountError = "Ce code ne se cumule pas avec les remises déjà appliquées : la remise la plus avantageuse est conservée";
-        discountErrorCode = "discount_not_combinable";
+  // The cart's codes not applied here, and why (one is said: cartCodeLost); the cart's code applied;
+  // the one payment waits for (Shopify couldn't be asked about it).
+  const notApplied: { code: string; reason: string }[] = [];
+  let appliedCartCode: string | null = null;
+  let waitFor: string | null = null;
+  if (input.discountCode && context?.cartPriced?.discounted && !cartsOwn(input.discountCode)) {
+    // A cart charged as Shopify's cart charged it, its automatic discounts already in the prices: only
+    // the cart's own codes on top (Shopify combined them with those discounts); another code can't be
+    // checked against what the cart applied.
+    discountError = "Les remises de votre panier sont déjà appliquées : un autre code ne peut pas s'y ajouter.";
+    discountErrorCode = "discount_cart_priced";
+  } else if (candidates.length) {
+    // Looked up together (no added wait). The Shopify cart's first code, and any that lowered the cart,
+    // are asked twice when Shopify doesn't answer (never silently dropped).
+    const tries = await Promise.all(candidates.map((code, k) => tryCode(code, fromCart && (k === 0 || required(code)))));
+    for (const [k, code] of candidates.entries()) {
+      const tried = tries[k];
+      const kept = tried.ok ? asCartPriced(tried.discount) : null;
+      if (!fromCart) {
+        // The typed code: applied, or the field's error (one the cart's own prices took nothing for: not combinable).
+        if (tried.ok && kept) {
+          discount = kept;
+          discountSource = tried.source;
+          shopifyCode = tried.shopifyCode;
+        } else {
+          discountError = tried.ok ? NOT_COMBINABLE : tried.error;
+          discountErrorCode = tried.ok ? "discount_not_combinable" : tried.errorCode;
+        }
+      } else if (tried.ok && kept && !discount && !waitFor) {
+        discount = kept;
+        discountSource = tried.source;
+        shopifyCode = tried.shopifyCode;
+        appliedCartCode = code;
+      } else if (!tried.ok || kept) {
+        // Invalid here, or valid too while one code applies here.
+        notApplied.push({ code, reason: tried.ok ? "discount_not_combinable" : tried.errorCode });
+        // Shopify can't be asked about a code that lowered the cart, ahead of any that applies: no later
+        // code meanwhile, payment waits for it (cartCodeLost).
+        if (!tried.ok && tried.errorCode === "discount_unavailable" && required(code) && !discount && !waitFor) waitFor = code;
       }
+      // Valid, but it took nothing in Shopify's cart (its own prices): nothing lost, nothing said.
     }
-    // Another currency's cart: the code's own computation (its cents aren't the shop's).
   }
 
   const ruleCtx = { subtotalCents: subtotal(buyerLines), productIds: buyerLines.map((l) => l.productId), country: input.countryCode ?? null };
@@ -420,35 +441,29 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
   if (totals.dropped?.includes("code") && discount) {
     discount = null;
     shopifyCode = null;
-    discountError = "Ce code ne se cumule pas avec les remises déjà appliquées : la remise la plus avantageuse est conservée";
+    discountError = NOT_COMBINABLE;
     discountErrorCode = "discount_not_combinable";
   }
   if (totals.dropped?.includes("automatic")) automatic = { cents: 0, titles: [] };
-  // The cart's own code that doesn't apply here: left out of the code field (the buyer never typed
-  // it), journaled, and said (cartCodeLost). A code that lowered the cart (codeCheck, verified when the
-  // checkout opened) blocks payment when these very lines would cost more than the cart showed, or
-  // when Shopify couldn't be asked: never silently charged more.
+  // The cart's own codes that don't apply here: left out of the code field (the buyer never typed
+  // them), journaled, and one said (cartCodeLost), a code that lowered the cart first. Payment is
+  // blocked when these very lines would cost more than the cart showed with its verified code
+  // (codeCheck), or while Shopify can't be asked about a code that lowered it: never charged more.
   let cartCodeLost: Quote["cartCodeLost"];
-  if (cartCode && !input.discountCode) {
-    const check = (session.cartContext as CartContext | null)?.codeCheck;
-    // A code that took money off in a cart charged as Shopify charges it is required too: Shopify
-    // unreachable blocks payment ("réessayez"), never charged more meanwhile.
-    const checked = !!check && check.code.toUpperCase() === cartCode.toUpperCase();
-    const required = checked || !!takenOff?.includes(cartCode.toUpperCase());
-    const overCart = checked && sameCodeCart(check!.items, buyerLines) && totals.subtotalCents - totals.discountCents > check!.totalCents;
-    if (discountError) {
-      await noteCartCodeDropped(session, cartCode, discountErrorCode);
-      cartCodeLost = { code: cartCode, reason: discountErrorCode ?? "discount_invalid", blocking: required && (discountErrorCode === "discount_unavailable" || overCart) };
-      discountError = null;
-      discountErrorCode = null;
-    } else if (overCart) {
-      await noteCartCodeDropped(session, cartCode, "discount_amount");
-      cartCodeLost = { code: cartCode, reason: "discount_amount", blocking: true };
-    }
-    // A cart charged as Shopify charges it with several codes that took money off there: one code
-    // applies here, another one is said (never dropped silently).
-    const other = takenOff && !cartCodeLost ? takenOff.find((c) => c !== discount?.code.toUpperCase()) : undefined;
-    if (other) cartCodeLost = { code: other, reason: "discount_not_combinable", blocking: false };
+  if (fromCart && candidates.length) {
+    // The cart's code applied above, then left out with the totals (it doesn't combine here).
+    if (appliedCartCode && !discount) notApplied.unshift({ code: appliedCartCode, reason: discountErrorCode ?? "discount_not_combinable" });
+    discountError = null;
+    discountErrorCode = null;
+    // Codes that lowered Shopify's cart beyond the 3 looked up: one code applies here.
+    for (const c of takenOff ?? []) if (!candidates.some((x) => same(x, c))) notApplied.push({ code: c, reason: "discount_not_combinable" });
+    const overCart = !!codeCheck && sameCodeCart(codeCheck.items, buyerLines) && totals.subtotalCents - totals.discountCents > codeCheck.totalCents;
+    const checkedLost = codeCheck ? notApplied.find((n) => same(n.code, codeCheck.code)) : undefined;
+    const lost = notApplied.find((n) => required(n.code)) ?? notApplied[0];
+    if (waitFor) cartCodeLost = { code: waitFor, reason: "discount_unavailable", blocking: true };
+    else if (overCart) cartCodeLost = { code: checkedLost?.code ?? codeCheck!.code, reason: checkedLost?.reason ?? "discount_amount", blocking: true };
+    else if (lost) cartCodeLost = { code: lost.code, reason: lost.reason, blocking: false };
+    if (cartCodeLost) await noteCartCodeDropped(session, cartCodeLost.code, cartCodeLost.reason);
   }
   // The Shopify cart's automatic discount stopped applying because the buyer changed the lines.
   const cartAutomatic = session.cartDiscounts as { totalCents?: unknown; titles?: unknown } | null;
@@ -525,7 +540,10 @@ async function noteCartCodeDropped(session: SessionWithStore, code: string, reas
     sessionId: session.id,
     level: "warn",
     kind: "cart.discount_code_dropped",
-    message: `Code du panier Shopify « ${code.slice(0, 60)} » non repris au checkout (${reason ?? "inapplicable"}) : vérifiez qu'il existe dans Shopify et que la lecture des codes Shopify est activée.`,
+    message:
+      reason === "discount_not_combinable"
+        ? `Code du panier Shopify « ${code.slice(0, 60)} » non repris au checkout : il ne se cumule pas avec la remise appliquée (un seul code par commande) ; l'acheteur en est informé.`
+        : `Code du panier Shopify « ${code.slice(0, 60)} » non repris au checkout (${reason ?? "inapplicable"}) : vérifiez qu'il existe dans Shopify et que la lecture des codes Shopify est activée.`,
     data: { code: code.slice(0, 60), reason },
   });
 }

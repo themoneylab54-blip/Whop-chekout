@@ -160,9 +160,44 @@ describe("cartPricedLines: the cart as Shopify charges it", () => {
     // A line Shopify prices at 0 (an app's gift) stays free in any currency.
     const gift = cartOf([item({ price: 0, final_price: 0, final_line_price: 0, original_line_price: 0 })], { currency: "USD" });
     expect(ok(cartPricedLines(gift, [line()], "EUR")).lines[0].unitPriceCents).toBe(0);
-    // The codes that took money off are known in any currency (their cents only in the shop's).
-    const coded = cartOf([item({ final_line_price: 2700, line_level_discount_allocations: [code(300, "TEN")] })], { currency: "USD" });
-    expect(ok(cartPricedLines(coded, [line()], "EUR"))).toMatchObject({ codeCents: {}, codesTakenOff: ["TEN"] });
+    // A code's amount in any currency, converted at its line's own rate (EUR charged / USD in the cart):
+    // 10 % off a 33.00 USD line → 3.00 off the 30.00 EUR line, taken off exactly by the quote.
+    const coded = cartOf([item({ price: 3300, final_price: 2970, final_line_price: 2970, original_line_price: 3300, line_level_discount_allocations: [code(330, "TEN")] })], { currency: "USD" });
+    const c = ok(cartPricedLines(coded, [line()], "EUR"));
+    expect([c.lines[0].unitPriceCents, c.codeCents, c.codesTakenOff]).toEqual([3000, { TEN: 300 }, ["TEN"]]);
+    // A cart-level code too: shared over the lines by amount, each part at its line's rate.
+    const cartLevel = cartOf(
+      [item({ price: 3300, final_price: 3300, final_line_price: 3300, original_line_price: 3300 }), item({ variant_id: 12, price: 1100, final_price: 1100, final_line_price: 1100, original_line_price: 1100 })],
+      { currency: "USD", total_price: 3960, cart_level_discount_applications: [{ type: "discount_code", title: "TEN", total_allocated_amount: 440 }] },
+    );
+    const l = ok(cartPricedLines(cartLevel, [line(), line({ variantId: V(12), unitPriceCents: 1000, compareAtCents: null })], "EUR"));
+    expect([charged(l.lines), l.codeCents]).toEqual([4000, { TEN: 400 }]);
+  });
+
+  it("another currency's bundle price (Shopify's sign): converted at the ECB rate and kept when lower; without a rate, the shop's price, said", () => {
+    // 22.00 USD for a bundle whose variant is 30.00 EUR, 2.00 USD of it a code: 1 USD = 0.90 EUR.
+    const bundle = cartOf([item({ price: 2200, final_price: 2000, final_line_price: 2000, original_line_price: 2200, has_components: true, line_level_discount_allocations: [code(200, "DUO")] })], { currency: "USD" });
+    const fx = ok(cartPricedLines(bundle, [line()], "EUR", new Map(), 0.9));
+    // 22.00 USD × 0.90 = 19.80 EUR (the code apart, applied by the quote: 2.00 USD → 1.80 EUR).
+    expect([fx.lines[0].unitPriceCents, fx.lines[0].appPrice, fx.raised, fx.codeCents]).toEqual([1980, { unitCents: 1980, originalUnitCents: 3000 }, false, { DUO: 180 }]);
+    // A rate that would make it dearer than the shop's price: never above it (the cart's discount ratio).
+    expect(ok(cartPricedLines(bundle, [line()], "EUR", new Map(), 2)).lines[0].unitPriceCents).toBe(3000);
+    // No rate (ECB unavailable): the shop's price, the buyer told — never a guessed conversion.
+    const none = ok(cartPricedLines(bundle, [line()], "EUR"));
+    expect([none.lines[0].unitPriceCents, none.raised, none.codeCents]).toEqual([3000, true, { DUO: 272 }]);
+  });
+
+  it("a code allocation without a title (it couldn't be applied again) stays in the price, as the cart charged it", () => {
+    const r = ok(cartPricedLines(cartOf([item({ final_price: 2700, final_line_price: 2700, line_level_discount_allocations: [code(300, " ")] })]), [line()], "EUR"));
+    expect([r.lines[0].unitPriceCents, r.codeCents, r.codesTakenOff, r.discounted]).toEqual([2700, {}, [], true]);
+    const cartLevel = ok(cartPricedLines(cartOf([item()], { total_price: 2800, cart_level_discount_applications: [{ type: "discount_code", title: "", total_allocated_amount: 200 }] }), [line()], "EUR"));
+    expect([cartLevel.lines[0].unitPriceCents, cartLevel.codeCents]).toEqual([2800, {}]);
+  });
+
+  it("a lower price raised to the variant's: the cart's code keeps its share of the price charged", () => {
+    // A 25.00 market price, 2.50 of it a code: charged 30.00, the code takes 3.00 off (the same 10 %).
+    const r = ok(cartPricedLines(cartOf([item({ price: 2500, final_price: 2250, final_line_price: 2250, original_line_price: 2500, line_level_discount_allocations: [code(250, "DIX")] })]), [line()], "EUR"));
+    expect([r.lines[0].unitPriceCents, r.raised, r.codeCents]).toEqual([3000, true, { DIX: 300 }]);
   });
 
   it("subscriptions and gift cards stay Shopify's; an empty or unpriced cart can't be charged", () => {

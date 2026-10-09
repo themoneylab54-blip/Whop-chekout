@@ -109,6 +109,15 @@ const bodySchema = z.object({
   // Random key of this click (loader): a retry (checkout domain timed out, then the app's API)
   // gets the session the first request created, never a second session nor a second conversion.
   requestKey: z.string().regex(/^[A-Za-z0-9_-]{16,64}$/).optional(),
+  // A cart permalink's ?discount=CODE: offered to the quote like the cart's own code (validated there,
+  // never trusted as is). Only a code's characters (no spaces: the checkout's notice repeats it, never a
+  // sentence a crafted link wrote); anything else is left out, never the cart refused.
+  discountCode: z
+    .string()
+    .trim()
+    .regex(/^[\p{L}\p{N}][\p{L}\p{N}_\-.#%+&!*@$€]{0,59}$/u)
+    .optional()
+    .catch(undefined),
 });
 
 /** Transient refusals (Shopify slow, the cart changing, the click's other request still running, a burst). */
@@ -226,7 +235,12 @@ async function handle(req: Request) {
   // Lines taken from the re-read cart itself (charged as Shopify's cart charges them): the same rules.
   if (cart.lines.some((l) => excluded.includes(l.productHandle))) return refuse(409, "Produit géré par le checkout Shopify", "excluded", true, store.id);
   lines = cart.lines;
-  const { cartDiscounts, cartContext } = cart;
+  const { cartDiscounts } = cart;
+  // A permalink's code, when the cart carries none of its own: the quote looks it up like the cart's
+  // (a cart charged as Shopify's cart charged it keeps its own codes only).
+  const linkCode = parsed.data.discountCode;
+  const cartContext =
+    linkCode && !cart.cartContext?.discountCodes?.length && !cart.cartContext?.cartPriced ? { ...(cart.cartContext ?? {}), discountCodes: [linkCode] } : cart.cartContext;
 
   // A/B arms of this visitor, both at once.
   const [variantArm, testArms] = await Promise.all([assignVariant(store.id, visitor.id), assignCheckoutTests(store.id, visitor.id)]);

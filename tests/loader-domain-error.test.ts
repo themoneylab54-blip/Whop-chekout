@@ -4,10 +4,9 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 /*
- * Storefront loader, a store's own checkout domain that stops answering after the ping said it was
- * fine: the click's request gives up after 25 s and goes to the app's API, and the automatic retry goes
- * straight to the app too (never a second 25 s wait on the silent domain), and so do the visit's next
- * pages (the tab's ping answer); the checkout then opens on the app's host (?via=app).
+ * Storefront loader, a store's own checkout domain failing fast (a passing network error, not 25 s
+ * of silence): the click goes on through the app's API at once and the checkout opens, but the tab
+ * keeps the ping's answer (the next page asks the domain again) — only a silent domain is remembered.
  */
 
 const API = "https://app.example.com";
@@ -24,7 +23,6 @@ const settle = async () => {
 
 const domainPosts: string[] = [];
 const appPosts: string[] = [];
-let appReplies = 0;
 
 vi.stubGlobal(
   "fetch",
@@ -38,17 +36,11 @@ vi.stubGlobal(
     if (init?.body === '{"warm":true}') return Promise.resolve(new Response("{}"));
     if (u === `${DOMAIN}/api/public/sessions`) {
       domainPosts.push(String(init?.body));
-      // Never answers (aborted by the loader's own timer).
-      return new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))));
+      return Promise.reject(new TypeError("Failed to fetch"));
     }
     if (u === `${API}/api/public/sessions`) {
       appPosts.push(String(init?.body));
-      appReplies++;
-      return Promise.resolve(
-        appReplies === 1
-          ? new Response("<html>502</html>", { status: 502 })
-          : new Response(JSON.stringify({ url: `${DOMAIN}/c/s_1`, visitorId: "v_12345678" }), { status: 200 }),
-      );
+      return Promise.resolve(new Response(JSON.stringify({ url: `${DOMAIN}/c/s_1`, visitorId: "v_12345678" }), { status: 200 }));
     }
     return Promise.resolve(new Response("{}"));
   }),
@@ -59,30 +51,18 @@ document.body.innerHTML = `
   <form action="/cart" method="post"><button type="button" name="checkout" id="checkout-btn">Checkout</button></form>`;
 new Function(source)();
 
-describe("loader: the store's checkout domain goes silent", () => {
-  it("25 s on the domain, then the app; the automatic retry goes straight to the app; the checkout opens", async () => {
+describe("loader: the store's checkout domain fails fast", () => {
+  it("the app's API at once, the checkout opens; the tab still trusts the domain (only 25 s of silence is remembered)", async () => {
     await settle(); // config + ping
+    expect(JSON.parse(sessionStorage.getItem("whopco_ping") ?? "null")).toMatchObject({ origin: DOMAIN, ok: true });
     const ev = new MouseEvent("click", { bubbles: true, cancelable: true });
     document.getElementById("checkout-btn")!.dispatchEvent(ev);
     expect(ev.defaultPrevented).toBe(true);
     await settle();
     expect(domainPosts).toHaveLength(1);
-    expect(appPosts).toHaveLength(0);
-    await vi.advanceTimersByTimeAsync(25_000);
-    await settle();
-    // The app's API answered 502: one automatic retry 800 ms later, on the app only.
     expect(appPosts).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(800);
-    await settle();
-    expect(domainPosts).toHaveLength(1);
-    expect(appPosts).toHaveLength(2);
-    // Same click, same key everywhere.
-    const keys = [...domainPosts, ...appPosts].map((b) => JSON.parse(b).requestKey);
-    expect(new Set(keys).size).toBe(1);
-    // Opened (no message).
     expect(sessionStorage.getItem("whopco_pending")).toBe("1");
     expect(document.getElementById("whopco-error")).toBeNull();
-    // The tab remembers the silent domain (the ping's answer): the visit's next pages use the app at once.
-    expect(JSON.parse(sessionStorage.getItem("whopco_ping") ?? "null")).toMatchObject({ origin: DOMAIN, ok: false });
+    expect(JSON.parse(sessionStorage.getItem("whopco_ping") ?? "null")).toMatchObject({ origin: DOMAIN, ok: true });
   });
 });

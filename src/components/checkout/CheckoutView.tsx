@@ -1054,9 +1054,14 @@ export function CheckoutView({
           const capped = sent && qtyKey(latestQty.current) === qtyKey(sent) && qtyKey(confirmed) !== qtyKey(sent);
           // A plain cart's Shopify automatic discount holds for its exact lines: once they change, say so.
           if (sent && Array.isArray(q.automaticDiscountLost)) setQtyError(L.automaticDiscountLost);
-          // What the Shopify cart showed and this checkout doesn't charge the same way: said, never silent.
-          else if (q.cartCodeLost && !q.cartCodeLost.blocking && typeof q.cartCodeLost.code === "string") setQtyError(L.cartCodeNotApplied(q.cartCodeLost.code));
-          else if (q.cartPricesAdjusted) setQtyError(L.cartPricesAdjusted);
+          else {
+            // What the Shopify cart showed and this checkout doesn't charge the same way: said (both), never silent.
+            const said = [
+              q.cartCodeLost && !q.cartCodeLost.blocking && typeof q.cartCodeLost.code === "string" ? L.cartCodeNotApplied(q.cartCodeLost.code) : null,
+              q.cartPricesAdjusted ? L.cartPricesAdjusted : null,
+            ].filter(Boolean);
+            if (said.length) setQtyError(said.join(" "));
+          }
           // A suggested product Shopify no longer sells is dropped: say so (the follow-up quote keeps the message).
           if (sent && Object.entries(sent).some(([id, n]) => n > 0 && !(id in confirmed) && !(id in confirmedQty))) {
             pendingQtyAnnounce.current = null;

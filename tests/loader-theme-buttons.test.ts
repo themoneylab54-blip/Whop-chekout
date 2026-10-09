@@ -7,8 +7,10 @@ import { afterAll, describe, expect, it, vi } from "vitest";
  * Storefront loader, a theme's own buttons, links and forms: a checkout button is recognised by its
  * whole label (a price after it aside) and only in the cart (a container below <body>, or the cart
  * form's own button), never a promo code's « Valider », an upsell's « Acheter », « Payer en 3 fois »,
- * a sticky « Acheter maintenant » or a menu's « Commander »; only links and forms going to this shop's
- * checkout count; a cart permalink (/cart/111:2,222:1) is a « buy now » of its items.
+ * a sticky « Acheter maintenant », a menu's « Commander » nor a product's add-to-cart widget
+ * (« Commander » in #StickyAddToCart, « Payer maintenant » in .product__addtocart); only links and forms
+ * going to this shop's checkout count; a cart permalink (/cart/111:2,222:1) is a « buy now » of its
+ * items, its ?discount= code with it.
  */
 
 const API = "https://app.example.com";
@@ -22,7 +24,7 @@ const settle = async () => {
   for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(0);
 };
 
-const posts: { items?: { variant_id: string | number; quantity: number }[] }[] = [];
+const posts: { items?: { variant_id: string | number; quantity: number }[]; discountCode?: string }[] = [];
 
 vi.stubGlobal(
   "fetch",
@@ -63,6 +65,22 @@ document.body.innerHTML = `
   <form action="/cart/add" id="product-form-2"><input type="hidden" name="id" value="222"></form>
   <div class="sticky-bar"><button type="submit" form="product-form-1" id="sticky-buy">Acheter maintenant</button></div>
   <div class="sticky-add-to-cart"><button type="button" form="product-form-1" id="sticky-order">Commander</button></div>
+  <div class="sticky-add-to-cart"><button type="button" id="sticky-order-now">Commander maintenant</button></div>
+  <div class="sticky-add-to-cart"><button type="button" id="sticky-order-js">Commander</button></div>
+  <div id="StickyAddToCart"><div class="inner"><button type="button" id="sticky-camel">Commander</button></div></div>
+  <div class="product__addtocart"><button type="button" id="addtocart-pay-now">Payer maintenant</button></div>
+  <div class="product__addtocart"><button type="button" id="addtocart-pay">Payer</button></div>
+  <div class="sticky-cart"><button type="button" id="sticky-cart-order">Commander</button></div>
+  <div class="page-wrapper cart-push"><div class="product-sticky-bar"><button type="button" id="sticky-product-order">Commander</button></div></div>
+  <div class="add-to-cart-notification"><button type="button" id="added-popup-pay">Paiement</button></div>
+  <div class="cart-drawer--sticky"><div class="sticky-footer"><button type="button" id="sticky-drawer-pay">Checkout</button></div></div>
+  <div class="mini-cart"><div class="mini-cart__sticky"><button type="button" id="minicart-sticky-pay">Checkout</button></div></div>
+  <div class="drawer"><div class="cart__sticky"><button type="button" id="cart-sticky-pay">Paiement</button></div></div>
+  <div class="cart-sticky-bottom"><button type="button" id="cart-sticky-bottom-pay">Checkout</button></div>
+  <div id="sticky-cart"><button type="button" id="sticky-cart-root-pay">Checkout</button></div>
+  <div class="sticky-cart-bar"><button type="button" form="cart" id="sticky-cart-form-order">Commander</button></div>
+  <div class="add-to-cart-sidebar"><button type="button" id="atc-sidebar-pay">Checkout</button></div>
+  <div id="slidecart"><div class="atc-upsell"><button type="button" id="atc-upsell-pay">Paiement</button></div></div>
   <div class="shopify-payment-button"><button type="button" class="shopify-payment-button__button" id="orphan-buy">Buy it now</button></div>
   <form action="/fr/cart" method="post" id="cart"></form>
   <div class="summary"><button type="button" form="cart" id="form-owned">Paiement</button></div>
@@ -72,10 +90,11 @@ document.body.innerHTML = `
   <a href="/fr/checkout" id="locale-link">Go</a>
   <a href="${location.origin}/checkouts/cn/abc" id="absolute-link">Go</a>
   <a href="/cart/111:2,222:1" id="permalink">Buy the bundle</a>
+  <a href="/fr/cart/111:1?discount=ETE10,VIP5" id="permalink-code">Buy with the code</a>
   <a href="https://partner.example.net/cart/111:1" id="foreign-permalink">Partner bundle</a>
   <form action="/fr/checkout" id="checkout-form"><button type="submit" id="checkout-submit">Go</button></form>
   <div class="upcart-drawer"><button type="button" id="upcart-pay">🔒 Paiement sécurisé</button></div>
-  <div id="sidecart"><button type="button" id="sidecart-now">Commander maintenant</button></div>
+  <div id="sidecart"><button type="button" id="sidecart-now">Passer la commande maintenant</button></div>
   <div class="minicart"><button type="button" id="minicart-caisse">Passer à la caisse</button></div>
   <div class="cart-footer"><input name="discount"><button type="button" id="checkout-beside-code">Checkout ✓</button></div>
   <div class="shopify-section" id="shopify-section-main">
@@ -129,6 +148,10 @@ describe("loader: a theme's checkout buttons", () => {
     for (const id of ["promo-ok", "promo-commander", "note-ok", "upsell-buy", "pay-later", "sticky-buy", "sticky-order", "pay-outside", "pay-cartography"]) await expectTheirs(id);
     // The sticky button's own submission (its product form) isn't ours either.
     expect(themeSubmits).toEqual(["product-form-1"]);
+    // A product's add-to-cart widget, its button tied to no form (the theme's script adds the product):
+    // never the cart, whatever its words (« cart » in its class) — and a word after « Commander » /
+    // « Payer » is a buy button's label, not a checkout's.
+    for (const id of ["sticky-order-now", "sticky-order-js", "sticky-camel", "addtocart-pay-now", "addtocart-pay", "sticky-cart-order", "sticky-product-order"]) await expectTheirs(id);
     // Even on the cart page, a « Commander » outside the cart.
     history.pushState(null, "", "/fr/cart");
     await expectTheirs("menu-commander");
@@ -139,11 +162,18 @@ describe("loader: a theme's checkout buttons", () => {
     for (const id of ["drawer-pay", "price-pay", "camel-pay", "form-owned"]) await expectOurs(id);
   });
 
+  it("the cart's own parts named after adding or « sticky » stay the cart's: the popup once a product is added, a drawer's sticky footer", async () => {
+    for (const id of ["added-popup-pay", "sticky-drawer-pay"]) await expectOurs(id);
+    // « Checkout » / « Paiement » (never a product button's label) in a cart's sticky part or a panel
+    // shown after adding; « Commander » tied to the cart form, whatever wraps it.
+    for (const id of ["minicart-sticky-pay", "cart-sticky-pay", "cart-sticky-bottom-pay", "sticky-cart-root-pay", "sticky-cart-form-order", "atc-sidebar-pay", "atc-upsell-pay"]) await expectOurs(id);
+  });
+
   it("a « buy now » outside any product form isn't guessed among the page's several forms", async () => {
     await expectTheirs("orphan-buy");
   });
 
-  it("cart-drawer apps' buttons are ours: « 🔒 Paiement sécurisé » in an UpCart drawer, « Commander maintenant » in #sidecart, « Passer à la caisse » in a minicart, « Checkout ✓ » beside a code field", async () => {
+  it("cart-drawer apps' buttons are ours: « 🔒 Paiement sécurisé » in an UpCart drawer, « Passer la commande maintenant » in #sidecart, « Passer à la caisse » in a minicart, « Checkout ✓ » beside a code field", async () => {
     for (const id of ["upcart-pay", "sidecart-now", "minicart-caisse", "checkout-beside-code"]) await expectOurs(id);
   });
 
@@ -200,6 +230,12 @@ describe("loader: links and forms", () => {
       { variant_id: "111", quantity: 2 },
       { variant_id: "222", quantity: 1 },
     ]);
+    expect(posts[posts.length - 1].discountCode).toBeUndefined();
     await expectTheirs("foreign-permalink");
+  });
+
+  it("a permalink's ?discount=CODE goes with its items, its first code when several (the checkout validates it like the cart's code)", async () => {
+    await expectOurs("permalink-code");
+    expect(posts[posts.length - 1]).toMatchObject({ items: [{ variant_id: "111", quantity: 1 }], discountCode: "ETE10" });
   });
 });

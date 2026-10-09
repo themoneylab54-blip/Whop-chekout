@@ -17,7 +17,8 @@ import type { CartLine, LineComponent, LineProperty } from "./pricing";
  *  - note / attributes: to the order's note and additional details.
  * A cart that can't be represented line by line (an app's price or bundle, a code, another currency)
  * is charged as Shopify's cart charges it (cartPricedLines): the buyer stays on this checkout. Only
- * subscriptions and gift cards are Shopify's checkout's.
+ * subscriptions and gift cards (and the merchant's excluded products, or a switched-off checkout) are
+ * Shopify's checkout's.
  */
 
 export const MAX_PROPERTIES = 25;
@@ -139,9 +140,13 @@ export type CartContext = {
     discounted: boolean;
     /** A lower cart price without proof was replaced by the variant's price (the buyer is told). */
     raised?: boolean;
-    /** What each of the cart's codes took off in Shopify's cart (upper-cased code → cents, shop currency): applied for exactly that once validated. */
+    /**
+     * What each of the cart's codes took off in Shopify's cart (upper-cased code → cents in the shop's
+     * currency, at each line's own rate): applied for that once validated (an amount-off code never
+     * above its own amount). Absent: a checkout opened before amounts were kept.
+     */
     codeCents?: Record<string, number>;
-    /** The cart's codes that took money off there (upper-cased, any currency): one that didn't takes nothing here. */
+    /** The cart's codes that took money off there (as the cart wrote them, compared ignoring case): one that didn't takes nothing here. */
     codesTakenOff?: string[];
   };
 };
@@ -475,20 +480,22 @@ export function reconcileCart(cart: CartJs, lines: CartLine[], shopCurrency: str
  *  - the cart's discount codes are NOT in the prices: the checkout applies them like a typed code
  *    (validated, limits and uses counted, see quoteSession);
  *  - another currency: each line keeps the cart's discount ratio on the variant's price in the shop's
- *    currency (never below it otherwise);
+ *    currency; a proven lower price (a bundle) is converted with `fxRate` (cart → shop currency) and
+ *    kept when lower, else (no rate) the ratio price is charged and said (`raised`);
  *  - a line total that doesn't divide by its quantity is rounded down (a few cents at most);
  *  - every line must be one the Admin API priced (sellable, active): `lines`, the cart's own variants
  *    included; a bundle parent Shopify sells only through its components gets them from `components`
  *    (per parent unit, bundleComponents), else it can't be ordered.
  * Only the server's own re-read of the cart, never the browser's. Subscriptions and gift cards stay
  * Shopify's. `discounted`: discounts other than codes are in the prices; `codeCents`: what each code
- * took off in Shopify's cart (same currency only). Pure.
+ * took off in Shopify's cart, in the shop's currency at each line's own rate (so it applies exactly). Pure.
  */
 export function cartPricedLines(
   cart: CartJs,
   lines: CartLine[],
   shopCurrency: string,
   components: Map<string, LineComponent[]> = new Map(),
+  fxRate: number | null = null,
 ):
   | { ok: true; lines: CartLine[]; discounted: boolean; raised: boolean; codeCents: Record<string, number>; codesTakenOff: string[] }
   | { ok: false; reason: UnsupportedCartReason; detail?: string } {
@@ -500,7 +507,7 @@ export function cartPricedLines(
   const adminOf = new Map(lines.filter((l) => !l.gift).map((l) => [keyOf(l.variantId), l]));
   const componentsOfParent = new Map([...components].map(([id, parts]) => [keyOf(id), parts]));
 
-  type Row = { item: CartJsItem; admin: CartLine; quantity: number; final: number; automatic: number; codes: number };
+  type Row = { item: CartJsItem; admin: CartLine; quantity: number; final: number; automatic: number; codes: number; byCode: Map<string, number> };
   const rows: Row[] = [];
   for (const item of items) {
     const variantId = gidOf(item.variant_id ?? item.id);
@@ -510,26 +517,40 @@ export function cartPricedLines(
     const finalUnit = num(item.final_price);
     const final = num(item.final_line_price) ?? (finalUnit != null ? finalUnit * quantity : null);
     if (final == null || final < 0) return { ok: false, reason: "cart_unreadable", detail: variantId };
-    // Codes apart (the checkout's own code pipeline applies them); automatic, scripts: in the price.
+    // Codes apart (the checkout's own code pipeline applies them); automatic, scripts: in the price —
+    // and a code without a title too (it couldn't be applied again: kept as the cart charged it).
     let automatic = 0;
     let codes = 0;
+    const byCode = new Map<string, number>();
     for (const a of item.line_level_discount_allocations ?? []) {
       const cents = Math.max(0, num(a?.amount) ?? 0);
-      if (a?.discount_application?.type === "discount_code") codes += cents;
-      else automatic += cents;
+      const code = codeTitle(a?.discount_application);
+      if (code) {
+        codes += cents;
+        if (cents > 0) byCode.set(code, (byCode.get(code) ?? 0) + cents);
+      } else automatic += cents;
     }
-    rows.push({ item, admin, quantity, final, automatic, codes });
+    rows.push({ item, admin, quantity, final, automatic, codes, byCode });
   }
   // Cart-level discounts other than codes (an automatic discount on the order, or what total_price
   // takes off without a listed application): shared over the lines by amount (largest remainders).
   const lineSum = rows.reduce((s, r) => s + r.final + r.codes, 0);
   const total = num(cart.total_price);
   const applications = cart.cart_level_discount_applications ?? [];
-  const cartCodes = applications.filter((a) => a?.type === "discount_code").reduce((s, a) => s + Math.max(0, num(a?.total_allocated_amount) ?? 0), 0);
-  const listed = applications.filter((a) => a?.type !== "discount_code").reduce((s, a) => s + Math.max(0, num(a?.total_allocated_amount) ?? 0), 0);
+  const cartCodes = applications.filter((a) => codeTitle(a)).reduce((s, a) => s + Math.max(0, num(a?.total_allocated_amount) ?? 0), 0);
+  const listed = applications.filter((a) => !codeTitle(a)).reduce((s, a) => s + Math.max(0, num(a?.total_allocated_amount) ?? 0), 0);
   const lineCodes = rows.reduce((s, r) => s + r.codes, 0);
   const cartLevel = Math.min(lineSum, Math.max(0, total != null ? lineSum - lineCodes - total - cartCodes : listed));
-  const shares = cartLevel > 0 ? splitByWeights(cartLevel, rows.map((r) => r.final + r.codes)) : rows.map(() => 0);
+  const weights = rows.map((r) => r.final + r.codes);
+  const shares = cartLevel > 0 ? splitByWeights(cartLevel, weights) : rows.map(() => 0);
+  // A cart-level code's amount shared by the same weights: each line's part converts at its own rate.
+  for (const a of applications) {
+    const cents = Math.max(0, num(a?.total_allocated_amount) ?? 0);
+    const code = codeTitle(a);
+    if (!code || cents <= 0) continue;
+    splitByWeights(cents, weights).forEach((part, k) => rows[k].byCode.set(code, (rows[k].byCode.get(code) ?? 0) + part));
+  }
+  const codeCents: Record<string, number> = {};
 
   const out: CartLine[] = [];
   let raised = false;
@@ -548,7 +569,15 @@ export function cartPricedLines(
       // kept in proportion (a 20 % or a 100 % automatic discount stays one).
       amount = base > 0 ? Math.floor((catalog * Math.max(0, base - discount)) / base) : 0;
       if (sameCurrency) raised = true;
+      else if (proven && base > 0) {
+        // Another currency's proven bundle price: converted, kept when lower; no rate: said.
+        if (fxRate && fxRate > 0) amount = Math.min(amount, Math.floor(Math.max(0, base - discount) * fxRate));
+        else raised = true;
+      }
     }
+    // What each code took off this line, in the shop's currency at the line's own rate (charged / cart's).
+    const before = base - discount;
+    for (const [code, cents] of r.byCode) codeCents[code] = (codeCents[code] ?? 0) + (before > 0 ? Math.floor((cents * amount) / before) : 0);
     const unit = Math.floor(amount / r.quantity);
     // The variant's data only: what the Admin API's line carried for another cart shape is the cart's now.
     const line: CartLine = { ...r.admin, quantity: r.quantity, unitPriceCents: unit, locked: true, cartPriced: true };
@@ -576,9 +605,14 @@ export function cartPricedLines(
     out.push(line);
   }
   const discounted = cartLevel > 0 || rows.some((r) => r.automatic > 0);
-  const allocations = cartCodeAllocations(cart);
-  const codeCents = sameCurrency ? Object.fromEntries(allocations.map((c) => [c.code.toUpperCase(), c.cents])) : {};
-  return { ok: true, lines: out, discounted, raised, codeCents, codesTakenOff: allocations.map((c) => c.code.toUpperCase()) };
+  for (const code of Object.keys(codeCents)) if (codeCents[code] <= 0) delete codeCents[code];
+  const codesTakenOff = cartCodeAllocations(cart).map((c) => c.code).filter(Boolean);
+  return { ok: true, lines: out, discounted, raised, codeCents, codesTakenOff };
+}
+
+/** The upper-cased code of a discount application, or "" (not a code, or a code without a title). */
+function codeTitle(app: { type?: string; title?: string } | null | undefined): string {
+  return app?.type === "discount_code" ? String(app.title ?? "").trim().toUpperCase() : "";
 }
 
 /**

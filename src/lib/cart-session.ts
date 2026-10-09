@@ -2,6 +2,7 @@ import "server-only";
 import type { Store } from "@prisma/client";
 import { checkDiscount, subtotal, type CartLine, type LineComponent } from "./pricing";
 import { bundleComponents, priceCart } from "./shopify";
+import { crossRate, ecbRates } from "./fx";
 import { db } from "./db";
 import { log, recordEvent } from "./log";
 import { rateLimit } from "./ratelimit";
@@ -230,7 +231,11 @@ async function asShopifyCharges(store: SessionCartStore, reason: UnsupportedCart
     log.warn("cart.priced_lookup_failed", "Shopify couldn't price the cart's own lines", { storeId: store.id, err });
     return refuse(store.id, "pricing_unavailable", detail, found, cart);
   }
-  const priced = cartPricedLines(cart, admin, store.shopCurrency, components);
+  // A cart shown in another currency: ECB rates (cached) convert a proven bundle price (never a guess).
+  const cartCurrency = String(cart.currency ?? "").toUpperCase();
+  const fx = cartCurrency && cartCurrency !== store.shopCurrency.toUpperCase() ? await ecbRates().catch(() => null) : null;
+  const fxRate = fx ? crossRate(cartCurrency, store.shopCurrency, fx.rates) : null;
+  const priced = cartPricedLines(cart, admin, store.shopCurrency, components, fxRate);
   if (!priced.ok) return refuse(store.id, priced.reason, priced.detail ?? detail, found, cart);
   noteOversized(store.id, cart.items ?? []);
   await journal(store.id, "cart.priced_as_shopify_cart", `Panier facturé comme le panier Shopify (jamais sous le prix catalogue sans preuve) : ${UNSUPPORTED_REASON_TEXT[reason]}.`, {
@@ -243,13 +248,13 @@ async function asShopifyCharges(store: SessionCartStore, reason: UnsupportedCart
   const context = sanitizeCartContext(cart.note, cart.attributes);
   // The cart's codes: applied by the quote like a typed code (validated, limits and uses counted), for
   // exactly what each took off in Shopify's cart — the one that took the most first.
-  const allocated = cartCodeAllocations(cart).map((c) => c.code);
+  const allocated = cartCodeAllocations(cart).map((c) => c.code).filter(Boolean);
   const codes = [...allocated, ...cartDiscountCodes(cart).filter((c) => !allocated.some((a) => a.toUpperCase() === c.toUpperCase()))].slice(0, 3);
   const cartPriced = {
     reason,
     discounted: priced.discounted,
     ...(priced.raised ? { raised: true } : {}),
-    ...(Object.keys(priced.codeCents).length ? { codeCents: priced.codeCents } : {}),
+    codeCents: priced.codeCents,
     codesTakenOff: priced.codesTakenOff,
   };
   return {

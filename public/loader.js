@@ -294,14 +294,15 @@
           location.href = "/checkout";
         });
     } else if (items) {
-      // Buy-now fallback: Shopify cart permalink for just these items.
+      // Buy-now fallback: Shopify cart permalink for just these items (a permalink's code kept).
       location.href =
         "/cart/" +
         items
           .map(function (i) {
             return i.variant_id + ":" + i.quantity;
           })
-          .join(",");
+          .join(",") +
+        (items.discountCode ? "?discount=" + encodeURIComponent(items.discountCode) : "");
     } else {
       location.href = "/checkout";
     }
@@ -413,6 +414,13 @@
     }
     return null;
   }
+  function savePing(origin, ok) {
+    try {
+      sessionStorage.setItem("whopco_ping", JSON.stringify({ origin: origin, ok: ok, at: Date.now() }));
+    } catch (e) {
+      /* storage blocked */
+    }
+  }
   function pingCheckoutDomain() {
     if (!config || !config.sessionEndpoint || config.sessionEndpoint === sessionsUrl()) return;
     var origin;
@@ -444,11 +452,7 @@
     domainPing = Promise.race([ping, timeout]).then(function (ok) {
       domainReachable = ok;
       log(ok ? "checkout domain reachable" : "checkout domain unreachable, the app's API will be used");
-      try {
-        sessionStorage.setItem("whopco_ping", JSON.stringify({ origin: origin, ok: ok, at: Date.now() }));
-      } catch (e) {
-        /* storage blocked */
-      }
+      savePing(origin, ok);
       return ok;
     });
   }
@@ -466,16 +470,17 @@
     }
   }
   // One session request with its answer read, 25 s at most in every browser (a plain timer; the request
-  // is also aborted where AbortController exists). Past that it's a network error (a TypeError): the
-  // app's API next, or the automatic retry, with the same key.
+  // is also aborted where AbortController exists). Past that it's a network error (a TypeError marked
+  // `timeout`): the app's API next, or the automatic retry, with the same key.
   var SESSION_TIMEOUT = 25000;
   function timedFetch(url, init) {
     var ctrl = typeof AbortController === "function" ? new AbortController() : null;
     var timer;
     var limit = new Promise(function (resolve, reject) {
       timer = setTimeout(function () {
+        // Rejected first, then the request aborted: the race ends on this error, never the abort's.
+        reject(Object.assign(new TypeError("no answer within " + SESSION_TIMEOUT / 1000 + " s"), { timeout: true }));
         if (ctrl) ctrl.abort();
-        reject(new TypeError("no answer within " + SESSION_TIMEOUT / 1000 + " s"));
       }, SESSION_TIMEOUT);
     });
     var answer = fetch(url, ctrl ? Object.assign({}, init, { signal: ctrl.signal }) : init).then(function (res) {
@@ -506,9 +511,18 @@
       return timedFetch(config.sessionEndpoint, init).catch(function (err) {
         log("checkout domain unreachable, retrying on the app:", err && err.message);
         viaApp = true;
-        // The automatic retry goes straight to the app too (never two more waits on a silent domain).
+        // The automatic retry goes straight to the app too (never two more waits on a silent domain). A
+        // domain silent for 25 s is the next pages' answer too (the tab's ping answer); a passing network
+        // error isn't (the next page asks the domain again, quickly told when it fails).
         domainReachable = false;
         domainPing = Promise.resolve(false);
+        if (err && err.timeout) {
+          try {
+            savePing(new URL(config.sessionEndpoint).origin, false);
+          } catch (e) {
+            /* not a URL: nothing kept */
+          }
+        }
         return timedFetch(direct, init);
       });
     });
@@ -602,6 +616,9 @@
             attributes: lineProperties(cart.attributes) || undefined,
             // Same key on the retries (app's API, automatic retry): the server answers the same session.
             requestKey: key,
+            // A permalink's ?discount=CODE (its first, when several): offered to the checkout like the cart's
+            // own code (validated there).
+            discountCode: items && items.discountCode ? items.discountCode.split(",")[0].trim() || undefined : undefined,
           }),
         });
       })
@@ -755,8 +772,9 @@
   // named differently, a "Checkout" / "Paiement" button in the cart or its drawer).
   var ANY_CHECKOUT = ["[name='checkout']"];
   // The whole label of a theme's checkout button (lowercase, accents left out): never "Acheter", "Valider"
-  // alone or "Payer en 3 fois".
-  var CHECKOUT_LABEL = /^(check[ -]?out|secure check[ -]?out|(proceed|go|continue) to (check[ -]?out|payment)|paiement( securise)?|payer|(proceder|passer|aller|continuer) (au|vers le) paiement|passer (a )?la caisse|passer commande|passer (a )?la commande|valider (la|ma) commande|valider (mon|le) panier|finaliser (la|ma) commande|commander|kasse|(weiter )?zur kasse( gehen)?|bestellen|pagar|tramitar pedido|finalizar compra|realizar pedido|cassa|vai alla cassa|procedi al pagamento|afrekenen|naar de kassa)( (maintenant|now|securely|en toute securite))?$/;
+  // alone or "Payer en 3 fois". A word after it (« maintenant », "now") only after an unambiguous phrase:
+  // « Commander maintenant » or « Payer maintenant » is a product page's buy button as often.
+  var CHECKOUT_LABEL = /^((check[ -]?out|secure check[ -]?out|(proceed|go|continue) to (check[ -]?out|payment)|paiement( securise)?|(proceder|passer|aller|continuer) (au|vers le) paiement|passer (a )?la caisse|passer commande|passer (a )?la commande|valider (la|ma) commande|valider (mon|le) panier|finaliser (la|ma) commande|(weiter )?zur kasse( gehen)?|tramitar pedido|finalizar compra|realizar pedido|vai alla cassa|procedi al pagamento|afrekenen|naar de kassa)( (maintenant|now|securely|en toute securite))?|commander|payer|kasse|bestellen|pagar|cassa)$/;
   // Labels a discount code's own button could carry too (« Commander » beside a code field isn't the checkout).
   var AMBIGUOUS_LABEL = /^(commander|payer|pagar|bestellen|kasse|cassa)$/;
   var DISCOUNT_FIELD = "input[name*='discount' i], input[name*='coupon' i], input[id*='discount' i]";
@@ -782,18 +800,20 @@
     return u && CHECKOUT_PATH.test(u.pathname) ? a : null;
   }
   // A cart permalink of this shop (/cart/111:1,222:2: a page builder's "buy now", a reorder link): its
-  // items, bought like a "buy now".
+  // items, bought like a "buy now", with the link's code (?discount=CODE) for the checkout.
   function permalinkItems(t) {
     var a = t.closest && t.closest("a[href], area[href]");
     var u = a && shopUrl(a.getAttribute("href"));
     // ?storefront=true fills the cart without a checkout: the theme's.
     var m = u && u.searchParams.get("storefront") !== "true" && PERMALINK_PATH.exec(u.pathname);
-    return m
-      ? m[1].split(",").map(function (pair) {
-          var p = pair.split(":");
-          return { variant_id: p[0], quantity: parseInt(p[1], 10) || 1 };
-        })
-      : null;
+    if (!m) return null;
+    var items = m[1].split(",").map(function (pair) {
+      var p = pair.split(":");
+      return { variant_id: p[0], quantity: parseInt(p[1], 10) || 1 };
+    });
+    var code = (u.searchParams.get("discount") || "").trim();
+    if (code && code.length <= 60) items.discountCode = code;
+    return items;
   }
 
   // A button's words without a price or separator after them: "Passer la commande • 49,00 €",
@@ -813,25 +833,56 @@
     return s.replace(/^[^a-z]+|[^a-z]+$/g, "");
   }
   // "cart" as a word of a tag, id or class ("cart-drawer", "CartDrawer", "mini_cart"), or a word ending in
-  // it (cart-drawer apps: "upcart", "minicart", "sidecart", "slidecart", "ajaxcart"), not "js-cartography".
-  var CART_TOKEN = /^([a-z]*cart|cart(drawer|popup|notification|items?|footer|summary|modal|panel|sidebar|page|form|wrapper|container|content))$/;
-  function cartWord(s) {
-    var words = String(s || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/);
-    for (var k = 0; k < words.length; k++) if (CART_TOKEN.test(words[k])) return true;
-    return false;
+  // it (cart-drawer apps: "upcart", "minicart", "sidecart", "slidecart", "ajaxcart"), not "js-cartography"
+  // nor a way to it ("addtocart", "gotocart").
+  var CART_TOKEN = /^((?!.*tocart$)[a-z]*cart|cart(drawer|popup|notification|items?|footer|summary|modal|panel|sidebar|page|form|wrapper|container|content))$/;
+  // A product's add-to-cart widget: an "add to cart" name ("sticky-add-to-cart", "StickyAddToCart",
+  // "product__addtocart", "sticky-atc") but the popup once the product is added ("add-to-cart-notification"),
+  // or a sticky bar of a product or named "cart" ("product-sticky-bar", "sticky-cart") but the cart's own
+  // parts ("cart-drawer--sticky", "upcart-sticky-footer"). Only a label a product's button carries too
+  // (« Commander », « Payer ») is refused there: « Checkout » or « Paiement » in "mini-cart__sticky" is the cart's.
+  var ADD_TO_CART = / (add ?to ?cart|atc) /;
+  var ADDED_NOTICE = / (popup|notification|notice|modal|drawer|success|confirmation|message|added) /;
+  var CART_PART = / (drawer|popup|notification|modal|footer|summary|subtotal|total|checkout|aside|sidebar|recap|items|lines) /;
+  // Each class (or the id, the tag) read as words: 1 the cart's, 0 neither; -1 a product's add-to-cart
+  // widget when `widgets` (an ambiguous label), else only its cart words count.
+  function cartWord(s, widgets) {
+    var found = 0;
+    var names = String(s || "").split(/\s+/);
+    for (var n = 0; n < names.length; n++) {
+      var words = names[n].replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/);
+      var name = " " + words.join(" ") + " ";
+      var cart = false;
+      for (var k = 0; k < words.length; k++) if (CART_TOKEN.test(words[k])) cart = true;
+      if (widgets) {
+        var adding = ADD_TO_CART.test(name) && !ADDED_NOTICE.test(name);
+        var sticky = / sticky /.test(name) && (cart ? !CART_PART.test(name) : / (product|buy|purchase) /.test(name));
+        if (adding || sticky) return -1;
+      }
+      if (cart) found = 1;
+    }
+    return found;
   }
   // A form posting to the cart (/cart, /fr/cart, /cart/update…), not "add to cart".
   function cartForm(form) {
     var action = (form && form.getAttribute && form.getAttribute("action")) || "";
     return /\/cart(\/|\?|#|$)/.test(action) && !/\/cart\/add/.test(action);
   }
-  // In the cart (drawer, popup, page): a cart container strictly below <body> (a "cart-open" class on
-  // <body> or <html> would make every button a checkout), or the cart form's own button (form="cart").
-  function inCart(btn) {
+  // In the cart (drawer, popup, page): the cart form's own button (form="cart"), or a cart container
+  // strictly below <body> (a "cart-open" class on <body> or <html> would make every button a checkout);
+  // with `widgets` (an ambiguous label), never a product's add-to-cart widget's (a product page's sticky
+  // bar), whatever holds it.
+  function inCart(btn, widgets) {
+    if (btn.form && cartForm(btn.form)) return true;
+    if (widgets && (cartWord(btn.id, true) < 0 || cartWord(btn.getAttribute("class"), true) < 0)) return false;
     for (var el = btn.parentElement; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
-      if (cartWord(el.tagName) || cartWord(el.id) || cartWord(el.getAttribute("class")) || (el.tagName === "FORM" && cartForm(el))) return true;
+      var tag = cartWord(el.tagName, widgets);
+      var id = cartWord(el.id, widgets);
+      var cls = cartWord(el.getAttribute("class"), widgets);
+      if (tag < 0 || id < 0 || cls < 0) return false;
+      if (tag > 0 || id > 0 || cls > 0 || (el.tagName === "FORM" && cartForm(el))) return true;
     }
-    return !!(btn.form && cartForm(btn.form));
+    return false;
   }
   // A discount code's button: the code field right beside it, or in its own form (not the cart's).
   function discountButton(btn) {
@@ -853,9 +904,11 @@
     // Never a product's own button ("buy now", "add to cart", a sticky bar's form="product-form-1").
     if (matches(btn, BUY_NOW) || btn.closest("form[action*='/cart/add'], product-form") || (btn.form && /\/cart\/add/.test(btn.form.getAttribute("action") || ""))) return null;
     var label = buttonLabel(btn);
-    if (!label || label.length > 40 || !CHECKOUT_LABEL.test(label) || (AMBIGUOUS_LABEL.test(label) && discountButton(btn))) return null;
-    // Only in the cart, even on the cart page ("Commander" in its menu isn't a checkout).
-    return inCart(btn) ? btn : null;
+    var ambiguous = AMBIGUOUS_LABEL.test(label);
+    if (!label || label.length > 40 || !CHECKOUT_LABEL.test(label) || (ambiguous && discountButton(btn))) return null;
+    // Only in the cart, even on the cart page ("Commander" in its menu isn't a checkout); a label a
+    // product's button carries too, never in a product's add-to-cart widget.
+    return inCart(btn, ambiguous) ? btn : null;
   }
 
   // A click once the config is loaded (onClick and held clicks alike): opens our checkout and returns

@@ -532,8 +532,131 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
     expect(e.cartContext).toMatchObject({ discountCodes: ["BNDFAST10", "OTHER"], cartPriced: { codeCents: { BNDFAST10: 250, OTHER: 100 } } });
     const eq = await quoteSession(e, { addOnIds: [] });
     expect([eq.discount?.code, eq.totals.discountCents, eq.totals.totalCents]).toEqual(["BNDFAST10", 250, 2450]);
-    // The other code that took money off in the cart: one code applies here, that one is said.
-    expect(eq.cartCodeLost).toEqual({ code: "OTHER", reason: "discount_not_combinable", blocking: false });
+    // The other code that took money off in the cart (unknown here): one code applies here, that one is said.
+    expect(eq.cartCodeLost).toEqual({ code: "OTHER", reason: "discount_invalid", blocking: false });
+  });
+
+  it("several codes in the cart: the first that applies here is kept (exact amount), one that took nothing is skipped, a lost one is said as the cart wrote it", async () => {
+    const store = await makeStore();
+    await db.shippingRate.create({ data: { storeId: store.id, name: "Poste", countries: [], priceCents: 500 } });
+    await db.discountCode.createMany({
+      data: [
+        { storeId: store.id, code: "BNDGOOD", type: "PERCENT", value: 10 },
+        { storeId: store.id, code: "BNDNOTHING", type: "PERCENT", value: 50 },
+        { storeId: store.id, code: "BNDSHIP", type: "FREE_SHIPPING", value: 0 },
+      ],
+    });
+    const cart = (codes: string[], allocations: { amount: number; discount_application: { type: string; title: string } }[]) => {
+      const off = allocations.reduce((s, a) => s + a.amount, 0);
+      return {
+        token: "bnd-token-40",
+        currency: "EUR",
+        total_price: 3000 - off,
+        discount_codes: codes.map((code) => ({ code, applicable: true })),
+        items: [{ variant_id: 11, quantity: 1, final_line_price: 3000 - off, line_level_discount_allocations: allocations }],
+      };
+    };
+    const open = async (c: unknown) => {
+      stubCart(c);
+      const res = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1 }], cartToken: "bnd-token-40" });
+      expect(res.status).toBe(200);
+      return db.checkoutSession.findUniqueOrThrow({ where: { id: ((await res.json()) as { id: string }).id }, include: { store: true } });
+    };
+
+    // Two codes lowered the cart (Shopify combined them): "bndLost" (unknown here, the larger) first,
+    // then BNDGOOD; BNDSHIP listed too. BNDGOOD applies for exactly its 1.50; the lost one is said, as written.
+    const two = await open(cart(["bndLost", "BNDGOOD", "BNDSHIP"], [
+      { amount: 200, discount_application: { type: "discount_code", title: "bndLost" } },
+      { amount: 150, discount_application: { type: "discount_code", title: "BNDGOOD" } },
+    ]));
+    expect(two.cartContext).toMatchObject({ discountCodes: ["bndLost", "BNDGOOD", "BNDSHIP"], cartPriced: { codeCents: { BNDLOST: 200, BNDGOOD: 150 }, codesTakenOff: ["bndLost", "BNDGOOD"] } });
+    const q = await quoteSession(two, { addOnIds: [] });
+    expect([q.discount?.code, q.totals.discountCents, q.totals.shippingCents, q.totals.totalCents]).toEqual(["BNDGOOD", 150, 500, 3000 - 150 + 500]);
+    expect(q.cartCodeLost).toEqual({ code: "bndLost", reason: "discount_invalid", blocking: false });
+    expect([q.discountError, q.discountErrorCode]).toEqual([null, null]);
+
+    // One code lowered the cart (unknown here); BNDNOTHING took nothing there (Shopify didn't combine
+    // it): skipped silently, never applied for its 50 %; the free-shipping code applies (its own rule).
+    const ship = await open(cart(["bndLost", "BNDNOTHING", "BNDSHIP"], [{ amount: 200, discount_application: { type: "discount_code", title: "bndLost" } }]));
+    expect(ship.cartContext).toMatchObject({ discountCodes: ["bndLost", "BNDNOTHING", "BNDSHIP"], cartPriced: { codesTakenOff: ["bndLost"] } });
+    const s = await quoteSession(ship, { addOnIds: [] });
+    expect([s.discount?.code, s.discount?.type, s.totals.discountCents, s.totals.shippingCents, s.totals.totalCents]).toEqual(["BNDSHIP", "FREE_SHIPPING", 0, 0, 3000]);
+    expect(s.cartCodeLost).toEqual({ code: "bndLost", reason: "discount_invalid", blocking: false });
+
+    // The free-shipping code not applied while another code is: said too (the buyer loses it).
+    const both = await open(cart(["BNDGOOD", "BNDSHIP"], [{ amount: 300, discount_application: { type: "discount_code", title: "BNDGOOD" } }]));
+    const b = await quoteSession(both, { addOnIds: [] });
+    expect([b.discount?.code, b.totals.totalCents, b.cartCodeLost]).toEqual(["BNDGOOD", 3000 - 300 + 500, { code: "BNDSHIP", reason: "discount_not_combinable", blocking: false }]);
+    expect(await db.eventLog.findFirstOrThrow({ where: { storeId: store.id, kind: "cart.discount_code_dropped" } })).toMatchObject({ data: { code: "bndLost", reason: "discount_invalid" } });
+
+    // Shopify can't be asked about the code that took the most off (asked twice): no other code
+    // meanwhile, payment waits for it ("réessayez") — never charged more.
+    const { clearShopifyDiscountCache } = await import("@/lib/shopify-discounts");
+    const reading = await db.store.update({ where: { id: store.id }, data: { shopifyDiscountCodes: true, shopifyScopes: "read_products,read_discounts" } });
+    clearShopifyDiscountCache();
+    shopify.shopifyGraphql.mockRejectedValue(new Error("Shopify 503"));
+    const waiting = await quoteSession({ ...two, store: reading }, { addOnIds: [] });
+    expect([waiting.discount, waiting.cartCodeLost]).toEqual([null, { code: "bndLost", reason: "discount_unavailable", blocking: true }]);
+    expect(shopify.shopifyGraphql).toHaveBeenCalledTimes(2);
+    await expect(prepareSession({ ...two, store: reading }, { addOnIds: [], countryCode: "FR" })).rejects.toMatchObject({ code: "discount_unavailable" });
+    shopify.shopifyGraphql.mockReset();
+  });
+
+  it("a cart permalink's ?discount=CODE is offered to the quote like the cart's own code (validated there); a malformed one is left out, the cart still sold", async () => {
+    const store = await makeStore();
+    await db.shippingRate.create({ data: { storeId: store.id, name: "Poste", countries: [], priceCents: 0 } });
+    await db.discountCode.create({ data: { storeId: store.id, code: "BNDLINK", type: "PERCENT", value: 10 } });
+    const res = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1 }], discountCode: " bndlink " });
+    expect(res.status).toBe(200);
+    const s = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await res.json()) as { id: string }).id }, include: { store: true } });
+    expect(s.cartContext).toEqual({ discountCodes: ["bndlink"] });
+    const q = await quoteSession(s, { addOnIds: [] });
+    expect([q.discount?.code, q.totals.totalCents, q.cartCodeLost]).toEqual(["BNDLINK", 2700, undefined]);
+    // Removable like the cart's own code.
+    expect((await quoteSession(s, { addOnIds: [], discountCode: "" })).totals.totalCents).toBe(3000);
+    // An unknown one: said, never blocking (it lowered no cart).
+    const unknown = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1 }], discountCode: "BNDNOPE" });
+    const u = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await unknown.json()) as { id: string }).id }, include: { store: true } });
+    expect((await quoteSession(u, { addOnIds: [] })).cartCodeLost).toEqual({ code: "BNDNOPE", reason: "discount_invalid", blocking: false });
+    // Not a code (markup, too long, a sentence the notice would repeat): left out.
+    for (const discountCode of ["<b>" + "x".repeat(80), "Appelez le 06 12 34 56 78"]) {
+      const odd = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1 }], discountCode });
+      expect(odd.status).toBe(200);
+      const o = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await odd.json()) as { id: string }).id } });
+      expect(o.cartContext).toBeNull();
+    }
+  });
+
+  it("a cart's amount-off code on a line raised to the variant's price takes off its own amount, never more (a percentage scales)", async () => {
+    const store = await makeStore();
+    await db.shippingRate.create({ data: { storeId: store.id, name: "Poste", countries: [], priceCents: 0 } });
+    await db.discountCode.createMany({
+      data: [
+        { storeId: store.id, code: "BNDFIVE", type: "FIXED", value: 500 },
+        { storeId: store.id, code: "BNDTWENTY", type: "PERCENT", value: 20 },
+      ],
+    });
+    // Another market's 25.00 for a 30.00 variant (no sign it's an app's: raised), the code's amount off.
+    const open = async (code: string, off: number) => {
+      stubCart({
+        token: "bnd-token-50",
+        currency: "EUR",
+        total_price: 2500 - off,
+        discount_codes: [{ code, applicable: true }],
+        items: [{ variant_id: 11, quantity: 1, price: 2500, original_line_price: 2500, final_line_price: 2500 - off, line_level_discount_allocations: [{ amount: off, discount_application: { type: "discount_code", title: code } }] }],
+      });
+      const res = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1 }], cartToken: "bnd-token-50" });
+      expect(res.status).toBe(200);
+      return db.checkoutSession.findUniqueOrThrow({ where: { id: ((await res.json()) as { id: string }).id }, include: { store: true } });
+    };
+    const fixed = await open("BNDFIVE", 500);
+    expect(fixed.cartContext).toMatchObject({ cartPriced: { raised: true, codeCents: { BNDFIVE: 600 } } });
+    const f = await quoteSession(fixed, { addOnIds: [] });
+    // 30.00 − 5.00 (not the 6.00 its share of the raised line would be).
+    expect([f.discount?.code, f.totals.discountCents, f.totals.totalCents, f.cartPricesAdjusted]).toEqual(["BNDFIVE", 500, 2500, true]);
+    // 20 % off: 5.00 of 25.00 in the cart, 6.00 of the 30.00 charged.
+    const pct = await quoteSession(await open("BNDTWENTY", 500), { addOnIds: [] });
+    expect([pct.discount?.code, pct.totals.discountCents, pct.totals.totalCents]).toEqual(["BNDTWENTY", 600, 2400]);
   });
 
   it("a cart charged as Shopify charges it: its own code that took nothing there takes nothing here (typed again: said)", async () => {
