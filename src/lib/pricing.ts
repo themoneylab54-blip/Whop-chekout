@@ -50,6 +50,11 @@ export type CartLine = {
   /** Quantity fixed by the Shopify cart (app pricing, properties, bundle): changed from the cart only. */
   locked?: boolean;
   /**
+   * Priced as Shopify's cart charged it (cartPricedLines: an app's price, bundle, code or currency the
+   * checkout couldn't represent line by line): already the cart's offer, left out of the checkout's own.
+   */
+  cartPriced?: boolean;
+  /**
    * Shopify's ProductVariant.requiresComponents: a bundle parent sold only through its components
    * (Shopify Bundles, Cart Transform). Without components from the cart it can't be ordered here.
    */
@@ -545,7 +550,7 @@ export function breakDeal(b: QuantityBreak): BreakDeal {
  * gift already is an offer (no combination rules with ours: counting them would discount twice). Pure.
  */
 export function offerBaseLines(lines: CartLine[]): CartLine[] {
-  return lines.filter((l) => !l.gift && !l.appPrice && !l.appGift && !l.appDiscounted);
+  return lines.filter((l) => !l.gift && !l.appPrice && !l.appGift && !l.appDiscounted && !l.cartPriced);
 }
 
 /**

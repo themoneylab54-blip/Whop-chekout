@@ -10,12 +10,14 @@ import type { CartLine, LineComponent, LineProperty } from "./pricing";
  *  - items[].final_line_price + line_level_discount_allocations: a line Shopify prices lower than the
  *    variant keeps that price only on a sign the buyer can't forge (bundle components Shopify
  *    expanded; an automatic allocation is added back, never a sign); otherwise (Markets / B2B price list, a hidden key alone)
- *    the cart goes to Shopify's checkout (never charged more than the cart showed, never less than
- *    verified). A higher cart price is refused too (an app's markup would be lost). Only the server's own re-read of the cart, never the browser's.
+ *    reconcileCart refuses it, and so a higher cart price (an app's markup): such carts are charged
+ *    by cartPricedLines. Only the server's own re-read of the cart, never the browser's.
  *  - items[].item_components / components (bundle parents expanded by Cart Transform): the order
  *    gets the component variants at their share of the line when the cart gives their prices.
  *  - note / attributes: to the order's note and additional details.
- * Anything that can't be represented faithfully sends the buyer to Shopify's own checkout.
+ * A cart that can't be represented line by line (an app's price or bundle, a code, another currency)
+ * is charged as Shopify's cart charges it (cartPricedLines): the buyer stays on this checkout. Only
+ * subscriptions and gift cards are Shopify's checkout's.
  */
 
 export const MAX_PROPERTIES = 25;
@@ -51,6 +53,7 @@ export type UnsupportedCartReason =
   | "bundle_without_cart"
   | "cart_unreadable"
   | "code_unsupported"
+  | "pricing_unavailable"
   | "subscription";
 
 /** Dashboard / journal wording of each reason (French, merchant-facing). */
@@ -62,16 +65,18 @@ export const UNSUPPORTED_REASON_TEXT: Record<UnsupportedCartReason, string> = {
   price_higher: "prix du panier Shopify plus élevé que le prix de la variante (supplément d'app non reproductible)",
   price_not_divisible: "prix de lot non divisible par la quantité",
   bundle_components_unpriced: "composants de lot sans prix exploitables",
-  bundle_components_unresolved: "lot Cart Transform (has_components) dont /cart.js ne donne pas les composants : commander la variante parente fausserait le stock",
-  gift_not_discounted: "cadeau d'app (Kaching, BOGOS…) sans remise dans le panier : l'acheteur le paierait",
+  bundle_components_unresolved:
+    "lot Cart Transform (has_components) dont /cart.js ne donne pas les composants : ceux d'un lot Shopify sont lus dans Shopify, sinon la variante parente est commandée sans décompter le stock des composants",
+  gift_not_discounted: "cadeau d'app (Kaching, BOGOS…) sans remise dans le panier : facturé comme le panier l'affiche",
   price_unreconciled: "total du checkout supérieur au total du panier Shopify",
   price_unverified:
-    "prix du panier Shopify plus bas que le prix de la variante sans signe vérifiable d'une app (liste de prix Markets / B2B, prix TTC par pays, ou clé d'app seule) : le checkout ne facture jamais plus que le panier",
+    "prix du panier Shopify plus bas que le prix de la variante sans signe vérifiable d'une app (liste de prix Markets / B2B, prix TTC par pays, ou clé d'app seule) : prix catalogue facturé, l'acheteur en est informé",
   bundle_quantity: "lot en quantité supérieure à 1 (répartition des composants ambiguë)",
   bundle_without_cart: "lot d'app sans panier Shopify vérifiable (achat direct)",
   cart_unreadable: "panier Shopify illisible alors qu'il contient un lot d'app ou une remise automatique",
   code_unsupported:
-    "code promo du panier Shopify impossible à reproduire au checkout (code inconnu, lecture des codes Shopify désactivée, Shopify injoignable, plusieurs codes ou autre devise) : l'acheteur paierait plus que le panier",
+    "code promo du panier Shopify impossible à vérifier au checkout (code inconnu, lecture des codes Shopify désactivée, Shopify injoignable, plusieurs codes ou autre devise)",
+  pricing_unavailable: "Shopify n'a pas pu tarifer les articles du panier (réessayé)",
   subscription: "abonnement (selling plan) ou carte cadeau dans le panier : vendus par le checkout Shopify uniquement",
 };
 
@@ -124,6 +129,21 @@ export type CartContext = {
    * (the cart's total_price) — else payment is blocked (quote `cartCodeLost`).
    */
   codeCheck?: { code: string; totalCents: number; items: { variantId: string; quantity: number }[] };
+  /**
+   * The lines are the Shopify cart charged as Shopify charges it (cartPricedLines), for `reason`.
+   * `discounted`: discounts other than codes (automatic, cart-level) are already in the line prices —
+   * only the cart's own codes apply on top (the checkout can't tell how another would combine).
+   */
+  cartPriced?: {
+    reason: UnsupportedCartReason;
+    discounted: boolean;
+    /** A lower cart price without proof was replaced by the variant's price (the buyer is told). */
+    raised?: boolean;
+    /** What each of the cart's codes took off in Shopify's cart (upper-cased code → cents, shop currency): applied for exactly that once validated. */
+    codeCents?: Record<string, number>;
+    /** The cart's codes that took money off there (upper-cased, any currency): one that didn't takes nothing here. */
+    codesTakenOff?: string[];
+  };
 };
 
 const gidOf = (id: unknown) => {
@@ -443,6 +463,125 @@ export function reconcileCart(cart: CartJs, lines: CartLine[], shopCurrency: str
 }
 
 /**
+ * The Shopify cart charged as Shopify charges it, for a cart reconcileCart can't represent line by
+ * line (an app's price, a bundle, a code it couldn't verify, another currency): one locked line per
+ * cart line, at the cart's price before its discount codes, its other discounts (automatic, scripts,
+ * cart-level) taken off. Rules:
+ *  - a line priced above the variant (an app's surcharge) keeps the cart's price;
+ *  - a line priced below it keeps that price only on a sign the buyer can't forge (bundle components
+ *    Shopify expanded or flagged, a line Shopify prices at 0): a Markets / B2B price list, another
+ *    country's tax-inclusive price or an app's price change alone could be another market's, so the
+ *    variant's own price is charged instead, its discounts kept in proportion (`raised`: said);
+ *  - the cart's discount codes are NOT in the prices: the checkout applies them like a typed code
+ *    (validated, limits and uses counted, see quoteSession);
+ *  - another currency: each line keeps the cart's discount ratio on the variant's price in the shop's
+ *    currency (never below it otherwise);
+ *  - a line total that doesn't divide by its quantity is rounded down (a few cents at most);
+ *  - every line must be one the Admin API priced (sellable, active): `lines`, the cart's own variants
+ *    included; a bundle parent Shopify sells only through its components gets them from `components`
+ *    (per parent unit, bundleComponents), else it can't be ordered.
+ * Only the server's own re-read of the cart, never the browser's. Subscriptions and gift cards stay
+ * Shopify's. `discounted`: discounts other than codes are in the prices; `codeCents`: what each code
+ * took off in Shopify's cart (same currency only). Pure.
+ */
+export function cartPricedLines(
+  cart: CartJs,
+  lines: CartLine[],
+  shopCurrency: string,
+  components: Map<string, LineComponent[]> = new Map(),
+):
+  | { ok: true; lines: CartLine[]; discounted: boolean; raised: boolean; codeCents: Record<string, number>; codesTakenOff: string[] }
+  | { ok: false; reason: UnsupportedCartReason; detail?: string } {
+  const items = (cart.items ?? []).filter((i) => Math.floor(Number(i.quantity ?? 0)) > 0);
+  if (!items.length) return { ok: false, reason: "cart_changed", detail: "empty cart" };
+  const shopifyOnly = items.find((i) => i.selling_plan_allocation != null || i.gift_card === true);
+  if (shopifyOnly) return { ok: false, reason: "subscription", detail: gidOf(shopifyOnly.variant_id ?? shopifyOnly.id) };
+  const sameCurrency = String(cart.currency ?? "").toUpperCase() === shopCurrency.toUpperCase();
+  const adminOf = new Map(lines.filter((l) => !l.gift).map((l) => [keyOf(l.variantId), l]));
+  const componentsOfParent = new Map([...components].map(([id, parts]) => [keyOf(id), parts]));
+
+  type Row = { item: CartJsItem; admin: CartLine; quantity: number; final: number; automatic: number; codes: number };
+  const rows: Row[] = [];
+  for (const item of items) {
+    const variantId = gidOf(item.variant_id ?? item.id);
+    const admin = adminOf.get(keyOf(variantId));
+    if (!admin) return { ok: false, reason: "unknown_line", detail: variantId };
+    const quantity = Math.floor(Number(item.quantity));
+    const finalUnit = num(item.final_price);
+    const final = num(item.final_line_price) ?? (finalUnit != null ? finalUnit * quantity : null);
+    if (final == null || final < 0) return { ok: false, reason: "cart_unreadable", detail: variantId };
+    // Codes apart (the checkout's own code pipeline applies them); automatic, scripts: in the price.
+    let automatic = 0;
+    let codes = 0;
+    for (const a of item.line_level_discount_allocations ?? []) {
+      const cents = Math.max(0, num(a?.amount) ?? 0);
+      if (a?.discount_application?.type === "discount_code") codes += cents;
+      else automatic += cents;
+    }
+    rows.push({ item, admin, quantity, final, automatic, codes });
+  }
+  // Cart-level discounts other than codes (an automatic discount on the order, or what total_price
+  // takes off without a listed application): shared over the lines by amount (largest remainders).
+  const lineSum = rows.reduce((s, r) => s + r.final + r.codes, 0);
+  const total = num(cart.total_price);
+  const applications = cart.cart_level_discount_applications ?? [];
+  const cartCodes = applications.filter((a) => a?.type === "discount_code").reduce((s, a) => s + Math.max(0, num(a?.total_allocated_amount) ?? 0), 0);
+  const listed = applications.filter((a) => a?.type !== "discount_code").reduce((s, a) => s + Math.max(0, num(a?.total_allocated_amount) ?? 0), 0);
+  const lineCodes = rows.reduce((s, r) => s + r.codes, 0);
+  const cartLevel = Math.min(lineSum, Math.max(0, total != null ? lineSum - lineCodes - total - cartCodes : listed));
+  const shares = cartLevel > 0 ? splitByWeights(cartLevel, rows.map((r) => r.final + r.codes)) : rows.map(() => 0);
+
+  const out: CartLine[] = [];
+  let raised = false;
+  for (const [k, r] of rows.entries()) {
+    const catalog = r.admin.unitPriceCents * r.quantity;
+    // The line's price before its discounts, and the discounts the price keeps (codes apart).
+    const base = r.final + r.automatic + r.codes;
+    const discount = r.automatic + shares[k];
+    const cartComponents = componentsOf(r.item);
+    // Signs the buyer can't forge that an app set the price: Shopify's expanded bundle, its flag, a free line.
+    const proven = Array.isArray(cartComponents) || r.item.has_components === true || base === 0;
+    let amount: number;
+    if (sameCurrency && (base >= catalog || proven)) amount = Math.max(0, base - discount);
+    else {
+      // The variant's price (another currency, or a lower price without proof), the cart's discounts
+      // kept in proportion (a 20 % or a 100 % automatic discount stays one).
+      amount = base > 0 ? Math.floor((catalog * Math.max(0, base - discount)) / base) : 0;
+      if (sameCurrency) raised = true;
+    }
+    const unit = Math.floor(amount / r.quantity);
+    // The variant's data only: what the Admin API's line carried for another cart shape is the cart's now.
+    const line: CartLine = { ...r.admin, quantity: r.quantity, unitPriceCents: unit, locked: true, cartPriced: true };
+    delete line.appPrice;
+    delete line.appGift;
+    delete line.appDiscounted;
+    delete line.components;
+    delete line.properties;
+    if (unit < r.admin.unitPriceCents) {
+      // Below the variant's price (its discounts, a verified bundle price): shown struck through.
+      line.appPrice = { unitCents: unit, originalUnitCents: r.admin.unitPriceCents };
+      line.compareAtCents = Math.max(r.admin.compareAtCents ?? 0, r.admin.unitPriceCents);
+    } else if ((line.compareAtCents ?? 0) <= unit) line.compareAtCents = null;
+    const properties = sanitizeProperties(r.item.properties);
+    if (properties.length) line.properties = properties;
+    if (r.admin.requiresComponents) {
+      // A parent Shopify sells only through its components: they are ordered (their stock), never the parent.
+      const parts = componentsOfParent.get(keyOf(r.admin.variantId));
+      if (!parts?.length) return { ok: false, reason: "bundle_components_unresolved", detail: r.admin.variantId };
+      line.components = parts.map((c) => ({ ...c, quantity: c.quantity * r.quantity, weightCents: c.weightCents * r.quantity }));
+    } else if (Array.isArray(cartComponents) && r.quantity === 1) {
+      // A single bundle Shopify expanded: its components are ordered, sharing the line's amount.
+      line.components = cartComponents;
+    }
+    out.push(line);
+  }
+  const discounted = cartLevel > 0 || rows.some((r) => r.automatic > 0);
+  const allocations = cartCodeAllocations(cart);
+  const codeCents = sameCurrency ? Object.fromEntries(allocations.map((c) => [c.code.toUpperCase(), c.cents])) : {};
+  return { ok: true, lines: out, discounted, raised, codeCents, codesTakenOff: allocations.map((c) => c.code.toUpperCase()) };
+}
+
+/**
  * Discount codes the Shopify cart carries (applicable ones of `discount_codes`, and the titles of
  * code allocations): at most 3, 60 characters each. Pure.
  */
@@ -487,7 +626,7 @@ export function cartHeldByApp(lines: CartLine[]): boolean {
   const buyer = lines.filter((l) => !l.gift);
   const keys = buyer.map((l) => keyOf(l.variantId));
   return (
-    buyer.some((l) => !!l.appPrice || !!l.appGift || !!l.appDiscounted || !!l.components?.length || hasBundleHint(l.properties)) || new Set(keys).size !== keys.length
+    buyer.some((l) => !!l.cartPriced || !!l.appPrice || !!l.appGift || !!l.appDiscounted || !!l.components?.length || hasBundleHint(l.properties)) || new Set(keys).size !== keys.length
   );
 }
 
@@ -664,12 +803,20 @@ export function carryCartExtras(previous: CartLine[], priced: CartLine[]): CartL
  * the parts add up exactly). Pure.
  */
 export function splitOverComponents(totalCents: number, components: LineComponent[]): number[] {
-  const weight = components.reduce((s, c) => s + Math.max(0, c.weightCents), 0);
+  return splitByWeights(
+    totalCents,
+    components.map((c) => c.weightCents),
+  );
+}
+
+/** Splits `totalCents` in proportion to `weights` (largest remainders: the parts add up exactly). Pure. */
+export function splitByWeights(totalCents: number, weights: number[]): number[] {
+  const weight = weights.reduce((s, w) => s + Math.max(0, w), 0);
   if (weight <= 0) {
-    const base = Math.floor(totalCents / components.length);
-    return components.map((_, i) => base + (i < totalCents - base * components.length ? 1 : 0));
+    const base = Math.floor(totalCents / weights.length);
+    return weights.map((_, i) => base + (i < totalCents - base * weights.length ? 1 : 0));
   }
-  const exact = components.map((c) => (totalCents * Math.max(0, c.weightCents)) / weight);
+  const exact = weights.map((w) => (totalCents * Math.max(0, w)) / weight);
   const parts = exact.map(Math.floor);
   let rest = totalCents - parts.reduce((a, b) => a + b, 0);
   const order = exact.map((e, i) => [e - Math.floor(e), i] as const).sort((a, b) => b[0] - a[0]);

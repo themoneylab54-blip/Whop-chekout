@@ -156,6 +156,8 @@ export type Quote = {
    * couldn't be asked, twice): payment is refused (assertPayable) — back to the cart / Shopify's checkout.
    */
   cartCodeLost?: { code: string; reason: string; blocking: boolean };
+  /** Some lines of a cart charged as Shopify charges it are at the variant's price, not the cart's lower one. */
+  cartPricesAdjusted?: boolean;
 };
 
 /** Id of the shipping protection in the paid snapshot's add-ons (Shopify line "Protection colis"). */
@@ -296,7 +298,15 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
   let shopifyCode: ShopifyCodeDiscount | null = null;
   let discountError: string | null = null;
   let discountErrorCode: string | null = null;
-  if (discountCode) {
+  // A cart charged as Shopify's cart charged it, its automatic discounts already in the prices: only
+  // the cart's own codes on top (Shopify combined them with those discounts); another code can't be
+  // checked against what the cart applied.
+  const context = session.cartContext as CartContext | null;
+  const cartsOwn = (code: string) => (context?.discountCodes ?? []).some((c) => c.toUpperCase() === code.toUpperCase());
+  if (discountCode && context?.cartPriced?.discounted && !cartsOwn(discountCode)) {
+    discountError = "Les remises de votre panier sont déjà appliquées : un autre code ne peut pas s'y ajouter.";
+    discountErrorCode = "discount_cart_priced";
+  } else if (discountCode) {
     // One message for unknown, inactive, expired or used-up codes: don't help guess private codes.
     const invalid = "Code promo invalide ou expiré";
     if (!discountRow && session.store.shopifyDiscountCodes && session.store.shopifyAccessToken && canReadShopifyDiscounts(session.store)) {
@@ -357,6 +367,28 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
     }
   }
 
+  // A cart charged as Shopify charges it: one of its own codes (validated above: limits, uses) takes
+  // off exactly what it took off in Shopify's cart, where Shopify combined it with the discounts now in
+  // the prices; one that took nothing there (not combinable, its minimum…) takes nothing here either.
+  // A free-shipping code keeps its own rule; another currency's cart keeps the code's own computation.
+  const pricedCodes = context?.cartPriced?.codeCents;
+  const takenOff = context?.cartPriced?.codesTakenOff;
+  if (discount && context?.cartPriced && discount.type !== "FREE_SHIPPING" && cartsOwn(discount.code)) {
+    const key = discount.code.toUpperCase();
+    const cents = pricedCodes?.[key];
+    if (cents && cents > 0) discount = { ...discount, type: "FIXED", value: cents, scopeShare: undefined, eligibleVariantIds: undefined };
+    else if (!takenOff || !takenOff.includes(key)) {
+      // It took nothing in Shopify's cart: nothing here either (typed again: said).
+      discount = null;
+      shopifyCode = null;
+      if (input.discountCode) {
+        discountError = "Ce code ne se cumule pas avec les remises déjà appliquées : la remise la plus avantageuse est conservée";
+        discountErrorCode = "discount_not_combinable";
+      }
+    }
+    // Another currency's cart: the code's own computation (its cents aren't the shop's).
+  }
+
   const ruleCtx = { subtotalCents: subtotal(buyerLines), productIds: buyerLines.map((l) => l.productId), country: input.countryCode ?? null };
   const eligible = allAddOns.filter((a) => addOnEligible(a.showIf, ruleCtx));
   const addOns = eligible.filter((a) => input.addOnIds.includes(a.id));
@@ -399,8 +431,11 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
   let cartCodeLost: Quote["cartCodeLost"];
   if (cartCode && !input.discountCode) {
     const check = (session.cartContext as CartContext | null)?.codeCheck;
-    const required = !!check && check.code.toUpperCase() === cartCode.toUpperCase();
-    const overCart = required && sameCodeCart(check!.items, buyerLines) && totals.subtotalCents - totals.discountCents > check!.totalCents;
+    // A code that took money off in a cart charged as Shopify charges it is required too: Shopify
+    // unreachable blocks payment ("réessayez"), never charged more meanwhile.
+    const checked = !!check && check.code.toUpperCase() === cartCode.toUpperCase();
+    const required = checked || !!takenOff?.includes(cartCode.toUpperCase());
+    const overCart = checked && sameCodeCart(check!.items, buyerLines) && totals.subtotalCents - totals.discountCents > check!.totalCents;
     if (discountError) {
       await noteCartCodeDropped(session, cartCode, discountErrorCode);
       cartCodeLost = { code: cartCode, reason: discountErrorCode ?? "discount_invalid", blocking: required && (discountErrorCode === "discount_unavailable" || overCart) };
@@ -410,6 +445,10 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
       await noteCartCodeDropped(session, cartCode, "discount_amount");
       cartCodeLost = { code: cartCode, reason: "discount_amount", blocking: true };
     }
+    // A cart charged as Shopify charges it with several codes that took money off there: one code
+    // applies here, another one is said (never dropped silently).
+    const other = takenOff && !cartCodeLost ? takenOff.find((c) => c !== discount?.code.toUpperCase()) : undefined;
+    if (other) cartCodeLost = { code: other, reason: "discount_not_combinable", blocking: false };
   }
   // The Shopify cart's automatic discount stopped applying because the buyer changed the lines.
   const cartAutomatic = session.cartDiscounts as { totalCents?: unknown; titles?: unknown } | null;
@@ -417,7 +456,11 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
     !!cartAutomatic && Number(cartAutomatic.totalCents) > 0 && !totals.dropped?.includes("automatic") && automatic.cents === 0
       ? (Array.isArray(cartAutomatic.titles) ? cartAutomatic.titles.map(String).slice(0, 5) : [])
       : null;
-  const volumeBreak = quantityBreakForLines(tiers.breaks, offerBaseLines(buyerLines));
+  // A cart fixed as a whole (an app's lines, the Shopify cart's prices) can't take more items: no
+  // "add N more" nudge then (a tier still counts what it holds).
+  const frozen = cartFrozen(buyerLines);
+  const reached = quantityBreakForLines(tiers.breaks, offerBaseLines(buyerLines));
+  const volumeBreak = frozen ? { ...reached, next: null, missing: null } : reached;
   const protectionCents = totals.protectionCents ?? 0;
   const discountedSub = totals.subtotalCents - totals.discountCents;
   const quote: Quote = {
@@ -445,13 +488,14 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
     volumeBreak: totals.dropped?.includes("breaks") ? { ...volumeBreak, current: null } : volumeBreak,
     gifts: {
       earned: progress.earned.filter((g) => gifts.some((l) => l.variantId === g.variantId)).map((g) => ({ title: giftTitle(g, session.lang), variantId: g.variantId })),
-      next: progress.next ? { title: giftTitle(progress.next.tier, session.lang), missingQty: progress.next.missingQty, missingCents: progress.next.missingCents } : null,
+      next: progress.next && !frozen ? { title: giftTitle(progress.next.tier, session.lang), missingQty: progress.next.missingQty, missingCents: progress.next.missingCents } : null,
     },
     protection: protectionBlock ? { selected: protectionCents > 0, priceCents: offered?.protectionCents ?? 0 } : null,
     extraAddOns: protectionCents > 0 ? [{ id: PROTECTION_ADDON_ID, title: "Protection colis", priceCents: protectionCents, variantId: null, costCents: null }] : [],
-    ...(cartFrozen(buyerLines) ? { cartLocked: true } : {}),
+    ...(frozen ? { cartLocked: true } : {}),
     ...(automaticLost ? { automaticDiscountLost: automaticLost } : {}),
     ...(cartCodeLost ? { cartCodeLost } : {}),
+    ...(context?.cartPriced?.raised ? { cartPricesAdjusted: true } : {}),
   };
   // The Shopify code as read (limits, usage count): frozen on the snapshot, never sent to the browser.
   if (shopifyCode && discountSource === "shopify") shopifyCodeOf.set(quote, shopifyCode);

@@ -1,4 +1,4 @@
-import { clientIp, rateLimit } from "@/lib/ratelimit";
+import { clientIp, memoryRateLimit, rateLimit } from "@/lib/ratelimit";
 import { z } from "zod";
 import type { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
@@ -37,6 +37,16 @@ const jsonSize = (v: unknown) => {
   }
 };
 
+/**
+ * Line properties / cart attributes within the limits (50 keys of 255 characters, 16 KB), else left
+ * out (null) rather than refusing the whole cart: the buyer can always pay, and a cart with a token
+ * gets its properties from the server's own re-read anyway.
+ */
+const boundedRecord = z.preprocess(
+  (p) => (p && typeof p === "object" && !Array.isArray(p) && Object.keys(p).length <= 50 && Object.keys(p).every((k) => k.length <= 255) && jsonSize(p) <= MAX_PROPERTIES_BYTES ? p : null),
+  z.record(z.string(), z.unknown()).nullable().optional(),
+);
+
 const bodySchema = z.object({
   store: z.string().min(1).max(40),
   items: z
@@ -48,17 +58,22 @@ const bodySchema = z.object({
         selling_plan: z.union([z.string(), z.number()]).nullable().optional(),
         gift_card: z.boolean().optional(),
         // Line item properties of the cart line (personalization, bundle apps' "_…" keys).
-        properties: z
-          .record(z.string().max(255), z.unknown())
-          .refine((p) => Object.keys(p).length <= 50 && jsonSize(p) <= MAX_PROPERTIES_BYTES)
-          .nullable()
-          .optional(),
+        properties: boundedRecord,
       }),
     )
     .min(1)
     .max(100)
-    // Every line's properties together: the cart copy this route keeps stays small.
-    .refine((items) => items.reduce((n, i) => n + (i.properties ? jsonSize(i.properties) : 0), 0) <= MAX_CART_BYTES),
+    // Every line's properties together: the cart copy this route keeps stays small (past the budget,
+    // a line's properties are left out, never the cart refused).
+    .transform((items) => {
+      let total = 0;
+      return items.map((i) => {
+        const size = i.properties ? jsonSize(i.properties) : 0;
+        if (total + size > MAX_CART_BYTES) return { ...i, properties: null };
+        total += size;
+        return i;
+      });
+    }),
   returnUrl: z.string().url().max(2000).optional(),
   // Last paid touch (utm_* / click ids + "ts", ms since epoch) and the first one ever.
   utm: z
@@ -86,28 +101,29 @@ const bodySchema = z.object({
   cartToken: z.string().regex(/^[\w\-?=&%.:]{8,300}$/).optional(),
   automaticDiscounts: z.boolean().optional(),
   // The storefront saw lines an app may have priced (bundle components, price ≠ variant's): the
-  // server re-reads the cart and keeps only what Shopify computed, or sends the buyer to Shopify.
+  // server re-reads the cart and keeps only what Shopify computed, or refuses the cart.
   appPricing: z.boolean().optional(),
   // Cart note and attributes (copied to the order; the server's re-read wins when there is one).
   note: z.string().max(5000).nullable().optional(),
-  attributes: z
-    .record(z.string().max(255), z.unknown())
-    .refine((a) => Object.keys(a).length <= 50 && jsonSize(a) <= MAX_PROPERTIES_BYTES)
-    .nullable()
-    .optional(),
+  attributes: boundedRecord,
   // Random key of this click (loader): a retry (checkout domain timed out, then the app's API)
   // gets the session the first request created, never a second session nor a second conversion.
   requestKey: z.string().regex(/^[A-Za-z0-9_-]{16,64}$/).optional(),
 });
 
+/** Transient refusals (Shopify slow, the cart changing, the click's other request still running, a burst). */
+// Not an unreadable cart (already read twice) nor the rate limit (the same minute would refuse again).
+const RETRYABLE_REASONS = new Set(["price_failed", "pricing_unavailable", "in_progress", "cart_changed"]);
+
 /**
  * A cart the checkout can't open. `native` marks the only carts Shopify's checkout keeps
  * (checkout switched off, subscriptions, gift cards, excluded products): for every other refusal
- * the loader stays on the shop with a "try again" message, never Shopify's checkout.
+ * the loader stays on the shop with a "try again" message, never Shopify's checkout. `retryable`
+ * marks a transient one (RETRYABLE_REASONS): the loader retries it once on its own first.
  */
-function refuse(status: number, error: string, reason: string, native = false) {
-  log.warn("session.refused", "Checkout session refused", { status, reason });
-  return json({ error, reason, ...(native ? { native: true, fallback: true } : {}) }, { status, cors: true });
+function refuse(status: number, error: string, reason: string, native = false, storeId?: string) {
+  log.warn("session.refused", "Checkout session refused", { status, reason, ...(storeId ? { storeId } : {}) });
+  return json({ error, reason, ...(native ? { native: true, fallback: true } : {}), ...(RETRYABLE_REASONS.has(reason) ? { retryable: true } : {}) }, { status, cors: true });
 }
 
 /** Called by the storefront loader with the contents of /cart.js. */
@@ -118,8 +134,10 @@ async function handle(req: Request) {
   const raw = await readJson(req);
   // The loader's warm-up when the buyer heads for « Checkout » (hover, touch, cart opened): this
   // function and its database connection are awake (and the CORS preflight cached) before the
-  // click. Nothing created, no rate limit spent.
+  // click. Nothing created, no session rate limit spent; capped per IP in memory (no query), so a
+  // flood of warm-ups never reaches the database.
   if (raw && typeof raw === "object" && (raw as { warm?: unknown }).warm === true) {
+    if (!memoryRateLimit(`warm:ip:${clientIp(req)}`, 30)) return json({ warm: false }, { status: 429, cors: true });
     await db.$queryRaw`SELECT 1`.catch(() => undefined);
     return json({ warm: true }, { cors: true });
   }
@@ -130,6 +148,10 @@ async function handle(req: Request) {
     return refuse(400, "Panier invalide", "invalid_body");
   }
   const { store: publicId, items, returnUrl, tracking, visitorId } = parsed.data;
+  // Properties or attributes over the limits were left out (the cart is still sold): said in the logs.
+  const sent = raw as { items?: { properties?: unknown }[]; attributes?: unknown };
+  const dropped = items.filter((i, k) => sent.items?.[k]?.properties && !i.properties).length + (sent.attributes && !parsed.data.attributes ? 1 : 0);
+  if (dropped) log.warn("session.properties_dropped", "Line properties or cart attributes over the limits left out", { store: publicId, dropped });
   // Subscriptions (selling plans) and gift cards can't be sold here (no recurring billing, no gift
   // card issuing): the whole cart goes to Shopify's checkout.
   const unsupported = unsupportedCart(items);
@@ -139,15 +161,15 @@ async function handle(req: Request) {
     db.store.findUnique({ where: { publicId } }),
     requestKey ? db.checkoutSession.findFirst({ where: { requestKey, store: { publicId } }, select: { id: true, visitorId: true } }) : null,
   ]);
-  if (!ok) return refuse(429, "Trop de requêtes", "rate_limited");
-  if (unsupported) return refuse(409, unsupported === "selling_plan" ? "Abonnement : checkout Shopify" : "Carte cadeau : checkout Shopify", unsupported, true);
+  if (!ok) return refuse(429, "Trop de requêtes", "rate_limited", false, store?.id);
+  if (unsupported) return refuse(409, unsupported === "selling_plan" ? "Abonnement : checkout Shopify" : "Carte cadeau : checkout Shopify", unsupported, true, store?.id);
 
   // At least one processor able to take the payment (Whop and/or Stripe, under the store's mode).
   if (!store?.enabled || !store.shopifyConnectedAt || !anyProviderConnected(store) || store.fallbackActiveAt) {
-    return refuse(409, "Checkout désactivé", "disabled", true);
+    return refuse(409, "Checkout désactivé", "disabled", true, store?.id);
   }
-  // Called on another store's checkout domain: unknown here (the loader then uses Shopify's checkout).
-  if (await isForeignCheckoutHost(req, store)) return refuse(404, "Boutique introuvable", "foreign_host");
+  // Called on another store's checkout domain: unknown here (refused: the buyer stays on the shop).
+  if (await isForeignCheckoutHost(req, store)) return refuse(404, "Boutique introuvable", "foreign_host", false, store.id);
 
   // Same click already handled: that session again (the first request may also still be running,
   // see the create below).
@@ -177,15 +199,15 @@ async function handle(req: Request) {
     lines = await priceCart(store, items.map((i) => ({ variantId: i.variant_id, quantity: i.quantity })));
   } catch (err) {
     log.error("checkout.price_failed", "Could not price the cart with Shopify", { err });
-    return refuse(502, "Impossible de charger le panier", "price_failed");
+    return refuse(502, "Impossible de charger le panier", "price_failed", false, store.id);
   }
-  if (lines.length === 0) return refuse(400, "Panier vide", "empty_cart");
+  if (lines.length === 0) return refuse(400, "Panier vide", "empty_cart", false, store.id);
   // Gift cards checked on Shopify's own data too (a storefront script could leave the flag out).
-  if (lines.some((l) => l.giftCard)) return refuse(409, "Carte cadeau : checkout Shopify", "gift_card", true);
+  if (lines.some((l) => l.giftCard)) return refuse(409, "Carte cadeau : checkout Shopify", "gift_card", true, store.id);
   // Excluded products keep Shopify's checkout, whatever the storefront script did.
   const excluded = loadInterception(store.interception).excludedHandles;
   if (lines.some((l) => excluded.includes(l.productHandle))) {
-    return refuse(409, "Produit géré par le checkout Shopify", "excluded", true);
+    return refuse(409, "Produit géré par le checkout Shopify", "excluded", true, store.id);
   }
 
   // Touches are kept with their date ("ts"): the attribution window (1/7/28 days) is applied
@@ -197,9 +219,12 @@ async function handle(req: Request) {
   const visitor = resolveVisitor(visitorId);
   const cartToken = parsed.data.cartToken ?? null;
   // Line properties, app prices (Cart Transform), bundle components and Shopify's automatic
-  // discounts as the server re-read them; a cart that can't be represented goes to Shopify.
+  // discounts as the server re-read them; a cart that can't be represented line by line is charged
+  // as Shopify's cart charges it (Shopify's checkout only for a subscription).
   const cart = await sessionCart(store, cartInput, lines, cartRead);
-  if (!cart.ok) return refuse(409, "Panier refusé : " + cart.reason, cart.reason, cart.reason === "subscription");
+  if (!cart.ok) return refuse(409, "Panier refusé : " + cart.reason, cart.reason, cart.reason === "subscription", store.id);
+  // Lines taken from the re-read cart itself (charged as Shopify's cart charges them): the same rules.
+  if (cart.lines.some((l) => excluded.includes(l.productHandle))) return refuse(409, "Produit géré par le checkout Shopify", "excluded", true, store.id);
   lines = cart.lines;
   const { cartDiscounts, cartContext } = cart;
 
@@ -236,7 +261,7 @@ async function handle(req: Request) {
       throw err;
     });
   // That request's session, and its conversion only.
-  if (!session) return (await replay()) ?? refuse(409, "Session en cours de création", "in_progress");
+  if (!session) return (await replay()) ?? refuse(409, "Session en cours de création", "in_progress", false, store.id);
   // Redacted copy of a cart holding app lines (support diagnostics, purged after 7 days).
   if (cart.diagnostic) {
     const d = cart.diagnostic;

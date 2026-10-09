@@ -39,7 +39,7 @@ import { centsToDecimal, MAX_GIFT_TIERS, MAX_PERCENT_TIERS, validateQuantityTier
 import { pickupConfigured, searchPickupPoints } from "@/lib/pickup";
 import { cleanRecordI18n } from "@/components/checkout/localize";
 import { recordValueModeChange } from "@/lib/value-mode";
-import { closeFallbackPeriod, recordCheckoutEnabled } from "@/lib/fallback";
+import { recordCheckoutEnabled } from "@/lib/fallback";
 import { buyerName, sessionIdsByBuyerName } from "@/lib/order-search";
 import { flashUrl, issueField, type FlashParams } from "@/lib/flash";
 import { checkoutHostOf, formatDomainError, normalizeCheckoutDomain, parseDomainError } from "@/lib/checkout-domain";
@@ -1796,29 +1796,6 @@ export async function saveOfferMergeAction(storeId: string, fd: FormData) {
   back(path, { ok: "Réglage des offres post-achat enregistré" });
 }
 
-export async function saveFallbackAction(storeId: string, fd: FormData) {
-  await getStore(storeId);
-  const autoFallback = fd.get("autoFallback") === "on";
-  await db.store.update({ where: { id: storeId }, data: { autoFallback } });
-  back(storePath(storeId, "settings"), { ok: autoFallback ? "Checkout de secours activé" : "Checkout de secours désactivé" });
-}
-
-export async function clearFallbackAction(storeId: string) {
-  const store = await getStore(storeId);
-  const path = storePath(storeId, "settings");
-  if (!store.fallbackActiveAt) back(path, { ok: "Le checkout Whop est déjà actif" });
-  await db.store.update({ where: { id: storeId }, data: { fallbackActiveAt: null, fallbackReason: null } });
-  await closeFallbackPeriod(storeId);
-  await recordEvent({
-    storeId,
-    kind: "fallback.cleared_manually",
-    message: "Checkout Whop réactivé manuellement depuis les réglages (le checkout Shopify de secours n'est plus utilisé).",
-    data: { since: store.fallbackActiveAt.toISOString(), reason: store.fallbackReason },
-  });
-  revalidatePath(storePath(storeId), "layout");
-  back(path, { ok: "Checkout Whop réactivé. Si Whop échoue encore, le secours se réenclenchera tout seul." });
-}
-
 export async function savePickupAction(storeId: string, fd: FormData) {
   const { user, store } = await requireStoreAction(storeId, "edit");
   const path = storePath(storeId, "shipping");
@@ -1978,8 +1955,6 @@ async function settingsSectionAction(key: string): Promise<((storeId: string, fd
   switch (key) {
     case "Boutique":
       return saveSettingsAction;
-    case "Checkout de secours":
-      return saveFallbackAction;
     case "Marges & coûts":
       return saveMarginsAction;
     case "Coûts":

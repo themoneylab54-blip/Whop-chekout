@@ -23,6 +23,14 @@ function memoryHit(key: string, limit: number, windowMs: number): boolean {
   return bucket.count <= limit;
 }
 
+/**
+ * Memory-only check (this instance, no database round trip): for calls too cheap to spend a query
+ * on, such as the loader's warm-up. Returns true when the call is allowed.
+ */
+export function memoryRateLimit(key: string, limit: number, windowMs = 60_000): boolean {
+  return memoryHit(key, limit, windowMs);
+}
+
 /** Returns true when the call is allowed. Fails open if the database is unreachable. */
 export async function rateLimit(key: string, limit: number, windowMs = 60_000): Promise<boolean> {
   if (!memoryHit(key, limit, windowMs)) return false;

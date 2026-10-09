@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 /*
  * Storefront loader: never Shopify's checkout on a failure. A click before the config arrives is
@@ -12,9 +12,14 @@ import { describe, expect, it, vi } from "vitest";
 
 const API = "https://app.example.com";
 const source = readFileSync(join(process.cwd(), "public/loader.js"), "utf8");
-const flush = () => new Promise((r) => setTimeout(r, 0));
+
+// Fake timers: the retry's pause runs without waiting for it.
+vi.useFakeTimers();
+afterAll(() => {
+  vi.useRealTimers();
+});
 const settle = async () => {
-  for (let i = 0; i < 10; i++) await flush();
+  for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(0);
 };
 
 type Reply = { status: number; body: unknown };
@@ -76,6 +81,11 @@ describe("loader: never Shopify's checkout on a failure", () => {
   it("« Try again » asks again; a server error is retried once on its own before the message", async () => {
     sessions.push({ status: 502, body: { error: "Impossible de charger le panier", reason: "price_failed" } }, { status: 502, body: { error: "x" } });
     (document.querySelector("#whopco-error button") as HTMLButtonElement).click();
+    await settle();
+    // The automatic retry comes after a short pause (no message meanwhile).
+    expect(sessionCalls).toBe(2);
+    expect(errorShown()).toBe(false);
+    await vi.advanceTimersByTimeAsync(800);
     await settle();
     expect(sessionCalls).toBe(3);
     expect(errorShown()).toBe(true);

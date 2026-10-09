@@ -218,7 +218,7 @@ model Store {
   mondialRelayEnseigne String?
   mondialRelayKey      String? // encrypted
 
-  // --- Safety net: fall back to Shopify's own checkout while Whop is failing ---
+  // No longer used, always false: the automatic switch to Shopify's own checkout was removed (migration 0043)
   autoFallback             Boolean   @default(false)
   // Chargeback fee charged per dispute (profit analytics), and monthly fixed costs
   disputeFeeCents          Int       @default(1500)

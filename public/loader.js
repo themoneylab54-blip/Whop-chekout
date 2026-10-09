@@ -3,8 +3,8 @@
  * Injected automatically on the shop via a Shopify ScriptTag (or pasted once in theme.liquid).
  * Replaces the Shopify checkout with the store's Whop checkout, following the
  * interception settings from the dashboard. Shopify's own checkout only runs when the merchant
- * switched ours off, for carts it can't sell (subscriptions, gift cards, excluded products) or
- * when our server can't be reached at all; any other failure keeps the buyer on the shop with a
+ * switched ours off or for carts it can't sell (subscriptions, gift cards, excluded products), as the
+ * session server says; any failure (our server down included) keeps the buyer on the shop with a
  * "try again" message.
  */
 (function () {
@@ -27,11 +27,22 @@
 
   var config = null;
   var configLoading = true;
+  // The whole page view on Shopify's checkout: only when ours is switched off or our server unreachable.
   var bypass = false;
+  // One click handed back to the theme (see letThrough): the next ones are still ours.
+  var passThrough = false;
   var busy = false;
 
   function log() {
     if (DEBUG && window.console) console.log.apply(console, ["[whop-checkout]"].concat([].slice.call(arguments)));
+  }
+
+  function wait(ms, value) {
+    return new Promise(function (resolve) {
+      setTimeout(function () {
+        resolve(value);
+      }, ms);
+    });
   }
 
   // After a successful payment the thank-you page links back here: empty the cart once,
@@ -60,7 +71,6 @@
     "input[name='checkout']",
     "a[href='/checkout']",
     "a[href^='/checkout?']",
-    "a[href*='/checkout'][class*='checkout']",
     "form[action='/checkout'] [type='submit']",
     "[data-checkout-button]",
     ".cart__checkout",
@@ -96,8 +106,19 @@
     return null;
   }
 
+  // Settings assumed while the store's own load (clicks held meanwhile) or when they can't be read:
+  // everything on, with the store's own selectors as its last page had them (localStorage).
+  var DEFAULT_INTERCEPTION = { cartCheckout: true, cartDrawer: true, buyNow: true, addToCartDirect: false, customSelectors: "", excludedHandles: [] };
+  var cachedCustom = localGet("whopco_custom");
+  if (typeof cachedCustom === "string") DEFAULT_INTERCEPTION.customSelectors = cachedCustom;
+
+  // The settings in force: the store's, or the assumed ones while they load.
+  function settings() {
+    return config ? config.interception : DEFAULT_INTERCEPTION;
+  }
+
   function customSelectors() {
-    return (config.interception.customSelectors || "")
+    return String(settings().customSelectors || "")
       .split(/[\n,]/)
       .map(function (s) {
         return s.trim();
@@ -106,7 +127,7 @@
   }
 
   function checkoutSelectors() {
-    var i = config.interception;
+    var i = settings();
     var list = [];
     if (i.cartCheckout) list = list.concat(CART_CHECKOUT);
     if (i.cartDrawer) list = list.concat(DRAWER_CHECKOUT);
@@ -239,7 +260,7 @@
     el.id = id;
     el.setAttribute("aria-live", "polite");
     el.style.cssText =
-      "position:fixed;inset:0;z-index:2147483647;background:rgba(255,255,255,.75);display:flex;align-items:center;justify-content:center;font:500 15px/1.4 system-ui,sans-serif;color:#111";
+      "position:fixed;top:0;right:0;bottom:0;left:0;z-index:2147483647;background:rgba(255,255,255,.75);display:flex;align-items:center;justify-content:center;font:500 15px/1.4 system-ui,sans-serif;color:#111";
     el.innerHTML =
       '<div style="display:flex;gap:10px;align-items:center"><span style="width:18px;height:18px;border:2px solid #111;border-right-color:transparent;border-radius:50%;display:inline-block;animation:whopco-spin .8s linear infinite"></span>Redirection vers le paiement sécurisé…</div><style>@keyframes whopco-spin{to{transform:rotate(360deg)}}</style>';
     document.body.appendChild(el);
@@ -367,14 +388,17 @@
 
   // The session POST goes to the store's checkout domain (checkout.<shop>.com). If that domain can't be
   // reached from this browser (DNS not propagated here, network filter, certificate being renewed), the
-  // same request goes to the app's own API (where this script comes from) before Shopify's checkout.
-  // Reachability is decided up front by a light ping (started when the config loads, 3 s max), so the
-  // POST itself never times out on a slow cart pricing; and the POST carries a random key of the click,
-  // so a retry on the app's API gets the session the first request created (one session, one conversion).
-  // The ping fetches a static file served by the CDN (never a function: no cold start, no cost per
-  // pageview), and its answer is kept for 10 minutes in the tab (one ping per visit, not per page).
+  // same request goes to the app's own API (where this script comes from).
+  // Reachability is decided up front by a light ping (started when the config loads, 3 s max so a slow
+  // mobile network isn't taken for an unreachable domain; a click only waits for a ping still running),
+  // so the POST itself only has a long time limit (25 s, see timedFetch) that a slow cart pricing never
+  // reaches; and the POST carries a random key of the click, so a retry on the app's API gets the session
+  // the first request created (one session, one conversion). The ping fetches a static file served by
+  // the CDN (never a function: no cold start, no cost per pageview), and its answer is kept for 10
+  // minutes in the tab (one ping per visit, not per page).
   var viaApp = false;
   var domainPing = null;
+  var domainReachable = null; // the ping's answer once known (the warm-up follows it too)
   var PING_ASSET = "/checkout-icon.svg";
   var PING_CACHE_MS = 10 * 60 * 1000;
   function sessionsUrl() {
@@ -399,6 +423,7 @@
     }
     var known = cachedPing(origin);
     if (known !== null) {
+      domainReachable = known;
       domainPing = Promise.resolve(known);
       return;
     }
@@ -414,9 +439,10 @@
     var timeout = new Promise(function (resolve) {
       setTimeout(function () {
         resolve(false);
-      }, 1500);
+      }, 3000);
     });
     domainPing = Promise.race([ping, timeout]).then(function (ok) {
+      domainReachable = ok;
       log(ok ? "checkout domain reachable" : "checkout domain unreachable, the app's API will be used");
       try {
         sessionStorage.setItem("whopco_ping", JSON.stringify({ origin: origin, ok: ok, at: Date.now() }));
@@ -439,25 +465,51 @@
       return (Date.now().toString(36) + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)).slice(0, 40);
     }
   }
+  // One session request with its answer read, 25 s at most in every browser (a plain timer; the request
+  // is also aborted where AbortController exists). Past that it's a network error (a TypeError): the
+  // app's API next, or the automatic retry, with the same key.
+  var SESSION_TIMEOUT = 25000;
+  function timedFetch(url, init) {
+    var ctrl = typeof AbortController === "function" ? new AbortController() : null;
+    var timer;
+    var limit = new Promise(function (resolve, reject) {
+      timer = setTimeout(function () {
+        if (ctrl) ctrl.abort();
+        reject(new TypeError("no answer within " + SESSION_TIMEOUT / 1000 + " s"));
+      }, SESSION_TIMEOUT);
+    });
+    var answer = fetch(url, ctrl ? Object.assign({}, init, { signal: ctrl.signal }) : init).then(function (res) {
+      return res.text().then(function (text) {
+        return { ok: res.ok, status: res.status, text: text };
+      });
+    });
+    return Promise.race([answer, limit]).then(
+      function (r) {
+        clearTimeout(timer);
+        return r;
+      },
+      function (err) {
+        clearTimeout(timer);
+        throw err;
+      }
+    );
+  }
   function postSession(init) {
     var direct = sessionsUrl();
     viaApp = false;
-    if (config.sessionEndpoint === direct) return fetch(direct, init);
+    if (config.sessionEndpoint === direct) return timedFetch(direct, init);
     return (domainPing || Promise.resolve(true)).then(function (reachable) {
       if (!reachable) {
         viaApp = true;
-        return fetch(direct, init);
+        return timedFetch(direct, init);
       }
-      // Safety net only (a domain that stops answering mid-request): long enough for a cold cart
-      // pricing, and the request key makes the retry return the same session anyway.
-      var first = init;
-      if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
-        first = Object.assign({}, init, { signal: AbortSignal.timeout(20000) });
-      }
-      return fetch(config.sessionEndpoint, first).catch(function (err) {
+      return timedFetch(config.sessionEndpoint, init).catch(function (err) {
         log("checkout domain unreachable, retrying on the app:", err && err.message);
         viaApp = true;
-        return fetch(direct, init);
+        // The automatic retry goes straight to the app too (never two more waits on a silent domain).
+        domainReachable = false;
+        domainPing = Promise.resolve(false);
+        return timedFetch(direct, init);
       });
     });
   }
@@ -476,26 +528,52 @@
     }
   }
 
-  function goToCheckout(items, retried) {
+  // Shopify's cart: an unreadable one is retried, never taken for an empty cart.
+  function readCart() {
+    return fetch("/cart.js", { credentials: "same-origin", headers: { Accept: "application/json" } }).then(function (r) {
+      if (!r.ok) throw Object.assign(new Error("cart.js " + r.status), { retryable: true });
+      return r.json();
+    });
+  }
+  function cartLines(cart) {
+    return ((cart && cart.items) || []).filter(function (i) {
+      return i.quantity > 0;
+    });
+  }
+  // The shop's cart page, in the buyer's language when the theme gives it (/fr/cart).
+  function cartPage() {
+    var root = window.Shopify && window.Shopify.routes && window.Shopify.routes.root;
+    return (typeof root === "string" && /^\/([a-z]{2}(-[a-z]{2})?\/?)?$/i.test(root) ? root.replace(/\/?$/, "/") : "/") + "cart";
+  }
+  function httpUrl(u) {
+    try {
+      var url = typeof u === "string" ? new URL(u) : null;
+      return !!url && (url.protocol === "https:" || (url.protocol === "http:" && /^(localhost|127\.0\.0\.1)$/.test(url.hostname)));
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function goToCheckout(items, retried, key) {
     if (busy) return;
     busy = true;
+    // One key per click, kept by the automatic retry: a lost answer never makes a second session.
+    key = key || requestKey();
     var startedAt = Date.now();
     overlay(true);
     var cartPromise = items
       ? Promise.resolve({ items: items })
-      : fetch("/cart.js", { credentials: "same-origin", headers: { Accept: "application/json" } }).then(function (r) {
-          return r.json();
+      : readCart().then(function (cart) {
+          // Empty: an "add to cart" may still be on its way, so once more 600 ms later.
+          return cartLines(cart).length ? cart : wait(600).then(readCart);
         });
     cartPromise
       .then(function (cart) {
-        var cartItems = (cart.items || []).filter(function (i) {
-          return i.quantity > 0;
-        });
-        if (!cartItems.length) throw nativeError("empty cart");
+        var cartItems = cartLines(cart);
+        if (!cartItems.length) throw Object.assign(new Error("empty cart"), { empty: true });
         if (excluded(cartItems)) throw nativeError("excluded product");
         // Subscriptions (selling plans) and gift cards stay on Shopify's checkout, whole cart.
         if (unsupported(cartItems)) throw nativeError("subscription or gift card");
-        var key = requestKey();
         return postSession({
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -522,42 +600,62 @@
             // Cart note and attributes, copied to the order (the server's own re-read wins).
             note: typeof cart.note === "string" && cart.note ? cart.note.slice(0, 5000) : undefined,
             attributes: lineProperties(cart.attributes) || undefined,
-            // Same key on the retry (app's API): the server answers the same session.
+            // Same key on the retries (app's API, automatic retry): the server answers the same session.
             requestKey: key,
           }),
         });
       })
       .then(function (res) {
-        return res.json().then(function (body) {
-          if (!res.ok || !body.url) {
-            var err = new Error((body && body.error) || "session failed (" + res.status + ")");
-            // Only the carts Shopify keeps (checkout off, subscription, gift card, excluded).
-            err.native = !!(body && body.native);
-            err.retryable = res.status >= 500 || res.status === 429;
-            throw err;
-          }
-          body.url = onAppHost(body.url);
-          keepVisitorId(body.visitorId);
-          log("redirect", body.url, "after", Date.now() - startedAt, "ms");
-          if (DEBUG) badge("Whop Checkout : session prête en " + (Date.now() - startedAt) + " ms", true);
-          try {
-            sessionStorage.setItem("whopco_pending", "1");
-          } catch (e) {}
-          location.href = body.url;
-        });
+        var body = {};
+        try {
+          body = JSON.parse(res.text) || {};
+        } catch (e) {
+          /* a proxy's HTML error page (502, 504): a server error, not a broken answer */
+        }
+        // Only an http(s) address is opened (never a "javascript:" one).
+        if (!res.ok || !httpUrl(body.url)) {
+          var err = new Error(body.error || "session failed (" + res.status + ")");
+          // Only the carts Shopify keeps (checkout off, subscription, gift card, excluded).
+          err.native = !!body.native;
+          // A server error or a passing refusal the server marks (cart_changed, in_progress…); not a
+          // 429: the same minute would refuse again.
+          err.retryable = body.retryable === true || res.status >= 500;
+          throw err;
+        }
+        body.url = onAppHost(body.url);
+        keepVisitorId(body.visitorId);
+        log("redirect", body.url, "after", Date.now() - startedAt, "ms");
+        if (DEBUG) badge("Whop Checkout : session prête en " + (Date.now() - startedAt) + " ms", true);
+        try {
+          sessionStorage.setItem("whopco_pending", "1");
+        } catch (e) {}
+        location.href = body.url;
       })
       .catch(function (err) {
-        busy = false;
+        if (err && err.empty) {
+          // Still empty: the shop's cart page, never Shopify's checkout.
+          busy = false;
+          overlay(false);
+          log("empty cart");
+          location.href = cartPage();
+          return;
+        }
         if (err && err.native) {
+          busy = false;
           log("Shopify checkout:", err.message);
           nativeCheckout(items);
           return;
         }
-        // A network or server hiccup: once more on its own before telling the buyer.
+        // A network or server hiccup: once more on its own (same key, after a short pause) before
+        // telling the buyer. Still busy meanwhile: one flow per click.
         if (!retried && (!err || err.retryable || err instanceof TypeError)) {
           log("checkout failed, retrying:", err && err.message);
-          return goToCheckout(items, true);
+          return wait(800).then(function () {
+            busy = false;
+            goToCheckout(items, true, key);
+          });
         }
+        busy = false;
         log("checkout failed:", err && err.message);
         failed(err && err.message, items);
       });
@@ -581,7 +679,7 @@
     el.id = id;
     el.setAttribute("role", "alert");
     el.style.cssText =
-      "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:16px;font:500 15px/1.4 system-ui,sans-serif;color:#111";
+      "position:fixed;top:0;right:0;bottom:0;left:0;z-index:2147483647;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:16px;font:500 15px/1.4 system-ui,sans-serif;color:#111";
     var card = document.createElement("div");
     card.style.cssText = "background:#fff;border-radius:12px;padding:20px;max-width:360px;width:100%;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,.2)";
     var text = document.createElement("p");
@@ -613,12 +711,21 @@
   }
 
   function productFormItems(el) {
+    // The button's own product form; its section's only one; the page's only one (never a guess among
+    // several); else the product page's selected variant (?variant=).
+    var forms = document.querySelectorAll("form[action*='/cart/add']");
+    var section = el.closest && el.closest(".shopify-section, [id^='shopify-section'], section");
+    var sectionForms = section ? section.querySelectorAll("form[action*='/cart/add']") : [];
     var form =
       (el.closest && el.closest("form[action*='/cart/add']")) ||
       (el.closest && el.closest("product-form, .product-form, [data-product-form]") &&
         el.closest("product-form, .product-form, [data-product-form]").querySelector("form[action*='/cart/add']")) ||
-      document.querySelector("form[action*='/cart/add']");
-    if (!form) return null;
+      (sectionForms.length === 1 ? sectionForms[0] : null) ||
+      (forms.length === 1 ? forms[0] : null);
+    if (!form) {
+      var variant = /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?products\//i.test(location.pathname) && new URLSearchParams(location.search).get("variant");
+      return variant && /^\d+$/.test(variant) ? [{ variant_id: variant, quantity: 1, handle: location.pathname.split("/products/")[1] || "" }] : null;
+    }
     var fd = new FormData(form);
     var id = fd.get("id");
     if (!id) return null;
@@ -644,92 +751,234 @@
   /* Listeners (capture phase, before the theme's own handlers)        */
   /* ---------------------------------------------------------------- */
 
-  // Any other checkout link or button of a theme (a link to /checkout, a "checkout" button
+  // Any other checkout link or button of a theme (a link to this shop's checkout, a "checkout" button
   // named differently, a "Checkout" / "Paiement" button in the cart or its drawer).
-  var ANY_CHECKOUT = ["a[href*='/checkout']", "[name='checkout']", "[href*='/checkouts/']"];
-  var CHECKOUT_TEXT = /^\s*(check\s*out|proceed to checkout|go to checkout|paiement|passer (à la|la) commande|commander|finaliser( la commande)?|valider( la commande| mon panier)?|payer|acheter|zur kasse|kasse|pagar|tramitar pedido|vai alla cassa|cassa|afrekenen|bestellen)\b/i;
-  var CART_CONTEXT = "cart-drawer, cart-notification, form[action*='/cart'], [id*='cart' i], [class*='cart' i], [id*='Cart'], [class*='Cart']";
-  function genericCheckout(t) {
-    if (!config || !(config.interception.cartCheckout || config.interception.cartDrawer)) return null;
-    var hit = matches(t, ANY_CHECKOUT);
-    if (hit) return hit;
-    var btn = t.closest && t.closest("button, a, input[type='submit'], [role='button']");
-    // Never a product's own "add to cart" / "buy" button.
-    if (!btn || matches(btn, BUY_NOW) || (btn.closest && btn.closest("form[action*='/cart/add'], product-form"))) return null;
-    var label = (btn.value || btn.textContent || btn.getAttribute("aria-label") || "").trim();
-    if (!label || label.length > 40 || !CHECKOUT_TEXT.test(label)) return null;
-    // Only in the cart (page, drawer or popup): "Buy" elsewhere is a product button.
-    var inCart = /^\/cart\/?$/.test(location.pathname);
+  var ANY_CHECKOUT = ["[name='checkout']"];
+  // The whole label of a theme's checkout button (lowercase, accents left out): never "Acheter", "Valider"
+  // alone or "Payer en 3 fois".
+  var CHECKOUT_LABEL = /^(check[ -]?out|secure check[ -]?out|(proceed|go|continue) to (check[ -]?out|payment)|paiement( securise)?|payer|(proceder|passer|aller|continuer) (au|vers le) paiement|passer (a )?la caisse|passer commande|passer (a )?la commande|valider (la|ma) commande|valider (mon|le) panier|finaliser (la|ma) commande|commander|kasse|(weiter )?zur kasse( gehen)?|bestellen|pagar|tramitar pedido|finalizar compra|realizar pedido|cassa|vai alla cassa|procedi al pagamento|afrekenen|naar de kassa)( (maintenant|now|securely|en toute securite))?$/;
+  // Labels a discount code's own button could carry too (« Commander » beside a code field isn't the checkout).
+  var AMBIGUOUS_LABEL = /^(commander|payer|pagar|bestellen|kasse|cassa)$/;
+  var DISCOUNT_FIELD = "input[name*='discount' i], input[name*='coupon' i], input[id*='discount' i]";
+  // Cart page, checkout and cart permalink paths, with or without a market's language prefix (/fr/cart,
+  // /en-us/checkout, /cart/111:1,222:2).
+  var CART_PAGE = /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?cart\/?$/i;
+  var CHECKOUT_PATH = /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?checkouts?(\/|$)/i;
+  var PERMALINK_PATH = /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?cart\/(\d+:\d+(?:,\d+:\d+)*)\/?$/i;
+
+  // An address of this shop (relative ones included), never another site's.
+  function shopUrl(href) {
     try {
-      inCart = inCart || !!(btn.parentElement && btn.parentElement.closest(CART_CONTEXT));
-    } catch (e) {}
-    return inCart ? btn : null;
+      var u = new URL(href, document.baseURI);
+      return u.origin === location.origin ? u : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  // A link to this shop's checkout (/checkout, /checkouts/…).
+  function checkoutLink(t) {
+    var a = t.closest && t.closest("a[href], area[href]");
+    var u = a && shopUrl(a.getAttribute("href"));
+    return u && CHECKOUT_PATH.test(u.pathname) ? a : null;
+  }
+  // A cart permalink of this shop (/cart/111:1,222:2: a page builder's "buy now", a reorder link): its
+  // items, bought like a "buy now".
+  function permalinkItems(t) {
+    var a = t.closest && t.closest("a[href], area[href]");
+    var u = a && shopUrl(a.getAttribute("href"));
+    // ?storefront=true fills the cart without a checkout: the theme's.
+    var m = u && u.searchParams.get("storefront") !== "true" && PERMALINK_PATH.exec(u.pathname);
+    return m
+      ? m[1].split(",").map(function (pair) {
+          var p = pair.split(":");
+          return { variant_id: p[0], quantity: parseInt(p[1], 10) || 1 };
+        })
+      : null;
   }
 
-  // A checkout click before the config arrived: held until it does (never Shopify's checkout).
-  var DEFAULT_CHECKOUT = CART_CHECKOUT.concat(DRAWER_CHECKOUT, ANY_CHECKOUT);
+  // A button's words without a price or separator after them: "Passer la commande • 49,00 €",
+  // "Checkout - $49.00" and "Paiement →" read "passer la commande", "checkout" and "paiement".
+  function buttonLabel(btn) {
+    var s = String((btn.tagName === "INPUT" ? btn.value : btn.textContent) || btn.getAttribute("aria-label") || "")
+      .replace(/\s+/g, " ")
+      .split(/[•·⋅|]| [-–—:] /)[0];
+    if (s.length > 80) return ""; // a block of text, not a button's label
+    s = s
+      .replace(/\(?\s*([$€£¥]|\b[A-Z]{3})?\s?\d[\d\s.,']*([$€£¥]|[A-Z]{3}\b)?\s*\)?\s*$/, "")
+      .replace(/[\s→›»>:.!–—-]+$/, "")
+      .trim()
+      .toLowerCase();
+    s = s.normalize ? s.normalize("NFD").replace(/[\u0300-\u036f]/g, "") : s;
+    // A lock or an emoji around the words ("🔒 Paiement sécurisé", "Checkout ✓").
+    return s.replace(/^[^a-z]+|[^a-z]+$/g, "");
+  }
+  // "cart" as a word of a tag, id or class ("cart-drawer", "CartDrawer", "mini_cart"), or a word ending in
+  // it (cart-drawer apps: "upcart", "minicart", "sidecart", "slidecart", "ajaxcart"), not "js-cartography".
+  var CART_TOKEN = /^([a-z]*cart|cart(drawer|popup|notification|items?|footer|summary|modal|panel|sidebar|page|form|wrapper|container|content))$/;
+  function cartWord(s) {
+    var words = String(s || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/);
+    for (var k = 0; k < words.length; k++) if (CART_TOKEN.test(words[k])) return true;
+    return false;
+  }
+  // A form posting to the cart (/cart, /fr/cart, /cart/update…), not "add to cart".
+  function cartForm(form) {
+    var action = (form && form.getAttribute && form.getAttribute("action")) || "";
+    return /\/cart(\/|\?|#|$)/.test(action) && !/\/cart\/add/.test(action);
+  }
+  // In the cart (drawer, popup, page): a cart container strictly below <body> (a "cart-open" class on
+  // <body> or <html> would make every button a checkout), or the cart form's own button (form="cart").
+  function inCart(btn) {
+    for (var el = btn.parentElement; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+      if (cartWord(el.tagName) || cartWord(el.id) || cartWord(el.getAttribute("class")) || (el.tagName === "FORM" && cartForm(el))) return true;
+    }
+    return !!(btn.form && cartForm(btn.form));
+  }
+  // A discount code's button: the code field right beside it, or in its own form (not the cart's).
+  function discountButton(btn) {
+    try {
+      var kids = btn.parentElement ? btn.parentElement.children : [];
+      for (var k = 0; k < kids.length; k++) if (kids[k] !== btn && kids[k].matches(DISCOUNT_FIELD)) return true;
+      return !!(btn.form && !cartForm(btn.form) && btn.form.querySelector(DISCOUNT_FIELD));
+    } catch (e) {
+      return false;
+    }
+  }
+  function genericCheckout(t) {
+    var i = settings();
+    if (!(i.cartCheckout || i.cartDrawer)) return null;
+    var hit = matches(t, ANY_CHECKOUT) || checkoutLink(t);
+    if (hit) return hit;
+    var btn = t.closest && t.closest("button, a, input[type='submit'], [role='button']");
+    if (!btn) return null;
+    // Never a product's own button ("buy now", "add to cart", a sticky bar's form="product-form-1").
+    if (matches(btn, BUY_NOW) || btn.closest("form[action*='/cart/add'], product-form") || (btn.form && /\/cart\/add/.test(btn.form.getAttribute("action") || ""))) return null;
+    var label = buttonLabel(btn);
+    if (!label || label.length > 40 || !CHECKOUT_LABEL.test(label) || (AMBIGUOUS_LABEL.test(label) && discountButton(btn))) return null;
+    // Only in the cart, even on the cart page ("Commander" in its menu isn't a checkout).
+    return inCart(btn) ? btn : null;
+  }
+
+  // A click once the config is loaded (onClick and held clicks alike): opens our checkout and returns
+  // true for one we take ("buy now" with its product form's items, a cart permalink's items, a cart
+  // checkout), false otherwise.
+  function intercept(t) {
+    var i = config.interception;
+    if (i.buyNow && matches(t, BUY_NOW)) {
+      var items = productFormItems(t);
+      if (items) goToCheckout(items);
+      return !!items;
+    }
+    var linked = (i.buyNow || i.cartCheckout) && permalinkItems(t);
+    if (linked) {
+      goToCheckout(linked);
+      return true;
+    }
+    if (matches(t, checkoutSelectors()) || genericCheckout(t)) {
+      goToCheckout(null);
+      return true;
+    }
+    return false;
+  }
+  // A submission that opens the checkout: a form posting to this shop's checkout, or the cart form sent
+  // by one of its checkout buttons (clicked, or the theme's requestSubmit).
+  function checkoutSubmission(form, submitter) {
+    var i = settings();
+    if (!(i.cartCheckout || i.cartDrawer)) return false;
+    var u = shopUrl(form.getAttribute("action") || "");
+    if (u && CHECKOUT_PATH.test(u.pathname)) return true;
+    if (!cartForm(form)) return false;
+    // Sent by the theme's script without a button: its hidden "checkout" field says so.
+    if (!submitter) return !!form.querySelector("input[name='checkout']");
+    return submitter.name === "checkout" || !!matches(submitter, checkoutSelectors()) || !!genericCheckout(submitter);
+  }
+
+  // A held click or submission handed back to the theme (its handlers, its default action): this one
+  // only, the next ones are still ours.
+  function letThrough(w) {
+    var t = w.el;
+    while (t && typeof t.click !== "function") t = t.parentElement; // an <svg> icon: its button
+    passThrough = true;
+    try {
+      if (w.form) resubmit(w.form, w.submitter);
+      else if (t) t.click();
+    } finally {
+      passThrough = false;
+    }
+  }
+  function resubmit(form, submitter) {
+    try {
+      if (typeof form.requestSubmit === "function") return submitter ? form.requestSubmit(submitter) : form.requestSubmit();
+    } catch (e) {
+      /* a submitter that isn't this form's: a plain submit */
+    }
+    form.submit();
+  }
+
+  // A checkout click or submission before the config arrived: held until it does (8 s at most), judged
+  // with the assumed settings; never Shopify's checkout on its own.
   var waiting = [];
-  function holdUntilConfig(e) {
-    var t = e.target;
-    if (!(t instanceof Element) || !(matches(t, DEFAULT_CHECKOUT) || matches(t, BUY_NOW))) return;
+  function hold(e, what) {
     e.preventDefault();
     e.stopImmediatePropagation();
     overlay(true);
-    waiting.push(t);
+    waiting.push(what);
   }
+  function holdUntilConfig(e) {
+    var t = e.target;
+    if (t instanceof Element && (matches(t, BUY_NOW) || permalinkItems(t) || matches(t, checkoutSelectors()) || genericCheckout(t))) hold(e, { el: t });
+  }
+  // The held click or submission (the last one: a double click is one intent), decided like onClick or
+  // onSubmit once the config is known; one we don't take goes back to the theme. Checkout switched off
+  // (or an unknown store): Shopify's checkout for this page view.
   function releaseWaiting() {
     var list = waiting;
     waiting = [];
     if (!list.length) return;
     overlay(false);
-    list.slice(-1).forEach(function (t) {
-      if (config && config.enabled) {
-        if (config.interception.buyNow && matches(t, BUY_NOW)) {
-          var items = productFormItems(t);
-          if (items) return goToCheckout(items);
-        }
-        return goToCheckout(null);
-      }
-      // Checkout switched off (or our server unreachable): the theme's own button.
+    var w = list[list.length - 1];
+    if (config && config.enabled) {
+      if (w.form && checkoutSubmission(w.form, w.submitter)) return goToCheckout(null);
+      if (!w.form && intercept(w.el)) return;
+    } else {
       bypass = true;
-      if (typeof t.click === "function") t.click();
-    });
+    }
+    letThrough(w);
+  }
+
+  // Our server's settings couldn't be read (twice, or not within 8 s for a waiting click): the checkout
+  // is tried anyway with the assumed settings, and the session server decides — checkout switched off,
+  // an excluded product, a subscription: Shopify's checkout; our server down: « Réessayer ».
+  // Never Shopify's checkout on our own.
+  function assumedConfig() {
+    return { enabled: true, interception: DEFAULT_INTERCEPTION, sessionEndpoint: sessionsUrl() };
   }
 
   function onClick(e) {
+    if (passThrough) return;
     if (!bypass && configLoading) return holdUntilConfig(e);
     if (bypass || !config || !config.enabled) return;
     var t = e.target;
-    if (!(t instanceof Element)) return;
-
-    if (config.interception.buyNow && matches(t, BUY_NOW)) {
-      var items = productFormItems(t);
-      if (items) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        goToCheckout(items);
-      }
-      return;
-    }
-    if (matches(t, checkoutSelectors()) || genericCheckout(t)) {
+    if (t instanceof Element && intercept(t)) {
       e.preventDefault();
       e.stopImmediatePropagation();
-      goToCheckout(null);
     }
   }
 
   function onSubmit(e) {
-    if (bypass || !config || !config.enabled) return;
+    if (passThrough || bypass) return;
     var form = e.target;
     if (!(form instanceof HTMLFormElement)) return;
     var action = form.getAttribute("action") || "";
     var submitter = e.submitter;
+    // Before the config: a checkout submission waits for it too (a button without a type in a checkout
+    // form, the theme's requestSubmit on the cart form).
+    if (configLoading) {
+      if (checkoutSubmission(form, submitter)) hold(e, { form: form, submitter: submitter });
+      return;
+    }
+    if (!config || !config.enabled) return;
 
-    // Cart form submitted through its "checkout" button.
-    if (
-      (config.interception.cartCheckout || config.interception.cartDrawer) &&
-      (/\/checkout/.test(action) || (/\/cart\/?$/.test(action) && submitter && (submitter.name === "checkout" || genericCheckout(submitter))))
-    ) {
+    if (checkoutSubmission(form, submitter)) {
       e.preventDefault();
       e.stopImmediatePropagation();
       goToCheckout(null);
@@ -758,10 +1007,22 @@
   document.addEventListener("click", onClick, true);
   document.addEventListener("submit", onSubmit, true);
 
+  // Back from our checkout (back/forward cache): the page returns as it was left, spinner included.
+  // Everything is decided again from here.
+  window.addEventListener("pageshow", function (e) {
+    if (!e.persisted) return;
+    busy = false;
+    bypass = false;
+    overlay(false);
+    var err = document.getElementById("whopco-error");
+    if (err) err.remove();
+  });
+
   /*
    * Warm-up: when the buyer heads for the checkout (pointer over or touch on a checkout button, the
    * cart opened, the cart page), the checkout's server and its connections are woken before the
-   * click: a cold server is most of the wait after it. At most once a minute, nothing created.
+   * click: a cold server is most of the wait after it. At most once a minute per tab (once the server
+   * answered, its time is kept in sessionStorage for the tab's next pages), nothing created.
    */
   var warmedAt = 0;
   var CART_OPENERS = ["a[href='/cart']", "a[href$='/cart']", "cart-icon", "[aria-controls*='cart' i]", "[data-cart-toggle]", "[href='#cart']"];
@@ -776,22 +1037,43 @@
       document.head.appendChild(l);
     } catch (e) {}
   }
+  function warmedRecently() {
+    var at = warmedAt;
+    try {
+      at = Math.max(at, Number(sessionStorage.getItem("whopco_warm")) || 0);
+    } catch (e) {
+      /* storage blocked: this page's own time */
+    }
+    var age = Date.now() - at;
+    return age >= 0 && age < 60000;
+  }
   function warm() {
-    if (!config || !config.enabled || Date.now() - warmedAt < 60000) return;
+    if (!config || !config.enabled || warmedRecently()) return;
     warmedAt = Date.now();
-    var endpoint = config.sessionEndpoint || sessionsUrl();
+    var at = warmedAt;
+    // Where the click's POST will go: the app's own API when the checkout domain is unreachable from here.
+    var endpoint = domainReachable === false ? sessionsUrl() : config.sessionEndpoint || sessionsUrl();
     preconnect(endpoint);
     preconnect(API);
     try {
-      fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"warm":true}', keepalive: true }).catch(function () {});
+      // No keepalive: a preflighted keepalive request is unreliable in some browsers.
+      fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"warm":true}' })
+        .then(function () {
+          // Kept for the tab's next pages once it answered: one cut short by leaving the page doesn't count.
+          try {
+            sessionStorage.setItem("whopco_warm", String(at));
+          } catch (e) {}
+        })
+        .catch(function () {});
     } catch (e) {}
     log("warm-up sent");
   }
   function onIntent(e) {
-    if (!config || !config.enabled) return;
+    // The throttle before any selector: pointerover fires on every element the pointer crosses.
+    if (!config || !config.enabled || warmedRecently()) return;
     var t = e.target;
     if (!(t instanceof Element)) return;
-    if (matches(t, checkoutSelectors()) || matches(t, BUY_NOW) || matches(t, CART_OPENERS) || genericCheckout(t)) warm();
+    if (matches(t, checkoutSelectors()) || (config.interception.buyNow && matches(t, BUY_NOW)) || matches(t, CART_OPENERS) || genericCheckout(t)) warm();
   }
   document.addEventListener("pointerover", onIntent, { capture: true, passive: true });
   document.addEventListener("touchstart", onIntent, { capture: true, passive: true });
@@ -823,35 +1105,65 @@
     document.body.appendChild(b);
   }
 
-  var configInit = {};
-  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") configInit.signal = AbortSignal.timeout(8000);
-  fetch(API + "/api/public/stores/" + encodeURIComponent(STORE) + "/config", configInit)
-    .then(function (r) {
+  /* ---------------------------------------------------------------- */
+  /* Config                                                            */
+  /* ---------------------------------------------------------------- */
+
+  // A network error, an HTTP error or a broken answer is tried once more 1.5 s later: only a second
+  // failure means our server can't be reached (the checkout is then tried with assumedConfig).
+  function fetchConfig() {
+    return fetch(API + "/api/public/stores/" + encodeURIComponent(STORE) + "/config").then(function (r) {
+      if (!r.ok) throw new Error("config HTTP " + r.status);
       return r.json();
-    })
-    .then(function (c) {
-      config = c && c.interception ? c : null;
-      configLoading = false;
-      releaseWaiting();
-      log("config", c);
-      if (!config) {
-        if (DEBUG) badge("Whop Checkout : configuration introuvable", false);
-        return;
-      }
-      if (c && c.enabled) pingCheckoutDomain();
-      if (c && c.enabled && /^\/cart\/?$/.test(location.pathname)) warm();
-      if (!DEBUG) return;
-      if (!c.enabled) return badge("Whop Checkout : désactivé (checkout Shopify natif)", false);
-      badge("Whop Checkout : interception active ✓", true);
-      highlight();
-      new MutationObserver(highlight).observe(document.body, { childList: true, subtree: true });
-    })
-    .catch(function (err) {
-      // Our server can't be reached at all: the shop's own checkout (nothing else can sell).
-      config = null;
-      configLoading = false;
-      log("config failed:", err && err.message);
-      if (DEBUG) badge("Whop Checkout : serveur injoignable", false);
-      releaseWaiting();
     });
+  }
+  var configRequest = fetchConfig().catch(function (err) {
+    log("config failed, retrying:", err && err.message);
+    return wait(1500).then(fetchConfig);
+  });
+  // A held click waits 8 s at most (a plain timer: AbortSignal.timeout is missing in older Safari).
+  // Past that the checkout is tried with the default settings; the request keeps going and a late
+  // config replaces them.
+  var SLOW = {};
+  Promise.race([configRequest, wait(8000, SLOW)])
+    .then(function (c) {
+      if (c !== SLOW) return c;
+      log("config still loading after 8 s: the checkout is tried with the default settings");
+      if (DEBUG) badge("Whop Checkout : réglages en retard (checkout tenté avec les réglages par défaut)", false);
+      config = assumedConfig();
+      configLoading = false;
+      releaseWaiting();
+      return configRequest;
+    })
+    .then(
+      function (c) {
+        // An answer without settings is an unknown store: the shop's own checkout.
+        config = c && c.interception ? c : null;
+        configLoading = false;
+        // The store's own selectors, for the clicks of its next pages made before their config arrives.
+        if (config) localSet("whopco_custom", String(config.interception.customSelectors || ""));
+        releaseWaiting();
+        log("config", c);
+        if (!config) {
+          if (DEBUG) badge("Whop Checkout : configuration introuvable", false);
+          return;
+        }
+        if (c.enabled) pingCheckoutDomain();
+        // Landing on the cart: warmed once the ping knows where the POST will go (3 s at most).
+        if (c.enabled && CART_PAGE.test(location.pathname)) (domainPing || Promise.resolve()).then(warm);
+        if (!DEBUG) return;
+        if (!c.enabled) return badge("Whop Checkout : désactivé (checkout Shopify natif)", false);
+        badge("Whop Checkout : interception active ✓", true);
+        highlight();
+        new MutationObserver(highlight).observe(document.body, { childList: true, subtree: true });
+      },
+      function (err) {
+        // Our server's settings can't be read (twice): the checkout is tried anyway (assumedConfig).
+        config = assumedConfig();
+        configLoading = false;
+        log("config failed:", err && err.message);
+        if (DEBUG) badge("Whop Checkout : réglages injoignables (checkout tenté quand même)", false);
+        releaseWaiting();
+      }
+    );
 })();

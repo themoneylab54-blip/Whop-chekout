@@ -364,15 +364,20 @@ export default async function OrderDetailPage({
         <div className="space-y-6">
           <Card icon={Package} title="Articles">
             <ul className="divide-y divide-zinc-100">
-              {lines.map((l) => (
-                <li key={l.variantId} className="flex items-center gap-3 py-2.5">
+              {lines.map((l, i) => (
+                // One variant can be on several lines (an app's paid + free lines, the cart's own split).
+                <li key={`${l.variantId}-${i}`} className="flex items-center gap-3 py-2.5">
                   <Thumb src={l.imageUrl} size={44} />
                   <span className="min-w-0 flex-1 text-sm">
                     <span className="block truncate font-medium">{l.title}</span>
                     <span className="text-xs text-zinc-500">
                       {l.variantTitle ? `${l.variantTitle} · ` : ""}
                       {l.quantity} × {money(l.unitPriceCents)}
-                      {l.appPrice ? ` (prix de lot d'app, catalogue ${money(l.appPrice.originalUnitCents)})` : ""}
+                      {l.appPrice
+                        ? ` (prix ${l.cartPriced ? "du panier Shopify" : "de lot d'app"}, catalogue ${money(l.appPrice.originalUnitCents)})`
+                        : l.cartPriced
+                          ? " (prix du panier Shopify)"
+                          : ""}
                     </span>
                     {/* Line item properties as sent to Shopify (hidden "_…" app keys dimmed). */}
                     {(l.properties ?? []).map((p) => (

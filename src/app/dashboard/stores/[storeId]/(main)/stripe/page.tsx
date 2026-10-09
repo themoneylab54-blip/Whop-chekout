@@ -36,10 +36,10 @@ const MODES = [
     hint: "Recommandé. Whop encaisse comme aujourd'hui ; si Whop tombe, Stripe prend le relais sur la même page, sans que le client s'en aperçoive.",
   },
   { id: "stripe_primary", hint: "Stripe encaisse d'abord ; Whop ne sert que si Stripe ne répond plus." },
-  { id: "stripe_only", hint: "Seul Stripe encaisse. Si Stripe tombe, vos clients passent par le checkout Shopify." },
+  { id: "stripe_only", hint: "Seul Stripe encaisse. Si Stripe tombe, vos clients restent sur votre checkout et peuvent réessayer." },
 ] as const;
 
-/** Journal lines of the switches between processors (and to Shopify's checkout). */
+/** Journal lines of the switches between processors (and, in older entries, the former switch to Shopify's checkout). */
 const SWITCH_KINDS = [
   "checkout.provider_switched",
   "checkout.provider_test",
@@ -376,7 +376,7 @@ export default async function StripePage({ params, searchParams }: { params: Pro
         {!whopLeft && store.paymentMode !== "stripe_only" && usable && (
           <p className="mb-4 rounded-lg bg-sky-50 px-3 py-2 text-sm text-sky-900 ring-1 ring-sky-600/20">
             {storeLive(current)
-              ? "Whop n'est pas connecté : Stripe encaisse tous les paiements, sans secours (en dernier recours, vos clients passent par le checkout Shopify)."
+              ? "Whop n'est pas connecté : Stripe encaisse tous les paiements, sans secours (si Stripe ne répond plus, vos clients restent sur votre checkout et peuvent réessayer)."
               : "Whop n'est pas connecté : Stripe encaissera seul, sans secours, une fois le checkout mis en ligne (Vue d'ensemble)."}
           </p>
         )}
@@ -446,7 +446,7 @@ export default async function StripePage({ params, searchParams }: { params: Pro
         </Card>
       )}
 
-      <Card icon={ArrowLeftRight} iconColor="#0ea5e9" title="Journal des bascules" description="Passages d'un processeur à l'autre, vers le checkout Shopify de secours, et changements de connexion.">
+      <Card icon={ArrowLeftRight} iconColor="#0ea5e9" title="Journal des bascules" description="Passages d'un processeur à l'autre et changements de connexion. En cas de panne, vos clients restent sur votre checkout, jamais celui de Shopify.">
         {switches.length === 0 ? (
           <p className="text-sm text-zinc-600">Aucune bascule pour l&apos;instant.</p>
         ) : (

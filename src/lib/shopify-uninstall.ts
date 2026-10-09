@@ -21,12 +21,6 @@ export async function markDisabledByUninstall(storeId: string): Promise<void> {
   await db.appSetting.upsert({ where: { key: disabledKey(storeId) }, create: { key: disabledKey(storeId), value: now.toISOString(), updatedAt: now }, update: { value: now.toISOString(), updatedAt: now } });
 }
 
-/** Whether the checkout was switched off by an uninstall; the mark is removed (one use). */
-export async function consumeDisabledByUninstall(storeId: string): Promise<boolean> {
-  const { count } = await db.appSetting.deleteMany({ where: { key: disabledKey(storeId) } });
-  return count > 0;
-}
-
 /** The merchant decided about the checkout (toggle, disconnect): never switched back on for them. */
 export async function clearDisabledByUninstall(storeId: string): Promise<void> {
   await db.appSetting.deleteMany({ where: { key: disabledKey(storeId) } });

@@ -184,6 +184,10 @@ type QuoteState = {
   cartLocked?: boolean;
   /** The Shopify cart's automatic discount stopped applying (the buyer changed the lines). */
   automaticDiscountLost?: string[];
+  /** The Shopify cart's own code that doesn't apply here (said, never charged silently). */
+  cartCodeLost?: { code: string; reason: string; blocking: boolean };
+  /** Lines charged at the store's price rather than the cart's lower one (said). */
+  cartPricesAdjusted?: boolean;
 };
 
 /** Per line, as the server allows (checkout.ts MAX_LINE_QTY). */
@@ -1050,6 +1054,9 @@ export function CheckoutView({
           const capped = sent && qtyKey(latestQty.current) === qtyKey(sent) && qtyKey(confirmed) !== qtyKey(sent);
           // A plain cart's Shopify automatic discount holds for its exact lines: once they change, say so.
           if (sent && Array.isArray(q.automaticDiscountLost)) setQtyError(L.automaticDiscountLost);
+          // What the Shopify cart showed and this checkout doesn't charge the same way: said, never silent.
+          else if (q.cartCodeLost && !q.cartCodeLost.blocking && typeof q.cartCodeLost.code === "string") setQtyError(L.cartCodeNotApplied(q.cartCodeLost.code));
+          else if (q.cartPricesAdjusted) setQtyError(L.cartPricesAdjusted);
           // A suggested product Shopify no longer sells is dropped: say so (the follow-up quote keeps the message).
           if (sent && Object.entries(sent).some(([id, n]) => n > 0 && !(id in confirmed) && !(id in confirmedQty))) {
             pendingQtyAnnounce.current = null;

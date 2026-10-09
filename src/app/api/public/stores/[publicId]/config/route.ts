@@ -32,8 +32,9 @@ async function handle(_req: Request, ctx: { params: Promise<{ publicId: string }
       stripeChargesEnabled: true,
     },
   });
-  // Live with at least one usable processor (Whop and/or Stripe, under the store's mode). While the
-  // processors are failing, the storefront keeps Shopify's checkout (see fallback.ts).
+  // Live with at least one usable processor (Whop and/or Stripe, under the store's mode). Failing
+  // processors never switch the storefront to Shopify's checkout: buyers stay on ours (fallback.ts
+  // only moves new sessions to the other processor; fallbackActiveAt is no longer set).
   const live = !!store?.enabled && anyProviderConnected(store) && !!store.shopifyConnectedAt && !store.fallbackActiveAt;
   return json(
     {

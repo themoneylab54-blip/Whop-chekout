@@ -8,9 +8,10 @@ import { chooseProvider, PROVIDER_NAMES, providerConnected, providerOrder, type 
 import type { Store } from "@prisma/client";
 
 /*
- * Safety net: when Whop can't open checkouts (outage, frozen account, revoked key),
- * the storefront goes back to Shopify's own checkout automatically, so no sale is
- * lost; a background probe switches the custom checkout back on once Whop answers.
+ * Safety net: when the processor new sessions use can't open checkouts (outage, frozen account,
+ * revoked key), new sessions pay with the other one (Whop ↔ Stripe) on the same page, and a
+ * background probe switches back once it answers. Buyers are never sent to Shopify's own checkout:
+ * the automatic switch to it was removed (fallbackActiveAt is no longer set).
  */
 
 const WINDOW_MS = 10 * 60_000;
@@ -129,8 +130,8 @@ export async function noteFailoverCleared(storeId: string, at = Date.now()): Pro
  * meanwhile). When the processor new sessions use reaches the threshold:
  * - it is the mode's primary and the secondary is usable → store-level failover (providerFailoverAt:
  *   new sessions pay with the secondary on the same page; journal fallback.provider_switched + alert);
- * - otherwise (the secondary failing too during a failover, or no usable secondary) → Shopify's own
- *   checkout (fallbackActiveAt, when the automatic fallback is on), as before.
+ * - otherwise (the secondary failing too during a failover, or no usable secondary) → no switch:
+ *   buyers stay on this checkout and can retry, never Shopify's (the failures alert the merchant).
  * Failures of the other processor (sessions already switched, a sticky session) never flip the store.
  * The processor "new sessions use" is the effective one (effectiveProvider: connections included).
  *
@@ -141,7 +142,7 @@ export async function noteFailoverCleared(storeId: string, at = Date.now()): Pro
  * count (uncountedFailure).
  *
  * During a failover, the secondary failing while the primary created checkouts in the window (its
- * sticky sessions work): the failover ends (back to the primary) instead of Shopify's checkout.
+ * sticky sessions work): the failover ends (back to the primary).
  * Hysteresis: within 10 min of a failover's end, only failures after that end count; a failover
  * starting again within the hour is journaled without a new alert (one alert per cycle).
  */

@@ -1,10 +1,27 @@
 import "server-only";
 import type { Store } from "@prisma/client";
-import { checkDiscount, subtotal, type CartLine } from "./pricing";
+import { checkDiscount, subtotal, type CartLine, type LineComponent } from "./pricing";
+import { bundleComponents, priceCart } from "./shopify";
 import { db } from "./db";
 import { log, recordEvent } from "./log";
 import { rateLimit } from "./ratelimit";
-import { boundedCartSnapshot, cartCodeAllocations, cartDiscountCodes, cartHeldByApp, detectCartApps, hasBundleHint, oversizedHiddenProperties, sanitizeCartContext, sanitizeProperties, UNSUPPORTED_REASON_TEXT, withClientProperties, type CartContext, type CartJs, type UnsupportedCartReason } from "./cart-fidelity";
+import {
+  boundedCartSnapshot,
+  cartCodeAllocations,
+  cartDiscountCodes,
+  cartHeldByApp,
+  cartPricedLines,
+  detectCartApps,
+  hasBundleHint,
+  oversizedHiddenProperties,
+  sanitizeCartContext,
+  sanitizeProperties,
+  UNSUPPORTED_REASON_TEXT,
+  withClientProperties,
+  type CartContext,
+  type CartJs,
+  type UnsupportedCartReason,
+} from "./cart-fidelity";
 import {
   canReadShopifyDiscounts,
   lookupShopifyCodeWithRetry,
@@ -21,8 +38,11 @@ import {
  * personalization apps, see lib/cart-fidelity): the server re-reads /cart.js whenever the storefront
  * sent a cart token (never trusting its own flags: a Cart Transform price may not look like one in
  * the browser), carries properties / note /
- * attributes, and refuses (→ Shopify's checkout, journaled "cart.unsupported_app_pricing") what
- * it can't represent rather than charging a wrong price.
+ * attributes. What it can't represent line by line is charged as Shopify's cart charges it
+ * (cartPricedLines, journaled "cart.priced_as_shopify_cart": never below the variant's price without a
+ * sign the buyer can't forge, said when replaced; the cart's codes validated and applied for what they
+ * took off): the buyer stays on this checkout. Only subscriptions and gift cards go to Shopify's
+ * checkout; an unreadable app cart is refused ("cart.unsupported_app_pricing").
  */
 
 export type SessionCartInput = {
@@ -62,6 +82,8 @@ export function cartLooksApp(input: SessionCartInput): boolean {
 
 /** Re-read timeout of a cart the storefront saw as plain: it never delays the checkout by more. */
 export const PLAIN_CART_READ_MS = 1500;
+/** Second re-read of an app's (or discounted) cart Shopify didn't answer for in time, before a retry is asked. */
+export const SECOND_CART_READ_MS = 4000;
 
 /**
  * Starts the cart re-read early (in parallel with the Admin API pricing), or null. A cart the
@@ -85,43 +107,176 @@ export async function sessionCart(
   const clientContext = sanitizeCartContext(input.note, input.attributes);
   const clientHint = !!input.appPricing || input.items.some((i) => hasBundleHint(sanitizeProperties(i.properties)));
   if (cartRead && input.cartToken) {
-    // Shopify's automatic discounts are always taken from the re-read cart (the server's figures).
-    const verified = await verifiedCart(store, input.cartToken, lines, { discounts: true, cart: cartRead });
-    if (verified.status === "unsupported") return refuse(store.id, verified.reason, verified.detail, detectCartApps(verified.cart), verified.cart);
-    if (verified.status === "ok") {
-      noteOversized(store.id, verified.cart.items ?? []);
-      const diagnostic = await diagnose(store.id, verified.cart, verified.lines, verified.discounts);
-      // App prices / automatic discounts hold for this exact cart: every line is fixed (lib/checkout linesFor).
-      // Items the re-read cart doesn't hold (direct API call): the storefront's properties, as without a cart.
-      const inCart = new Set((verified.cart.items ?? []).map((i) => variantKey(i.variant_id ?? i.id)));
-      const missing = input.items.filter((i) => !inCart.has(variantKey(i.variant_id)));
-      const withProps = missing.length ? withClientProperties(verified.lines, missing) : { ok: true as const, lines: verified.lines };
-      if (!withProps.ok) return refuse(store.id, withProps.reason, withProps.detail);
-      // An app's lines hold for this exact cart: every line is fixed. A plain cart with a sitewide
-      // automatic discount isn't (a change drops that discount, see automaticDiscountFor).
-      const frozen = cartHeldByApp(withProps.lines);
-      const lines = frozen ? withProps.lines.map((l) => (l.locked ? l : { ...l, locked: true })) : withProps.lines;
-      // A code that lowered the cart must be reproducible here, else the buyer would pay more than the
-      // cart showed: checked once now (Shopify's checkout takes the cart otherwise).
-      const code = await verifyCartCode(store, verified.cart, lines);
-      if (!code.ok) return refuse(store.id, "code_unsupported", code.detail, detectCartApps(verified.cart), verified.cart);
-      // The cart's discount codes (a /discount/CODE link, Fast Bundle's code): the quote offers them to
-      // Shopify's code lookup, so the buyer keeps a valid one (the verified one first).
-      const all = cartDiscountCodes(verified.cart);
-      const codes = code.check ? [code.check.code, ...all.filter((c) => c.toUpperCase() !== code.check!.code.toUpperCase())].slice(0, 3) : all;
-      const cartContext = codes.length ? { ...(verified.context ?? {}), discountCodes: codes, ...(code.check ? { codeCheck: code.check } : {}) } : verified.context;
-      return { ok: true, lines, cartDiscounts: verified.discounts, cartContext, diagnostic };
+    // An app's (or discounted) cart Shopify didn't answer for in time is asked once more, longer: its
+    // prices can't be guessed, and a plain cart goes on at the variants' prices anyway.
+    const cart = (await cartRead) ?? (clientHint || input.automaticDiscounts ? await readCartJs(store, input.cartToken, { timeoutMs: SECOND_CART_READ_MS }) : null);
+    if (cart) {
+      // Shopify's automatic discounts are always taken from the re-read cart (the server's figures).
+      const verified = await verifiedCart(store, input.cartToken, lines, { discounts: true, cart: Promise.resolve(cart) });
+      if (verified.status === "unsupported") return asShopifyCharges(store, verified.reason, verified.detail, cart, lines);
+      if (verified.status === "ok") {
+        noteOversized(store.id, verified.cart.items ?? []);
+        // App prices / automatic discounts hold for this exact cart: every line is fixed (lib/checkout linesFor).
+        // Items the re-read cart doesn't hold (direct API call): the storefront's properties, as without a cart.
+        const inCart = new Set((verified.cart.items ?? []).map((i) => variantKey(i.variant_id ?? i.id)));
+        const missing = input.items.filter((i) => !inCart.has(variantKey(i.variant_id)));
+        let base = verified.lines;
+        if (missing.length) {
+          const withProps = withClientProperties(verified.lines, missing);
+          if (withProps.ok) base = withProps.lines;
+          else if (withProps.reason === "bundle_without_cart" || withProps.reason === "bundle_components_unresolved") {
+            // An app's line the cart doesn't hold (its price can't be read there): the variant's own price,
+            // a Shopify Bundles parent through its components.
+            const priced = await withBundleComponents(store, atCatalogPrices(verified.lines, missing));
+            if (!priced.ok) return refuse(store.id, priced.reason, priced.detail);
+            await journalCatalogPriced(store.id, withProps.reason, withProps.detail);
+            base = priced.lines;
+          } else return refuse(store.id, withProps.reason, withProps.detail);
+        }
+        // An app's lines hold for this exact cart: every line is fixed. A plain cart with a sitewide
+        // automatic discount isn't (a change drops that discount, see automaticDiscountFor).
+        const frozen = cartHeldByApp(base);
+        const fixed = frozen ? base.map((l) => (l.locked ? l : { ...l, locked: true })) : base;
+        // A code that lowered the cart must be reproducible here, else the buyer would pay more than the
+        // cart showed: checked once now (the cart is charged as Shopify charges it otherwise).
+        const code = await verifyCartCode(store, verified.cart, fixed);
+        if (!code.ok) return asShopifyCharges(store, "code_unsupported", code.detail, cart, lines);
+        const diagnostic = await diagnose(store.id, verified.cart, verified.lines, verified.discounts);
+        // The cart's discount codes (a /discount/CODE link, Fast Bundle's code): the quote offers them to
+        // Shopify's code lookup, so the buyer keeps a valid one (the verified one first).
+        const all = cartDiscountCodes(verified.cart);
+        const codes = code.check ? [code.check.code, ...all.filter((c) => c.toUpperCase() !== code.check!.code.toUpperCase())].slice(0, 3) : all;
+        const cartContext = codes.length ? { ...(verified.context ?? {}), discountCodes: codes, ...(code.check ? { codeCheck: code.check } : {}) } : verified.context;
+        return { ok: true, lines: fixed, cartDiscounts: verified.discounts, cartContext, diagnostic };
+      }
     }
-    // Unreadable cart: plain lines keep going as before, an app's can't, nor one the storefront saw
-    // discounted automatically (without Shopify's discount the buyer would pay more than the cart).
+    // Unreadable twice: plain lines keep going as before, an app's can't, nor one the storefront saw
+    // discounted automatically (without Shopify's figures the price would be a guess): a retry is asked.
     if (clientHint || input.automaticDiscounts) return refuse(store.id, "cart_unreadable");
-  } else if (clientHint && !input.cartToken) {
-    return refuse(store.id, "bundle_without_cart");
   }
   noteOversized(store.id, input.items);
   const withProps = withClientProperties(lines, input.items);
-  if (!withProps.ok) return refuse(store.id, withProps.reason, withProps.detail);
-  return { ok: true, lines: withProps.lines, cartDiscounts: null, cartContext: clientContext, diagnostic: null };
+  if (withProps.ok) return { ok: true, lines: withProps.lines, cartDiscounts: null, cartContext: clientContext, diagnostic: null };
+  // No Shopify cart to read (buy now, direct call): an app's line or a bundle parent is sold at the
+  // variant's own price with its properties (never below it), the cart fixed — journaled, not refused.
+  if (withProps.reason === "bundle_without_cart" || withProps.reason === "bundle_components_unresolved") {
+    const priced = await withBundleComponents(store, atCatalogPrices(lines, input.items));
+    if (!priced.ok) return refuse(store.id, priced.reason, priced.detail);
+    await journalCatalogPriced(store.id, withProps.reason, withProps.detail);
+    return { ok: true, lines: priced.lines, cartDiscounts: null, cartContext: clientContext, diagnostic: null };
+  }
+  return refuse(store.id, withProps.reason, withProps.detail);
+}
+
+/**
+ * Bundle parents Shopify sells only through their components (Shopify Bundles), without components
+ * from a cart: their components from the Admin API, scaled to the line's quantity — never the parent
+ * ordered alone (wrong stock). None found: refused.
+ */
+async function withBundleComponents(
+  store: SessionCartStore,
+  lines: CartLine[],
+): Promise<{ ok: true; lines: CartLine[] } | { ok: false; reason: UnsupportedCartReason; detail?: string }> {
+  const parents = lines.filter((l) => l.requiresComponents && !l.gift && !l.components?.length);
+  if (!parents.length) return { ok: true, lines };
+  let found: Map<string, LineComponent[]>;
+  try {
+    found = await bundleComponents(store, parents.map((l) => l.variantId));
+  } catch (err) {
+    log.warn("cart.bundle_components_failed", "Shopify couldn't give a bundle's components", { storeId: store.id, err });
+    return { ok: false, reason: "pricing_unavailable" };
+  }
+  const out: CartLine[] = [];
+  for (const l of lines) {
+    if (!l.requiresComponents || l.gift || l.components?.length) {
+      out.push(l);
+      continue;
+    }
+    const parts = [...found].find(([id]) => variantKey(id) === variantKey(l.variantId))?.[1];
+    if (!parts?.length) return { ok: false, reason: "bundle_components_unresolved", detail: l.variantId };
+    out.push({ ...l, locked: true, components: parts.map((c) => ({ ...c, quantity: c.quantity * l.quantity, weightCents: c.weightCents * l.quantity })) });
+  }
+  return { ok: true, lines: out };
+}
+
+function journalCatalogPriced(storeId: string, reason: UnsupportedCartReason, detail: string | undefined) {
+  return journal(storeId, "cart.catalog_priced", `Lot d'app hors panier Shopify (achat direct) facturé au prix catalogue des variantes : ${UNSUPPORTED_REASON_TEXT[reason]}.`, {
+    reason,
+    ...(detail ? { detail: detail.slice(0, 200) } : {}),
+  });
+}
+
+/**
+ * A cart the checkout can't represent line by line (an app's price, bundle, code, another currency),
+ * charged as Shopify's cart charges it (cartPricedLines: never below the variant's price without a
+ * verified sign; the cart's codes go through the checkout's own code pipeline): the buyer stays on
+ * this checkout. Every line is the Admin API's (the cart's own variants priced here too); a bundle
+ * parent sold only through its components gets them from the Admin API. Subscriptions and gift cards
+ * go to Shopify's checkout; a cart that can't be priced that way is refused.
+ */
+async function asShopifyCharges(store: SessionCartStore, reason: UnsupportedCartReason, detail: string | undefined, cart: CartJs, lines: CartLine[]): Promise<SessionCart> {
+  const found = detectCartApps(cart);
+  if (reason === "subscription") return refuse(store.id, reason, detail, found, cart);
+  let admin = lines;
+  let components = new Map<string, LineComponent[]>();
+  try {
+    // The cart's own variants the storefront didn't send (it chose which ones to send): sellable ones only.
+    const known = new Set(lines.map((l) => variantKey(l.variantId)));
+    const others = (cart.items ?? []).filter((i) => Number(i.quantity ?? 0) > 0 && !known.has(variantKey(i.variant_id ?? i.id)));
+    if (others.length) admin = [...lines, ...(await priceCart(store, others.map((i) => ({ variantId: String(i.variant_id ?? i.id ?? ""), quantity: Number(i.quantity) }))))];
+    const parents = admin.filter((l) => l.requiresComponents && !l.gift).map((l) => l.variantId);
+    if (parents.length) components = await bundleComponents(store, parents);
+  } catch (err) {
+    log.warn("cart.priced_lookup_failed", "Shopify couldn't price the cart's own lines", { storeId: store.id, err });
+    return refuse(store.id, "pricing_unavailable", detail, found, cart);
+  }
+  const priced = cartPricedLines(cart, admin, store.shopCurrency, components);
+  if (!priced.ok) return refuse(store.id, priced.reason, priced.detail ?? detail, found, cart);
+  noteOversized(store.id, cart.items ?? []);
+  await journal(store.id, "cart.priced_as_shopify_cart", `Panier facturé comme le panier Shopify (jamais sous le prix catalogue sans preuve) : ${UNSUPPORTED_REASON_TEXT[reason]}.`, {
+    reason,
+    ...(detail ? { detail: detail.slice(0, 200) } : {}),
+    apps: found.apps,
+    unknownKeys: found.unknownKeys,
+    cart: boundedCartSnapshot(cart, MAX_EVENT_SNAPSHOT_BYTES),
+  });
+  const context = sanitizeCartContext(cart.note, cart.attributes);
+  // The cart's codes: applied by the quote like a typed code (validated, limits and uses counted), for
+  // exactly what each took off in Shopify's cart — the one that took the most first.
+  const allocated = cartCodeAllocations(cart).map((c) => c.code);
+  const codes = [...allocated, ...cartDiscountCodes(cart).filter((c) => !allocated.some((a) => a.toUpperCase() === c.toUpperCase()))].slice(0, 3);
+  const cartPriced = {
+    reason,
+    discounted: priced.discounted,
+    ...(priced.raised ? { raised: true } : {}),
+    ...(Object.keys(priced.codeCents).length ? { codeCents: priced.codeCents } : {}),
+    codesTakenOff: priced.codesTakenOff,
+  };
+  return {
+    ok: true,
+    lines: priced.lines,
+    // Shopify's automatic discounts are in the cart's prices already: none on top.
+    cartDiscounts: null,
+    cartContext: { ...(context ?? {}), ...(codes.length ? { discountCodes: codes } : {}), cartPriced },
+    diagnostic: await diagnose(store.id, cart, priced.lines, null, { cartPriced: true }),
+  };
+}
+
+/** Lines without a Shopify cart to read, at the variants' own prices, with the storefront's properties, fixed. Pure. */
+function atCatalogPrices(lines: CartLine[], items: SessionCartInput["items"]): CartLine[] {
+  const props = new Map<string, ReturnType<typeof sanitizeProperties>>();
+  for (const it of items) if (!props.has(variantKey(it.variant_id))) props.set(variantKey(it.variant_id), sanitizeProperties(it.properties));
+  return lines.map((l) => {
+    const p = props.get(variantKey(l.variantId));
+    return { ...l, ...(p?.length ? { properties: p } : {}), locked: true };
+  });
+}
+
+/** One journal entry per store and kind / reason every 10 min (a busy store doesn't flood the journal). */
+async function journal(storeId: string, kind: string, message: string, data: Record<string, unknown> & { reason: string }) {
+  if (await rateLimit(`journal:${kind}:${storeId}:${data.reason}`, 1, 10 * 60_000)) {
+    await recordEvent({ storeId, level: "warn", kind, message, data });
+  }
 }
 
 type CodeCheck = NonNullable<CartContext["codeCheck"]>;
@@ -176,7 +331,7 @@ function noteOversized(storeId: string, items: { properties?: unknown }[]) {
  * that looks like a bundle but carries neither a discount nor an app price is flagged (never charged
  * silently at full price without the merchant knowing).
  */
-async function diagnose(storeId: string, cart: CartJs, lines: CartLine[], discounts: CartDiscounts | null): Promise<CartDiagnostic | null> {
+async function diagnose(storeId: string, cart: CartJs, lines: CartLine[], discounts: CartDiscounts | null, opts: { cartPriced?: boolean } = {}): Promise<CartDiagnostic | null> {
   const found = detectCartApps(cart);
   const apps = found.apps.filter((a) => a !== "automatic_discount" && a !== "discount_code");
   if (!apps.length && !found.unknownKeys.length) return null;
@@ -189,7 +344,8 @@ async function diagnose(storeId: string, cart: CartJs, lines: CartLine[], discou
       data: { apps: found.apps, unknownKeys: found.unknownKeys },
     });
   }
-  const bundleLike = lines.some((l) => hasBundleHint(l.properties));
+  // A cart charged as Shopify's cart charges it has its discounts in its prices: nothing to flag.
+  const bundleLike = !opts.cartPriced && lines.some((l) => hasBundleHint(l.properties));
   if (bundleLike && !discounts && !lines.some((l) => l.appPrice) && (await rateLimit(`journal:cart_bundle_nodiscount:${storeId}`, 1, 24 * 3600_000))) {
     await recordEvent({
       storeId,
@@ -210,7 +366,10 @@ async function refuse(storeId: string, reason: UnsupportedCartReason, detail?: s
       storeId,
       level: "warn",
       kind: "cart.unsupported_app_pricing",
-      message: `Panier envoyé au checkout Shopify : ${UNSUPPORTED_REASON_TEXT[reason]}.`,
+      message:
+        reason === "subscription"
+          ? `Panier envoyé au checkout Shopify : ${UNSUPPORTED_REASON_TEXT[reason]}.`
+          : `Panier impossible à ouvrir au checkout : ${UNSUPPORTED_REASON_TEXT[reason]}.`,
       // A refused cart has no session (CartSnapshot needs one): a redacted, truncated copy rides on the event.
       data: {
         reason,

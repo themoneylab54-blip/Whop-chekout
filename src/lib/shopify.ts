@@ -6,7 +6,7 @@ import { decrypt, safeEqual } from "./crypto";
 import { env } from "./env";
 import { log } from "./log";
 import { assertBreakerClosed, boundedTimeout, breakerOpen, isTimeoutError, timeLeft, tripBreaker } from "./deadline";
-import { allocateDiscount, centsToDecimal, productKey, type CartLine } from "./pricing";
+import { allocateDiscount, centsToDecimal, productKey, type CartLine, type LineComponent } from "./pricing";
 import { splitOverComponents, type CartContext } from "./cart-fidelity";
 
 export const SHOPIFY_API_VERSION = "2026-07";
@@ -347,6 +347,49 @@ export async function priceCart(
     .filter((l) => l.quantity > 0);
 }
 
+/**
+ * Components of bundle parents Shopify sells only through them (Shopify Bundles: requiresComponents),
+ * per parent unit, weighted by their prices (the order splits the line's amount by them). A parent
+ * Shopify lists no component for is left out of the map (it can't be ordered).
+ */
+export async function bundleComponents(store: ConnectedStore, parentIds: string[]): Promise<Map<string, LineComponent[]>> {
+  const ids = [...new Set(parentIds.map(variantGid))].slice(0, 50);
+  const out = new Map<string, LineComponent[]>();
+  if (!ids.length) return out;
+  type Part = { quantity: number; productVariant: { id: string; title: string; price: string; product: { title: string; hasOnlyDefaultVariant: boolean } } | null };
+  const data = await shopifyGraphql<{ nodes: ({ __typename: string; id: string; productVariantComponents?: { nodes: Part[] } | null } | null)[] }>(
+    store,
+    `query($ids: [ID!]!) {
+      nodes(ids: $ids) {
+        __typename
+        ... on ProductVariant {
+          id
+          productVariantComponents(first: 30) { nodes { quantity productVariant { id title price product { title hasOnlyDefaultVariant } } } }
+        }
+      }
+    }`,
+    { ids },
+  );
+  for (const n of data.nodes) {
+    if (n?.__typename !== "ProductVariant") continue;
+    const parts = (n.productVariantComponents?.nodes ?? []).filter((c) => c.productVariant && c.quantity > 0);
+    if (!parts.length) continue;
+    out.set(
+      n.id,
+      parts.map((c) => {
+        const v = c.productVariant!;
+        return {
+          variantId: v.id,
+          quantity: c.quantity,
+          weightCents: Math.max(0, Math.round(Number(v.price) * 100)) * c.quantity,
+          title: `${v.product.title}${v.product.hasOnlyDefaultVariant ? "" : ` — ${v.title}`}`.slice(0, 200),
+        };
+      }),
+    );
+  }
+  return out;
+}
+
 /* ------------------------------------------------------------------ */
 /* Orders                                                              */
 /* ------------------------------------------------------------------ */
@@ -548,7 +591,13 @@ export function buildOrderCreateInput(o: PaidOrderInput) {
   // Prices an app set on the cart (bundles): already in the line prices, stated for the merchant.
   const appCents = o.lines.reduce((s, l) => s + (l.appPrice ? Math.max(0, l.appPrice.originalUnitCents - l.unitPriceCents) * l.quantity : 0), 0);
   if (o.automaticTitles?.length) order.note = `${order.note} — remises automatiques Shopify : ${o.automaticTitles.join(" + ").slice(0, 300)}`;
-  if (appCents > 0) order.note = `${order.note} — prix de lot fixés par une app du panier Shopify (−${centsToDecimal(appCents)} ${o.currency} sur les prix catalogue, déjà dans les prix des lignes)`;
+  if (o.cart?.cartPriced) {
+    // The cart charged as Shopify charged it (an app's price, bundle or currency the checkout couldn't
+    // represent line by line): the merchant sees why the line prices differ from the catalog.
+    order.note = `${order.note} — lignes au prix du panier Shopify (prix d'app, lot ou remise automatique${o.cart.cartPriced.discounted ? " déjà déduite" : ""}), jamais sous le prix catalogue sans preuve`;
+  } else if (appCents > 0) {
+    order.note = `${order.note} — prix de lot fixés par une app du panier Shopify (−${centsToDecimal(appCents)} ${o.currency} sur les prix catalogue, déjà dans les prix des lignes)`;
+  }
   if (o.discount?.freeShipping) {
     // Shopify zeroes every shipping line of a free-shipping code: only when shipping was free as paid,
     // or the order total would drop below what Whop charged.

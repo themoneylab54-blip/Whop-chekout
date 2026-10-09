@@ -4,7 +4,7 @@ import type { CartLine } from "@/lib/pricing";
 /*
  * Bundle / upsell / personalization apps against a real Postgres: the storefront's cart (/cart.js,
  * mocked) re-read by the session route, Kaching's discount-function mode, a Cart Transform price
- * (merge mode), personalization properties, the fallback to Shopify's checkout (journaled), locked
+ * (merge mode), personalization properties, carts charged as Shopify's cart charges them (journaled), locked
  * quantities on the quote, and the paid order's input (properties, cart note / attributes, the
  * charged amount). Shopify's Admin API and Whop are mocked. Test data is prefixed bnd_ and deleted.
  */
@@ -126,11 +126,12 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
     expect(await db.rateLimit.count({ where: { key: `session:ip:10.77.0.${ip}` } })).toBe(0);
   });
 
-  it("app line (hidden key) + personalization: properties and cart context on the order, cart fixed; a Cart Transform price with only a hidden key goes to Shopify", async () => {
+  it("app line (hidden key) + personalization: properties and cart context on the order, cart fixed; a lower price with only a hidden key is charged at the variant's price", async () => {
     const store = await makeStore();
     await db.shippingRate.create({ data: { storeId: store.id, name: "Poste", countries: [], priceCents: 0 } });
     // Fast Bundle / Kaching merge mode: 2 × 30 € sold 2 × 25 €, no discount allocation, no components:
-    // nothing verifies that price, and charging 30 € would be more than the cart showed → Shopify's checkout.
+    // nothing the buyer can't forge explains that price (another market's could) → the variant's price,
+    // on this checkout (never Shopify's).
     stubCart({
       token: "bnd-token-1",
       currency: "EUR",
@@ -138,8 +139,16 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
       items: [{ variant_id: 11, quantity: 2, price: 2500, final_price: 2500, final_line_price: 5000, original_line_price: 5000, line_level_discount_allocations: [], properties: { _bundle_id: "fb_9" } }, { variant_id: 12, quantity: 1, final_line_price: 1500, line_level_discount_allocations: [] }],
     });
     const lower = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 2, properties: { _bundle_id: "fb_9" } }, { variant_id: 12, quantity: 1 }], cartToken: "bnd-token-1", appPricing: true });
-    expect([lower.status, ((await lower.json()) as { reason: string }).reason]).toEqual([409, "price_unverified"]);
-    expect((await db.eventLog.findFirstOrThrow({ where: { storeId: store.id, kind: "cart.unsupported_app_pricing" } })).message).toContain("sans signe vérifiable");
+    expect(lower.status).toBe(200);
+    const lowered = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await lower.json()) as { id: string }).id } });
+    expect(lowered.subtotalCents).toBe(7500);
+    expect((lowered.lines as unknown as CartLine[]).map((l) => [l.variantId, l.quantity, l.unitPriceCents, l.cartPriced, l.locked])).toEqual([
+      [V(11), 2, 3000, true, true],
+      [V(12), 1, 1500, true, true],
+    ]);
+    expect((lowered.lines as unknown as CartLine[])[0].appPrice).toBeUndefined();
+    expect(lowered.cartContext).toMatchObject({ cartPriced: { reason: "price_unverified", discounted: false } });
+    expect((await db.eventLog.findFirstOrThrow({ where: { storeId: store.id, kind: "cart.priced_as_shopify_cart" } })).message).toContain("sans signe vérifiable");
 
     const fetchMock = stubCart({
       token: "bnd-token-1",
@@ -173,7 +182,8 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
     const snap = await db.cartSnapshot.findUniqueOrThrow({ where: { sessionId: id } });
     expect(snap.unknownKeys).toEqual(["_app_ref", "_bundle_id"]);
     expect(JSON.stringify(snap.data)).not.toMatch(/Léa|Paquet cadeau|bnd-token-1/);
-    expect(await db.eventLog.count({ where: { storeId: store.id, kind: "cart.apps_detected" } })).toBe(1);
+    // Both carts' unknown keys journaled (once a day per set of keys).
+    expect(await db.eventLog.count({ where: { storeId: store.id, kind: "cart.apps_detected" } })).toBe(2);
 
     // An app's line (hidden key) holds for this exact cart: every line is fixed, a change (even
     // removing the other line) is ignored and adds nothing.
@@ -239,40 +249,54 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
     expect((await db.cartSnapshot.findUniqueOrThrow({ where: { sessionId: id } })).apps).toEqual(["automatic_discount", "kaching"]);
   });
 
-  it("safety net: a cart Shopify prices lower than we can explain goes to Shopify's checkout", async () => {
+  it("safety net: a cart Shopify prices lower than its lines (a cart-level app price) is charged as the cart says", async () => {
     const store = await makeStore();
     // A cart-level app price we can't see per line (total below the lines).
     stubCart({ token: "bnd-token-7", currency: "EUR", total_price: 2000, items: [{ variant_id: 11, quantity: 1, final_line_price: 3000, line_level_discount_allocations: [], properties: { __kaching_bundles: "{}" } }] });
     const res = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1, properties: { __kaching_bundles: "{}" } }], cartToken: "bnd-token-7" });
-    expect([res.status, ((await res.json()) as { reason: string }).reason]).toEqual([409, "price_unreconciled"]);
+    expect(res.status).toBe(200);
+    const s = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await res.json()) as { id: string }).id } });
+    expect([s.subtotalCents, (s.lines as unknown as CartLine[])[0].unitPriceCents]).toEqual([2000, 2000]);
+    expect(s.cartContext).toMatchObject({ cartPriced: { reason: "price_unreconciled", discounted: true } });
     // Cart Transform parent (has_components) whose components the AJAX cart doesn't list.
     stubCart({ token: "bnd-token-8", currency: "EUR", total_price: 3000, items: [{ variant_id: 11, quantity: 1, final_line_price: 3000, has_components: true, line_level_discount_allocations: [] }] });
     const merged = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1 }], cartToken: "bnd-token-8", appPricing: true });
-    expect([merged.status, ((await merged.json()) as { reason: string }).reason]).toEqual([409, "bundle_components_unresolved"]);
-    const entry = await db.eventLog.findFirstOrThrow({ where: { storeId: store.id, kind: "cart.unsupported_app_pricing", data: { path: ["reason"], equals: "bundle_components_unresolved" } } });
+    expect(merged.status).toBe(200);
+    const m = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await merged.json()) as { id: string }).id } });
+    // The parent is ordered (its components' stock isn't decremented: said in the journal).
+    expect((m.lines as unknown as CartLine[])[0]).toMatchObject({ variantId: V(11), unitPriceCents: 3000, cartPriced: true });
+    expect((m.lines as unknown as CartLine[])[0].components).toBeUndefined();
+    const entry = await db.eventLog.findFirstOrThrow({ where: { storeId: store.id, kind: "cart.priced_as_shopify_cart", data: { path: ["reason"], equals: "bundle_components_unresolved" } } });
     expect(entry.data).toMatchObject({ apps: ["cart_transform"] });
+    expect(entry.message).toContain("stock des composants");
   });
 
-  it("unsupported app pricing is refused (never Shopify's checkout), journaled", async () => {
+  it("an app's surcharge is charged as the cart says, a buy-now bundle at the variant's price; only an unreadable app cart is refused (retry)", async () => {
     const store = await makeStore();
     // An app's surcharge (cart price above the variant's) on a personalized line.
     stubCart({ token: "bnd-token-3", currency: "EUR", items: [{ variant_id: 11, quantity: 1, final_line_price: 3900, line_level_discount_allocations: [], properties: { Gravure: "Léa" } }] });
     const res = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1, properties: { Gravure: "Léa" } }], cartToken: "bnd-token-3" });
-    expect(res.status).toBe(409);
-    const body = await res.json();
-    expect(body).toMatchObject({ reason: "price_higher" });
-    expect(body.native).toBeUndefined();
-    const entry = await db.eventLog.findFirstOrThrow({ where: { storeId: store.id, kind: "cart.unsupported_app_pricing" } });
+    expect(res.status).toBe(200);
+    const surcharged = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await res.json()) as { id: string }).id } });
+    expect((surcharged.lines as unknown as CartLine[])[0]).toMatchObject({ unitPriceCents: 3900, cartPriced: true, properties: [{ name: "Gravure", value: "Léa" }] });
+    expect(surcharged.subtotalCents).toBe(3900);
+    const entry = await db.eventLog.findFirstOrThrow({ where: { storeId: store.id, kind: "cart.priced_as_shopify_cart" } });
     expect(entry.message).toContain("supplément");
 
-    // Bundle bought with "buy now" (no cart to verify its price).
+    // Bundle bought with "buy now" (no cart to read its price): the variant's own price, its properties kept.
     const buyNow = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1, properties: { _kaching_bundle_id: "kb" } }] });
-    expect([buyNow.status, ((await buyNow.json()) as { reason: string }).reason]).toEqual([409, "bundle_without_cart"]);
+    expect(buyNow.status).toBe(200);
+    const b = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await buyNow.json()) as { id: string }).id } });
+    expect((b.lines as unknown as CartLine[])[0]).toMatchObject({ unitPriceCents: 3000, locked: true, properties: [{ name: "_kaching_bundle_id", value: "kb" }] });
+    expect(await db.eventLog.count({ where: { storeId: store.id, kind: "cart.catalog_priced" } })).toBe(1);
 
-    // Cart unreadable while it holds an app's bundle.
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 500 })));
+    // Cart unreadable (asked twice) while it holds an app's bundle: refused for a retry, never Shopify's checkout.
+    const failing = vi.fn(async () => new Response("nope", { status: 500 }));
+    vi.stubGlobal("fetch", failing);
     const unreadable = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1, properties: { _bundle: "x" } }], cartToken: "bnd-token-4", appPricing: true });
-    expect([unreadable.status, ((await unreadable.json()) as { reason: string }).reason]).toEqual([409, "cart_unreadable"]);
+    const refusal = (await unreadable.json()) as { reason: string; native?: boolean };
+    expect([unreadable.status, refusal.reason, refusal.native]).toEqual([409, "cart_unreadable", undefined]);
+    expect(failing).toHaveBeenCalledTimes(2);
 
     // A plain cart unreadable: goes on as before (no discounts), properties from the storefront.
     const plain = await post({ store: store.publicId, items: [{ variant_id: 12, quantity: 1, properties: { Couleur: "Bleu" } }], cartToken: "bnd-token-5", note: "Merci" });
@@ -283,17 +307,22 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
 
   it("a cart token is always re-read, whatever the browser's flags (Cart Transform price without properties)", async () => {
     const store = await makeStore();
-    // Lower, no verified sign on the line (Markets / B2B price list, tax-inclusive price): Shopify's
-    // checkout (never charged more than the cart showed), journaled.
+    // Lower, no verified sign on the line (Markets / B2B price list, tax-inclusive price): another
+    // market's price is never kept — the variant's price, on this checkout, journaled.
     let fetchMock = stubCart({ token: "bnd-token-6", currency: "EUR", total_price: 2500, items: [{ variant_id: 11, quantity: 1, price: 2500, final_price: 2500, final_line_price: 2500, original_line_price: 2500, line_level_discount_allocations: [] }] });
     const lower = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1 }], cartToken: "bnd-token-6" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect([lower.status, ((await lower.json()) as { reason: string }).reason]).toEqual([409, "price_unverified"]);
-    expect(await db.eventLog.findFirstOrThrow({ where: { storeId: store.id, kind: "cart.unsupported_app_pricing" } })).toMatchObject({ data: { reason: "price_unverified", detail: V(11) } });
+    expect(lower.status).toBe(200);
+    const low = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await lower.json()) as { id: string }).id } });
+    expect((low.lines as unknown as CartLine[])[0]).toMatchObject({ unitPriceCents: 3000, cartPriced: true });
+    expect((low.lines as unknown as CartLine[])[0].appPrice).toBeUndefined();
+    expect(await db.eventLog.findFirstOrThrow({ where: { storeId: store.id, kind: "cart.priced_as_shopify_cart" } })).toMatchObject({ data: { reason: "price_unverified", detail: V(11) } });
     // Higher: the markup isn't lost.
     stubCart({ token: "bnd-token-6", currency: "EUR", total_price: 3500, items: [{ variant_id: 11, quantity: 1, final_line_price: 3500, line_level_discount_allocations: [] }] });
     const higher = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1 }], cartToken: "bnd-token-6" });
-    expect([higher.status, ((await higher.json()) as { reason: string }).reason]).toEqual([409, "price_higher"]);
+    expect(higher.status).toBe(200);
+    const high = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await higher.json()) as { id: string }).id } });
+    expect((high.lines as unknown as CartLine[])[0]).toMatchObject({ unitPriceCents: 3500, cartPriced: true });
     // Subscription line forged as a one-time purchase (no selling_plan sent, appPricing true): refused.
     stubCart({ token: "bnd-token-6", currency: "EUR", total_price: 2400, items: [{ variant_id: 11, quantity: 1, final_line_price: 2400, line_level_discount_allocations: [], selling_plan_allocation: { selling_plan: { id: 9 }, price: 2400 } }] });
     const sub = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1 }], cartToken: "bnd-token-6", appPricing: true });
@@ -312,9 +341,11 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
     expect(res.status).toBe(200);
     const s = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await res.json()) as { id: string }).id } });
     expect((s.lines as unknown as CartLine[])[0]).toMatchObject({ properties: [{ name: "Prénom", value: "Tom" }], locked: true });
-    // A bundle app's line the cart doesn't hold: its price can't be verified.
+    // A bundle app's line the cart doesn't hold (its price can't be read there): the variant's own price.
     const bundle = await post({ store: store.publicId, items: [{ variant_id: 12, quantity: 1, properties: { _kaching_bundle_id: "kb" } }], cartToken: "bnd-token-9" });
-    expect([bundle.status, ((await bundle.json()) as { reason: string }).reason]).toEqual([409, "bundle_without_cart"]);
+    expect(bundle.status).toBe(200);
+    const bs = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await bundle.json()) as { id: string }).id } });
+    expect((bs.lines as unknown as CartLine[])[0]).toMatchObject({ variantId: V(12), unitPriceCents: 1500, locked: true, properties: [{ name: "_kaching_bundle_id", value: "kb" }] });
   });
 
   it("the checkout's quantity break doesn't stack on a Kaching discount-function bundle (appDiscounted)", async () => {
@@ -446,22 +477,79 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
     const changed = await quoteSession(session, { addOnIds: [], discountCode: "", quantities: { [V(11)]: 2 } });
     expect([changed.automaticDiscount, changed.automaticDiscountLost, changed.totals.totalCents]).toEqual([null, ["Soldes"], 6000]);
 
-    // 1: a code that lowered the cart but can't be reproduced (unknown here, Shopify codes not read):
-    // the buyer would pay more than the cart showed → Shopify's checkout, journaled.
+    // 1: a code that lowered the cart but can't be verified here (unknown here, Shopify codes not read):
+    // the cart charged as Shopify charges it, its automatic discount in the price; the code goes through
+    // the checkout's own code pipeline (validated, limits counted) — here it doesn't apply, said.
     stubCart(cart("BNDUNKNOWN"));
     const other = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1 }], cartToken: "bnd-token-12" });
-    expect([other.status, ((await other.json()) as { reason: string }).reason]).toEqual([409, "code_unsupported"]);
-    const refused = await db.eventLog.findFirstOrThrow({ where: { storeId: store.id, kind: "cart.unsupported_app_pricing" }, orderBy: { createdAt: "desc" } });
-    expect(refused.message).toContain("code promo du panier Shopify impossible à reproduire");
-    expect(refused.data).toMatchObject({ reason: "code_unsupported", detail: "BNDUNKNOWN: Shopify codes not read" });
-    // Two codes that both lowered the cart: the checkout applies one → refused.
+    expect(other.status).toBe(200);
+    const o = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await other.json()) as { id: string }).id }, include: { store: true } });
+    expect((o.lines as unknown as CartLine[])[0]).toMatchObject({ unitPriceCents: 2700, cartPriced: true, locked: true });
+    expect(o.cartContext).toMatchObject({ discountCodes: ["BNDUNKNOWN"], cartPriced: { reason: "code_unsupported", discounted: true } });
+    expect(o.cartDiscounts).toBeNull();
+    const priced = await db.eventLog.findFirstOrThrow({ where: { storeId: store.id, kind: "cart.priced_as_shopify_cart" }, orderBy: { createdAt: "desc" } });
+    expect(priced.message).toContain("code promo du panier Shopify impossible à vérifier");
+    expect(priced.data).toMatchObject({ reason: "code_unsupported", detail: "BNDUNKNOWN: Shopify codes not read" });
+    // The quote: the automatic discount already in the price (none on top); the cart's code tried like a
+    // typed one and, invalid here, dropped with a notice (never charged silently).
+    const oq = await quoteSession(o, { addOnIds: [] });
+    expect([oq.totals.subtotalCents, oq.totals.totalCents, oq.automaticDiscount, oq.cartLocked]).toEqual([2700, 2700, null, true]);
+    expect(oq.cartCodeLost).toEqual({ code: "BNDUNKNOWN", reason: "discount_invalid", blocking: false });
+    // Another code than the cart's own: refused (it can't be checked against the cart's automatic discount).
+    const typed = await quoteSession(o, { addOnIds: [], discountCode: "BNDFAST10" });
+    expect([typed.discount, typed.discountErrorCode, typed.totals.totalCents]).toEqual([null, "discount_cart_priced", 2700]);
+    // Two codes that both lowered the cart: the checkout applies the first it can verify (a valid app code here).
     stubCart({
       ...cart("BNDFAST10"),
       total_price: 2330,
       items: [{ ...cart("BNDFAST10").items[0], final_line_price: 2330, line_level_discount_allocations: [...cart("BNDFAST10").items[0].line_level_discount_allocations, { amount: 100, discount_application: { type: "discount_code", title: "OTHER" } }] }],
     });
     const two = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1 }], cartToken: "bnd-token-12" });
-    expect(((await two.json()) as { reason: string }).reason).toBe("code_unsupported");
+    expect(two.status).toBe(200);
+    const t = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await two.json()) as { id: string }).id } });
+    expect([(t.lines as unknown as CartLine[])[0].unitPriceCents, (t.cartContext as { discountCodes?: string[] }).discountCodes]).toEqual([2700, ["BNDFAST10", "OTHER"]]);
+    const tq = await quoteSession({ ...t, store: o.store }, { addOnIds: [] });
+    expect([tq.discount?.code, tq.totals.totalCents]).toEqual(["BNDFAST10", 2430]);
+    // The cart's code takes off exactly what it took off in Shopify's cart (25.00 there, where Shopify
+    // combined it with the automatic discount), not the checkout's own 10 % (27.00); counted as a use.
+    stubCart({
+      ...cart("BNDFAST10"),
+      total_price: 2350,
+      items: [
+        {
+          ...cart("BNDFAST10").items[0],
+          final_line_price: 2350,
+          line_level_discount_allocations: [
+            { amount: 250, discount_application: { type: "discount_code", title: "BNDFAST10" } },
+            { amount: 300, discount_application: { type: "automatic", title: "Soldes" } },
+            { amount: 100, discount_application: { type: "discount_code", title: "OTHER" } },
+          ],
+        },
+      ],
+    });
+    const exact = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1 }], cartToken: "bnd-token-12" });
+    const e = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await exact.json()) as { id: string }).id }, include: { store: true } });
+    expect(e.cartContext).toMatchObject({ discountCodes: ["BNDFAST10", "OTHER"], cartPriced: { codeCents: { BNDFAST10: 250, OTHER: 100 } } });
+    const eq = await quoteSession(e, { addOnIds: [] });
+    expect([eq.discount?.code, eq.totals.discountCents, eq.totals.totalCents]).toEqual(["BNDFAST10", 250, 2450]);
+    // The other code that took money off in the cart: one code applies here, that one is said.
+    expect(eq.cartCodeLost).toEqual({ code: "OTHER", reason: "discount_not_combinable", blocking: false });
+  });
+
+  it("a cart charged as Shopify charges it: its own code that took nothing there takes nothing here (typed again: said)", async () => {
+    const store = await makeStore();
+    await db.shippingRate.create({ data: { storeId: store.id, name: "Poste", countries: [], priceCents: 0 } });
+    await db.discountCode.create({ data: { storeId: store.id, code: "BNDNOSTACK", type: "PERCENT", value: 10 } });
+    // An app's surcharge (cart-priced) and a code Shopify lists as applicable but didn't apply (not combinable).
+    stubCart({ token: "bnd-token-30", currency: "EUR", total_price: 3900, discount_codes: [{ code: "BNDNOSTACK", applicable: true }], items: [{ variant_id: 11, quantity: 1, final_line_price: 3900, line_level_discount_allocations: [], properties: { Gravure: "Tom" } }] });
+    const res = await post({ store: store.publicId, items: [{ variant_id: 11, quantity: 1, properties: { Gravure: "Tom" } }], cartToken: "bnd-token-30" });
+    expect(res.status).toBe(200);
+    const s = await db.checkoutSession.findUniqueOrThrow({ where: { id: ((await res.json()) as { id: string }).id }, include: { store: true } });
+    expect(s.cartContext).toMatchObject({ discountCodes: ["BNDNOSTACK"], cartPriced: { reason: "price_higher", codesTakenOff: [] } });
+    const q = await quoteSession(s, { addOnIds: [] });
+    expect([q.discount, q.totals.totalCents, q.cartCodeLost]).toEqual([null, 3900, undefined]);
+    const typed = await quoteSession(s, { addOnIds: [], discountCode: "BNDNOSTACK" });
+    expect([typed.discount, typed.discountErrorCode, typed.totals.totalCents]).toEqual([null, "discount_not_combinable", 3900]);
   });
 
   it("1: a verified cart code dropped later is never hidden: payment blocked on the same cart (non-transient, or Shopify unreachable twice), a notice after a buyer's change", async () => {
@@ -508,7 +596,7 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
     shopify.shopifyGraphql.mockReset();
   });
 
-  it("3: an unreadable cart the storefront saw discounted automatically goes to Shopify's checkout", async () => {
+  it("3: an unreadable cart the storefront saw discounted automatically is refused for a retry (never Shopify's checkout)", async () => {
     const store = await makeStore();
     vi.stubGlobal(
       "fetch",
