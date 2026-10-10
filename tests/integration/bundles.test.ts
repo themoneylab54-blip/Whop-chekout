@@ -62,11 +62,13 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
   }
 
   let ip = 0;
+  // A third octet per run: another run's rate-limit rows (shared test database) never meet this one's.
+  const net = `10.${70 + Math.floor(Math.random() * 50)}.${Math.floor(Math.random() * 250)}`;
   const post = (body: Record<string, unknown>) =>
     sessionsRoute.POST(
       new Request("https://x.test/api/public/sessions", {
         method: "POST",
-        headers: { "content-type": "application/json", "x-forwarded-for": `10.77.0.${++ip}` },
+        headers: { "content-type": "application/json", "x-forwarded-for": `${net}.${++ip}` },
         body: JSON.stringify(body),
       }),
       { params: Promise.resolve({}) },
@@ -123,7 +125,7 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ warm: true });
     expect(await db.checkoutSession.count()).toBe(before);
-    expect(await db.rateLimit.count({ where: { key: `session:ip:10.77.0.${ip}` } })).toBe(0);
+    expect(await db.rateLimit.count({ where: { key: `session:ip:${net}.${ip}` } })).toBe(0);
   });
 
   it("app line (hidden key) + personalization: properties and cart context on the order, cart fixed; a lower price with only a hidden key is charged at the variant's price", async () => {
@@ -247,6 +249,68 @@ describe.skipIf(!hasDb)("bundle apps (integration)", async () => {
     expect(q.automaticDiscount).toEqual({ cents: 1800, titles: ["Kaching Bundle -20%"] });
     expect(q.totals.totalCents).toBe(7200);
     expect((await db.cartSnapshot.findUniqueOrThrow({ where: { sessionId: id } })).apps).toEqual(["automatic_discount", "kaching"]);
+  });
+
+  it("Kaching's bundle as Shopify's cart really gives it (Sovéline, 10 Oct 2026): its discount function's type is empty — the cart's automatic discount, never a code nor the full price", async () => {
+    const store = await makeStore();
+    await db.shippingRate.create({ data: { storeId: store.id, name: "Poste", countries: [], priceCents: 0 } });
+    // « 150 jours : 3 achetés = 2 offerts » — 2 at the full price, 3 for 5.00 in all (cart.js as read live).
+    const deal = JSON.stringify({ deal: "9Dyp", main: true, id: "c_5c" });
+    stubCart({
+      token: "bnd-token-60",
+      currency: "EUR",
+      total_price: 6500,
+      original_total_price: 15000,
+      discount_codes: [],
+      cart_level_discount_applications: [],
+      items: [
+        { variant_id: 11, quantity: 2, price: 3000, final_price: 3000, final_line_price: 6000, original_line_price: 6000, properties: { __kaching_bundles: deal }, line_level_discount_allocations: [] },
+        {
+          variant_id: 11,
+          quantity: 3,
+          price: 3000,
+          final_price: 167,
+          final_line_price: 500,
+          original_line_price: 9000,
+          properties: { __kaching_bundles: deal },
+          line_level_discount_allocations: [
+            { amount: 8500, discount_application: { type: "", title: "150 jours", value: "85.00", value_type: "fixed_amount", allocation_method: "across", target_selection: "entitled", target_type: "line_item", total_allocated_amount: 8500 } },
+          ],
+        },
+      ],
+    });
+    const items = [
+      { variant_id: 11, quantity: 2, properties: { __kaching_bundles: deal } },
+      { variant_id: 11, quantity: 3, properties: { __kaching_bundles: deal } },
+    ];
+    const res = await post({ store: store.publicId, items, cartToken: "bnd-token-60", automaticDiscounts: true, appPricing: true });
+    expect(res.status).toBe(200);
+    const { id } = (await res.json()) as { id: string };
+    const session = await db.checkoutSession.findUniqueOrThrow({ where: { id }, include: { store: true } });
+    // One line of 5 at the variant's price, the bundle's discount as the cart's automatic one.
+    expect((session.lines as unknown as CartLine[]).map((l) => [l.quantity, l.unitPriceCents, !!l.appDiscounted, !!l.locked])).toEqual([[5, 3000, true, true]]);
+    expect(session.cartDiscounts).toMatchObject({ totalCents: 8500, titles: ["150 jours"] });
+    const q = await quoteSession(session, { addOnIds: [] });
+    expect([q.totals.subtotalCents, q.automaticDiscount, q.totals.totalCents, q.discount, q.cartCodeLost]).toEqual([15000, { cents: 8500, titles: ["150 jours"] }, 6500, null, undefined]);
+    expect((await db.cartSnapshot.findUniqueOrThrow({ where: { sessionId: id } })).apps).toEqual(expect.arrayContaining(["automatic_discount", "kaching"]));
+
+    // A code typed on top: the bundle's discount function names its lines itself (« 150 jours »), so
+    // Shopify finds no discount of that title — it combines with nothing, the better one is kept.
+    const { clearShopifyDiscountCache } = await import("@/lib/shopify-discounts");
+    await db.discountCode.create({ data: { storeId: store.id, code: "BNDMERCI10", type: "PERCENT", value: 10 } });
+    const reading = { ...session, store: await db.store.update({ where: { id: store.id }, data: { shopifyScopes: "read_products,read_discounts" } }) };
+    clearShopifyDiscountCache();
+    shopify.shopifyGraphql.mockResolvedValue({ discountNodes: { nodes: [] } });
+    const typed = await quoteSession(reading, { addOnIds: [], discountCode: "BNDMERCI10" });
+    expect([typed.discount, typed.discountErrorCode, typed.totals.totalCents]).toEqual([null, "discount_not_combinable", 6500]);
+    // The app discount found, set to combine with order discounts: the code stacks, as Shopify would.
+    clearShopifyDiscountCache();
+    shopify.shopifyGraphql.mockResolvedValue({
+      discountNodes: { nodes: [{ discount: { __typename: "DiscountAutomaticApp", title: "150 jours", combinesWith: { productDiscounts: false, orderDiscounts: true, shippingDiscounts: true }, discountClasses: ["PRODUCT"] } }] },
+    });
+    const stacked = await quoteSession(reading, { addOnIds: [], discountCode: "BNDMERCI10" });
+    expect([stacked.discount?.code, stacked.totals.totalCents]).toEqual(["BNDMERCI10", 5850]);
+    shopify.shopifyGraphql.mockReset();
   });
 
   it("safety net: a cart Shopify prices lower than its lines (a cart-level app price) is charged as the cart says", async () => {

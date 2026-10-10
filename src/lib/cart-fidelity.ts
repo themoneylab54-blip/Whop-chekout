@@ -292,13 +292,22 @@ export function componentsOf(item: CartJsItem): LineComponent[] | "invalid" | nu
   return out;
 }
 
+/**
+ * Whether a cart discount is a code (Shopify's type "discount_code"): the only kind the checkout
+ * applies again itself. Every other one — "automatic", an app's discount function (Shopify leaves
+ * its type empty: Kaching's bundles), a script — is part of what Shopify's cart charges. Pure.
+ */
+export function isCodeDiscount(type: unknown): boolean {
+  return type === "discount_code";
+}
+
 function normalize(item: CartJsItem): Normalized {
   let allocated = 0;
   let automatic = 0;
   for (const a of item.line_level_discount_allocations ?? []) {
     const cents = Math.max(0, num(a?.amount) ?? 0);
     allocated += cents;
-    if (a?.discount_application?.type === "automatic") automatic += cents;
+    if (!isCodeDiscount(a?.discount_application?.type)) automatic += cents;
   }
   return {
     variantId: gidOf(item.variant_id ?? item.id),
@@ -666,18 +675,18 @@ export function cartHeldByApp(lines: CartLine[]): boolean {
 
 /**
  * What Shopify's cart charges for the merchandise, discount codes left out: total_price plus every
- * non-automatic allocation. Null when unknown. A code that lowered the cart is checked apart: verified
- * reproducible when the checkout opens (else `code_unsupported`), then held to the cart's total_price
- * by the quote (CartContext.codeCheck). Pure.
+ * code's allocation (isCodeDiscount: an app's discount stays in). Null when unknown. A code that
+ * lowered the cart is checked apart: verified reproducible when the checkout opens (else
+ * `code_unsupported`), then held to the cart's total_price by the quote (CartContext.codeCheck). Pure.
  */
 export function cartMerchandiseCents(cart: CartJs): number | null {
   const total = num(cart.total_price);
   if (total == null) return null;
   let codes = 0;
   for (const it of cart.items ?? []) {
-    for (const a of it.line_level_discount_allocations ?? []) if (a?.discount_application?.type !== "automatic") codes += Math.max(0, num(a?.amount) ?? 0);
+    for (const a of it.line_level_discount_allocations ?? []) if (isCodeDiscount(a?.discount_application?.type)) codes += Math.max(0, num(a?.amount) ?? 0);
   }
-  for (const app of cart.cart_level_discount_applications ?? []) if (app?.type !== "automatic") codes += Math.max(0, num(app?.total_allocated_amount) ?? 0);
+  for (const app of cart.cart_level_discount_applications ?? []) if (isCodeDiscount(app?.type)) codes += Math.max(0, num(app?.total_allocated_amount) ?? 0);
   return total + codes;
 }
 
@@ -712,11 +721,11 @@ export function detectCartApps(cart: CartJs): { apps: string[]; unknownKeys: str
     if (it.product_type === "PPLR_HIDDEN_PRODUCT") apps.add("zepto");
     if (/-sca_clone_freegift/.test(String(it.handle ?? ""))) apps.add("bogos");
     if (it.has_components === true || componentsOf(it)) apps.add("cart_transform");
-    if ((it.line_level_discount_allocations ?? []).some((a) => a?.discount_application?.type === "automatic")) apps.add("automatic_discount");
+    if ((it.line_level_discount_allocations ?? []).some((a) => !isCodeDiscount(a?.discount_application?.type) && (num(a?.amount) ?? 0) > 0)) apps.add("automatic_discount");
     if ((it.line_level_discount_allocations ?? []).some((a) => a?.discount_application?.type === "discount_code")) apps.add("discount_code");
   }
   for (const k of Object.keys(cart.attributes ?? {})) see(k);
-  if ((cart.cart_level_discount_applications ?? []).some((a) => a?.type === "automatic")) apps.add("automatic_discount");
+  if ((cart.cart_level_discount_applications ?? []).some((a) => !isCodeDiscount(a?.type) && (num(a?.total_allocated_amount) ?? 0) > 0)) apps.add("automatic_discount");
   return { apps: [...apps].sort(), unknownKeys: [...unknown].sort().slice(0, 20) };
 }
 

@@ -91,13 +91,13 @@ export const SECOND_CART_READ_MS = 4000;
  * storefront saw as plain gets 1.5 s and no alert on failure (it goes on at the variants' prices);
  * an app's or discounted one 3 s.
  */
-export function startCartRead(store: Pick<Store, "id" | "shopDomain">, input: SessionCartInput): Promise<CartJs | null> | null {
+export function startCartRead(store: Pick<Store, "id" | "shopDomain" | "storefrontHost">, input: SessionCartInput): Promise<CartJs | null> | null {
   if (!needsCartRead(input)) return null;
   return cartLooksApp(input) ? readCartJs(store, input.cartToken!) : readCartJs(store, input.cartToken!, { timeoutMs: PLAIN_CART_READ_MS, alert: false });
 }
 
 /** What sessionCart reads of the store (the cart's code is checked against Shopify's codes). */
-export type SessionCartStore = Pick<Store, "id" | "shopDomain" | "shopCurrency" | "shopifyAccessToken" | "shopifyDiscountCodes" | "shopifyScopes" | "shopifyCountsApiOrders">;
+export type SessionCartStore = Pick<Store, "id" | "shopDomain" | "storefrontHost" | "shopCurrency" | "shopifyAccessToken" | "shopifyDiscountCodes" | "shopifyScopes" | "shopifyCountsApiOrders">;
 
 export async function sessionCart(
   store: SessionCartStore,

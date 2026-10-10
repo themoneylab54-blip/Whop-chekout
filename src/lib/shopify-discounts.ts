@@ -8,7 +8,7 @@ import { recordIncident } from "./incidents";
 import { externalCoveredUntil, externalImportStatus } from "./shopify-history";
 import { rateLimit } from "./ratelimit";
 import { productKey, subtotal, type CartLine, type Combines, type DiscountClass, type DiscountInput } from "./pricing";
-import { cartMerchandiseCents, reconcileCart, type CartContext, type CartJs as FidelityCartJs, type UnsupportedCartReason } from "./cart-fidelity";
+import { cartMerchandiseCents, isCodeDiscount, reconcileCart, type CartContext, type CartJs as FidelityCartJs, type UnsupportedCartReason } from "./cart-fidelity";
 
 /*
  * Shopify's own discounts on the Whop checkout.
@@ -670,19 +670,29 @@ export function shopifyCodeAsDiscount(
 
 const autoCache = new Map<string, Cached<{ cls: DiscountClass; combinesWith: Combines } | null>>();
 
+/** An app's (discount function's) class: its only one, else a product discount. */
+function appDiscountClass(classes: unknown): DiscountClass {
+  const list = Array.isArray(classes) ? classes.map((c) => String(c).toUpperCase()) : [];
+  return list.length === 1 && list[0] === "ORDER" ? "order" : list.length === 1 && list[0] === "SHIPPING" ? "shipping" : "product";
+}
+
 /**
  * Class and combinesWith of automatic discounts found by title (`discountNodes`), merged:
  * they combine with a class only if every one of them does; the class is "product" unless all are
- * of one other class. Null when none was recognized (unknown: combine, the previous behavior). Pure.
+ * of one other class. A title no discount carries — an app's discount function names its lines
+ * itself (Kaching's « 150 jours ») — is a product discount that combines with nothing: never a
+ * stack Shopify might refuse. Null when Shopify's answer isn't a list (unknown: combine). Pure.
  */
 export function parseAutomaticStack(data: unknown, titles: string[]): { cls: DiscountClass; combinesWith: Combines } | null {
   const nodes = (data as { discountNodes?: { nodes?: { discount?: Record<string, unknown> | null }[] } } | null)?.discountNodes?.nodes;
   if (!Array.isArray(nodes)) return null;
-  const wanted = new Set(titles.map((t) => t.trim().toLowerCase()));
+  const wanted = [...new Set(titles.map((t) => t.trim().toLowerCase()).filter(Boolean))];
   const found: { cls: DiscountClass; combinesWith: Combines }[] = [];
+  const matched = new Set<string>();
   for (const n of nodes) {
     const d = n?.discount;
-    if (!d || !wanted.has(String(d.title ?? "").trim().toLowerCase())) continue;
+    const title = String(d?.title ?? "").trim().toLowerCase();
+    if (!d || !wanted.includes(title)) continue;
     const combinesWith = combinesOf(d.combinesWith);
     if (!combinesWith) continue;
     const t = d.__typename;
@@ -695,9 +705,15 @@ export function parseAutomaticStack(data: unknown, titles: string[]): { cls: Dis
             ? (d.customerGets as { items?: { __typename?: string } } | undefined)?.items?.__typename === "AllDiscountItems"
               ? "order"
               : "product"
-            : null;
-    if (cls) found.push({ cls, combinesWith });
+            : t === "DiscountAutomaticApp"
+              ? appDiscountClass(d.discountClasses)
+              : null;
+    if (cls) {
+      found.push({ cls, combinesWith });
+      matched.add(title);
+    }
   }
+  for (const t of wanted) if (!matched.has(t)) found.push({ cls: "product", combinesWith: { product: false, order: false, shipping: false } });
   if (!found.length) return null;
   const classes = new Set(found.map((f) => f.cls));
   return {
@@ -718,6 +734,7 @@ export const AUTOMATIC_QUERY = `query($q: String!) {
         ... on DiscountAutomaticBasic { title combinesWith { productDiscounts orderDiscounts shippingDiscounts } customerGets { items { __typename } } }
         ... on DiscountAutomaticBxgy { title combinesWith { productDiscounts orderDiscounts shippingDiscounts } }
         ... on DiscountAutomaticFreeShipping { title combinesWith { productDiscounts orderDiscounts shippingDiscounts } }
+        ... on DiscountAutomaticApp { title combinesWith { productDiscounts orderDiscounts shippingDiscounts } discountClasses }
       }
     }
   }
@@ -725,7 +742,8 @@ export const AUTOMATIC_QUERY = `query($q: String!) {
 
 /**
  * Stacking rules of the automatic discounts Shopify applied to the cart (looked up by their titles,
- * cached 10 min). Any failure reads as unknown (null: they combine, as before).
+ * cached 10 min; one no discount carries combines with nothing, see parseAutomaticStack). A failed
+ * lookup reads as unknown (null: they combine, as before).
  */
 export async function automaticStackFor(store: LookupStore, titles: string[]): Promise<{ cls: DiscountClass; combinesWith: Combines } | null> {
   const list = [...new Set(titles.map((t) => t.trim()).filter(Boolean))].slice(0, 5);
@@ -773,7 +791,8 @@ export type PricedLine = { variantId: string; quantity: number; unitPriceCents: 
 
 /**
  * Automatic discounts of a /cart.js body (amounts in cents, as Shopify's AJAX API gives them):
- * line-level and cart-level allocations of type "automatic" only (codes are handled apart).
+ * line-level and cart-level allocations of every kind but codes (isCodeDiscount: "automatic", an
+ * app's discount function, a script; codes are handled apart).
  * With the checkout's `lines` (shop-currency prices), every cart item must be one of them and a
  * line's allocations are capped at that line's price; the cart-level part at what remains.
  * Null when there is none (or an item isn't a checkout line). Pure, exported for tests.
@@ -788,11 +807,11 @@ export function automaticDiscountsOf(cart: CartJs, lines?: PricedLine[]): CartDi
     const v = variantGidOf(item.variant_id ?? item.id);
     let amount = 0;
     for (const a of item.line_level_discount_allocations ?? []) {
-      if (a.discount_application?.type !== "automatic") continue;
+      if (isCodeDiscount(a.discount_application?.type)) continue;
       const cents = Math.round(Number(a.amount ?? 0));
       if (cents > 0) {
         amount += cents;
-        if (a.discount_application.title) titles.add(a.discount_application.title);
+        if (a.discount_application?.title) titles.add(a.discount_application.title);
       }
     }
     if (amount <= 0) continue;
@@ -807,7 +826,7 @@ export function automaticDiscountsOf(cart: CartJs, lines?: PricedLine[]): CartDi
   }
   let cartLevel = 0;
   for (const app of cart.cart_level_discount_applications ?? []) {
-    if (app.type !== "automatic") continue;
+    if (isCodeDiscount(app.type)) continue;
     const amount = Math.round(Number(app.total_allocated_amount ?? 0));
     if (amount > 0) {
       cartLevel += amount;
@@ -851,28 +870,82 @@ export function sameItems(a: { variantId: string; quantity: number }[], b: { var
  * cart shown in another currency — Shopify Markets — has amounts that aren't the checkout's).
  * Null on any doubt; failures are journaled (the buyer loses the discount).
  */
+/** The shop's own storefront hosts as URL hostnames: its domain (and its www / bare twin), then *.myshopify.com. Pure. */
+export function storefrontHosts(store: Pick<Store, "shopDomain" | "storefrontHost">): string[] {
+  const out: string[] = [];
+  const add = (h: string | null | undefined) => {
+    try {
+      const host = h ? new URL(`https://${h.trim()}`).hostname.toLowerCase() : "";
+      if (host && !out.includes(host)) out.push(host);
+    } catch {
+      /* not a host */
+    }
+  };
+  const domain = store.storefrontHost?.trim().toLowerCase();
+  add(domain);
+  if (domain) add(domain.startsWith("www.") ? domain.slice(4) : `www.${domain}`);
+  add(store.shopDomain);
+  return out;
+}
+
+/**
+ * Where a storefront's redirect may take the cart's cookie: from the shop's *.myshopify.com address
+ * (Shopify sends it to the shop's current domain) any public https host; else one of the shop's own
+ * hosts, or the www / bare twin of the host it comes from. Never an IP address, a port or a local
+ * name. Pure.
+ */
+export function cartRedirectAllowed(from: URL, to: URL, hosts: string[]): boolean {
+  if (to.protocol !== "https:" || to.port || /^\[|^\d+(\.\d+){3}$/.test(to.hostname) || !to.hostname.includes(".")) return false;
+  const a = from.hostname.toLowerCase();
+  const b = to.hostname.toLowerCase();
+  return a.endsWith(".myshopify.com") || hosts.includes(b) || a === `www.${b}` || b === `www.${a}`;
+}
+
+/** Largest /cart.js body read (a cart is a few KB; anything bigger isn't one). */
+const MAX_CART_BODY = 1_000_000;
+
 /**
  * The buyer's cart re-read from the storefront with its token (Shopify's AJAX cart API, 3 s by
- * default): the server's own figures, never the browser's. Null on failure (journaled; `alert`
- * false for a cart that looked plain: it goes on at the variants' prices, nothing is at stake).
+ * default, for the whole read): the server's own figures, never the browser's. Asked on the shop's
+ * *.myshopify.com address — Shopify's own answer, whose redirect names the shop's current domain
+ * (a domain recorded once could have changed hands) — following up to two redirects by hand
+ * (cartRedirectAllowed): a redirect the fetch followed itself would drop the cart's cookie. Null on
+ * failure (journaled; `alert` false for a cart that looked plain: it goes on at the variants'
+ * prices, nothing is at stake).
  */
 export async function readCartJs(
-  store: Pick<Store, "id" | "shopDomain">,
+  store: Pick<Store, "id" | "shopDomain" | "storefrontHost">,
   cartToken: string,
   opts: { timeoutMs?: number; alert?: boolean } = {},
 ): Promise<CartJs | null> {
-  if (!store.shopDomain || !/^[\w\-?=&%.:]{8,300}$/.test(cartToken)) return null;
+  const hosts = storefrontHosts(store);
+  const start = hosts.find((h) => h.endsWith(".myshopify.com"));
+  if (!start || !/^[\w\-?=&%.:]{8,300}$/.test(cartToken)) return null;
+  const signal = AbortSignal.timeout(opts.timeoutMs ?? 3000);
   try {
-    const res = await extFetch("shopify", "cart.js", `https://${store.shopDomain}/cart.js`, {
-      headers: { Accept: "application/json", Cookie: `cart=${cartToken}` },
-      signal: AbortSignal.timeout(opts.timeoutMs ?? 3000),
-      cache: "no-store",
-      redirect: "error",
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const cart = (await res.json()) as CartJs;
-    if (!cart || typeof cart !== "object" || !Array.isArray(cart.items)) throw new Error("unexpected cart body");
-    return cart;
+    let url = new URL(`https://${start}/cart.js`);
+    for (let hop = 0; ; hop++) {
+      const res = await extFetch("shopify", "cart.js", url.href, {
+        headers: { Accept: "application/json", Cookie: `cart=${cartToken}` },
+        signal,
+        cache: "no-store",
+        redirect: "manual",
+      });
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get("location");
+        const next = location ? new URL(location, url) : null;
+        if (hop >= 2 || !next || !cartRedirectAllowed(url, next, hosts)) throw new Error(`redirect to ${next?.hostname ?? "nowhere"} refused`);
+        url = next;
+        continue;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status} on ${url.hostname}`);
+      if (Number(res.headers.get("content-length") ?? 0) > MAX_CART_BODY) throw new Error(`cart body too large on ${url.hostname}`);
+      const text = await res.text();
+      if (text.length > MAX_CART_BODY) throw new Error(`cart body too large on ${url.hostname}`);
+      const cart = JSON.parse(text) as CartJs;
+      if (!cart || typeof cart !== "object" || !Array.isArray(cart.items)) throw new Error(`unexpected cart body on ${url.hostname}`);
+      return cart;
+    }
   } catch (err) {
     await recordIncident({
       storeId: store.id,
@@ -911,7 +984,7 @@ async function discountsOfCart(store: Pick<Store, "id" | "shopCurrency">, cart: 
  * aren't the checkout's). Null on any doubt; failures are journaled (the buyer loses the discount).
  */
 export async function verifiedCartDiscounts(
-  store: Pick<Store, "id" | "shopDomain" | "shopCurrency">,
+  store: Pick<Store, "id" | "shopDomain" | "storefrontHost" | "shopCurrency">,
   cartToken: string,
   lines: PricedLine[],
 ): Promise<CartDiscounts | null> {
@@ -938,7 +1011,7 @@ export type VerifiedCart =
  * app-adjusted prices. "unsupported": the cart can't be represented, Shopify's checkout takes it.
  */
 export async function verifiedCart(
-  store: Pick<Store, "id" | "shopDomain" | "shopCurrency">,
+  store: Pick<Store, "id" | "shopDomain" | "storefrontHost" | "shopCurrency">,
   cartToken: string,
   lines: CartLine[],
   opts: { discounts: boolean; cart?: Promise<CartJs | null> },

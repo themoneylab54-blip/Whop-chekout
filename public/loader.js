@@ -376,13 +376,15 @@
     return false;
   }
 
+  // Any discount but a code: "automatic", an app's discount function (Shopify leaves its type empty:
+  // Kaching's bundles), a script.
   function hasAutomaticDiscounts(cart) {
     var apps = cart.cart_level_discount_applications || [];
-    for (var i = 0; i < apps.length; i++) if (apps[i] && apps[i].type === "automatic") return true;
+    for (var i = 0; i < apps.length; i++) if (apps[i] && apps[i].type !== "discount_code" && apps[i].total_allocated_amount > 0) return true;
     var items = cart.items || [];
     for (var j = 0; j < items.length; j++) {
       var allocs = items[j].line_level_discount_allocations || [];
-      for (var k = 0; k < allocs.length; k++) if (allocs[k] && allocs[k].discount_application && allocs[k].discount_application.type === "automatic") return true;
+      for (var k = 0; k < allocs.length; k++) if (allocs[k] && allocs[k].amount > 0 && !(allocs[k].discount_application && allocs[k].discount_application.type === "discount_code")) return true;
     }
     return false;
   }

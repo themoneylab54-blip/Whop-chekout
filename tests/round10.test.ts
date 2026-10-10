@@ -189,8 +189,21 @@ describe("Shopify codes: combinesWith, class, buy X get Y", () => {
       },
     };
     expect(parseAutomaticStack(data, ["soldes"])).toEqual({ cls: "product", combinesWith: { product: true, order: false, shipping: true } });
-    expect(parseAutomaticStack(data, ["Inconnue"])).toBeNull();
+    // A title no discount carries (an app's discount function names its lines itself): combines with nothing.
+    expect(parseAutomaticStack(data, ["Inconnue"])).toEqual({ cls: "product", combinesWith: { product: false, order: false, shipping: false } });
+    expect(parseAutomaticStack(data, ["soldes", "Inconnue"])).toEqual({ cls: "product", combinesWith: { product: false, order: false, shipping: false } });
+    // Shopify's answer unreadable: unknown (they combine, as before).
     expect(parseAutomaticStack({ orders: {} }, ["Soldes"])).toBeNull();
+  });
+
+  it("an app's discount function (Kaching) is read with its own rules and class", () => {
+    const app = (combines: boolean, classes: string[]) => ({
+      discountNodes: { nodes: [{ discount: { __typename: "DiscountAutomaticApp", title: "Kaching Bundles", combinesWith: { productDiscounts: false, orderDiscounts: combines, shippingDiscounts: true }, discountClasses: classes } }] },
+    });
+    expect(parseAutomaticStack(app(true, ["PRODUCT"]), ["Kaching Bundles"])).toEqual({ cls: "product", combinesWith: { product: false, order: true, shipping: true } });
+    expect(parseAutomaticStack(app(false, ["ORDER"]), ["kaching bundles"])).toEqual({ cls: "order", combinesWith: { product: false, order: false, shipping: true } });
+    expect(parseAutomaticStack(app(true, ["PRODUCT", "ORDER"]), ["Kaching Bundles"])?.cls).toBe("product");
+    expect(AUTOMATIC_QUERY).toContain("... on DiscountAutomaticApp { title combinesWith { productDiscounts orderDiscounts shippingDiscounts } discountClasses }");
   });
 });
 

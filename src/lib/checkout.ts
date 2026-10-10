@@ -421,9 +421,11 @@ export async function quoteSession(session: SessionWithStore, input: QuoteInput)
   const protectionOn = !!protectionBlock && (input.protection ?? protectionBlock.props.defaultOn);
   // Automatic discounts Shopify computed for this very cart (verified when the checkout opened).
   let automatic = automaticDiscountFor(session.cartDiscounts, buyerLines, session.currency);
-  // Stacking (Shopify's combinesWith, the app's settings): only needed when discounts meet.
+  // Stacking (Shopify's combinesWith, the app's settings): only needed when discounts meet. The
+  // cart's own verified code was applied by Shopify with these very automatic discounts: they combine.
+  const combinedInCart = !!discount && !!codeCheck && same(codeCheck.code, discount.code);
   const automaticStack =
-    automatic.cents > 0 && (discount || tiers.breaks.length) && canReadShopifyDiscounts(session.store) ? await automaticStackFor(session.store, automatic.titles) : null;
+    automatic.cents > 0 && (discount || tiers.breaks.length) && !combinedInCart && canReadShopifyDiscounts(session.store) ? await automaticStackFor(session.store, automatic.titles) : null;
   const stack = { automaticDiscountCents: automatic.cents, automaticStack, breaksCombineWithCodes: session.store.breaksCombineWithCodes, automaticLineCents: automatic.lineCents };
   let totals = computeTotals({ lines, rate, discount, addOns, quantityBreaks: tiers.breaks, protection: protectionOn ? protectionBlock!.props : null, ...stack });
   let offered = protectionBlock ? computeTotals({ lines, rate, discount, addOns: [], quantityBreaks: tiers.breaks, protection: protectionBlock.props, ...stack }) : null;
