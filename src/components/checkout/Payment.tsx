@@ -3,7 +3,8 @@
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Clock3, RefreshCw, Truck } from "lucide-react";
 import { WhopCheckoutEmbed, WhopExpressCheckoutButton, useCheckoutEmbedControls } from "@whop/checkout/react";
-import { EXPRESS_WALLETS, type ExpressWallet, type Theme } from "@/lib/layout";
+import type { Theme } from "@/lib/layout";
+import { EXPRESS_WALLETS, type ExpressWallet } from "@/lib/layout-shared";
 import { PAYPAL_AFTER_WINDOW_MS, PAYPAL_SERVER_IN_FLIGHT_MS } from "@/lib/paypal-timing";
 import type { Labels } from "./i18n";
 

@@ -30,15 +30,11 @@ import {
   variantGidOf,
   MAX_OFFER_QUANTITY,
   SURVEY_OTHER_MAX,
-  type Block,
-  type BlockOf,
-  type BlockStyle,
   type OfferArm,
   formatRatingScore,
   ratingIsSet,
-  type ReviewItem,
-  type ReviewSummary,
-} from "@/lib/layout";
+} from "@/lib/layout-shared";
+import type { Block, BlockOf, BlockStyle, ReviewItem, ReviewSummary } from "@/lib/layout";
 import { importedReviewsOrigin, orderReviewsForCart, type CartProducts } from "@/lib/reviews-import";
 import { BlockIcon, ICONS, IconTile } from "@/components/icons";
 import { honestReviewItems, isSampleReview, liveReviewItems, liveStatItems, liveTextParts, liveWhyUsRows } from "@/lib/sample-content";

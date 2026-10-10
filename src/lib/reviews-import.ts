@@ -1,4 +1,5 @@
-import { MAX_REVIEW_ITEMS, REVIEW_LIMITS, type ReviewItem, type ReviewSummary } from "./layout";
+import type { ReviewItem, ReviewSummary } from "./layout";
+import { MAX_REVIEW_ITEMS, REVIEW_LIMITS } from "./layout-shared";
 
 /*
  * Real customer reviews for the "Avis clients" block: parsing of review apps' CSV exports

@@ -1,5 +1,6 @@
 import type { ExpressCheckoutPaymentMethodsOption, StripePaymentElementOptions } from "@stripe/stripe-js";
-import { expressMethodsSchema, type ExpressMethods } from "@/lib/layout";
+import type { ExpressMethods } from "@/lib/layout";
+import { expressMethodsOf } from "@/lib/layout-shared";
 
 /*
  * Stripe options derived from the checkout theme, kept apart from StripePanel (which the page loads
@@ -14,7 +15,7 @@ import { expressMethodsSchema, type ExpressMethods } from "@/lib/layout";
  * PayPal shows only when enabled on the merchant's Stripe account. Pure.
  */
 export function stripeExpressPaymentMethods(settings: Partial<ExpressMethods> | null | undefined): ExpressCheckoutPaymentMethodsOption {
-  const s = expressMethodsSchema.parse(settings ?? {});
+  const s = expressMethodsOf(settings ?? {});
   return {
     applePay: s.applePay ? "always" : "never",
     googlePay: s.googlePay === "off" ? "never" : "always",
@@ -37,7 +38,7 @@ export function stripeExpressAny(settings: Partial<ExpressMethods> | null | unde
  * Link left to Stripe (auto). Pure.
  */
 export function stripePaymentWallets(settings: Partial<ExpressMethods> | null | undefined, expressRowShown: boolean): NonNullable<StripePaymentElementOptions["wallets"]> {
-  const s = expressMethodsSchema.parse(settings ?? {});
+  const s = expressMethodsOf(settings ?? {});
   if (expressRowShown) return { applePay: "never", googlePay: "never", link: s.whopPay ? "never" : "auto" };
   return { applePay: s.applePay ? "auto" : "never", googlePay: s.googlePay === "off" ? "never" : "auto", link: "auto" };
 }

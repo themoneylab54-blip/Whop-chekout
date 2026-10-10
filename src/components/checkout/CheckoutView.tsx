@@ -16,7 +16,7 @@ import {
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Check, ChevronDown, ChevronRight, Gift, Info, Lock, Minus, Package, Plus, ShieldCheck, Tag, TrendingDown, UserRound, X } from "lucide-react";
 import type { Block, BlockOf, BlockType, Layout, Theme } from "@/lib/layout";
-import { cartShippable, expressMethodsShown, headerModeOf, offeredWalletsFor, type ExpressWallet } from "@/lib/layout";
+import { cartShippable, expressMethodsShown, headerModeOf, offeredWalletsFor, type ExpressWallet } from "@/lib/layout-shared";
 import { fieldBorderColor, HEADER_PLACEHOLDER_ON_DARK } from "@/lib/contrast";
 import { buttonVars } from "@/lib/button-colors";
 import {

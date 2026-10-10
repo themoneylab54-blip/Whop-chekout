@@ -1,4 +1,5 @@
-import { honestReviewItem, type Block, type ReviewItem } from "@/lib/layout";
+import type { Block, ReviewItem } from "@/lib/layout";
+import { honestReviewItem } from "@/lib/layout-shared";
 import { isPlaceholderTextBody, isPlaceholderTextHeading, isPlaceholderWhyUsRow, isSampleReview } from "@/lib/legacy-sample";
 
 /**
