@@ -6,7 +6,8 @@ import { describe, expect, it, vi } from "vitest";
 /*
  * Storefront loader, warm-up throttle kept for the tab (sessionStorage `whopco_warm`): a warm-up made
  * on the previous page holds for the minute (neither the cart landing nor hovering warms again, and a
- * throttled pointerover runs no selector at all); once the minute is over, hovering warms once.
+ * throttled pointerover runs no selector at all), though the cart landing still reads the cart ahead
+ * (Shopify's, nothing asked of our servers); once the minute is over, hovering warms once.
  */
 
 const API = "https://app.example.com";
@@ -17,14 +18,17 @@ const settle = async () => {
 };
 
 let warmCalls = 0;
+let cartReads = 0;
 
 vi.stubGlobal(
   "fetch",
   vi.fn(async (url: string, init?: RequestInit) => {
-    if (String(url).includes("/config")) {
+    const u = String(url);
+    if (u.includes("/config")) {
       return new Response(JSON.stringify({ enabled: true, interception: { cartCheckout: true, cartDrawer: true, buyNow: true, customSelectors: "", excludedHandles: [] }, sessionEndpoint: `${API}/api/public/sessions` }));
     }
-    if (init?.body === '{"warm":true}') warmCalls++;
+    if (u === "/cart.js") cartReads++;
+    if (u.endsWith("/api/public/sessions") && init?.body === '{"warm":true}') warmCalls++;
     return new Response("{}");
   }),
 );
@@ -39,15 +43,17 @@ new Function(source)();
 const over = () => document.getElementById("checkout-btn")!.dispatchEvent(new Event("pointerover", { bubbles: true }));
 
 describe("loader: warm-up throttle across the tab's pages", () => {
-  it("a warm-up from the previous page holds: no warm-up on landing or hover, no selector work", async () => {
+  it("a warm-up from the previous page holds: no warm-up on landing or hover, no selector work; the landing reads the cart ahead", async () => {
     await settle();
     expect(warmCalls).toBe(0);
+    expect(cartReads).toBe(1);
     const closest = vi.spyOn(Element.prototype, "closest");
     over();
     expect(closest).not.toHaveBeenCalled();
     closest.mockRestore();
     await settle();
     expect(warmCalls).toBe(0);
+    expect(cartReads).toBe(1);
   });
 
   it("once the minute is over, hovering warms once and keeps the new time for the tab", async () => {
@@ -56,6 +62,7 @@ describe("loader: warm-up throttle across the tab's pages", () => {
     over();
     await settle();
     expect(warmCalls).toBe(1);
+    expect(cartReads).toBe(2);
     expect(Date.now() - Number(sessionStorage.getItem("whopco_warm"))).toBeLessThan(1000);
   });
 });
