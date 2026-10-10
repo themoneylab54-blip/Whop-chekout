@@ -4,7 +4,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * The session route without a database (every module it calls mocked): the loader's warm-up is
  * capped per IP in memory (30 a minute, then 429 without any query, never spending the session rate
  * limit), and each refusal says whether the loader retries it once on its own (`retryable`) or
- * leaves the cart to Shopify's checkout (`native`), with the store in its log line when known.
+ * leaves the cart to Shopify's checkout (`native`), with the store in its log line when known. The
+ * pricing and the A/B lookups run alongside the host check, the cart re-read once it passed.
  */
 
 const mocks = vi.hoisted(() => ({
@@ -13,13 +14,19 @@ const mocks = vi.hoisted(() => ({
   priceCart: vi.fn(),
   sessionCart: vi.fn(),
   warn: vi.fn(),
+  foreignHost: vi.fn<(req: Request, store: unknown) => Promise<boolean>>(async () => false),
+  assignVariant: vi.fn(),
+  assignCheckoutTests: vi.fn(),
+  startCartRead: vi.fn<(store: unknown, input: unknown) => null>(() => null),
+  createSession: vi.fn(),
 }));
 
+vi.mock("next/server", async (orig) => ({ ...(await orig<typeof import("next/server")>()), after: () => undefined }));
 vi.mock("@/lib/db", () => ({
   db: {
     $queryRaw: mocks.queryRaw,
     store: { findUnique: mocks.findStore },
-    checkoutSession: { findFirst: vi.fn(async () => null), findUnique: vi.fn(async () => null) },
+    checkoutSession: { findFirst: vi.fn(async () => null), findUnique: vi.fn(async () => null), create: mocks.createSession },
   },
 }));
 vi.mock("@/lib/log", () => ({
@@ -29,17 +36,18 @@ vi.mock("@/lib/log", () => ({
 }));
 vi.mock("@/lib/metrics", () => ({ flushProviderMetrics: vi.fn() }));
 vi.mock("@/lib/sentry", () => ({ captureException: vi.fn() }));
-vi.mock("@/lib/checkout-domain-check", () => ({ isForeignCheckoutHost: vi.fn(async () => false) }));
+vi.mock("@/lib/checkout-domain-check", () => ({ isForeignCheckoutHost: mocks.foreignHost }));
 vi.mock("@/lib/checkout-domain", () => ({ checkoutBaseUrl: () => "https://checkout.example.com" }));
-vi.mock("@/lib/shopify", () => ({ priceCart: mocks.priceCart }));
+// The route gets a promise of its own (a spy's own promise is observed by Vitest, never "unhandled").
+vi.mock("@/lib/shopify", () => ({ priceCart: async (...args: unknown[]) => mocks.priceCart(...args) }));
 vi.mock("@/lib/layout", () => ({ loadInterception: () => ({ excludedHandles: [] }) }));
 vi.mock("@/lib/conversions", () => ({ sendCheckoutConversions: vi.fn() }));
-vi.mock("@/lib/experiments", () => ({ assignVariant: vi.fn() }));
-vi.mock("@/lib/checkout-tests", () => ({ assignCheckoutTests: vi.fn() }));
+vi.mock("@/lib/experiments", () => ({ assignVariant: async (...args: unknown[]) => mocks.assignVariant(...args) }));
+vi.mock("@/lib/checkout-tests", () => ({ assignCheckoutTests: async (...args: unknown[]) => mocks.assignCheckoutTests(...args) }));
 vi.mock("@/lib/pricing", () => ({ unsupportedCart: () => null }));
 vi.mock("@/lib/analytics", () => ({ touchWithin: () => null }));
 vi.mock("@/lib/geo", () => ({ geoCountryOf: () => null }));
-vi.mock("@/lib/cart-session", () => ({ sessionCart: mocks.sessionCart, startCartRead: () => null }));
+vi.mock("@/lib/cart-session", () => ({ sessionCart: mocks.sessionCart, startCartRead: mocks.startCartRead }));
 vi.mock("@/lib/visitor", () => ({ resolveVisitor: () => ({ id: "v_1", token: "v_1.sig" }), signVisitorId: vi.fn(), verifyVisitorId: vi.fn() }));
 vi.mock("@/lib/payment-provider", () => ({ anyProviderConnected: () => true }));
 vi.mock("@/lib/early-prepare", () => ({ prepareAhead: vi.fn() }));
@@ -167,5 +175,73 @@ describe("sessions route: oversized properties", () => {
     expect(input.attributes).toBeNull();
     // Said in the logs (support can tell why a personalization is missing).
     expect(mocks.warn.mock.calls.find(([kind]) => kind === "session.properties_dropped")?.[2]).toEqual({ store: "pub_1", dropped: 2 });
+  });
+});
+
+describe("sessions route: lookups overlapped", () => {
+  /** The host check answers when the test says. */
+  const heldHostCheck = () => {
+    let answer: (foreign: boolean) => void = () => undefined;
+    mocks.foreignHost.mockImplementationOnce(() => new Promise<boolean>((r) => (answer = r)));
+    return (foreign: boolean) => answer(foreign);
+  };
+  const withToken = { ...cart, cartToken: "hWN1?key=abc" };
+
+  it("the pricing and the A/B lookups start while the host check runs, the cart re-read once it passed; the arms land on the session", async () => {
+    mocks.findStore.mockResolvedValueOnce(store);
+    const answerHost = heldHostCheck();
+    mocks.priceCart.mockResolvedValueOnce([line]);
+    mocks.assignVariant.mockResolvedValueOnce({ experimentId: "exp_1", variant: "B" });
+    mocks.assignCheckoutTests.mockResolvedValueOnce({ ct_1: "A" });
+    mocks.sessionCart.mockResolvedValueOnce({ ok: true, lines: [line], cartDiscounts: null, cartContext: null, diagnostic: null });
+    mocks.createSession.mockResolvedValueOnce({ id: "cs_1" });
+    const pending = post(withToken);
+    await vi.waitFor(() => expect(mocks.foreignHost).toHaveBeenCalledTimes(1));
+    expect(mocks.priceCart).toHaveBeenCalledTimes(1);
+    expect(mocks.assignVariant).toHaveBeenCalledWith("store_1", "v_1");
+    expect(mocks.assignCheckoutTests).toHaveBeenCalledWith("store_1", "v_1");
+    // The re-read (journaled when it fails) waits for the host to be the store's.
+    expect(mocks.startCartRead).not.toHaveBeenCalled();
+    answerHost(false);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ id: "cs_1", visitorId: "v_1.sig" });
+    expect(mocks.startCartRead).toHaveBeenCalledTimes(1);
+    expect(mocks.createSession.mock.calls[0][0].data).toMatchObject({ visitorId: "v_1", experimentId: "exp_1", variant: "B", checkoutTestArms: { ct_1: "A" } });
+  });
+
+  it("refused on another store's domain, or by Shopify's pricing, before anything is written: the lookups started meanwhile settle unobserved, never an unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => void unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      mocks.findStore.mockResolvedValueOnce(store);
+      const answerHost = heldHostCheck();
+      mocks.priceCart.mockRejectedValueOnce(new Error("Shopify down"));
+      mocks.assignVariant.mockRejectedValueOnce(new Error("database down"));
+      mocks.assignCheckoutTests.mockRejectedValueOnce(new Error("database down"));
+      const pending = post(withToken);
+      await vi.waitFor(() => expect(mocks.foreignHost).toHaveBeenCalledTimes(1));
+      answerHost(true);
+      const foreign = await pending;
+      expect(foreign.status).toBe(404);
+      expect(await foreign.json()).toMatchObject({ reason: "foreign_host" });
+      expect(mocks.startCartRead).not.toHaveBeenCalled();
+
+      // On the store's own host: Shopify's failure answers (502), the A/B lookups' failure is never awaited.
+      mocks.findStore.mockResolvedValueOnce(store);
+      mocks.priceCart.mockRejectedValueOnce(new Error("Shopify down"));
+      mocks.assignVariant.mockRejectedValueOnce(new Error("database down"));
+      mocks.assignCheckoutTests.mockRejectedValueOnce(new Error("database down"));
+      const priced = await post(withToken);
+      expect(priced.status).toBe(502);
+      expect(await priced.json()).toMatchObject({ reason: "price_failed" });
+      expect(mocks.sessionCart).not.toHaveBeenCalled();
+      expect(mocks.createSession).not.toHaveBeenCalled();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 });

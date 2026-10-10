@@ -5,13 +5,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * shop's *.myshopify.com address — Shopify's own answer, whose redirect names the shop's current
  * domain (a domain recorded at connection could have lapsed and changed hands) — following up to two
  * redirects by hand: a redirect the fetch followed itself would drop the cart's cookie (every bundle
- * cart was refused as unreadable). Never to an IP, a port, a local name or plain http.
+ * cart was refused as unreadable). Never to an IP, a port, a local name or plain http. The host
+ * Shopify's redirect led to is where the store's reads start for 10 minutes (one request instead of
+ * two); any failure there asks *.myshopify.com again within the same read.
  */
 
 const incidents = vi.hoisted(() => ({ recordIncident: vi.fn(async (_e: unknown) => undefined) }));
 vi.mock("@/lib/incidents", () => incidents);
 
-const { readCartJs, storefrontHosts, cartRedirectAllowed } = await import("@/lib/shopify-discounts");
+const { readCartJs, storefrontHosts, cartRedirectAllowed, clearShopifyDiscountCache } = await import("@/lib/shopify-discounts");
 
 const CART = { token: "hWN1", currency: "EUR", total_price: 6490, items: [{ variant_id: 1, quantity: 5 }] };
 type Call = { url: string; cookie: string | null; redirect: RequestRedirect | undefined };
@@ -33,6 +35,7 @@ const moved = (to: string) => () => new Response(null, { status: 301, headers: {
 beforeEach(() => {
   calls = [];
   incidents.recordIncident.mockClear();
+  clearShopifyDiscountCache();
 });
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -116,5 +119,187 @@ describe("readCartJs: the buyer's cart, asked of Shopify, read on the shop's cur
     expect(await readCartJs(store, "short")).toBeNull();
     expect(await readCartJs({ ...store, shopDomain: null }, "hWN1?key=abc")).toBeNull();
     expect(calls).toEqual([]);
+  });
+});
+
+describe("readCartJs: where Shopify's redirect led, the store's next reads start (10 minutes)", () => {
+  const store = { id: "st_1", shopDomain: "yctp21-8n.myshopify.com", storefrontHost: "xn--sovline-dya.fr" };
+  const SHOPIFY = "https://yctp21-8n.myshopify.com/cart.js";
+  const DOMAIN = "https://xn--sovline-dya.fr/cart.js";
+  const NEW = "https://new-domain.fr/cart.js";
+  const urls = () => calls.map((c) => c.url);
+  /** A read through Shopify's redirect (remembered), then the calls forgotten. */
+  const learn = async (s = store, routes: Record<string, () => Response> = { [SHOPIFY]: moved(DOMAIN), [DOMAIN]: cartJs }) => {
+    serve(routes);
+    expect(await readCartJs(s, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+    calls = [];
+  };
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("the store's next read starts where Shopify's redirect led: one request, the same cookie", async () => {
+    await learn();
+    expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1", total_price: 6490 });
+    expect(calls).toEqual([{ url: DOMAIN, cookie: "cart=hWN1?key=abc", redirect: "manual" }]);
+    // Through the shop's domain then its www twin: the host that answered is the start.
+    const WWW = "https://www.xn--sovline-dya.fr/cart.js";
+    const other = { ...store, id: "st_2" };
+    await learn(other, { [SHOPIFY]: moved(DOMAIN), [DOMAIN]: moved(WWW), [WWW]: cartJs });
+    expect(await readCartJs(other, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+    expect(urls()).toEqual([WWW]);
+    expect(incidents.recordIncident).not.toHaveBeenCalled();
+  });
+
+  it("the remembered host failing in any way: forgotten, Shopify asked again within the same read, its new answer the start", async () => {
+    const failures = [
+      () => new Response("busy", { status: 503 }),
+      () => new Response("<html>not a cart</html>", { status: 200 }),
+      moved("https://other-shop.example/cart.js"),
+      () => {
+        throw new TypeError("fetch failed");
+      },
+    ];
+    for (const failing of failures) {
+      clearShopifyDiscountCache();
+      await learn();
+      serve({ [DOMAIN]: failing, [SHOPIFY]: moved(NEW), [NEW]: cartJs });
+      expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+      expect(urls()).toEqual([DOMAIN, SHOPIFY, NEW]);
+      // The domain change picked up at once: the next read starts on the new domain.
+      calls = [];
+      expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+      expect(urls()).toEqual([NEW]);
+      calls = [];
+    }
+    expect(incidents.recordIncident).not.toHaveBeenCalled();
+    // Shopify answering itself now (the shop dropped its domain): nothing remembered.
+    serve({ [NEW]: () => new Response("gone", { status: 404 }), [SHOPIFY]: cartJs });
+    expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+    expect(urls()).toEqual([NEW, SHOPIFY]);
+    calls = [];
+    expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+    expect(urls()).toEqual([SHOPIFY]);
+  });
+
+  it("one time limit for the whole read: the remembered host hanging leaves none to ask Shopify; one incident, the host forgotten", async () => {
+    await learn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: string, init?: RequestInit) => {
+        calls.push({ url: String(input), cookie: new Headers(init?.headers).get("cookie"), redirect: init?.redirect });
+        const signal = init?.signal;
+        if (signal?.aborted) return Promise.reject(signal.reason);
+        return new Promise<Response>((_, reject) => signal?.addEventListener("abort", () => reject(signal.reason)));
+      }),
+    );
+    const t0 = Date.now();
+    expect(await readCartJs(store, "hWN1?key=abc", { timeoutMs: 200 })).toBeNull();
+    expect(Date.now() - t0).toBeLessThan(1_500);
+    expect(calls[0].url).toBe(DOMAIN);
+    expect(incidents.recordIncident).toHaveBeenCalledTimes(1);
+    calls = [];
+    serve({ [SHOPIFY]: moved(DOMAIN), [DOMAIN]: cartJs });
+    await readCartJs(store, "hWN1?key=abc");
+    expect(urls()).toEqual([SHOPIFY, DOMAIN]);
+  });
+
+  it("the remembered host's own redirects follow the rules of a host Shopify redirected to: its www / bare twin, the shop's hosts, never another site", async () => {
+    const WWW_NEW = "https://www.new-domain.fr/cart.js";
+    await learn(store, { [SHOPIFY]: moved(NEW), [NEW]: cartJs });
+    serve({ [NEW]: moved(WWW_NEW), [WWW_NEW]: cartJs });
+    expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+    expect(urls()).toEqual([NEW, WWW_NEW]);
+    // It redirects now: Shopify is asked again next time, and names the host to start at.
+    calls = [];
+    serve({ [SHOPIFY]: moved(WWW_NEW), [WWW_NEW]: cartJs });
+    await readCartJs(store, "hWN1?key=abc");
+    expect(urls()).toEqual([SHOPIFY, WWW_NEW]);
+    // To the shop's own domain: followed. To another site: refused (the cookie stays), Shopify asked again.
+    calls = [];
+    serve({ [WWW_NEW]: moved(DOMAIN), [DOMAIN]: cartJs });
+    expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+    expect(urls()).toEqual([WWW_NEW, DOMAIN]);
+    await learn(store, { [SHOPIFY]: moved(NEW), [NEW]: cartJs });
+    serve({ [NEW]: moved("https://other-shop.example/cart.js"), [SHOPIFY]: moved(DOMAIN), [DOMAIN]: cartJs });
+    expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+    expect(urls()).toEqual([NEW, SHOPIFY, DOMAIN]);
+  });
+
+  it("Shopify answering a read itself forgets the host another read learned meanwhile: its latest answer wins", async () => {
+    let release: () => void = () => undefined;
+    let held = true;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string, init?: RequestInit) => {
+        calls.push({ url: String(input), cookie: new Headers(init?.headers).get("cookie"), redirect: init?.redirect });
+        if (input === SHOPIFY && held) {
+          held = false;
+          await new Promise<void>((r) => (release = () => r()));
+          return cartJs();
+        }
+        return input === SHOPIFY ? moved(DOMAIN)() : cartJs();
+      }),
+    );
+    // A first read waits on Shopify; a second one is redirected meanwhile (the domain learned)…
+    const slow = readCartJs(store, "hWN1?key=abc");
+    expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+    // …then Shopify answers the first one itself: nothing remembered.
+    release();
+    expect(await slow).toMatchObject({ token: "hWN1" });
+    calls = [];
+    serve({ [SHOPIFY]: cartJs });
+    await readCartJs(store, "hWN1?key=abc");
+    expect(urls()).toEqual([SHOPIFY]);
+  });
+
+  it("10 minutes from Shopify's answer (a read on the remembered host doesn't extend them), then Shopify is asked again", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    await learn();
+    serve({ [SHOPIFY]: moved(DOMAIN), [DOMAIN]: cartJs });
+    vi.setSystemTime(Date.now() + 9 * 60_000);
+    await readCartJs(store, "hWN1?key=abc");
+    expect(urls()).toEqual([DOMAIN]);
+    calls = [];
+    vi.setSystemTime(Date.now() + 61_000);
+    await readCartJs(store, "hWN1?key=abc");
+    expect(urls()).toEqual([SHOPIFY, DOMAIN]);
+    // Learned afresh.
+    calls = [];
+    await readCartJs(store, "hWN1?key=abc");
+    expect(urls()).toEqual([DOMAIN]);
+  });
+
+  it("per store: another store starts at its own *.myshopify.com; this store connected to another shop never reads on the first shop's domain", async () => {
+    await learn();
+    const OTHER = "https://other-1.myshopify.com/cart.js";
+    serve({ [OTHER]: cartJs, [DOMAIN]: cartJs });
+    await readCartJs({ id: "st_9", shopDomain: "other-1.myshopify.com", storefrontHost: "xn--sovline-dya.fr" }, "hWN1?key=abc");
+    expect(urls()).toEqual([OTHER]);
+    calls = [];
+    await readCartJs(store, "hWN1?key=abc");
+    expect(urls()).toEqual([DOMAIN]);
+    calls = [];
+    await readCartJs({ ...store, shopDomain: "other-1.myshopify.com" }, "hWN1?key=abc");
+    expect(urls()).toEqual([OTHER]);
+  });
+
+  it("never a refused or failed host remembered", async () => {
+    const reads: Record<string, () => Response>[] = [
+      { [SHOPIFY]: moved(DOMAIN), [DOMAIN]: () => new Response("error", { status: 500 }) },
+      { [SHOPIFY]: moved(DOMAIN), [DOMAIN]: () => new Response("<html>challenge</html>", { status: 200 }) },
+      { [SHOPIFY]: moved(DOMAIN), [DOMAIN]: moved("https://other-shop.example/cart.js") },
+      { [SHOPIFY]: moved("http://xn--sovline-dya.fr/cart.js") },
+    ];
+    for (const routes of reads) {
+      serve(routes);
+      expect(await readCartJs(store, "hWN1?key=abc")).toBeNull();
+      calls = [];
+      serve({ [SHOPIFY]: cartJs });
+      expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+      expect(urls()).toEqual([SHOPIFY]);
+      calls = [];
+    }
+    expect(incidents.recordIncident).toHaveBeenCalledTimes(reads.length);
   });
 });

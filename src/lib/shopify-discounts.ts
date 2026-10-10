@@ -26,7 +26,8 @@ import { cartMerchandiseCents, isCodeDiscount, reconcileCart, type CartContext, 
  *    (/cart.js), re-read server-side with the cart token (never the browser's figures), and only
  *    while the checkout's lines are exactly that cart's lines. A changed quantity drops them.
  *
- * Lookups are cached briefly in memory (per instance): codes 60 s, collections 10 min.
+ * Lookups are cached briefly in memory (per instance): codes 60 s, collections 10 min, the host
+ * Shopify sends a store's cart reads to 10 min.
  */
 
 const CODE_TTL_MS = 60_000;
@@ -270,12 +271,13 @@ function remember<T>(map: Map<string, Cached<T>>, key: string, value: T) {
   map.set(key, { at: Date.now(), value });
 }
 
-/** Test hook: forget every cached lookup. */
+/** Test hook: forget every cached lookup (and the hosts carts were read on). */
 export function clearShopifyDiscountCache() {
   codeCache.clear();
   collectionCache.clear();
   autoCache.clear();
   failedLookups.clear();
+  cartHosts.clear();
 }
 
 type LookupStore = Pick<Store, "id" | "shopDomain" | "shopifyAccessToken" | "shopCurrency">;
@@ -905,13 +907,43 @@ export function cartRedirectAllowed(from: URL, to: URL, hosts: string[]): boolea
 const MAX_CART_BODY = 1_000_000;
 
 /**
+ * Where Shopify's redirect from the shop's *.myshopify.com address (`from`) last led each store's
+ * cart read (the host that answered), trusted for 10 minutes from that answer: the store's next
+ * reads start there. Per instance, 500 stores; one learned from another *.myshopify.com address
+ * (the store connected to another shop since) is never used.
+ */
+const CART_HOST_TTL_MS = 10 * 60_000;
+const cartHosts = new Map<string, { host: string; from: string; at: number }>();
+
+function rememberedCartHost(storeId: string, from: string): string | null {
+  const hit = cartHosts.get(storeId);
+  if (hit && hit.from === from && Date.now() - hit.at < CART_HOST_TTL_MS) return hit.host;
+  if (hit) cartHosts.delete(storeId);
+  return null;
+}
+
+function rememberCartHost(storeId: string, host: string, from: string) {
+  cartHosts.delete(storeId);
+  if (cartHosts.size >= CACHE_MAX) cartHosts.delete(cartHosts.keys().next().value as string);
+  cartHosts.set(storeId, { host, from, at: Date.now() });
+}
+
+/** Forgets the store's remembered `host` (not one another read learned meanwhile). */
+function forgetCartHost(storeId: string, host: string) {
+  if (cartHosts.get(storeId)?.host === host) cartHosts.delete(storeId);
+}
+
+/**
  * The buyer's cart re-read from the storefront with its token (Shopify's AJAX cart API, 3 s by
  * default, for the whole read): the server's own figures, never the browser's. Asked on the shop's
- * *.myshopify.com address — Shopify's own answer, whose redirect names the shop's current domain
- * (a domain recorded once could have changed hands) — following up to two redirects by hand
- * (cartRedirectAllowed): a redirect the fetch followed itself would drop the cart's cookie. Null on
- * failure (journaled; `alert` false for a cart that looked plain: it goes on at the variants'
- * prices, nothing is at stake).
+ * *.myshopify.com address — Shopify's own answer, whose redirect names the shop's current domain (a
+ * domain recorded at connection could have lapsed and changed hands) — following up to two redirects
+ * by hand (cartRedirectAllowed): a redirect the fetch followed itself would drop the cart's cookie.
+ * The host Shopify's own redirect led to minutes ago is trusted for 10 minutes: the store's next
+ * reads start there (one request instead of two; same cookie, its redirects under the rules of a
+ * host Shopify redirected to). Any failure there forgets it and asks *.myshopify.com again within
+ * the same time, so a domain change is picked up at once. Null on failure (journaled; `alert` false
+ * for a cart that looked plain: it goes on at the variants' prices, nothing is at stake).
  */
 export async function readCartJs(
   store: Pick<Store, "id" | "shopDomain" | "storefrontHost">,
@@ -919,10 +951,11 @@ export async function readCartJs(
   opts: { timeoutMs?: number; alert?: boolean } = {},
 ): Promise<CartJs | null> {
   const hosts = storefrontHosts(store);
-  const start = hosts.find((h) => h.endsWith(".myshopify.com"));
-  if (!start || !/^[\w\-?=&%.:]{8,300}$/.test(cartToken)) return null;
+  const shopify = hosts.find((h) => h.endsWith(".myshopify.com"));
+  if (!shopify || !/^[\w\-?=&%.:]{8,300}$/.test(cartToken)) return null;
   const signal = AbortSignal.timeout(opts.timeoutMs ?? 3000);
-  try {
+  // The cart asked on `start`, redirects followed by hand: the cart and the host that answered it.
+  const read = async (start: string): Promise<{ cart: CartJs; host: string }> => {
     let url = new URL(`https://${start}/cart.js`);
     for (let hop = 0; ; hop++) {
       const res = await extFetch("shopify", "cart.js", url.href, {
@@ -944,8 +977,32 @@ export async function readCartJs(
       if (text.length > MAX_CART_BODY) throw new Error(`cart body too large on ${url.hostname}`);
       const cart = JSON.parse(text) as CartJs;
       if (!cart || typeof cart !== "object" || !Array.isArray(cart.items)) throw new Error(`unexpected cart body on ${url.hostname}`);
-      return cart;
+      return { cart, host: url.hostname };
     }
+  };
+  try {
+    const remembered = rememberedCartHost(store.id, shopify);
+    if (remembered) {
+      try {
+        const done = await read(remembered);
+        // It redirects now: Shopify is asked again next time (and names the host to start at).
+        if (done.host !== remembered) forgetCartHost(store.id, remembered);
+        return done.cart;
+      } catch (err) {
+        // Moved, gone or failing: forgotten, and *.myshopify.com asked again (the same time limit).
+        forgetCartHost(store.id, remembered);
+        log.warn("cart.read_host_forgotten", "Cart re-read failed on the host Shopify last redirected to: asked on *.myshopify.com again", {
+          storeId: store.id,
+          host: remembered,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    const { cart, host } = await read(shopify);
+    // Shopify's redirect led there: the start of the next reads. Shopify answering itself: none.
+    if (host !== shopify) rememberCartHost(store.id, host, shopify);
+    else cartHosts.delete(store.id);
+    return cart;
   } catch (err) {
     await recordIncident({
       storeId: store.id,

@@ -177,8 +177,13 @@ async function handle(req: Request) {
   if (!store?.enabled || !store.shopifyConnectedAt || !anyProviderConnected(store) || store.fallbackActiveAt) {
     return refuse(409, "Checkout désactivé", "disabled", true, store?.id);
   }
+  // A/B arms follow the server's signed visitor id, never an id the browser picked.
+  const visitor = resolveVisitor(visitorId);
   // Called on another store's checkout domain: unknown here (refused: the buyer stays on the shop).
-  if (await isForeignCheckoutHost(req, store)) return refuse(404, "Boutique introuvable", "foreign_host", false, store.id);
+  // A query only on a host that is neither the app's nor the store's own (a retired domain): a new
+  // click's pricing and A/B lookups run alongside it, and it answers before anything is written.
+  const foreign = isForeignCheckoutHost(req, store);
+  const refuseForeign = () => refuse(404, "Boutique introuvable", "foreign_host", false, store.id);
 
   // Same click already handled: that session again (the first request may also still be running,
   // see the create below).
@@ -187,7 +192,7 @@ async function handle(req: Request) {
     const done = await db.checkoutSession.findUnique({ where: { storeId_requestKey: { storeId: store.id, requestKey } }, select: { id: true, visitorId: true } });
     return done ? sessionResponse(checkoutBaseUrl(store), done, visitorId) : null;
   };
-  if (earlier) return sessionResponse(checkoutBaseUrl(store), earlier, visitorId);
+  if (earlier) return (await foreign) ? refuseForeign() : sessionResponse(checkoutBaseUrl(store), earlier, visitorId);
 
   // Only accept return URLs on the shop itself, never an arbitrary redirect target.
   const allowedHosts = [store.shopDomain, store.storefrontHost].filter((h): h is string => !!h);
@@ -201,11 +206,20 @@ async function handle(req: Request) {
     note: parsed.data.note,
     attributes: parsed.data.attributes,
   };
-  // The cart re-read (bundle / discount apps) runs alongside the Admin API pricing.
+  // The Admin API pricing and this visitor's A/B arms (reads only) start now, alongside the host
+  // check, each awaited where it is needed: a refused cart leaves them to settle (their failures
+  // caught, never an unhandled rejection).
+  const priced = priceCart(store, items.map((i) => ({ variantId: i.variant_id, quantity: i.quantity })));
+  const arms = Promise.all([assignVariant(store.id, visitor.id), assignCheckoutTests(store.id, visitor.id)]);
+  priced.catch(() => undefined);
+  arms.catch(() => undefined);
+  if (await foreign) return refuseForeign();
+  // The cart re-read (bundle / discount apps) runs alongside the pricing, once the host is the
+  // store's (a failed re-read is journaled).
   const cartRead = startCartRead(store, cartInput);
   let lines;
   try {
-    lines = await priceCart(store, items.map((i) => ({ variantId: i.variant_id, quantity: i.quantity })));
+    lines = await priced;
   } catch (err) {
     log.error("checkout.price_failed", "Could not price the cart with Shopify", { err });
     return refuse(502, "Impossible de charger le panier", "price_failed", false, store.id);
@@ -224,8 +238,6 @@ async function handle(req: Request) {
   const utm = touchWithin(parsed.data.utm, null);
   const firstUtm = touchWithin(parsed.data.firstUtm, null);
 
-  // A/B arms follow the server's signed visitor id, never an id the browser picked.
-  const visitor = resolveVisitor(visitorId);
   const cartToken = parsed.data.cartToken ?? null;
   // Line properties, app prices (Cart Transform), bundle components and Shopify's automatic
   // discounts as the server re-read them; a cart that can't be represented line by line is charged
@@ -242,8 +254,8 @@ async function handle(req: Request) {
   const cartContext =
     linkCode && !cart.cartContext?.discountCodes?.length && !cart.cartContext?.cartPriced ? { ...(cart.cartContext ?? {}), discountCodes: [linkCode] } : cart.cartContext;
 
-  // A/B arms of this visitor, both at once.
-  const [variantArm, testArms] = await Promise.all([assignVariant(store.id, visitor.id), assignCheckoutTests(store.id, visitor.id)]);
+  // A/B arms of this visitor (looked up alongside the pricing).
+  const [variantArm, testArms] = await arms;
   const session = await db.checkoutSession
     .create({
       data: {
