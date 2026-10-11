@@ -631,6 +631,33 @@
     body.requestKey = key;
     return postSession({ method: "POST", headers: { "Content-Type": SIMPLE_TYPE }, body: JSON.stringify(body) });
   }
+  // One session request, as a later attempt checks it: its body (without key), key, ad identifiers, answer.
+  function ask(body, key, track) {
+    var request = { key: key, track: track, text: JSON.stringify(body), at: Date.now() };
+    request.answer = postBody(body, key);
+    return request;
+  }
+  function answerBody(res) {
+    try {
+      return JSON.parse(res.text) || {};
+    } catch (e) {
+      return {}; // a proxy's HTML error page (502, 504): a server error, not a broken answer
+    }
+  }
+  // Only an http(s) address is opened (never a "javascript:" one).
+  function opened(res) {
+    return res.ok && httpUrl(answerBody(res).url);
+  }
+  // A failure worth asking again: a server error or a passing refusal the server marks (cart_changed,
+  // in_progress…); not a 429 (the same minute would refuse again) nor any other refusal.
+  function passing(res) {
+    return res.status >= 500 || answerBody(res).retryable === true;
+  }
+  // The last session request of a click that failed, never opened: the next click making the same body opens
+  // its session or asks under its key (no second session for one cart). Kept 10 min at most: an older session
+  // is never opened without asking the server, which expires them.
+  var unopened = null;
+  var UNOPENED_MS = 10 * 60 * 1000;
   // At the click: the session of the cart read ahead (see preReadCart), asked as soon as that read is in (at
   // once, or when it lands for one still on its way) unless the click's own read is in first (`done`); only
   // for a read ahead still fresh (see freshPreRead) of a cart our checkout takes, else nothing is sent and
@@ -649,6 +676,7 @@
         return; // empty, excluded, a subscription: left to the click's own read
       }
       ahead.text = JSON.stringify(body);
+      ahead.at = Date.now();
       ahead.answer = postBody(body, key);
       ahead.answer.catch(function () {}); // never read when the click's own read finds another cart
       log("session asked ahead, from the cart read asked", Date.now() - pre.at, "ms ago");
@@ -666,17 +694,25 @@
     }
   }
 
-  // `ahead`: on the automatic retry or « Réessayer », the session a click asked ahead before its own read failed.
+  // `ahead`, on the automatic retry: the click's last session request (asked ahead, or after its read).
   function goToCheckout(items, retried, key, ahead) {
     if (busy) return;
     busy = true;
-    // One key per click, kept by the automatic retry: a lost answer never makes a second session.
+    // A new click after one that failed: that click's last request, still recent, goes with it.
+    var age = unopened ? Date.now() - unopened.at : -1;
+    if (!retried && !ahead && age >= 0 && age < UNOPENED_MS) {
+      ahead = unopened;
+      key = ahead.key;
+    }
+    unopened = null;
+    // One key per body: kept by the retries for the same cart (a lost answer never makes a second session), a
+    // new one for another cart (the server answers a key's first session, whatever the cart).
     key = key || requestKey();
     var startedAt = Date.now();
     overlay(true);
     var carried = !!ahead;
-    // Read once per click, and kept by a retry that checks a session asked ahead (an fbc made from an fbclid
-    // carries the time): the same cart makes the same body as the one sent ahead.
+    // Read once per click, and kept with its requests (an fbc made from an fbclid carries the time): the same
+    // cart makes the same body as an earlier request.
     var track = ahead ? ahead.track : clickTracking();
     var cartPromise = items
       ? Promise.resolve({ items: items })
@@ -687,54 +723,51 @@
     // The cart read ahead, still fresh: its session is asked as soon as that read is in, while the read above
     // checks it; that session opens only if this read makes the same body.
     if (!ahead && !items && !retried) ahead = sendAhead(track, key);
+    var last = null; // the session request this attempt waits on
     cartPromise
       .then(function (cart) {
         // This read is in: nothing more is asked ahead, whatever the cart.
         if (ahead) ahead.done = true;
         var body = sessionBody(cart, items, track);
         if (ahead) {
-          var sent = ahead.text !== null;
-          var answer = ahead.answer;
-          var same = sent && JSON.stringify(body) === ahead.text;
+          var earlier = ahead;
           ahead = null;
-          // After a failed read (the automatic retry, « Réessayer »): the session asked ahead when it was made,
-          // else asked again under its key (the server answers that session if it made it since, never a
-          // second one).
-          if (same && carried) {
-            return answer.then(
+          if (earlier.text === JSON.stringify(body)) {
+            last = earlier;
+            // The cart sent ahead, confirmed: its answer, as it comes.
+            if (!carried) return earlier.answer;
+            // An earlier request of this body (the automatic retry, a new click after a failure): its session
+            // if it opened one, else asked again under its key (the server answers that session if it made it
+            // since); on the automatic retry only after a passing failure (a refusal would come back the same).
+            return earlier.answer.then(
               function (res) {
-                return res.ok ? res : postBody(body, key);
+                if (opened(res) || (retried && !passing(res))) return res;
+                last = ask(body, key, track);
+                return last.answer;
               },
               function () {
-                return postBody(body, key);
+                last = ask(body, key, track);
+                return last.answer;
               }
             );
           }
-          if (same) return answer;
-          if (sent) {
-            // Another cart than the one read ahead: that session is never opened, this cart gets its own key.
-            log("cart changed since it was read ahead: asked again");
+          if (earlier.text !== null) {
+            // Another cart than an earlier request's: that session is never opened, this cart gets its own key.
+            log("cart changed since its session was asked: asked again");
             preRead = null;
             key = requestKey();
           }
         }
-        return postBody(body, key);
+        last = ask(body, key, track);
+        return last.answer;
       })
       .then(function (res) {
-        var body = {};
-        try {
-          body = JSON.parse(res.text) || {};
-        } catch (e) {
-          /* a proxy's HTML error page (502, 504): a server error, not a broken answer */
-        }
-        // Only an http(s) address is opened (never a "javascript:" one).
-        if (!res.ok || !httpUrl(body.url)) {
+        var body = answerBody(res);
+        if (!opened(res)) {
           var err = new Error(body.error || "session failed (" + res.status + ")");
           // Only the carts Shopify keeps (checkout off, subscription, gift card, excluded).
           err.native = !!body.native;
-          // A server error or a passing refusal the server marks (cart_changed, in_progress…); not a
-          // 429: the same minute would refuse again.
-          err.retryable = body.retryable === true || res.status >= 500;
+          err.retryable = passing(res);
           throw err;
         }
         body.url = onAppHost(body.url, res.viaApp);
@@ -747,9 +780,9 @@
         location.href = body.url;
       })
       .catch(function (err) {
-        // The click's own read failed: a session it asked ahead goes to the retry, then « Réessayer », with its
-        // key, opened there only for the same cart (another cart gets a new key); one not asked yet never is.
-        var asked = null;
+        // The attempt's last request (or, its read failing, the one asked ahead) goes to the retry, then the
+        // next click; one not asked yet never is.
+        var asked = last;
         if (ahead) {
           ahead.done = true;
           if (ahead.text !== null) asked = ahead;
@@ -779,7 +812,8 @@
         }
         busy = false;
         log("checkout failed:", err && err.message);
-        failed(err && err.message, items, asked);
+        unopened = asked;
+        failed(err && err.message, items);
       });
   }
 
@@ -790,9 +824,8 @@
   }
 
   // The checkout couldn't open: the buyer stays on the shop with a way to try again (never
-  // Shopify's checkout). With ?whopco_debug=1 the reason shows too. `asked`: a session asked ahead that
-  // no read confirmed, for « Réessayer » to check (no second session for the same cart).
-  function failed(reason, items, asked) {
+  // Shopify's checkout). With ?whopco_debug=1 the reason shows too.
+  function failed(reason, items) {
     overlay(false);
     if (DEBUG) badge("Whop Checkout : échec — " + (reason || "erreur inconnue"), false);
     var id = "whopco-error";
@@ -816,8 +849,7 @@
     retry.style.cssText = "background:#111;color:#fff;border:0;border-radius:8px;padding:10px 18px;font:600 15px system-ui,sans-serif;cursor:pointer";
     retry.addEventListener("click", function () {
       el.remove();
-      // A new click: a new key, unless it makes the same body as the session asked ahead (that one's key).
-      goToCheckout(items, false, asked && asked.key, asked);
+      goToCheckout(items);
     });
     var close = document.createElement("button");
     close.type = "button";
@@ -1272,7 +1304,7 @@
   var PRE_READ_MS = 20000; // sent ahead within 20 s of the read
   var PRE_READ_EVERY_MS = 5000; // one read ahead every 5 s at most
   var REREAD_MS = 300; // after the last cart change seen
-  var REREAD_EVERY_MS = 3000; // a read again 3 s at least after the last read
+  var REREAD_EVERY_MS = 3000; // a read again 3 s at least after the last read again
   var INTENT_MS = 20000; // read again only within 20 s of the buyer heading for the checkout
   var CART_CHANGE = /\/cart\/(add|change|update|clear)(\.js)?\/?$|\/discount\//i;
   // The last read ahead: { at: Date.now(), t: performance.now(), both when it was asked; promise; cart once in }.
@@ -1280,6 +1312,7 @@
   var cartChangedAt = -1; // performance.now() time the last cart change seen ended
   var cartWatch = null; // the PerformanceObserver, made for the first read ahead (false: none here)
   var rereadTimer = null;
+  var rereadAt = 0; // the last read again after changes
   var intentAt = 0; // the last warm(): a pointer or touch on a checkout button, the cart opened, the cart page
   function seeCartRequests(entries) {
     var seen = false;
@@ -1302,7 +1335,10 @@
   // The cart read again after changes: only while the read ahead is older than them and the buyer still heads
   // for the checkout.
   function rereadCart() {
-    if (preRead && preRead.t <= cartChangedAt && headingForCheckout()) preReadCart(true);
+    rereadTimer = null;
+    if (!(preRead && preRead.t <= cartChangedAt && headingForCheckout())) return;
+    rereadAt = Date.now();
+    preReadCart(true);
   }
   function watchCart() {
     if (cartWatch !== null) return cartWatch;
@@ -1310,11 +1346,12 @@
     try {
       if (typeof PerformanceObserver === "function") {
         var observer = new PerformanceObserver(function (list) {
-          // A read ahead outdated by a change: read again once the changes stop (debounced), 3 s at least after
-          // the last read, so a script writing the cart after each read never makes it loop.
+          // A read ahead outdated by a change: read again once the changes stop (debounced). The 3 s gap counts
+          // from the last read again, not from the buyer's own read (a drawer's quantities changed right after
+          // opening it are read 300 ms later), and keeps a script writing the cart after each read from looping.
           if (seeCartRequests(list.getEntries()) && preRead && headingForCheckout()) {
             clearTimeout(rereadTimer);
-            rereadTimer = setTimeout(rereadCart, Math.max(REREAD_MS, preRead.at + REREAD_EVERY_MS - Date.now()));
+            rereadTimer = setTimeout(rereadCart, Math.max(REREAD_MS, rereadAt + REREAD_EVERY_MS - Date.now()));
           }
         });
         observer.observe({ entryTypes: ["resource"] });

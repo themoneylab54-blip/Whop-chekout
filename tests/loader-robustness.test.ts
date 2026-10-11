@@ -6,7 +6,8 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 /*
  * Storefront loader, session answers: a proxy's HTML error page is a server error (retried once on its
  * own, after a pause, with the same click key), a refusal the server marks retryable is retried too,
- * « Réessayer » is a new click (new key); an empty cart is read again before going to the shop's cart
+ * « Réessayer » asks again for the same cart under the click's key (the server answers a session it made
+ * despite a lost answer, never a second one); an empty cart is read again before going to the shop's cart
  * page (never Shopify's checkout); a request without an answer is given up after 25 s; only an http(s)
  * checkout address is opened; back from our checkout (back/forward cache) the page works again.
  */
@@ -95,15 +96,14 @@ describe("loader: session answers", () => {
     expect(overlayShown()).toBe(false);
   });
 
-  it("« Réessayer » is a new click: a new key (a plain refusal isn't retried on its own)", async () => {
+  it("« Réessayer » on the same cart asks again under the click's key (a plain refusal isn't retried on its own)", async () => {
     replies.push({ status: 409, body: { error: "Panier refusé", reason: "price_higher" } });
     tryAgain();
     await settle();
     await vi.advanceTimersByTimeAsync(2000);
     await settle();
     expect(posts).toHaveLength(3);
-    expect(posts[2].requestKey).toMatch(/^[0-9a-f]{32}$/);
-    expect(posts[2].requestKey).not.toBe(posts[0].requestKey);
+    expect(posts[2].requestKey).toBe(posts[0].requestKey);
     expect(errorShown()).toBe(true);
     closeError();
   });
