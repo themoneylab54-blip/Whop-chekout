@@ -1010,8 +1010,9 @@ export async function sweepSnapshotClaims(now = new Date()): Promise<number> {
  * the request's budget is left (TAKEOVER_MIN_LEFT_MS). Still nothing SNAPSHOT_WAIT_MS after the
  * request's start, or too late to take over → whop_claim_timeout, a Whop failure (prepareWithFailover
  * switches the buyer to Stripe when usable, else the page retries; never a second configuration).
+ * Exported for tests.
  */
-async function waitForSnapshot(key: string, find: () => Promise<CheckoutQuote | null>, startedAt: number): Promise<{ snapshot: CheckoutQuote | null; claim?: SnapshotClaim }> {
+export async function waitForSnapshot(key: string, find: () => Promise<CheckoutQuote | null>, startedAt: number): Promise<{ snapshot: CheckoutQuote | null; claim?: SnapshotClaim }> {
   const { waitMs, pollMs, claimMs } = snapshotClaimTimings;
   const until = startedAt + waitMs;
   const waitFrom = Date.now();

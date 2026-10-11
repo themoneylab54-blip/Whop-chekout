@@ -7,14 +7,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * redirects by hand: a redirect the fetch followed itself would drop the cart's cookie (every bundle
  * cart was refused as unreadable). Never to an IP, a port, a local name or plain http. The host
  * Shopify's redirect led to (its /cart.js itself) is where the store's reads start for 10 minutes (one
- * request instead of two), with half the read's time at most (1 s): any failure there, a hang
- * included, asks *.myshopify.com again in the time left.
+ * request instead of two); silent for half the read's time (1 s at most), *.myshopify.com is asked
+ * too and the first cart to arrive wins; any failure there forgets it.
  */
 
 const incidents = vi.hoisted(() => ({ recordIncident: vi.fn<(e: unknown) => Promise<undefined>>(async () => undefined) }));
 vi.mock("@/lib/incidents", () => incidents);
 
-const { readCartJs, storefrontHosts, cartRedirectAllowed, clearShopifyDiscountCache } = await import("@/lib/shopify-discounts");
+const { readCartJs, storefrontHosts, cartRedirectAllowed, clearShopifyDiscountCache, hedgedCartRead } = await import("@/lib/shopify-discounts");
+const { log } = await import("@/lib/log");
 
 const CART = { token: "hWN1", currency: "EUR", total_price: 6490, items: [{ variant_id: 1, quantity: 5 }] };
 type Call = { url: string; cookie: string | null; redirect: RequestRedirect | undefined };
@@ -183,43 +184,126 @@ describe("readCartJs: where Shopify's redirect led, the store's next reads start
     expect(urls()).toEqual([SHOPIFY]);
   });
 
-  /** Like serve, but `hang` never answers (until the request is aborted, as a dead host's would). */
-  const serveHanging = (routes: Record<string, () => Response>, hang: string[]) =>
+  /**
+   * Like serve, but `hang` never answers and `slow` answers after its delay (both until the request is
+   * aborted, as a dead or slow host's would); when each request started and whether it was stopped.
+   */
+  let started: Record<string, number> = {};
+  let stopped: string[] = [];
+  const serveHanging = (routes: Record<string, () => Response>, hang: string[], slow: Record<string, number> = {}) => {
+    started = {};
+    stopped = [];
+    const t0 = Date.now();
     vi.stubGlobal(
       "fetch",
       vi.fn((input: string, init?: RequestInit) => {
         const url = String(input);
         calls.push({ url, cookie: new Headers(init?.headers).get("cookie"), redirect: init?.redirect });
+        started[url] = Date.now() - t0;
         const signal = init?.signal;
         if (signal?.aborted) return Promise.reject(signal.reason);
-        if (hang.includes(url)) return new Promise<Response>((_, reject) => signal?.addEventListener("abort", () => reject(signal.reason)));
         const route = routes[url];
+        if (hang.includes(url) || slow[url] != null)
+          return new Promise<Response>((resolve, reject) => {
+            let done = false;
+            const t =
+              slow[url] != null && route
+                ? setTimeout(() => {
+                    done = true;
+                    resolve(route());
+                  }, slow[url])
+                : undefined;
+            // Stopped while still waiting for its answer (a later abort of a finished request isn't one).
+            signal?.addEventListener("abort", () => {
+              if (done) return;
+              clearTimeout(t);
+              stopped.push(url);
+              reject(signal.reason);
+            });
+          });
         return route ? Promise.resolve(route()) : Promise.reject(new TypeError(`fetch failed: ${url}`));
       }),
     );
+  };
 
-  it("the remembered host hanging gets half the read's time (1 s at most): Shopify is asked in the time left, its answer the start; no incident", async () => {
+  it("the remembered host silent for half the read's time (1 s at most): Shopify is asked too, its cart taken, the host it names the start; no incident", async () => {
     await learn();
     serveHanging({ [SHOPIFY]: moved(NEW), [NEW]: cartJs }, [DOMAIN]);
     const t0 = Date.now();
     expect(await readCartJs(store, "hWN1?key=abc", { timeoutMs: 600 })).toMatchObject({ token: "hWN1" });
-    // Given up on after ~300 ms (half of 600), not the whole 600.
-    expect(Date.now() - t0).toBeGreaterThanOrEqual(280);
+    // Shopify asked after ~300 ms (half of 600), not at the end of the read.
+    expect(started[SHOPIFY]).toBeGreaterThanOrEqual(290);
+    expect(started[SHOPIFY]).toBeLessThan(450);
     expect(Date.now() - t0).toBeLessThan(590);
     expect(urls()).toEqual([DOMAIN, SHOPIFY, NEW]);
+    // The silent read stopped once Shopify's cart arrived.
+    expect(stopped).toEqual([DOMAIN]);
     expect(incidents.recordIncident).not.toHaveBeenCalled();
     calls = [];
     serve({ [NEW]: cartJs });
     await readCartJs(store, "hWN1?key=abc");
     expect(urls()).toEqual([NEW]);
-    // The default 3 s read: 1 s for the remembered host.
+    // The default 3 s read: Shopify asked after 1 s (the cap), not after half of 3 s.
     calls = [];
     serveHanging({ [SHOPIFY]: moved(DOMAIN), [DOMAIN]: cartJs }, [NEW]);
-    const t1 = Date.now();
     expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
-    expect(Date.now() - t1).toBeGreaterThanOrEqual(980);
-    expect(Date.now() - t1).toBeLessThan(2_000);
+    expect(started[SHOPIFY]).toBeGreaterThanOrEqual(990);
+    expect(started[SHOPIFY]).toBeLessThan(1_300);
     expect(urls()).toEqual([NEW, SHOPIFY, DOMAIN]);
+  });
+
+  it("a slow but working remembered host still answers (Shopify asked meanwhile, stopped once it does); it stays the start, nothing logged", async () => {
+    await learn();
+    const warn = vi.spyOn(log, "warn");
+    try {
+      // Plain cart (1.5 s): the shop's domain answers in 850 ms, past its 750 ms; Shopify, asked then, is slower still.
+      serveHanging({ [DOMAIN]: cartJs }, [], { [DOMAIN]: 850, [SHOPIFY]: 2_000 });
+      for (let i = 0; i < 3; i++) {
+        calls = [];
+        expect(await readCartJs(store, "hWN1?key=abc", { timeoutMs: 1_500 })).toMatchObject({ token: "hWN1" });
+        expect(urls()).toEqual([DOMAIN, SHOPIFY]);
+        expect(stopped).toEqual([SHOPIFY]);
+        serveHanging({ [DOMAIN]: cartJs }, [], { [DOMAIN]: 850, [SHOPIFY]: 2_000 });
+      }
+      expect(warn.mock.calls.filter(([event]) => event === "cart.read_host_forgotten")).toEqual([]);
+      expect(incidents.recordIncident).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("any time limit works (whole milliseconds), the remembered host used", async () => {
+    await learn();
+    serve({ [DOMAIN]: cartJs });
+    expect(await readCartJs(store, "hWN1?key=abc", { timeoutMs: 1_255 })).toMatchObject({ token: "hWN1" });
+    expect(await readCartJs(store, "hWN1?key=abc", { timeoutMs: 0.5 })).toMatchObject({ token: "hWN1" });
+    expect(urls()).toEqual([DOMAIN, DOMAIN]);
+    expect(incidents.recordIncident).not.toHaveBeenCalled();
+  });
+
+  it("hedgedCartRead: the first answer wins, the loser stopped and its failure ignored; the first's own failure told and the second asked at once; both failing rejects", async () => {
+    const after = (ms: number, v: string, stop: AbortSignal) =>
+      new Promise<{ v: string }>((resolve, reject) => {
+        const t = setTimeout(() => resolve({ v }), ms);
+        stop.addEventListener("abort", () => {
+          clearTimeout(t);
+          reject(new Error(`stopped ${v}`));
+        });
+      });
+    const told: unknown[] = [];
+    // The first answers within its time: the second never asked.
+    let asked = false;
+    expect(await hedgedCartRead((s) => after(10, "a", s), (s) => ((asked = true), after(10, "b", s)), 100, (e) => told.push(e))).toEqual({ v: "a", via: "first" });
+    expect(asked).toBe(false);
+    // The first silent: the second asked after 30 ms and wins; the first stopped, its stop never told.
+    expect(await hedgedCartRead((s) => after(500, "a", s), (s) => after(10, "b", s), 30, (e) => told.push(e))).toEqual({ v: "b", via: "second" });
+    // The first fails at once: told, the second asked without waiting.
+    const t0 = Date.now();
+    expect(await hedgedCartRead(() => Promise.reject(new Error("dead")), (s) => after(10, "b", s), 1_000, (e) => told.push(e))).toEqual({ v: "b", via: "second" });
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(told.map((e) => (e as Error).message)).toEqual(["dead"]);
+    // Both fail: the last error.
+    await expect(hedgedCartRead(() => Promise.reject(new Error("one")), () => Promise.reject(new Error("two")), 10, () => undefined)).rejects.toThrow("two");
   });
 
   it("Shopify hanging too: the read ends at its time limit, one incident, the host forgotten", async () => {

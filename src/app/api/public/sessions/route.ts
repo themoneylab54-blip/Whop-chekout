@@ -180,8 +180,8 @@ async function handle(req: Request) {
   // A/B arms follow the server's signed visitor id, never an id the browser picked.
   const visitor = resolveVisitor(visitorId);
   // Called on another store's checkout domain: unknown here (refused: the buyer stays on the shop).
-  // A query only on a host that is neither the app's nor the store's own (a retired domain): a new
-  // click's pricing and A/B lookups run alongside it, and it answers before anything is written.
+  // A query only on a host that is neither the app's nor the store's own (a retired domain); it
+  // answers before anything is started or written (see below).
   const foreign = isForeignCheckoutHost(req, store);
   const refuseForeign = () => refuse(404, "Boutique introuvable", "foreign_host", false, store.id);
 

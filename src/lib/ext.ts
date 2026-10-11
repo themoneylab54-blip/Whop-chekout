@@ -17,7 +17,23 @@ export async function extFetch(provider: Provider, op: string, input: string | U
     (ms > 5000 || res.status >= 400 ? log.warn : log.info)("ext.call", `${provider} ${op} ${res.status} in ${ms} ms`, { provider, op, status: res.status, ms });
     return res;
   } catch (err) {
+    // Stopped by its caller (another answer came first): no outcome of the provider's, not in its metrics.
+    if (init?.signal?.aborted && init.signal.reason instanceof CallStopped) {
+      log.info("ext.call_stopped", `${provider} ${op} stopped by its caller`, { provider, op, ms: Date.now() - started });
+      throw err;
+    }
     log.warn("ext.call", `${provider} ${op} failed`, { provider, op, ms: Date.now() - started, err });
     throw err;
+  }
+}
+
+/**
+ * The reason a caller aborts an external call it no longer needs (a hedged read whose other request
+ * answered first): extFetch then counts no failure for the provider.
+ */
+export class CallStopped extends Error {
+  constructor(message = "stopped by its caller") {
+    super(message);
+    this.name = "CallStopped";
   }
 }

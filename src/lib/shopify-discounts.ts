@@ -1,5 +1,5 @@
 import "server-only";
-import { extFetch } from "./ext";
+import { CallStopped, extFetch } from "./ext";
 import type { Store } from "@prisma/client";
 import { shopifyGraphql } from "./shopify";
 import { db } from "./db";
@@ -941,10 +941,12 @@ function forgetCartHost(storeId: string, host: string) {
  * by hand (cartRedirectAllowed): a redirect the fetch followed itself would drop the cart's cookie.
  * The host Shopify's own redirect led to minutes ago (its /cart.js itself, no other path) is trusted
  * for 10 minutes: the store's next reads start there (one request instead of two; same cookie, its
- * redirects under the rules of a host Shopify redirected to). It gets half the time at most (1 s at
- * most): failing there — an error, or no answer within that — forgets it and asks *.myshopify.com
- * again in the time left, so a domain change is picked up at once. Null on failure (journaled; `alert`
- * false for a cart that looked plain: it goes on at the variants' prices, nothing is at stake).
+ * redirects under the rules of a host Shopify redirected to). No answer from it within half the time
+ * (1 s at most): *.myshopify.com is asked too, and the first cart to arrive is taken (the other read
+ * is stopped), so a slow but working host still answers and a dead one costs that half at most. A
+ * failure there (an error, a redirect elsewhere) forgets it, so a domain change is picked up at once.
+ * Null on failure (journaled; `alert` false for a cart that looked plain: it goes on at the variants'
+ * prices, nothing is at stake).
  */
 export async function readCartJs(
   store: Pick<Store, "id" | "shopDomain" | "storefrontHost">,
@@ -954,7 +956,8 @@ export async function readCartJs(
   const hosts = storefrontHosts(store);
   const shopify = hosts.find((h) => h.endsWith(".myshopify.com"));
   if (!shopify || !/^[\w\-?=&%.:]{8,300}$/.test(cartToken)) return null;
-  const budgetMs = opts.timeoutMs ?? 3000;
+  // Whole milliseconds: AbortSignal.timeout refuses a fraction.
+  const budgetMs = Math.max(1, Math.floor(opts.timeoutMs ?? 3000));
   const signal = AbortSignal.timeout(budgetMs);
   // The cart asked on `start`, redirects followed by hand: the cart, and the host and path that answered it.
   const read = async (start: string, signal: AbortSignal): Promise<{ cart: CartJs; host: string; path: string }> => {
@@ -982,34 +985,39 @@ export async function readCartJs(
       return { cart, host: url.hostname, path: url.pathname };
     }
   };
+  // Shopify's redirect led to that host's own /cart.js: the start of the next reads (a redirect to
+  // another path, a localized one say, is never reused: the next read asks Shopify again). Shopify
+  // answering itself: none.
+  const learn = (done: { host: string; path: string }) => {
+    if (done.host !== shopify && done.path === "/cart.js") rememberCartHost(store.id, done.host, shopify);
+    else cartHosts.delete(store.id);
+  };
   try {
     const remembered = rememberedCartHost(store.id, shopify);
-    if (remembered) {
-      try {
-        // Its own share of the time: a host that hangs leaves *.myshopify.com the rest.
-        const done = await read(remembered, AbortSignal.any([signal, AbortSignal.timeout(Math.min(1000, budgetMs / 2))]));
-        // It redirects now: Shopify is asked again next time (and names the host to start at).
-        if (done.host !== remembered || done.path !== "/cart.js") forgetCartHost(store.id, remembered);
-        return done.cart;
-      } catch (err) {
+    if (!remembered) {
+      const done = await read(shopify, signal);
+      learn(done);
+      return done.cart;
+    }
+    const done = await hedgedCartRead(
+      (s) => read(remembered, AbortSignal.any([signal, s])),
+      (s) => read(shopify, AbortSignal.any([signal, s])),
+      Math.floor(Math.min(1000, budgetMs / 2)),
+      (err) => {
+        // Moved, gone or failing: forgotten (the read goes on through *.myshopify.com).
         forgetCartHost(store.id, remembered);
-        // The whole time is spent: nothing left to ask *.myshopify.com in (journaled below).
-        if (signal.aborted) throw err;
-        // Moved, gone, failing or too slow: forgotten, and *.myshopify.com asked in the time left.
-        log.warn("cart.read_host_forgotten", "Cart re-read failed on the host Shopify last redirected to: asked on *.myshopify.com again", {
+        log.warn("cart.read_host_forgotten", "Cart re-read failed on the host Shopify last redirected to: asked on *.myshopify.com", {
           storeId: store.id,
           host: remembered,
           err: err instanceof Error ? err.message : String(err),
         });
-      }
-    }
-    const { cart, host, path } = await read(shopify, signal);
-    // Shopify's redirect led to that host's own /cart.js: the start of the next reads (a redirect to
-    // another path, a localized one say, is never reused: the next read asks Shopify again).
-    // Shopify answering itself: none.
-    if (host !== shopify && path === "/cart.js") rememberCartHost(store.id, host, shopify);
-    else cartHosts.delete(store.id);
-    return cart;
+      },
+    );
+    if (done.via === "first") {
+      // It redirects now: Shopify is asked again next time (and names the host to start at).
+      if (done.host !== remembered || done.path !== "/cart.js") forgetCartHost(store.id, remembered);
+    } else learn(done);
+    return done.cart;
   } catch (err) {
     await recordIncident({
       storeId: store.id,
@@ -1020,6 +1028,69 @@ export async function readCartJs(
     });
     return null;
   }
+}
+
+/**
+ * The first of two reads to bring a cart (a hedged request): `first` at once; `second` once `first`
+ * has had `hedgeMs` without an answer, or as soon as it fails. The read that loses is stopped (its
+ * signal aborted with CallStopped: no failure counted for the provider; its own failure ignored);
+ * `firstFailed` is told of `first`'s own failure only (never of its stop). Rejects when both fail,
+ * with the last error. Exported for tests.
+ */
+export function hedgedCartRead<T>(
+  first: (stop: AbortSignal) => Promise<T>,
+  second: (stop: AbortSignal) => Promise<T>,
+  hedgeMs: number,
+  firstFailed: (err: unknown) => void,
+): Promise<T & { via: "first" | "second" }> {
+  return new Promise((resolve, reject) => {
+    const stopFirst = new AbortController();
+    const stopSecond = new AbortController();
+    let settled = false;
+    let running = 1;
+    let secondStarted = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      settled = true;
+      if (timer) clearTimeout(timer);
+    };
+    const failed = (err: unknown) => {
+      if (settled) return;
+      if (--running === 0) {
+        finish();
+        reject(err);
+      }
+    };
+    const startSecond = () => {
+      if (settled || secondStarted) return;
+      secondStarted = true;
+      running++;
+      second(stopSecond.signal).then(
+        (v) => {
+          if (settled) return;
+          finish();
+          stopFirst.abort(new CallStopped("another read answered first"));
+          resolve({ ...v, via: "second" });
+        },
+        (err) => failed(err),
+      );
+    };
+    first(stopFirst.signal).then(
+      (v) => {
+        if (settled) return;
+        finish();
+        stopSecond.abort(new CallStopped("another read answered first"));
+        resolve({ ...v, via: "first" });
+      },
+      (err) => {
+        if (settled) return;
+        firstFailed(err);
+        startSecond();
+        failed(err);
+      },
+    );
+    if (!settled) timer = setTimeout(startSecond, hedgeMs);
+  });
 }
 
 /** Automatic discounts of a re-read cart for these lines, or null (currency mismatch journaled). */

@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
@@ -6,10 +7,12 @@ import { describe, expect, it } from "vitest";
 /*
  * The buyer's checkout page ships no zod: every module the browser loads for /c/[id] (the "use
  * client" modules its segment files reach — the root layout, the page, its error and not-found
- * screens — and everything they import) is walked from the source, parsed as TypeScript, type-only
- * imports aside; none may import zod (~105 KB gzip, on the critical path to the payment form), nor a
- * package that depends on it. Schemas stay on the server (lib/layout); the client takes its
- * constants and helpers from lib/layout-shared.
+ * screens — and the browser instrumentation, and everything they import) is walked from the source,
+ * parsed as TypeScript, type-only imports aside; none may import zod (~105 KB gzip, on the critical
+ * path to the payment form), nor a package that depends on it (a package whose entry is "use client"
+ * ships even when a server module imports it). A "use server" module ships only as a reference: not
+ * walked from the client. Schemas stay on the server (lib/layout); the client takes its constants and
+ * helpers from lib/layout-shared.
  */
 
 const ROOT = path.resolve(__dirname, "..");
@@ -51,11 +54,23 @@ export function runtimeImports(file: string, src = readFileSync(file, "utf8")): 
   return specs;
 }
 
-const isClient = (file: string) => {
+/** A module's directive ("use client", "use server"), if any. */
+const directiveOf = (file: string): string | null => {
   const sf = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, false);
   const first = sf.statements[0];
-  return !!first && ts.isExpressionStatement(first) && ts.isStringLiteral(first.expression) && first.expression.text === "use client";
+  return first && ts.isExpressionStatement(first) && ts.isStringLiteral(first.expression) ? first.expression.text : null;
 };
+const isClient = (file: string) => directiveOf(file) === "use client";
+
+/** Whether a package's entry (as Node resolves it from `from`) is a "use client" module: it ships whoever imports it. */
+function clientPackage(spec: string, from: string): boolean {
+  try {
+    const entry = createRequire(from).resolve(spec);
+    return /^\s*(?:\/\/[^\n]*\n\s*|\/\*[\s\S]*?\*\/\s*)*["']use client["']/.test(readFileSync(entry, "utf8").slice(0, 2_000));
+  } catch {
+    return false;
+  }
+}
 
 /** The package a bare specifier names (`@scope/name/sub` → `@scope/name`). */
 const packageOf = (spec: string) => (spec.startsWith("@") ? spec.split("/").slice(0, 2).join("/") : spec.split("/")[0]);
@@ -72,7 +87,7 @@ function packageUsesZod(name: string, depth = 0, seen = new Set<string>()): bool
 }
 
 /** Modules of the browser's bundle for a route: every "use client" module its segment files reach, and their imports. */
-function clientGraph(entries: string[]): { files: Set<string>; packages: Set<string>; zod: string[] } {
+function clientGraph(entries: (string | { file: string; client: true })[]): { files: Set<string>; packages: Set<string>; zod: string[] } {
   const seen = new Set<string>();
   const client = new Set<string>();
   const packages = new Set<string>();
@@ -81,6 +96,8 @@ function clientGraph(entries: string[]): { files: Set<string>; packages: Set<str
     const key = `${file}|${inClient}`;
     if (seen.has(key)) return;
     seen.add(key);
+    // A server action reached from the client ships as a reference only: its imports stay on the server.
+    if (inClient && directiveOf(file) === "use server") return;
     const nowClient = inClient || isClient(file);
     if (nowClient) client.add(file);
     for (const spec of runtimeImports(file)) {
@@ -89,12 +106,16 @@ function clientGraph(entries: string[]): { files: Set<string>; packages: Set<str
         walk(next, nowClient, [...trail, file]);
         continue;
       }
-      if (!nowClient || spec.startsWith("@/") || spec.startsWith(".")) continue;
+      if (spec.startsWith("@/") || spec.startsWith(".") || spec.startsWith("node:")) continue;
+      if (!nowClient && !clientPackage(spec, file)) continue;
       packages.add(packageOf(spec));
       if (packageUsesZod(packageOf(spec))) zod.push([...trail, file].map((f) => path.relative(ROOT, f)).join(" → ") + ` → ${spec}`);
     }
   };
-  for (const entry of entries) walk(entry, false, []);
+  for (const entry of entries) {
+    if (typeof entry === "string") walk(entry, false, []);
+    else walk(entry.file, true, []);
+  }
   return { files: client, packages, zod };
 }
 
@@ -108,6 +129,10 @@ function segmentFiles(route: string): string[] {
   return out.filter((f) => existsSync(f));
 }
 
+/** The browser instrumentation Next bundles into every page (instrumentation-client), when there is one: client code. */
+const instrumentationClient = (): { file: string; client: true }[] =>
+  ["instrumentation-client.ts", "instrumentation-client.tsx", "instrumentation-client.js"].map((f) => path.join(SRC, f)).filter((f) => existsSync(f)).map((file) => ({ file, client: true as const }));
+
 describe("the checkout page's browser bundle", () => {
   const route = "c/[id]";
 
@@ -115,7 +140,7 @@ describe("the checkout page's browser bundle", () => {
     const entries = segmentFiles(route);
     // The root layout, the page and its error / not-found screens are all walked.
     for (const f of ["app/layout.tsx", "app/c/[id]/page.tsx", "app/c/[id]/error.tsx", "app/c/[id]/not-found.tsx"]) expect(entries.map((x) => path.relative(SRC, x))).toContain(f);
-    const { files, packages, zod } = clientGraph(entries);
+    const { files, packages, zod } = clientGraph([...entries, ...instrumentationClient()]);
     // The walk reaches the checkout's client modules and packages (not an empty graph that would prove nothing).
     for (const f of ["components/checkout/CheckoutView.tsx", "components/checkout/Payment.tsx", "components/checkout/blocks.tsx", "lib/layout-shared.ts"]) expect([...files].map((x) => path.relative(SRC, x))).toContain(f);
     expect([...packages]).toContain("@whop/checkout");
@@ -150,5 +175,8 @@ describe("the checkout page's browser bundle", () => {
     // A package depending on zod counts as zod.
     expect(packageUsesZod("zod")).toBe(true);
     expect(packageUsesZod("react")).toBe(false);
+    // A package whose entry is "use client" ships whoever imports it (Next's own Link module); a plain one doesn't.
+    expect(clientPackage("next/dist/client/link", path.join(SRC, "app/c/[id]/page.tsx"))).toBe(true);
+    expect(clientPackage("zod", path.join(SRC, "lib/layout.ts"))).toBe(false);
   });
 });
