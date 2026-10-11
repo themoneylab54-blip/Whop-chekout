@@ -6,11 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * domain (a domain recorded at connection could have lapsed and changed hands) — following up to two
  * redirects by hand: a redirect the fetch followed itself would drop the cart's cookie (every bundle
  * cart was refused as unreadable). Never to an IP, a port, a local name or plain http. The host
- * Shopify's redirect led to is where the store's reads start for 10 minutes (one request instead of
- * two); any failure there asks *.myshopify.com again within the same read.
+ * Shopify's redirect led to (its /cart.js itself) is where the store's reads start for 10 minutes (one
+ * request instead of two), with half the read's time at most (1 s): any failure there, a hang
+ * included, asks *.myshopify.com again in the time left.
  */
 
-const incidents = vi.hoisted(() => ({ recordIncident: vi.fn(async (_e: unknown) => undefined) }));
+const incidents = vi.hoisted(() => ({ recordIncident: vi.fn<(e: unknown) => Promise<undefined>>(async () => undefined) }));
 vi.mock("@/lib/incidents", () => incidents);
 
 const { readCartJs, storefrontHosts, cartRedirectAllowed, clearShopifyDiscountCache } = await import("@/lib/shopify-discounts");
@@ -182,22 +183,71 @@ describe("readCartJs: where Shopify's redirect led, the store's next reads start
     expect(urls()).toEqual([SHOPIFY]);
   });
 
-  it("one time limit for the whole read: the remembered host hanging leaves none to ask Shopify; one incident, the host forgotten", async () => {
-    await learn();
+  /** Like serve, but `hang` never answers (until the request is aborted, as a dead host's would). */
+  const serveHanging = (routes: Record<string, () => Response>, hang: string[]) =>
     vi.stubGlobal(
       "fetch",
       vi.fn((input: string, init?: RequestInit) => {
-        calls.push({ url: String(input), cookie: new Headers(init?.headers).get("cookie"), redirect: init?.redirect });
+        const url = String(input);
+        calls.push({ url, cookie: new Headers(init?.headers).get("cookie"), redirect: init?.redirect });
         const signal = init?.signal;
         if (signal?.aborted) return Promise.reject(signal.reason);
-        return new Promise<Response>((_, reject) => signal?.addEventListener("abort", () => reject(signal.reason)));
+        if (hang.includes(url)) return new Promise<Response>((_, reject) => signal?.addEventListener("abort", () => reject(signal.reason)));
+        const route = routes[url];
+        return route ? Promise.resolve(route()) : Promise.reject(new TypeError(`fetch failed: ${url}`));
       }),
     );
+
+  it("the remembered host hanging gets half the read's time (1 s at most): Shopify is asked in the time left, its answer the start; no incident", async () => {
+    await learn();
+    serveHanging({ [SHOPIFY]: moved(NEW), [NEW]: cartJs }, [DOMAIN]);
+    const t0 = Date.now();
+    expect(await readCartJs(store, "hWN1?key=abc", { timeoutMs: 600 })).toMatchObject({ token: "hWN1" });
+    // Given up on after ~300 ms (half of 600), not the whole 600.
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(280);
+    expect(Date.now() - t0).toBeLessThan(590);
+    expect(urls()).toEqual([DOMAIN, SHOPIFY, NEW]);
+    expect(incidents.recordIncident).not.toHaveBeenCalled();
+    calls = [];
+    serve({ [NEW]: cartJs });
+    await readCartJs(store, "hWN1?key=abc");
+    expect(urls()).toEqual([NEW]);
+    // The default 3 s read: 1 s for the remembered host.
+    calls = [];
+    serveHanging({ [SHOPIFY]: moved(DOMAIN), [DOMAIN]: cartJs }, [NEW]);
+    const t1 = Date.now();
+    expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+    expect(Date.now() - t1).toBeGreaterThanOrEqual(980);
+    expect(Date.now() - t1).toBeLessThan(2_000);
+    expect(urls()).toEqual([NEW, SHOPIFY, DOMAIN]);
+  });
+
+  it("Shopify hanging too: the read ends at its time limit, one incident, the host forgotten", async () => {
+    await learn();
+    serveHanging({}, [DOMAIN, SHOPIFY]);
     const t0 = Date.now();
     expect(await readCartJs(store, "hWN1?key=abc", { timeoutMs: 200 })).toBeNull();
     expect(Date.now() - t0).toBeLessThan(1_500);
-    expect(calls[0].url).toBe(DOMAIN);
+    expect(urls()).toEqual([DOMAIN, SHOPIFY]);
     expect(incidents.recordIncident).toHaveBeenCalledTimes(1);
+    calls = [];
+    serve({ [SHOPIFY]: moved(DOMAIN), [DOMAIN]: cartJs });
+    await readCartJs(store, "hWN1?key=abc");
+    expect(urls()).toEqual([SHOPIFY, DOMAIN]);
+  });
+
+  it("only a redirect to the host's own /cart.js is remembered (a localized path, say, is Shopify's to name each time)", async () => {
+    const LOCALIZED = "https://xn--sovline-dya.fr/en-us/cart.js";
+    await learn(store, { [SHOPIFY]: moved(LOCALIZED), [LOCALIZED]: cartJs });
+    serve({ [SHOPIFY]: moved(LOCALIZED), [LOCALIZED]: cartJs });
+    expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+    expect(urls()).toEqual([SHOPIFY, LOCALIZED]);
+    // The remembered host redirecting to another path now: used this once, then Shopify asked again.
+    calls = [];
+    await learn();
+    serve({ [DOMAIN]: moved(LOCALIZED), [LOCALIZED]: cartJs, [SHOPIFY]: moved(DOMAIN) });
+    expect(await readCartJs(store, "hWN1?key=abc")).toMatchObject({ token: "hWN1" });
+    expect(urls()).toEqual([DOMAIN, LOCALIZED]);
     calls = [];
     serve({ [SHOPIFY]: moved(DOMAIN), [DOMAIN]: cartJs });
     await readCartJs(store, "hWN1?key=abc");

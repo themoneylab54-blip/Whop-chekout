@@ -905,8 +905,8 @@ const SNAPSHOT_WAIT_MS = 22_000;
 /**
  * How often a request waiting for another one's checkout looks for it (each poll: the snapshot and
  * the claim row, two indexed reads): every 50 ms for the first 2 s of the wait (the early prepare's
- * checkout usually lands within a second), then every 150 ms — a slow Whop's long wait costs the
- * database no more than it did.
+ * checkout usually lands within a second), then every 150 ms. Three times the reads of a steady
+ * 150 ms in those 2 s; a full 22 s wait is about 174 polls (147 at a steady 150 ms).
  */
 const SNAPSHOT_POLL_MS = 50;
 const SNAPSHOT_FAST_POLL_FOR_MS = 2_000;
@@ -927,6 +927,11 @@ export const snapshotClaimTimings = {
   budgetMs: PREPARE_BUDGET_MS,
   takeoverMinLeftMs: TAKEOVER_MIN_LEFT_MS,
 };
+
+/** The time between two looks for another request's checkout, `waitedMs` into the wait. Pure. */
+export function snapshotPollEvery(waitedMs: number, pollMs = snapshotClaimTimings.pollMs): number {
+  return waitedMs < SNAPSHOT_FAST_POLL_FOR_MS ? pollMs : Math.max(pollMs, SNAPSHOT_SLOW_POLL_MS);
+}
 
 /** Whether enough of the request's budget is left to take a claim over (and call Whop itself). */
 function takeoverAllowed(startedAt: number): boolean {
@@ -1009,9 +1014,9 @@ export async function sweepSnapshotClaims(now = new Date()): Promise<number> {
 async function waitForSnapshot(key: string, find: () => Promise<CheckoutQuote | null>, startedAt: number): Promise<{ snapshot: CheckoutQuote | null; claim?: SnapshotClaim }> {
   const { waitMs, pollMs, claimMs } = snapshotClaimTimings;
   const until = startedAt + waitMs;
-  const slowFrom = Date.now() + SNAPSHOT_FAST_POLL_FOR_MS;
+  const waitFrom = Date.now();
   while (Date.now() < until) {
-    const every = Date.now() < slowFrom ? pollMs : Math.max(pollMs, SNAPSHOT_SLOW_POLL_MS);
+    const every = snapshotPollEvery(Date.now() - waitFrom, pollMs);
     await new Promise((r) => setTimeout(r, Math.max(1, Math.min(every, until - Date.now()))));
     const [found, row] = await Promise.all([find(), db.appSetting.findUnique({ where: { key }, select: { updatedAt: true } }).catch(() => undefined)]);
     if (found) return { snapshot: found };

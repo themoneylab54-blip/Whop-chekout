@@ -142,9 +142,9 @@ async function handle(req: Request) {
   // serial query here is time the buyer waits after clicking « Checkout ».
   const raw = await readJson(req);
   // The loader's warm-up when the buyer heads for « Checkout » (hover, touch, cart opened): this
-  // function and its database connection are awake (and the CORS preflight cached) before the
-  // click. Nothing created, no session rate limit spent; capped per IP in memory (no query), so a
-  // flood of warm-ups never reaches the database.
+  // function and its database connection are awake before the click (the loader's POSTs are
+  // CORS-simple, text/plain: no preflight to wait for). Nothing created, no session rate limit
+  // spent; capped per IP in memory (no query), so a flood of warm-ups never reaches the database.
   if (raw && typeof raw === "object" && (raw as { warm?: unknown }).warm === true) {
     if (!memoryRateLimit(`warm:ip:${clientIp(req)}`, 30)) return json({ warm: false }, { status: 429, cors: true });
     await db.$queryRaw`SELECT 1`.catch(() => undefined);
@@ -206,16 +206,16 @@ async function handle(req: Request) {
     note: parsed.data.note,
     attributes: parsed.data.attributes,
   };
-  // The Admin API pricing and this visitor's A/B arms (reads only) start now, alongside the host
-  // check, each awaited where it is needed: a refused cart leaves them to settle (their failures
-  // caught, never an unhandled rejection).
+  // A request on another checkout domain starts nothing (the host check needs no query on the app's
+  // own hosts and the store's domain: the usual case waits for nothing here).
+  if (await foreign) return refuseForeign();
+  // The Admin API pricing, this visitor's A/B arms (reads only) and the cart re-read (bundle /
+  // discount apps; a failed one is journaled) run alongside, each awaited where it is needed: a
+  // refused cart leaves them to settle (their failures caught, never an unhandled rejection).
   const priced = priceCart(store, items.map((i) => ({ variantId: i.variant_id, quantity: i.quantity })));
   const arms = Promise.all([assignVariant(store.id, visitor.id), assignCheckoutTests(store.id, visitor.id)]);
   priced.catch(() => undefined);
   arms.catch(() => undefined);
-  if (await foreign) return refuseForeign();
-  // The cart re-read (bundle / discount apps) runs alongside the pricing, once the host is the
-  // store's (a failed re-read is journaled).
   const cartRead = startCartRead(store, cartInput);
   let lines;
   try {

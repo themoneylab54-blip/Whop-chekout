@@ -5,7 +5,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * capped per IP in memory (30 a minute, then 429 without any query, never spending the session rate
  * limit), and each refusal says whether the loader retries it once on its own (`retryable`) or
  * leaves the cart to Shopify's checkout (`native`), with the store in its log line when known. The
- * pricing and the A/B lookups run alongside the host check, the cart re-read once it passed.
+ * host check comes first (no query on the usual hosts); the pricing, the A/B lookups and the cart
+ * re-read then run together.
  */
 
 const mocks = vi.hoisted(() => ({
@@ -187,7 +188,7 @@ describe("sessions route: lookups overlapped", () => {
   };
   const withToken = { ...cart, cartToken: "hWN1?key=abc" };
 
-  it("the pricing and the A/B lookups start while the host check runs, the cart re-read once it passed; the arms land on the session", async () => {
+  it("the host check first (no query on the usual hosts), then the pricing, the A/B lookups and the cart re-read together; the arms land on the session", async () => {
     mocks.findStore.mockResolvedValueOnce(store);
     const answerHost = heldHostCheck();
     mocks.priceCart.mockResolvedValueOnce([line]);
@@ -197,35 +198,38 @@ describe("sessions route: lookups overlapped", () => {
     mocks.createSession.mockResolvedValueOnce({ id: "cs_1" });
     const pending = post(withToken);
     await vi.waitFor(() => expect(mocks.foreignHost).toHaveBeenCalledTimes(1));
-    expect(mocks.priceCart).toHaveBeenCalledTimes(1);
-    expect(mocks.assignVariant).toHaveBeenCalledWith("store_1", "v_1");
-    expect(mocks.assignCheckoutTests).toHaveBeenCalledWith("store_1", "v_1");
-    // The re-read (journaled when it fails) waits for the host to be the store's.
+    // Nothing starts before the host is the store's (a request on another domain costs no Shopify call).
+    await new Promise((r) => setTimeout(r, 10));
+    expect(mocks.priceCart).not.toHaveBeenCalled();
+    expect(mocks.assignVariant).not.toHaveBeenCalled();
     expect(mocks.startCartRead).not.toHaveBeenCalled();
     answerHost(false);
     const res = await pending;
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ id: "cs_1", visitorId: "v_1.sig" });
+    expect(mocks.priceCart).toHaveBeenCalledTimes(1);
+    expect(mocks.assignVariant).toHaveBeenCalledWith("store_1", "v_1");
+    expect(mocks.assignCheckoutTests).toHaveBeenCalledWith("store_1", "v_1");
     expect(mocks.startCartRead).toHaveBeenCalledTimes(1);
     expect(mocks.createSession.mock.calls[0][0].data).toMatchObject({ visitorId: "v_1", experimentId: "exp_1", variant: "B", checkoutTestArms: { ct_1: "A" } });
   });
 
-  it("refused on another store's domain, or by Shopify's pricing, before anything is written: the lookups started meanwhile settle unobserved, never an unhandled rejection", async () => {
+  it("refused on another store's domain before anything starts; refused by Shopify's pricing before anything is written, the lookups started meanwhile settling unobserved (never an unhandled rejection)", async () => {
     const unhandled: unknown[] = [];
     const onUnhandled = (reason: unknown) => void unhandled.push(reason);
     process.on("unhandledRejection", onUnhandled);
     try {
       mocks.findStore.mockResolvedValueOnce(store);
       const answerHost = heldHostCheck();
-      mocks.priceCart.mockRejectedValueOnce(new Error("Shopify down"));
-      mocks.assignVariant.mockRejectedValueOnce(new Error("database down"));
-      mocks.assignCheckoutTests.mockRejectedValueOnce(new Error("database down"));
       const pending = post(withToken);
       await vi.waitFor(() => expect(mocks.foreignHost).toHaveBeenCalledTimes(1));
       answerHost(true);
       const foreign = await pending;
       expect(foreign.status).toBe(404);
       expect(await foreign.json()).toMatchObject({ reason: "foreign_host" });
+      expect(mocks.priceCart).not.toHaveBeenCalled();
+      expect(mocks.assignVariant).not.toHaveBeenCalled();
+      expect(mocks.assignCheckoutTests).not.toHaveBeenCalled();
       expect(mocks.startCartRead).not.toHaveBeenCalled();
 
       // On the store's own host: Shopify's failure answers (502), the A/B lookups' failure is never awaited.
