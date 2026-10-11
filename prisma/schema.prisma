@@ -126,6 +126,9 @@ model Store {
   whopWebhookId     String?
   whopWebhookSecret String? // encrypted
   whopConnectedAt   DateTime?
+  // The merchant's choice to clip « Propulsé par Whop » off Whop's form on the checkout (0044):
+  // Whop treats that line as its required merchant-of-record notice, so it shows unless asked
+  whopFooterHidden  Boolean   @default(false)
 
   // --- Stripe (migration 0034_stripe_provider) ---
   // Connected account (Stripe Connect OAuth, Standard): charges are direct charges on it

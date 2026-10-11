@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Globe2, KeyRound, Mail, Smartphone, Wallet } from "lucide-react";
+import { EyeOff, Globe2, KeyRound, Mail, Smartphone, Wallet } from "lucide-react";
 import { notFound } from "next/navigation";
 import { DirtyForm } from "@/components/dashboard/DirtyForm";
 import { requireStoreAccess, roleCan } from "@/lib/access";
@@ -14,6 +14,8 @@ import { env as appEnv } from "@/lib/env";
 import { ConfirmButton } from "@/components/dashboard/ConfirmButton";
 import { formatDate, formatDateTime } from "@/components/dashboard/format";
 import { paypalHiddenLines, paypalRefusals } from "@/lib/checkout";
+import { whopFooterVerdicts } from "@/lib/whop-footer";
+import { LANGS } from "@/components/checkout/i18n";
 import {
   connectWhopAction,
   disconnectWhopAction,
@@ -22,6 +24,7 @@ import {
   savePaymentMethodsAction,
   setupApplePayAction,
   setWhopCustomerEmailsAction,
+  setWhopFooterHiddenAction,
 } from "../../../../actions";
 
 export const metadata: Metadata = { title: "Whop" };
@@ -61,11 +64,19 @@ export default async function WhopPage({
   const appHost = new URL(appEnv.appUrl).hostname;
   const checkoutHost = checkoutHostOf(store);
   const applePayHosts = [...new Set([checkoutHost, appHost])];
-  const [applePay, whopEmails] = await Promise.all([
+  const [applePay, whopEmails, footerVerdicts] = await Promise.all([
     connected && applePayFile ? applePayDomainStatuses(store, applePayHosts) : null,
     // Whop's own buyer e-mails (account-wide): true = Whop sends its receipt too, null = unknown (cached).
     connected ? whopCustomerEmailsStatus(store) : null,
+    // « Propulsé par Whop »: the last checks of Whop's form, per checkout language (lib/whop-footer).
+    connected && store.whopFooterHidden ? whopFooterVerdicts(store) : null,
   ]);
+  // Hidden only once Whop's form was checked in some language (until then, still shown everywhere).
+  const footerBadge = !store.whopFooterHidden
+    ? { color: "zinc" as const, label: "Affichée" }
+    : footerVerdicts && Object.values(footerVerdicts).some((v) => v.clips)
+      ? { color: "amber" as const, label: "Masquée" }
+      : { color: "zinc" as const, label: "Masquage demandé" };
   const env = store.testMode ? "sandbox" : "production";
   const emailsControls = whopEmailsControls(whopEmails);
 
@@ -204,6 +215,74 @@ export default async function WhopPage({
                 <pre className="rounded-md bg-white/70 p-2.5 font-sans text-xs whitespace-pre-wrap text-zinc-800 ring-1 ring-amber-600/15">{whopSupportEmailsMessage(store.whopAccountId)}</pre>
               </div>
             </div>
+          )}
+        </Card>
+      )}
+
+      {connected && (
+        <Card
+          id="whop-footer"
+          icon={EyeOff}
+          iconColor="#334155"
+          title="Mention « Propulsé par Whop »"
+          description="La ligne sous le formulaire de carte : « Propulsé par Whop · Conditions · Confidentialité »."
+          actions={<Badge color={footerBadge.color}>{footerBadge.label}</Badge>}
+          className="mb-6"
+        >
+          <p className="text-sm text-zinc-700">
+            Whop présente cette ligne comme une mention obligatoire : Whop encaisse vos paiements en tant que marchand officiel (« merchant of record »), au titre de
+            prestataire de paiement (c&apos;est vous qui vendez les produits), et l&apos;acheteur doit pouvoir consulter ses conditions et sa politique de
+            confidentialité là où il paie. Whop n&apos;offre aucun réglage pour la retirer : la masquer peut aller contre ses conditions et faire courir un risque à
+            votre compte Whop. C&apos;est votre décision ; le support Whop peut vous dire si c&apos;est accepté pour votre compte.
+          </p>
+          <p className="mt-2 text-xs text-zinc-500">
+            Masquée, la mention reste dans le formulaire de Whop sans être visible : un client qui navigue au clavier passe par ses trois liens sans les voir, et un
+            lecteur d&apos;écran les lit encore.
+          </p>
+          {store.whopFooterHidden && footerVerdicts && (
+            <ul className="mt-3 space-y-1 text-xs text-zinc-600" data-testid="whop-footer-status">
+              {LANGS.filter((l) => footerVerdicts[l.code]).map((l) => {
+                const v = footerVerdicts[l.code];
+                return (
+                  <li key={l.code}>
+                    {l.label} :{" "}
+                    {v.clips
+                      ? `masquée (formulaire de Whop vérifié le ${formatDateTime(new Date(v.at), false, tzOf(store))})`
+                      : v.ok
+                        ? "affichée : la dernière vérification du formulaire de Whop est trop ancienne, elle est refaite à la prochaine visite"
+                        : v.reason === "branding_flag"
+                          ? `affichée : Whop règle sa marque autrement sur votre compte que sur le formulaire que nous savons masquer (vérifié le ${formatDateTime(new Date(v.at), false, tzOf(store))}) ; le support Whop peut vous dire si votre compte a un réglage particulier`
+                          : `affichée : le formulaire de Whop a changé (vérifié le ${formatDateTime(new Date(v.at), false, tzOf(store))}), la mention reste visible pour ne rien cacher d'autre`}
+                  </li>
+                );
+              })}
+              <li>
+                Chaque langue est vérifiée à la première visite du checkout dans cette langue (cette visite-là affiche encore la mention), puis toutes les 3 heures au plus.
+              </li>
+            </ul>
+          )}
+          {isOwner ? (
+            <div className="mt-4">
+              {store.whopFooterHidden ? (
+                <form action={setWhopFooterHiddenAction.bind(null, store.id, false)}>
+                  <SubmitButton variant="secondary">Afficher de nouveau la mention</SubmitButton>
+                </form>
+              ) : (
+                <form action={setWhopFooterHiddenAction.bind(null, store.id, true)}>
+                  <ConfirmButton
+                    title="Masquer la mention de Whop ?"
+                    description="Whop la présente comme obligatoire : Whop encaisse vos paiements en tant que marchand officiel, au titre de prestataire de paiement, et l'acheteur doit pouvoir consulter ses conditions et sa politique de confidentialité. La masquer peut aller contre les conditions de Whop et faire courir un risque à votre compte Whop. Vous pourrez la réafficher à tout moment, ici même."
+                    confirmLabel="Masquer quand même"
+                    variant="secondary"
+                    tone="default"
+                  >
+                    Masquer la mention
+                  </ConfirmButton>
+                </form>
+              )}
+            </div>
+          ) : (
+            <OwnerOnlyNote className="mt-3">masquer ou réafficher la mention de Whop (le risque concerne le compte Whop).</OwnerOnlyNote>
           )}
         </Card>
       )}

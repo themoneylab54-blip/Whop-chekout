@@ -26,6 +26,7 @@ import { clearDisabledByUninstall } from "@/lib/shopify-uninstall";
 import { MIN_CLIENT_SECRET_LENGTH, resolveShopDomainInput, SECRET_TOO_SHORT } from "@/lib/shopify-connect";
 import { clearShopifyStatus } from "@/lib/shopify-status";
 import { OPTIONAL_PAYMENT_METHOD_IDS, refundPayment, registerApplePayDomain, setupWhop, setWhopCustomerEmails, statementDescriptor, teardownWhop } from "@/lib/whop";
+import { forgetWhopFooterVerdicts } from "@/lib/whop-footer";
 import { testConversions } from "@/lib/conversions";
 import { draftDesign, hasPublished, publishedDesign, sameDesign } from "@/lib/design";
 import { log, recordEvent } from "@/lib/log";
@@ -1886,6 +1887,34 @@ export async function setWhopCustomerEmailsAction(storeId: string, send: boolean
     ok: send
       ? "E-mails Whop réactivés : Whop envoie de nouveau son reçu aux acheteurs de tout votre compte Whop."
       : "E-mails Whop coupés : vos clients ne reçoivent plus que la confirmation de Shopify.",
+  });
+}
+
+/**
+ * The merchant's choice to clip « Propulsé par Whop » (Whop's logo, Buyer Terms and Privacy links)
+ * off Whop's card form on the checkout. Owner only: Whop treats that line as its required
+ * merchant-of-record notice, and the risk is the Whop account's. The checkout clips it only while
+ * Whop's own page still draws it as measured (lib/whop-footer).
+ */
+export async function setWhopFooterHiddenAction(storeId: string, hidden: boolean) {
+  const store = await getStore(storeId, "owner");
+  const path = storePath(storeId, "whop");
+  await db.store.update({ where: { id: store.id }, data: { whopFooterHidden: hidden } });
+  // Shown again: the old checks go (hiding it later starts from a fresh check of Whop's form).
+  if (!hidden) await forgetWhopFooterVerdicts(store.id);
+  await recordEvent({
+    storeId,
+    kind: "whop.footer_choice",
+    message: hidden
+      ? "Masquage de la mention « Propulsé par Whop » demandé par le marchand (Whop la présente comme une mention obligatoire)."
+      : "Mention « Propulsé par Whop » de nouveau affichée sur le checkout.",
+    data: { hidden },
+  });
+  revalidatePath(path);
+  back(path, {
+    ok: hidden
+      ? "Masquage demandé : la mention disparaîtra du checkout dès que le formulaire de Whop aura été vérifié, à la première visite du checkout dans chaque langue."
+      : "Mention de nouveau affichée sur le checkout.",
   });
 }
 

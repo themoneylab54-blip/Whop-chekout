@@ -32,6 +32,7 @@ import { canReadShopifyDiscounts } from "@/lib/shopify-discounts";
 // The main market: shared with the early prepare (its first quote is this page's first input).
 import { primaryCountryOf } from "@/lib/early-prepare";
 import { firstPrepareBody, firstPrepareProtection, inlinePrepareScript } from "@/components/checkout/inlinePrepare";
+import { refreshWhopFooterCheck, whopFooterClipped, whopHostOf } from "@/lib/whop-footer";
 import { checkoutCountries, countryHints, pickFirstCountry, storeMarketOf } from "@/lib/first-country";
 
 export const dynamic = "force-dynamic";
@@ -168,6 +169,9 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
   // Save the card for the one-click post-purchase offer only when one is live.
   const pixel = browserPixel(session, "checkout");
   const saveCard = activeUpsells({ thankYouLayout: design.thankYouLayout }).length > 0;
+  // Whop's form as this page asks for it (its terms line hidden or not, the card kept for the offer):
+  // the footer check reads that very form.
+  const footerVariant = { hideTos: theme.requireTerms, saveCard };
   // The Shopify cart, for the breadcrumb / "Back to cart" (custom domain first).
   const shopHost = store.storefrontHost || store.shopDomain;
   const lines = session.lines as unknown as CartLine[];
@@ -195,7 +199,7 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
   // server component only reaches the browser with the RSC payload, once the scripts run.
   const preconnects: { href: string; crossOrigin?: "anonymous" }[] =
     provider === "whop"
-      ? [{ href: store.testMode ? "https://sandbox.whop.com" : "https://whop.com" }]
+      ? [{ href: `https://${whopHostOf(store.testMode)}` }]
       : provider === "stripe"
         ? [{ href: "https://js.stripe.com" }, { href: "https://api.stripe.com", crossOrigin: "anonymous" }]
         : [];
@@ -227,13 +231,21 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
       { initialCountry, localeCountry, primaryCountry: primary, rateCountry: storeMarketOf(rates), language: theme.language },
     ),
   );
-  const [localRates, primaryCountry, initialPaypal, returningCode, prepareCountry] = await Promise.all([
+  const [localRates, primaryCountry, initialPaypal, returningCode, prepareCountry, footerClipped] = await Promise.all([
     within(loadLocalRates(session.currency), 1500, null),
     primaryLookup,
     firstCountry.then((country) => paypalAtFirstPaint(session, provider, design, store.name, country, subtotal(lines))),
     loginCodeEnabled(session.store),
     firstCountry,
+    // « Propulsé par Whop » clipped off Whop's card form when the merchant chose it and Whop's page
+    // still draws it as measured (checked again after this answer when the last check is old:
+    // lib/whop-footer). Whop's form only: nothing read for a Stripe checkout.
+    provider === "whop" ? whopFooterClipped(store, theme.language, footerVariant) : false,
   ]);
+  if (provider === "whop" && store.whopFooterHidden) {
+    const check = { store, lang: theme.language, variant: footerVariant, sessionId: session.id, origin: `https://${reqHeaders.get("host")}` };
+    after(() => refreshWhopFooterCheck(check));
+  }
   // The page's first /prepare exactly as CheckoutView sends it on load (see firstPrepareBody), sent by
   // an inline script while this HTML is parsed: its answer is waiting for the page once hydrated. Like
   // the page's own first prepare, it marks the payment form shown (preparedAt), now as the HTML is read.
@@ -293,6 +305,8 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
         initialProvider={provider}
         stripeWarm={stripeWarm}
         returningCode={returningCode}
+        // The language Whop's form was checked in: the clip applies to a frame in that language only.
+        whopFooterLang={footerClipped ? theme.language : null}
       />
     </>
   );

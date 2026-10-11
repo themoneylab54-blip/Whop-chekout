@@ -149,6 +149,8 @@ type Props = {
   initialProvider?: "whop" | "stripe" | null;
   /** Live, paying with Stripe: Stripe.js is loaded while the first /prepare runs. */
   stripeWarm?: { publishableKey: string; stripeAccount: string } | null;
+  /** Live: Whop's « Propulsé par Whop » footer clipped off its card form in this language (the one the server checked Whop's form in); null: shown. */
+  whopFooterLang?: string | null;
 };
 
 type Address = {
@@ -702,6 +704,7 @@ export function CheckoutView({
   initialPaypal = false,
   initialProvider = null,
   stripeWarm = null,
+  whopFooterLang = null,
 }: Props) {
   // "Complétez votre commande" streamed by the server (a promise): none until it lands.
   const recommendationsStream = isPromise(recommendationsProp) ? recommendationsProp : null;
@@ -2448,6 +2451,7 @@ export function CheckoutView({
                 errorRef={prepareRef}
                 noShipping={prepareNoShipping}
                 onLockChange={setPanelLock}
+                whopFooterLang={whopFooterLang}
                 paypal={{
                   active: paypalActive,
                   prepared: paypalPrepared,

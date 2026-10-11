@@ -85,6 +85,18 @@ body {
     stroke-dashoffset: 0;
   }
 }
+/* Whop's form with its footer clipped off (WhopFooterClip): a box that clips and never scrolls
+   (Whop centering its frame, or the focus on a hidden link, would slide the form up with
+   `overflow: hidden`). iOS Safari < 16 has no `clip`: `hidden` there, and the component undoes any
+   scroll at once. */
+.wc-whop-clip {
+  overflow: clip;
+}
+@supports not (overflow: clip) {
+  .wc-whop-clip {
+    overflow: hidden;
+  }
+}
 .wc-check {
   animation: wc-check-pop 0.45s cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }

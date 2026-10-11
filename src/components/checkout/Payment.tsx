@@ -7,6 +7,7 @@ import type { Theme } from "@/lib/layout";
 import { EXPRESS_WALLETS, type ExpressWallet } from "@/lib/layout-shared";
 import { PAYPAL_AFTER_WINDOW_MS, PAYPAL_SERVER_IN_FLIGHT_MS } from "@/lib/paypal-timing";
 import type { Labels } from "./i18n";
+import { WhopFooterClip } from "./WhopFooterClip";
 
 type ExpressMethod = ExpressWallet;
 
@@ -631,6 +632,7 @@ export function PaymentPanel({
   paypal,
   onLockChange,
   inFlightAtLoad = false,
+  whopFooterLang = null,
 }: {
   prepared: Prepared | null;
   preparing: boolean;
@@ -672,6 +674,11 @@ export function PaymentPanel({
    * through (another tab, a reload during a PayPal window): the panel starts in its server wait.
    */
   inFlightAtLoad?: boolean;
+  /**
+   * Whop's « Propulsé par Whop » footer clipped off its card form in this language only: the one the
+   * server checked Whop's form in (see WhopFooterClip). Null: shown.
+   */
+  whopFooterLang?: string | null;
 }) {
   const controls = useCheckoutEmbedControls();
   const paypalOn = !!paypal?.active;
@@ -1311,40 +1318,50 @@ export function PaymentPanel({
             )}
           </div>
         ) : current ? (
-          <WhopCheckoutEmbed
+          <WhopFooterClip
             key={current.configId}
-            ref={controls}
-            sessionId={current.configId}
-            environment={current.environment}
-            theme="light"
-            locale={theme.language}
-            themeOptions={{ accentColor: theme.accentColor, borderRadius: theme.radius }}
-            hideSubmitButton={!whopButton}
-            hideEmail
-            hideAddressForm={!showBillingForm}
-            // The store's own terms checkbox already covers acceptance: no second "you accept X's terms" line.
-            hideTermsAndConditions={theme.requireTerms}
-            setupFutureUsage={saveCard ? "off_session" : undefined}
-            skipRedirect
-            returnUrl={returnUrl}
-            onStateChange={(s) => setReadyFor(s === "ready" ? current.configId : null)}
-            onComplete={paid}
-            onPaymentError={(e) => {
-              if (!paypalOn) cardDeclinedAt.current = Date.now();
-              setPaypalPending(false);
-              setPaypalWait(false);
-              setCheckFailed(false);
-              setConfirmLeave(null);
-              setSubmitting(false);
-              setError(e.message || labels.paymentFailed);
-            }}
-            onAddressValidationError={(e) => {
-              setSubmitting(false);
-              setShowBillingForm(true);
-              setError(e.error_message || labels.checkBillingAddress);
-            }}
-            fallback={<PaymentSkeleton />}
-          />
+            // Only the form the server checked, the card one: not the PayPal-only checkout (nor Whop's own
+            // PayPal button in it), nor Whop's billing address form (after an address error). Whop's
+            // "disabled" state is not another screen but its pay button's (an incomplete form, a payment
+            // going through): the clip stays on, so the frame never jumps while the buyer types or pays.
+            on={!paypalOn && !showBillingForm}
+            lang={theme.language}
+            checkedLang={whopFooterLang}
+          >
+            <WhopCheckoutEmbed
+              ref={controls}
+              sessionId={current.configId}
+              environment={current.environment}
+              theme="light"
+              locale={theme.language}
+              themeOptions={{ accentColor: theme.accentColor, borderRadius: theme.radius }}
+              hideSubmitButton={!whopButton}
+              hideEmail
+              hideAddressForm={!showBillingForm}
+              // The store's own terms checkbox already covers acceptance: no second "you accept X's terms" line.
+              hideTermsAndConditions={theme.requireTerms}
+              setupFutureUsage={saveCard ? "off_session" : undefined}
+              skipRedirect
+              returnUrl={returnUrl}
+              onStateChange={(s) => setReadyFor(s === "ready" ? current.configId : null)}
+              onComplete={paid}
+              onPaymentError={(e) => {
+                if (!paypalOn) cardDeclinedAt.current = Date.now();
+                setPaypalPending(false);
+                setPaypalWait(false);
+                setCheckFailed(false);
+                setConfirmLeave(null);
+                setSubmitting(false);
+                setError(e.message || labels.paymentFailed);
+              }}
+              onAddressValidationError={(e) => {
+                setSubmitting(false);
+                setShowBillingForm(true);
+                setError(e.error_message || labels.checkBillingAddress);
+              }}
+              fallback={<PaymentSkeleton />}
+            />
+          </WhopFooterClip>
         ) : (
           <PaymentSkeleton />
         )}
