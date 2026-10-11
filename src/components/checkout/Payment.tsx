@@ -6,7 +6,7 @@ import { WhopCheckoutEmbed, WhopExpressCheckoutButton, useCheckoutEmbedControls 
 import type { Theme } from "@/lib/layout";
 import { EXPRESS_WALLETS, type ExpressWallet } from "@/lib/layout-shared";
 import { PAYPAL_AFTER_WINDOW_MS, PAYPAL_SERVER_IN_FLIGHT_MS } from "@/lib/paypal-timing";
-import type { Labels } from "./i18n";
+import type { CheckoutLabels } from "./i18n";
 import { WHOP_READY_GRACE_MS, WhopFooterClip } from "./WhopFooterClip";
 import { afterVisibleTime } from "./paymentHealth";
 
@@ -233,7 +233,7 @@ export function ExpressCheckout({
    */
   stale?: boolean;
   theme: Theme;
-  labels: Labels;
+  labels: CheckoutLabels;
   returnUrl: string;
   email: string;
   onPaid: () => void;
@@ -503,7 +503,7 @@ export function WalletPlaceholder({ method }: { method: ExpressMethod }) {
  * Stripe's express row before its PaymentIntent exists (and while its code loads): the place of
  * StripeExpress before its wallets are known (title and "OR" invisible, one button's height).
  */
-export function StripeExpressPlaceholder({ labels, title, dividerLabel }: { labels?: Labels; title?: string; dividerLabel?: string }) {
+export function StripeExpressPlaceholder({ labels, title, dividerLabel }: { labels?: CheckoutLabels; title?: string; dividerLabel?: string }) {
   return (
     <section aria-hidden aria-busy data-testid="wc-stripe-express-placeholder">
       <p className="invisible mb-3 text-center text-xs font-medium tracking-wide uppercase">{title || labels?.expressCheckout || " "}</p>
@@ -529,7 +529,7 @@ export function ExpressUnavailable({
   tall = false,
   message,
 }: {
-  labels: Labels;
+  labels: CheckoutLabels;
   title?: string;
   dividerLabel?: string;
   alert?: boolean;
@@ -641,7 +641,7 @@ export function PaymentPanel({
   preparing: boolean;
   prepareError: string | null;
   theme: Theme;
-  labels: Labels;
+  labels: CheckoutLabels;
   payLabel: string;
   returnUrl: string;
   testMode: boolean;
@@ -1822,7 +1822,7 @@ export function PaymentPreview({
   beforeButton,
   hideWallets,
 }: {
-  labels: Labels;
+  labels: CheckoutLabels;
   payLabel: string;
   beforeButton?: ReactNode;
   /**
@@ -1872,7 +1872,7 @@ export function ExpressPreview({
   walletMethods = EXPRESS_WALLETS,
   paypal = true,
 }: {
-  labels: Labels;
+  labels: CheckoutLabels;
   title?: string;
   dividerLabel?: string;
   /** The wallets the merchant chose (see expressMethodsShown), in display order. */

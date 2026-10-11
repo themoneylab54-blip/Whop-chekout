@@ -2,7 +2,8 @@
 
 import { useEffect, useId, useRef, useState } from "react";
 import { ChevronDown, Clock, MapPin, Search } from "lucide-react";
-import { errorText, localeOf, type Labels, type Lang } from "./i18n";
+import { errorText, localeOf, type Lang } from "./i18n-core";
+import type { CheckoutLabels } from "./i18n";
 
 /** A relay point as returned by the pickup-points API. */
 export type PickupPointView = {
@@ -72,7 +73,7 @@ export function PickupPicker({
   addressCity: string;
   value: PickupPointView | null;
   onChange: (p: PickupPointView | null) => void;
-  L: Labels;
+  L: CheckoutLabels;
   lang: Lang;
   /** Shown when the buyer tried to pay without a point. */
   error?: string;

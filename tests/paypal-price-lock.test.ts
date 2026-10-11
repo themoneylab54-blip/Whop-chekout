@@ -42,6 +42,7 @@ vi.mock("@/components/checkout/Payment", async (orig) => {
 
 const { CheckoutView } = await import("@/components/checkout/CheckoutView");
 const { createBlock, defaultCheckoutLayout, defaultTheme } = await import("@/lib/layout");
+const { checkoutCopy } = await import("@/components/checkout/localize");
 const { PickupPicker } = await import("@/components/checkout/PickupPicker");
 const { SAMPLE_LINES } = await import("@/lib/sample");
 const { LABELS } = await import("@/components/checkout/i18n");
@@ -54,8 +55,7 @@ function page(extra: { note?: boolean } = {}) {
     layout.blocks.splice(at, 0, createBlock("order_note"));
   }
   const props: ComponentProps<typeof CheckoutView> = {
-    theme: { ...defaultTheme("Boutique"), language: "fr" },
-    layout,
+    copy: checkoutCopy({ ...defaultTheme("Boutique"), language: "fr" }, layout),
     currency: "EUR",
     lines: SAMPLE_LINES,
     rates: [{ id: "r1", name: "Colissimo", deliveryTime: null, countries: ["FR", "BE"], priceCents: 490, freeOverCents: null, active: true, kind: "standard" } as ComponentProps<typeof CheckoutView>["rates"][number]],

@@ -3,7 +3,7 @@ import { cache } from "react";
 import { notFound, redirect } from "next/navigation";
 import { headers } from "next/headers";
 import { geoCountryOf } from "@/lib/geo";
-import { localizeRate, recordText } from "@/components/checkout/localize";
+import { checkoutCopy, localizeRate, recordText } from "@/components/checkout/localize";
 import { after } from "next/server";
 import { db } from "@/lib/db";
 import { themeFontHrefs, loadCheckoutLayout, loadInterception, loadTheme, paypalExpressAllowed, variantGidOf, type Layout } from "@/lib/layout";
@@ -272,9 +272,10 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
       ))}
       {pixel && <AdPixels {...pixel} />}
       <CheckoutView
-        theme={theme}
-        // Live reviews only (no example / empty / hidden ones): see liveLayoutPayload.
-        layout={liveLayoutPayload(layout)}
+        // The theme, the layout (live reviews only, no example / empty / hidden ones: see
+        // liveLayoutPayload) and the page's texts, in the buyer's language here: the buyer's page never
+        // downloads the other languages' texts nor every block default.
+        copy={checkoutCopy(theme, liveLayoutPayload(layout))}
         currency={session.currency}
         lines={lines}
         // Only what the page needs (no carrier costs in the browser).

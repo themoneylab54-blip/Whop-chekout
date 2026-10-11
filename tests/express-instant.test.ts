@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement as h, type ComponentProps } from "react";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { Layout, Theme } from "@/lib/layout";
 
 /*
  * Express buttons at first paint: the express row is drawn before the first /prepare answers (our
@@ -40,18 +41,20 @@ vi.mock("@/components/checkout/Payment", async (orig) => {
 const { CheckoutView } = await import("@/components/checkout/CheckoutView");
 const { ExpressCheckout } = await import("@/components/checkout/Payment");
 const { createBlock, defaultCheckoutLayout, defaultTheme } = await import("@/lib/layout");
+const { checkoutCopy } = await import("@/components/checkout/localize");
 const { SAMPLE_LINES } = await import("@/lib/sample");
 const { LABELS } = await import("@/components/checkout/i18n");
 const { firstPrepareBody, firstPrepareProtection, inlinePrepareScript } = await import("@/components/checkout/inlinePrepare");
 const L = LABELS.fr;
 
 type ViewProps = ComponentProps<typeof CheckoutView>;
-function page(o: Partial<ViewProps> & { expressMethods?: Record<string, unknown>; expressOff?: boolean } = {}) {
-  const layout = defaultCheckoutLayout();
-  if (o.expressOff) layout.blocks = layout.blocks.map((b) => (b.type === "express" ? ({ ...b, props: { ...b.props, enabled: false } } as typeof b) : b));
-  const theme = { ...(o.theme ?? defaultTheme("Boutique")), language: "fr" as const, ...(o.expressMethods ? { expressMethods: o.expressMethods as never } : {}) };
+type PageOptions = Partial<Omit<ViewProps, "copy">> & { theme?: Theme; layout?: Layout; expressMethods?: Record<string, unknown>; expressOff?: boolean };
+function page({ theme: themeOption, layout: layoutOption, expressMethods, expressOff, ...o }: PageOptions = {}) {
+  const layout = layoutOption ?? defaultCheckoutLayout();
+  if (expressOff) layout.blocks = layout.blocks.map((b) => (b.type === "express" ? ({ ...b, props: { ...b.props, enabled: false } } as typeof b) : b));
+  const theme = { ...(themeOption ?? defaultTheme("Boutique")), language: "fr" as const, ...(expressMethods ? { expressMethods: expressMethods as never } : {}) };
   const props: ViewProps = {
-    layout,
+    copy: checkoutCopy(theme, layout),
     currency: "EUR",
     // Nothing to ship: Google Pay "auto" shows too.
     lines: SAMPLE_LINES.map((l) => ({ ...l, requiresShipping: false })),
@@ -63,7 +66,6 @@ function page(o: Partial<ViewProps> & { expressMethods?: Record<string, unknown>
     initialPaypal: true,
     initialProvider: "whop",
     ...o,
-    theme,
   };
   return h(CheckoutView, props);
 }
@@ -533,7 +535,7 @@ describe("the first /prepare sent by the page's inline script while its HTML is 
   });
 
   /** The page's first prepare as it sends it (the request's own text), with no inline script. */
-  async function pageFirstBody(o: Partial<ViewProps> = {}): Promise<string> {
+  async function pageFirstBody(o: PageOptions = {}): Promise<string> {
     render(page(o));
     await sleep(20);
     const call = vi.mocked(fetch).mock.calls.find(([u]) => String(u).endsWith("/prepare"));

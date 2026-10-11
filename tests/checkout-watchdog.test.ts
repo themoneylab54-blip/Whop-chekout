@@ -37,6 +37,7 @@ vi.mock("@/components/checkout/Payment", async (orig) => ({
 
 const { CheckoutView } = await import("@/components/checkout/CheckoutView");
 const { defaultCheckoutLayout, defaultTheme } = await import("@/lib/layout");
+const { checkoutCopy } = await import("@/components/checkout/localize");
 const { SAMPLE_LINES } = await import("@/lib/sample");
 const { BOOT_FLAG } = await import("@/components/checkout/inlineWatchdog");
 const { LEFT_MIN_MS, SLOW_AFTER_MS, STUCK_AFTER_MS } = await import("@/components/checkout/paymentHealth");
@@ -47,8 +48,7 @@ const { LABELS } = await import("@/components/checkout/i18n");
 type ViewProps = ComponentProps<typeof CheckoutView>;
 const page = () =>
   h(CheckoutView, {
-    theme: { ...defaultTheme("Boutique"), language: "fr" as const },
-    layout: defaultCheckoutLayout(),
+    copy: checkoutCopy({ ...defaultTheme("Boutique"), language: "fr" as const }, defaultCheckoutLayout()),
     currency: "EUR",
     lines: SAMPLE_LINES.map((l) => ({ ...l, requiresShipping: false })),
     rates: [{ id: "r1", name: "Colissimo", deliveryTime: null, countries: ["FR"], priceCents: 490, freeOverCents: null, active: true, kind: "standard" } as ViewProps["rates"][number]],

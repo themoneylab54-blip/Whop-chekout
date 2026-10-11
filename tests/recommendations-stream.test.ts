@@ -17,6 +17,7 @@ vi.mock("@whop/checkout/react", async () => {
 
 const { CheckoutView } = await import("@/components/checkout/CheckoutView");
 const { createBlock, defaultCheckoutLayout, defaultTheme } = await import("@/lib/layout");
+const { checkoutCopy } = await import("@/components/checkout/localize");
 const { SAMPLE_LINES } = await import("@/lib/sample");
 
 type ViewProps = ComponentProps<typeof CheckoutView>;
@@ -27,8 +28,7 @@ async function html(recommendations: ViewProps["recommendations"]) {
   (reco.props as { items: { variantId: string; title: string; imageUrl: string }[] }).items = [{ variantId: "gid://shopify/ProductVariant/99", title: "", imageUrl: "" }];
   layout.blocks.push(reco);
   const props: ViewProps = {
-    layout,
-    theme: { ...defaultTheme("Boutique"), language: "fr" as const },
+    copy: checkoutCopy({ ...defaultTheme("Boutique"), language: "fr" as const }, layout),
     currency: "EUR",
     lines: SAMPLE_LINES,
     rates: [{ id: "r1", name: "Colissimo", deliveryTime: null, countries: ["FR"], priceCents: 490, freeOverCents: null, active: true, kind: "standard" } as ViewProps["rates"][number]],

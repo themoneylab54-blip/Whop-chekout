@@ -5,7 +5,7 @@ import { Check, ChevronDown, CreditCard, ExternalLink, Gift, Home, LifeBuoy, Mai
 import { FIXED_THANK_YOU_BLOCKS, createBlock, dedupeSingletons, isFixedThankYou, upsellSellable, type Block, type BlockOf, type Layout, type OfferArm, type Theme } from "@/lib/layout";
 import { formatMoney, visibleProperties, type CartLine } from "@/lib/pricing";
 import { ContentBlock, focusAfterDecline, isEmptyInLive, offerAwaitingAnswer, StyledBlock, type ContentContext } from "./blocks";
-import { cartProductsOf } from "@/lib/reviews-import";
+import { cartProductsOf } from "@/lib/reviews-order";
 import { Footer, LineThumb, StoreHeader, themeVars } from "./CheckoutView";
 import { countryName, labelsFor, localeOf, paymentMethodName, type Labels } from "./i18n";
 import { localizeDeliveryTime, localizeLayout, localizeTheme } from "./localize";
@@ -646,7 +646,7 @@ export function ThankYouView({ theme: themeProp, layout: layoutProp, data: initi
             </a>
           )}
           <div style={{ order: TAIL }}>
-            <Footer theme={theme} languageSwitcher={!!sessionId} />
+            <Footer theme={theme} languageLabel={sessionId ? L.language : undefined} />
           </div>
         </div>
       </main>

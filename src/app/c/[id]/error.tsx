@@ -2,7 +2,8 @@
 
 import { useEffect, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
-import { labelsFor, pickLang } from "@/components/checkout/i18n";
+import { pickLang } from "@/components/checkout/i18n-core";
+import { ERROR_SCREEN_TEXTS } from "@/components/checkout/errorScreenTexts";
 import { StatusPage, statusPrimaryCls, statusSecondaryCls } from "@/components/checkout/StatusPage";
 import { HtmlLang } from "@/components/checkout/HtmlLang";
 import { reportHealth } from "@/components/checkout/paymentHealth";
@@ -31,7 +32,8 @@ export default function CheckoutError({ error, reset }: { error: Error & { diges
     },
     () => null,
   );
-  const L = labelsFor(lang);
+  // Its own four texts (the checkout's texts in every language stay off the buyer's page).
+  const L = ERROR_SCREEN_TEXTS[lang];
 
   useEffect(() => {
     console.error(error);

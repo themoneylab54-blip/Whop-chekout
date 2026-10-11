@@ -2,7 +2,7 @@
 
 import { useEffect, useId, useRef, useState } from "react";
 import { Check, KeyRound } from "lucide-react";
-import type { Labels } from "./i18n";
+import type { CheckoutLabels } from "./i18n";
 
 export type CodeBuyer = {
   email: string;
@@ -24,7 +24,7 @@ export function ReturningBuyerCode({
 }: {
   sessionId: string;
   email: string;
-  L: Labels;
+  L: CheckoutLabels;
   inputCls: string;
   onFilled: (buyer: CodeBuyer) => void;
 }) {

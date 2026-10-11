@@ -1,0 +1,48 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`the checkout's texts, frozen > every table, in every language 1`] = `
+{
+  "de": {
+    "blockDefaults": "81 a55959caf0636ac02ec9c54ffb70b4e33f6fa77efb3ff9bf35868c8a73693f9a",
+    "delays": "2–3 Werktage | 24 h | 3–5 Tage | Livraison en 48 h | 1 Woche | Sous 10 jours ouvrés",
+    "formulas": "53 4d85070ca2146d3ae8220c683d0d5eb7521321d03dc9979afe782ae9205bad57",
+    "frenchDefaultsIn": "7bab4322c01f870c354a243d2eb16811acdf514dd04c27036211905050572368",
+    "texts": "245 28393cc44bf19091c7ceed2db012f88c6fb80c700eb4053b8e89dd18c18507b3",
+  },
+  "en": {
+    "blockDefaults": "81 ab6010e2b40441f0495b6c69801d0e7801936c00a816cddaecf1587d90f392ac",
+    "delays": "2–3 business days | 24 h | 3–5 days | Livraison en 48 h | 1 week | Sous 10 jours ouvrés",
+    "formulas": "53 6fc5cccd6f71457be5ad7f1187ed567e22714bf48c4ce38dd15bd92552baab46",
+    "frenchDefaultsIn": "3751bd1f34c99a5946869908886f66668f3de7430d490eabea8ae6636458d4a7",
+    "texts": "245 403309c4b15822c9b4ac7b316cbbc2c72c97157f62fc861988f3e73d18277be0",
+  },
+  "es": {
+    "blockDefaults": "81 b7abe7302640939be3fb72ddf021a60a20a35a7d546e44dd87023b7d1a03f3ee",
+    "delays": "2–3 días hábiles | 24 h | 3–5 días | Livraison en 48 h | 1 semana | Sous 10 jours ouvrés",
+    "formulas": "53 c9fddbcbc224358f3ab0d87a779159215d80555c093163e4a39c41737871457b",
+    "frenchDefaultsIn": "5e8f1bda1eac18076d6aef0d3578f75ff5c3f8b4f3c00219779c0b9123ee30dc",
+    "texts": "245 524937d5faf579fd9ed65273495d315e1f9242cb67704e9a756e7cc60c277ad8",
+  },
+  "fr": {
+    "blockDefaults": "81 8f5ca800d0e8c2383bbb8c4a58aee81f96e24f529eec8a89c19d4f66134cb11a",
+    "delays": "2 à 3 jours ouvrés | 24 h | 3 à 5 jours | Livraison en 48 h | 1 semaine | Sous 10 jours ouvrés",
+    "formulas": "53 7cec3bceec8e03b5dd714694df84f084c90fb6a70350449bb905b14e9473a815",
+    "frenchDefaultsIn": "ce78cd64c5f6fc71a23df3298b4dbc21123ad9db9ef3027b1c48281de9302e8d",
+    "texts": "245 d9b3f1d9327be49ee4474f203bee80919ccb20286a91ab23e732150a675fd33e",
+  },
+  "it": {
+    "blockDefaults": "81 804919912da38d75fc56dfb551f2b4364b7afde3e773fec7561d62e90e2dfdd1",
+    "delays": "2–3 giorni lavorativi | 24 h | 3–5 giorni | Livraison en 48 h | 1 settimana | Sous 10 jours ouvrés",
+    "formulas": "53 138b5d217827ec2ce5a451fbfbd7cf2ea8cd6aa5d95ced526d3c34beb72da615",
+    "frenchDefaultsIn": "c7828699cd56636f86dd6c5159ce0af9aadadf35e968da6edbc1c789f3523712",
+    "texts": "245 4c8b0dd1c54f03a5e0cd4a977d99a371969dbbd993b31a7e871fa319c8845124",
+  },
+  "nl": {
+    "blockDefaults": "81 2a79a60d77c30ce392d5682e3fb9045498d7e5cf15b6669998a59eda57b3d60e",
+    "delays": "2–3 werkdagen | 24 h | 3–5 dagen | Livraison en 48 h | 1 week | Sous 10 jours ouvrés",
+    "formulas": "53 c298f510c4cb6cadcf46d15bc961ae29346a606d8cfe67e3fd5b4d2982eed0e4",
+    "frenchDefaultsIn": "2861f68542b3a1d73f28b8445c513257092311700ae7283f65b8b8c67cd019ee",
+    "texts": "245 4c09e9933f27478c3480312b8aa903c1cd902b6c814e1b478d206fa5156e57c5",
+  },
+}
+`;

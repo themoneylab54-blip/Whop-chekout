@@ -3,7 +3,7 @@
 import { useId, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Globe } from "lucide-react";
-import { LANG_COOKIE, LANGS, isLang, type Lang } from "./i18n";
+import { LANG_COOKIE, LANGS, isLang, type Lang } from "./i18n-core";
 
 /**
  * Compact language picker in the checkout footer. The choice is remembered for this

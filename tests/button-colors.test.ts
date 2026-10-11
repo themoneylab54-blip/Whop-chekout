@@ -17,6 +17,7 @@ vi.mock("@whop/checkout/react", () => ({
 }));
 
 const { themeSchema, loadTheme, defaultTheme, createBlock, defaultCheckoutLayout } = await import("@/lib/layout");
+const { checkoutCopy } = await import("@/components/checkout/localize");
 const { buttonVars, payButtonColors, otherButtonColors, suggestTextColor, buttonContrast } = await import("@/lib/button-colors");
 const { contrastFailures, themeContrastChecks } = await import("@/lib/contrast");
 const { CheckoutView, themeVars } = await import("@/components/checkout/CheckoutView");
@@ -127,8 +128,7 @@ describe("rendered markup: pay vs other buttons", () => {
 
   it("the checkout page: vars on the root; Pay with --pay-*, « Appliquer » with --btn2-*", () => {
     const props: ComponentProps<typeof CheckoutView> = {
-      theme: theme({ payButtonColor: "#16a34a", buttonColor: "#2563eb", secondaryButtonStyle: "solid" }),
-      layout: defaultCheckoutLayout(),
+      copy: checkoutCopy(theme({ payButtonColor: "#16a34a", buttonColor: "#2563eb", secondaryButtonStyle: "solid" }), defaultCheckoutLayout()),
       currency: "EUR",
       lines: SAMPLE_LINES,
       rates: [],

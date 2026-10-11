@@ -21,6 +21,7 @@ vi.mock("@/components/checkout/Payment", async (orig) => ({ ...(await orig<typeo
 const { CheckoutView } = await import("@/components/checkout/CheckoutView");
 const { ThankYouView } = await import("@/components/checkout/ThankYouView");
 const { defaultCheckoutLayout, defaultThankYouLayout, defaultTheme } = await import("@/lib/layout");
+const { checkoutCopy } = await import("@/components/checkout/localize");
 const { SAMPLE_LINES } = await import("@/lib/sample");
 const { LABELS } = await import("@/components/checkout/i18n");
 
@@ -40,8 +41,7 @@ describe("switch notice at prepare", () => {
       ),
     );
     const props: ComponentProps<typeof CheckoutView> = {
-      theme: { ...defaultTheme("Boutique"), language: "fr" },
-      layout: defaultCheckoutLayout(),
+      copy: checkoutCopy({ ...defaultTheme("Boutique"), language: "fr" }, defaultCheckoutLayout()),
       currency: "EUR",
       lines: SAMPLE_LINES,
       rates: [],

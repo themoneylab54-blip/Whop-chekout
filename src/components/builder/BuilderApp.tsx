@@ -133,7 +133,7 @@ import { ButtonColorControls } from "./ButtonColors";
 import { CanvasOverlays, type DropHint, type InlineEditing } from "./CanvasOverlays";
 import { applyTemplateTheme, blocksHiddenBy, blocksKeptAside, blocksShownBy, CHECKOUT_TEMPLATES, isCurrentTemplate, matchingCheckout, matchingThankYou, previewAfterPopover, TEMPLATE_CATEGORIES, THANK_YOU_TEMPLATES, type Template, type TemplateCategory } from "./templates";
 import { TranslationsEditor, untranslatedCount } from "./Translations";
-import { emptyTextDefault } from "@/components/checkout/localize";
+import { checkoutCopy, emptyTextDefault } from "@/components/checkout/localize";
 import { readableOn } from "@/lib/contrast";
 import { EmptyState, Panel, PanelHeading, RING, Tip, useConfirm, useOutsideClick, useRelativeTime } from "./ui";
 import { BlockThumb, TemplateThumb } from "./thumbs";
@@ -1141,11 +1141,13 @@ export function BuilderApp(props: {
   const fonts = [fontHref(shownTheme.font), shownTheme.headingFont !== "same" ? fontHref(shownTheme.headingFont) : null].filter(Boolean) as string[];
   const shownLayout = templateLook?.layout ?? layout;
   const previewTheme = useMemo(() => (translatedPreview ? { ...shownTheme, language: previewLang } : shownTheme), [shownTheme, previewLang, translatedPreview]);
+  // The checkout canvas in the previewed language, as the checkout page gets it from the server (the
+  // thank-you page puts itself in its language).
+  const checkoutPreview = useMemo(() => (page === "checkout" ? checkoutCopy(previewTheme, shownLayout) : null), [page, previewTheme, shownLayout]);
   const preview =
-    page === "checkout" ? (
+    checkoutPreview ? (
       <CheckoutView
-        theme={previewTheme}
-        layout={shownLayout}
+        copy={checkoutPreview}
         currency={props.currency}
         lines={props.sampleLines}
         rates={props.rates}

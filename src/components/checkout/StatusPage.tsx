@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { Lang } from "./i18n";
+import type { Lang } from "./i18n-core";
 
 /**
  * Neutral full-page message for checkout links that can't be shown (unknown or

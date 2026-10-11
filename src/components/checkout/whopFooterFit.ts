@@ -1,4 +1,4 @@
-import type { Lang } from "./i18n";
+import type { Lang } from "./i18n-core";
 
 /*
  * Whop's card form ends with its own footer, « Propulsé par Whop | Conditions | Confidentialité ».

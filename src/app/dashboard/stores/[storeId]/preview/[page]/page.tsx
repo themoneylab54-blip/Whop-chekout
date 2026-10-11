@@ -6,6 +6,7 @@ import { themeFontHrefs } from "@/lib/layout";
 import { draftDesign, hasDraft } from "@/lib/design";
 import { previewLines, previewThankYou } from "../../builder/sample";
 import { CheckoutView } from "@/components/checkout/CheckoutView";
+import { checkoutCopy } from "@/components/checkout/localize";
 import { ThankYouView } from "@/components/checkout/ThankYouView";
 import { canReadShopifyDiscounts } from "@/lib/shopify-discounts";
 
@@ -46,8 +47,7 @@ export default async function PreviewPage({ params }: { params: Promise<{ storeI
       <div>
         {page === "checkout" ? (
           <CheckoutView
-            theme={theme}
-            layout={design.checkoutLayout}
+            copy={checkoutCopy(theme, design.checkoutLayout)}
             currency={store.shopCurrency}
             lines={sample.lines}
             rates={store.shippingRates}

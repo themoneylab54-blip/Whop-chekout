@@ -1,5 +1,8 @@
 import type { Block, Layout, Theme } from "@/lib/layout";
-import { LABELS, type Lang } from "./i18n";
+import type { CheckoutCopy } from "./checkoutCopy";
+import { LABELS, checkoutTextFor, type Lang } from "./i18n";
+import { localizeDeliveryTime } from "./deliveryTime";
+import { SAMPLE_DEFAULTS } from "./sampleDefaults";
 
 /**
  * Buyer-language text of the checkout / thank-you blocks.
@@ -14,12 +17,10 @@ import { LABELS, type Lang } from "./i18n";
 /** Shipped French copy of the block defaults, and its translation in every checkout language. */
 export const DEFAULT_TEXTS = {
   fr: {
+    ...SAMPLE_DEFAULTS.fr,
     securePayment: "Paiement sécurisé",
     encryptedData: "Données chiffrées",
     orderTracking: "Suivi de commande",
-    textHeading: "Titre",
-    textBody: "Votre texte ici.",
-    testimonialQuote: "Livraison rapide et produit conforme, je recommande.",
     testimonialAuthor: "Client vérifié",
     ratingLabel: "note moyenne de nos clients",
     moneyBack30: "Satisfait ou remboursé 30 jours",
@@ -32,7 +33,6 @@ export const DEFAULT_TEXTS = {
     faqA2: "Oui, vous avez 30 jours pour changer d'avis.",
     freeShipping: "Livraison offerte",
     paymentMethods: "Moyens de paiement acceptés",
-    announcement: "Livraison offerte dès 50 € d'achat",
     countdown: "L'offre se termine dans :",
     countdownOffer: "Offre spéciale : se termine dans {timer}",
     countdownCart: "Votre panier est réservé pendant {timer}",
@@ -47,18 +47,13 @@ export const DEFAULT_TEXTS = {
     freeShippingBar: "Plus que {amount} pour profiter de la livraison offerte",
     freeShippingDone: "Bravo, la livraison est offerte !",
     reviewsTitle: "Ce que disent nos clients",
-    review1: "Commande reçue en 3 jours, qualité au top. Je recommande !",
-    review2: "Service client réactif et produit conforme aux photos.",
     comparisonTitle: "Pourquoi nous choisir",
     us: "Nous",
     them: "Les autres",
     support7: "Service client 7j/7",
     logosTitle: "Ils parlent de nous",
-    statCustomersValue: "+10 000",
     statCustomers: "clients satisfaits",
-    statRatingValue: "4,8/5",
     statRating: "note moyenne",
-    statDispatch: "expédition",
     fastDelivery: "Livraison rapide",
     shipped48: "Expédiée sous 48 h",
     support7Short: "Support 7j/7",
@@ -99,12 +94,10 @@ export const DEFAULT_TEXTS = {
     customerService: "Service client",
   },
   en: {
+    ...SAMPLE_DEFAULTS.en,
     securePayment: "Secure payment",
     encryptedData: "Encrypted data",
     orderTracking: "Order tracking",
-    textHeading: "Title",
-    textBody: "Your text here.",
-    testimonialQuote: "Fast delivery and the product is exactly as described. I recommend it.",
     testimonialAuthor: "Verified customer",
     ratingLabel: "average rating from our customers",
     moneyBack30: "30-day money-back guarantee",
@@ -117,7 +110,6 @@ export const DEFAULT_TEXTS = {
     faqA2: "Yes, you have 30 days to change your mind.",
     freeShipping: "Free shipping",
     paymentMethods: "Accepted payment methods",
-    announcement: "Free shipping on orders over €50",
     countdown: "Offer ends in:",
     countdownOffer: "Special offer: ends in {timer}",
     countdownCart: "Your cart is reserved for {timer}",
@@ -132,18 +124,13 @@ export const DEFAULT_TEXTS = {
     freeShippingBar: "Only {amount} more for free shipping",
     freeShippingDone: "Congrats, shipping is free!",
     reviewsTitle: "What our customers say",
-    review1: "Order received in 3 days, top quality. I recommend it!",
-    review2: "Responsive customer service and the product matches the photos.",
     comparisonTitle: "Why choose us",
     us: "Us",
     them: "Others",
     support7: "Customer service 7 days a week",
     logosTitle: "As seen in",
-    statCustomersValue: "10,000+",
     statCustomers: "happy customers",
-    statRatingValue: "4.8/5",
     statRating: "average rating",
-    statDispatch: "dispatch",
     fastDelivery: "Fast delivery",
     shipped48: "Shipped within 48 h",
     support7Short: "Support 7 days a week",
@@ -184,12 +171,10 @@ export const DEFAULT_TEXTS = {
     customerService: "Customer service",
   },
   de: {
+    ...SAMPLE_DEFAULTS.de,
     securePayment: "Sichere Zahlung",
     encryptedData: "Verschlüsselte Daten",
     orderTracking: "Sendungsverfolgung",
-    textHeading: "Titel",
-    textBody: "Ihr Text hier.",
-    testimonialQuote: "Schnelle Lieferung und Produkt wie beschrieben. Sehr empfehlenswert.",
     testimonialAuthor: "Verifizierter Kunde",
     ratingLabel: "Durchschnittsbewertung unserer Kunden",
     moneyBack30: "30 Tage Geld-zurück-Garantie",
@@ -202,7 +187,6 @@ export const DEFAULT_TEXTS = {
     faqA2: "Ja, Sie haben 30 Tage Bedenkzeit.",
     freeShipping: "Kostenloser Versand",
     paymentMethods: "Akzeptierte Zahlungsarten",
-    announcement: "Kostenloser Versand ab 50 € Bestellwert",
     countdown: "Das Angebot endet in:",
     countdownOffer: "Sonderangebot: endet in {timer}",
     countdownCart: "Ihr Warenkorb ist für {timer} reserviert",
@@ -217,18 +201,13 @@ export const DEFAULT_TEXTS = {
     freeShippingBar: "Nur noch {amount} bis zum kostenlosen Versand",
     freeShippingDone: "Glückwunsch, der Versand ist kostenlos!",
     reviewsTitle: "Das sagen unsere Kunden",
-    review1: "Bestellung in 3 Tagen erhalten, top Qualität. Sehr empfehlenswert!",
-    review2: "Reaktionsschneller Kundenservice und das Produkt entspricht den Fotos.",
     comparisonTitle: "Warum Sie uns wählen sollten",
     us: "Wir",
     them: "Andere",
     support7: "Kundenservice 7 Tage die Woche",
     logosTitle: "Bekannt aus",
-    statCustomersValue: "10.000+",
     statCustomers: "zufriedene Kunden",
-    statRatingValue: "4,8/5",
     statRating: "Durchschnittsbewertung",
-    statDispatch: "Versand",
     fastDelivery: "Schnelle Lieferung",
     shipped48: "Versand innerhalb von 48 Std.",
     support7Short: "Support 7 Tage die Woche",
@@ -269,12 +248,10 @@ export const DEFAULT_TEXTS = {
     customerService: "Kundenservice",
   },
   es: {
+    ...SAMPLE_DEFAULTS.es,
     securePayment: "Pago seguro",
     encryptedData: "Datos cifrados",
     orderTracking: "Seguimiento del pedido",
-    textHeading: "Título",
-    textBody: "Tu texto aquí.",
-    testimonialQuote: "Envío rápido y producto tal como se describe. Lo recomiendo.",
     testimonialAuthor: "Cliente verificado",
     ratingLabel: "valoración media de nuestros clientes",
     moneyBack30: "Satisfecho o reembolsado 30 días",
@@ -287,7 +264,6 @@ export const DEFAULT_TEXTS = {
     faqA2: "Sí, tienes 30 días para cambiar de opinión.",
     freeShipping: "Envío gratis",
     paymentMethods: "Métodos de pago aceptados",
-    announcement: "Envío gratis a partir de 50 € de compra",
     countdown: "La oferta termina en:",
     countdownOffer: "Oferta especial: termina en {timer}",
     countdownCart: "Tu carrito está reservado durante {timer}",
@@ -302,18 +278,13 @@ export const DEFAULT_TEXTS = {
     freeShippingBar: "Solo te faltan {amount} para el envío gratis",
     freeShippingDone: "¡Enhorabuena, el envío es gratis!",
     reviewsTitle: "Lo que dicen nuestros clientes",
-    review1: "Pedido recibido en 3 días, calidad excelente. ¡Lo recomiendo!",
-    review2: "Atención al cliente rápida y producto igual que en las fotos.",
     comparisonTitle: "Por qué elegirnos",
     us: "Nosotros",
     them: "Los demás",
     support7: "Atención al cliente 7 días a la semana",
     logosTitle: "Hablan de nosotros",
-    statCustomersValue: "+10.000",
     statCustomers: "clientes satisfechos",
-    statRatingValue: "4,8/5",
     statRating: "valoración media",
-    statDispatch: "envío",
     fastDelivery: "Entrega rápida",
     shipped48: "Enviado en 48 h",
     support7Short: "Soporte 7 días a la semana",
@@ -354,12 +325,10 @@ export const DEFAULT_TEXTS = {
     customerService: "Atención al cliente",
   },
   it: {
+    ...SAMPLE_DEFAULTS.it,
     securePayment: "Pagamento sicuro",
     encryptedData: "Dati crittografati",
     orderTracking: "Tracciamento dell'ordine",
-    textHeading: "Titolo",
-    textBody: "Il tuo testo qui.",
-    testimonialQuote: "Consegna rapida e prodotto conforme alla descrizione. Lo consiglio.",
     testimonialAuthor: "Cliente verificato",
     ratingLabel: "valutazione media dei nostri clienti",
     moneyBack30: "Soddisfatti o rimborsati 30 giorni",
@@ -372,7 +341,6 @@ export const DEFAULT_TEXTS = {
     faqA2: "Sì, hai 30 giorni per cambiare idea.",
     freeShipping: "Spedizione gratuita",
     paymentMethods: "Metodi di pagamento accettati",
-    announcement: "Spedizione gratuita da 50 € di spesa",
     countdown: "L'offerta termina tra:",
     countdownOffer: "Offerta speciale: termina tra {timer}",
     countdownCart: "Il tuo carrello è riservato per {timer}",
@@ -387,18 +355,13 @@ export const DEFAULT_TEXTS = {
     freeShippingBar: "Ancora {amount} per la spedizione gratuita",
     freeShippingDone: "Complimenti, la spedizione è gratuita!",
     reviewsTitle: "Cosa dicono i nostri clienti",
-    review1: "Ordine ricevuto in 3 giorni, qualità top. Lo consiglio!",
-    review2: "Servizio clienti reattivo e prodotto conforme alle foto.",
     comparisonTitle: "Perché sceglierci",
     us: "Noi",
     them: "Gli altri",
     support7: "Servizio clienti 7 giorni su 7",
     logosTitle: "Parlano di noi",
-    statCustomersValue: "+10.000",
     statCustomers: "clienti soddisfatti",
-    statRatingValue: "4,8/5",
     statRating: "valutazione media",
-    statDispatch: "spedizione",
     fastDelivery: "Consegna rapida",
     shipped48: "Spedito entro 48 ore",
     support7Short: "Assistenza 7 giorni su 7",
@@ -439,12 +402,10 @@ export const DEFAULT_TEXTS = {
     customerService: "Servizio clienti",
   },
   nl: {
+    ...SAMPLE_DEFAULTS.nl,
     securePayment: "Veilig betalen",
     encryptedData: "Versleutelde gegevens",
     orderTracking: "Bestelling volgen",
-    textHeading: "Titel",
-    textBody: "Je tekst hier.",
-    testimonialQuote: "Snelle levering en het product klopt precies. Een aanrader.",
     testimonialAuthor: "Geverifieerde klant",
     ratingLabel: "gemiddelde beoordeling van onze klanten",
     moneyBack30: "30 dagen niet goed, geld terug",
@@ -457,7 +418,6 @@ export const DEFAULT_TEXTS = {
     faqA2: "Ja, je hebt 30 dagen bedenktijd.",
     freeShipping: "Gratis verzending",
     paymentMethods: "Geaccepteerde betaalmethoden",
-    announcement: "Gratis verzending vanaf € 50",
     countdown: "De aanbieding eindigt over:",
     countdownOffer: "Speciale aanbieding: eindigt over {timer}",
     countdownCart: "Je winkelwagen is gereserveerd voor {timer}",
@@ -472,18 +432,13 @@ export const DEFAULT_TEXTS = {
     freeShippingBar: "Nog {amount} tot gratis verzending",
     freeShippingDone: "Gefeliciteerd, de verzending is gratis!",
     reviewsTitle: "Wat onze klanten zeggen",
-    review1: "Bestelling binnen 3 dagen ontvangen, topkwaliteit. Een aanrader!",
-    review2: "Snelle klantenservice en het product is zoals op de foto's.",
     comparisonTitle: "Waarom voor ons kiezen",
     us: "Wij",
     them: "Anderen",
     support7: "Klantenservice 7 dagen per week",
     logosTitle: "Bekend van",
-    statCustomersValue: "10.000+",
     statCustomers: "tevreden klanten",
-    statRatingValue: "4,8/5",
     statRating: "gemiddelde beoordeling",
-    statDispatch: "verzending",
     fastDelivery: "Snelle levering",
     shipped48: "Verzonden binnen 48 uur",
     support7Short: "Support 7 dagen per week",
@@ -779,36 +734,32 @@ export function localizeTheme<T extends Pick<Theme, "vatNote" | "language">>(the
   return vatNote === theme.vatNote ? theme : { ...theme, vatNote };
 }
 
+/**
+ * CheckoutView's copy in the theme's language (see CheckoutCopy): the theme and the layout in it, the
+ * blocks without their translations (in that language already: the browser never reads them), and the
+ * checkout page's plain texts.
+ */
+export function checkoutCopy(theme: Theme, layout: Layout): CheckoutCopy {
+  const localized = localizeLayout(layout, theme.language);
+  const blocks = localized.blocks.map((b) => {
+    if (b.i18n === undefined) return b;
+    const { i18n: _translations, ...rest } = b;
+    void _translations;
+    return rest as Block;
+  });
+  return {
+    theme: localizeTheme(theme),
+    layout: blocks.every((b, i) => b === localized.blocks[i]) ? localized : { ...localized, blocks },
+    labelText: checkoutTextFor(theme.language),
+  } as CheckoutCopy;
+}
+
 /* ------------------------------------------------------------------ */
 /* Shipping delays typed in French ("2 à 3 jours ouvrés")              */
 /* ------------------------------------------------------------------ */
 
-const UNITS: Record<Exclude<Lang, "fr">, Record<"business" | "days" | "weeks", [string, string]>> = {
-  en: { business: ["business day", "business days"], days: ["day", "days"], weeks: ["week", "weeks"] },
-  de: { business: ["Werktag", "Werktage"], days: ["Tag", "Tage"], weeks: ["Woche", "Wochen"] },
-  es: { business: ["día hábil", "días hábiles"], days: ["día", "días"], weeks: ["semana", "semanas"] },
-  it: { business: ["giorno lavorativo", "giorni lavorativi"], days: ["giorno", "giorni"], weeks: ["settimana", "settimane"] },
-  nl: { business: ["werkdag", "werkdagen"], days: ["dag", "dagen"], weeks: ["week", "weken"] },
-};
-
-const FR_DELAY = /^(\d{1,3})(?:\s*(?:à|a|-|–|—)\s*(\d{1,3}))?\s*(jours?\s+ouvr(?:é|e|able)s?|jours?|j|semaines?|h|heures?)$/i;
-
-/**
- * "2 à 3 jours ouvrés" → "2–3 business days" (EN), "2–3 Werktage" (DE)… Texts that are not
- * a plain French delay come back unchanged, and French stays as typed.
- */
-export function localizeDeliveryTime(text: string, lang: Lang): string {
-  if (lang === "fr" || !text) return text;
-  const m = FR_DELAY.exec(text.trim());
-  if (!m) return text;
-  const [, from, to, unitRaw] = m;
-  const range = to && to !== from ? `${from}–${to}` : from;
-  const unit = unitRaw.toLowerCase();
-  if (unit === "h" || unit.startsWith("heure")) return `${range} h`;
-  const kind = unit.startsWith("semaine") ? "weeks" : /ouvr/.test(unit) ? "business" : "days";
-  const [one, many] = UNITS[lang][kind];
-  return `${range} ${range === "1" ? one : many}`;
-}
+// localizeDeliveryTime lives in deliveryTime (the payment page needs it alone): re-exported.
+export { localizeDeliveryTime };
 
 /* ------------------------------------------------------------------ */
 /* Built-in wording of empty fields                                    */

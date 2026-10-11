@@ -1,78 +1,20 @@
-/**
- * What the average shown above imported reviews covers: true = every published review (full
- * Judge.me import, store-wide Shopify metafields), "file" = every review of the imported CSV,
- * { recent } = only the N most recent reviews read (partial Judge.me import; N pre-formatted),
- * "store" = every published review of the store (Shopify metafields of the active products),
- * "store-partial" = part of them (Shopify read capped at 2 000 products or cut short).
+import { LABEL_FNS, type LabelFns } from "./i18n-fns";
+import type { Lang } from "./i18n-core";
+import { ERROR_SCREEN_TEXTS } from "./errorScreenTexts";
+
+/*
+ * The checkout's texts in its six languages: the plain texts (LABEL_TEXTS) and the formulas (LABEL_FNS,
+ * i18n-fns), with the language helpers (i18n-core) re-exported. The server, the dashboard and the
+ * thank-you page import this module; the checkout page never does (it gets its own plain texts in the
+ * buyer's language from the server, CheckoutText, and puts them together with labelsOf).
  */
-export type ReviewsNoteSummary = boolean | "file" | "store" | "store-partial" | { recent: string };
 
-/** "The average rating covers …" sentence, one per language (under the reviews block). */
-const AVERAGE_SCOPE = {
-  fr: (s: Exclude<ReviewsNoteSummary, false>) =>
-    s === "file"
-      ? "La note moyenne porte sur tous les avis du fichier importé."
-      : s === "store"
-        ? "La note moyenne porte sur tous les avis publiés de la boutique."
-        : s === "store-partial"
-          ? "La note moyenne porte sur une partie des avis publiés de la boutique."
-          : typeof s === "object"
-            ? `La note moyenne porte sur les ${s.recent} avis les plus récents.`
-            : "La note moyenne porte sur tous les avis publiés.",
-  en: (s: Exclude<ReviewsNoteSummary, false>) =>
-    s === "file"
-      ? "The average rating covers all reviews in the imported file."
-      : s === "store"
-        ? "The average rating covers all of the store's published reviews."
-        : s === "store-partial"
-          ? "The average rating covers part of the store's published reviews."
-          : typeof s === "object"
-            ? `The average rating covers the ${s.recent} most recent reviews.`
-            : "The average rating covers all published reviews.",
-  de: (s: Exclude<ReviewsNoteSummary, false>) =>
-    s === "file"
-      ? "Die Durchschnittsbewertung bezieht sich auf alle Bewertungen der importierten Datei."
-      : s === "store"
-        ? "Die Durchschnittsbewertung bezieht sich auf alle veröffentlichten Bewertungen des Shops."
-        : s === "store-partial"
-          ? "Die Durchschnittsbewertung bezieht sich auf einen Teil der veröffentlichten Bewertungen des Shops."
-          : typeof s === "object"
-            ? `Die Durchschnittsbewertung bezieht sich auf die ${s.recent} neuesten Bewertungen.`
-            : "Die Durchschnittsbewertung bezieht sich auf alle veröffentlichten Bewertungen.",
-  es: (s: Exclude<ReviewsNoteSummary, false>) =>
-    s === "file"
-      ? "La valoración media se basa en todas las opiniones del archivo importado."
-      : s === "store"
-        ? "La valoración media se basa en todas las opiniones publicadas de la tienda."
-        : s === "store-partial"
-          ? "La valoración media se basa en una parte de las opiniones publicadas de la tienda."
-          : typeof s === "object"
-            ? `La valoración media se basa en las ${s.recent} opiniones más recientes.`
-            : "La valoración media se basa en todas las opiniones publicadas.",
-  it: (s: Exclude<ReviewsNoteSummary, false>) =>
-    s === "file"
-      ? "La valutazione media si basa su tutte le recensioni del file importato."
-      : s === "store"
-        ? "La valutazione media si basa su tutte le recensioni pubblicate del negozio."
-        : s === "store-partial"
-          ? "La valutazione media si basa su una parte delle recensioni pubblicate del negozio."
-          : typeof s === "object"
-            ? `La valutazione media si basa sulle ${s.recent} recensioni più recenti.`
-            : "La valutazione media si basa su tutte le recensioni pubblicate.",
-  nl: (s: Exclude<ReviewsNoteSummary, false>) =>
-    s === "file"
-      ? "De gemiddelde score is gebaseerd op alle reviews uit het geïmporteerde bestand."
-      : s === "store"
-        ? "De gemiddelde score is gebaseerd op alle gepubliceerde reviews van de winkel."
-        : s === "store-partial"
-          ? "De gemiddelde score is gebaseerd op een deel van de gepubliceerde reviews van de winkel."
-          : typeof s === "object"
-            ? `De gemiddelde score is gebaseerd op de ${s.recent} meest recente reviews.`
-            : "De gemiddelde score is gebaseerd op alle gepubliceerde reviews.",
-};
+export * from "./i18n-core";
 
-export const LABELS = {
+/** The plain texts of the checkout, per language (data: sent to the buyer's page for its language). */
+export const LABEL_TEXTS = {
   fr: {
+    ...ERROR_SCREEN_TEXTS.fr,
     contact: "Contact",
     email: "E-mail",
     marketing: "Recevoir nos offres et nouveautés par e-mail",
@@ -137,23 +79,19 @@ export const LABELS = {
     discountCode: "Code promo",
     apply: "Appliquer",
     remove: "Retirer",
-    removeCode: (code: string) => `Retirer le code ${code}`,
     subtotal: "Sous-total",
     discount: "Réduction",
     shipping: "Livraison",
     addonsTotal: "Options",
     total: "Total",
-    items: (n: number) => `${n} article${n > 1 ? "s" : ""}`,
     summary: "Récapitulatif",
     showSummary: "Afficher le récapitulatif",
     hideSummary: "Masquer le récapitulatif",
     endsIn: "Fin dans",
-    thankYou: (name: string) => (name ? `Merci, ${name} !` : "Merci !"),
     orderConfirmed: "Votre commande est confirmée.",
     orderProcessing: "Paiement reçu, confirmation de la commande en cours…",
     orderPaymentFailed: "Le paiement n'a pas abouti : votre commande n'est pas passée. Réessayez ou choisissez un autre moyen de paiement.",
     backToCheckout: "Revenir au paiement",
-    confirmationSent: (email: string) => `Confirmation envoyée à ${email}`,
     order: "Commande",
     shipTo: "Livraison à",
     continueShopping: "Continuer mes achats",
@@ -167,16 +105,13 @@ export const LABELS = {
       "Droit de rétractation : vous disposez de 14 jours à compter de la réception de votre commande pour nous la retourner, sans avoir à vous justifier.",
     /** Linked to the store's contact (hidden when there is none). */
     withdrawalContact: "Contactez-nous pour exercer ce droit.",
-    upsellAdded: (name: string) => `Ajouté ! Commande ${name} confirmée.`,
     upsellAddedPending: "Ajout en cours de confirmation…",
     upsellPendingTitle: "Confirmation de votre offre en cours…",
     upsellPendingText: "Merci de patienter quelques secondes, ne rechargez pas la page.",
     upsellFailedRetry: "Le paiement de l'offre n'a pas abouti : rien n'a été débité. Vous pouvez réessayer en toute sécurité.",
     upsellStillPending: "La confirmation prend plus de temps que prévu. Si l'offre a été débitée, elle sera ajoutée automatiquement à votre commande et vous recevrez un e-mail.",
     upsellNoCard: "Aucun nouveau paiement à saisir : votre moyen de paiement enregistré sera utilisé.",
-    upsellShopCurrency: (shop: string, paid: string) => `Débité en ${shop}, la devise de la boutique (votre commande a été payée en ${paid}).`,
     statementNote: "Le paiement apparaîtra sur votre relevé bancaire sous le nom de notre prestataire de paiement Whop.",
-    youSave: (amount: string) => `Vous économisez ${amount}`,
     testMode: "Mode test : paiement sandbox Whop, aucune somme réelle débitée.",
     error: "Une erreur est survenue. Réessayez.",
     stepOrdered: "Commande",
@@ -185,50 +120,27 @@ export const LABELS = {
     stepDone: "Confirmée",
     stepUpcoming: "À venir",
     video: "Vidéo",
-    totalUpdatedLive: (amount: string) => `Nouveau total : ${amount}`,
     checkoutTitle: "Paiement",
     thankYouTitle: "Commande confirmée",
-    completeFields: (f: string) => `Complétez : ${f}`,
     termsShort: "CGV",
     /** Pay button hint when the terms box is the only thing missing. */
     acceptTermsToContinue: "Acceptez les CGV pour continuer",
     invalidZip: "Code postal invalide",
     paymentLoading: "Chargement du paiement sécurisé…",
     paymentProcessing: "Traitement du paiement…",
-    retry: "Réessayer",
     shippingCalculated: "Calculé après saisie de l'adresse",
     goToPayment: "Continuer vers le paiement",
     verifiedPurchase: "Achat vérifié",
     prevReview: "Avis précédent",
     nextReview: "Avis suivant",
-    reviewN: (n: number) => `Avis ${n}`,
     reviewsCarousel: "carrousel d'avis",
     reviewSlide: "avis",
-    // `n`: the count as written in the buyer's locale; `count`: the number itself, for the
-    // plural rules of the other languages ("avis" is invariable).
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    reviewsCount: (n: string, count?: number) => `${n} avis`,
     reviewPhoto: "Photo du client",
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    reviewsSummary: (score: string, n: string, count?: number) => `Note moyenne : ${score} sur 5, ${n} avis`,
-    /** Screen-reader name of a star row: `n` as written in the buyer's locale, `count` for the plural. */
-    starsOutOf5: (n: string, count: number) => `${n} ${count >= 2 ? "étoiles" : "étoile"} sur 5`,
-    moreReviews: (n: number) => `Voir ${n} avis de plus`,
-    /** Under a reviews block showing imported reviews (EU Omnibus: where reviews come from). */
-    importedReviewsNote: (app: string | null, o: { mixed?: boolean; summary?: ReviewsNoteSummary } = {}) =>
-      `${o.mixed ? "Sélection d'avis, dont certains importés" : "Sélection d'avis importés"} de ${app ?? "l'application d'avis de la boutique"} ; « Achat vérifié » indique un achat confirmé par l'application.` +
-      (o.summary ? ` ${AVERAGE_SCOPE.fr(o.summary)}` : ""),
-    /** What the shown average covers, alone (reviews block without imported reviews). */
-    averageScope: AVERAGE_SCOPE.fr,
     daysShort: "j",
     estimatedDelivery: "Livraison estimée",
     orderNumberPending: "Numéro de commande en cours d'attribution…",
-    quantity: (n: number) => `Quantité : ${n}`,
     notFoundTitle: "Lien de paiement introuvable",
     notFoundText: "Ce lien de paiement est invalide ou a expiré. Retournez sur la boutique et relancez votre commande depuis le panier.",
-    errorTitle: "Un problème est survenu",
-    errorBody: "La page de paiement n'a pas pu se charger. Aucun paiement n'a été effectué.",
-    backToStore: "Retour à la boutique",
     securePayment: "Paiement sécurisé",
     reference: "Réf.",
     paymentUnavailable: "Le paiement est momentanément indisponible",
@@ -250,38 +162,16 @@ export const LABELS = {
     backToCart: "Retour au panier",
     addressHint: "Commencez à saisir votre adresse",
     fieldValid: "Valide",
-    addressSuggestions: (n: number) => `${n} adresse${n > 1 ? "s" : ""} suggérée${n > 1 ? "s" : ""} : flèches pour choisir, Entrée pour valider`,
-    qtyDecrease: (name: string) => `Diminuer la quantité de ${name}`,
-    qtyIncrease: (name: string) => `Augmenter la quantité de ${name}`,
-    qtyRemove: (name: string) => `Retirer ${name} du panier`,
-    qtyChanged: (name: string, n: number) => `${name} : quantité ${n}`,
-    qtyRemoved: (name: string) => `${name} retiré du panier`,
     qtyMax: "Quantité maximale atteinte",
     lockedLineEdit: "Modifiez ce lot depuis le panier",
     lockedLineQty: "Quantité fixée par le panier",
     qtyError: "La quantité n'a pas pu être modifiée. Réessayez.",
     automaticDiscountLost: "Le panier a changé : la remise automatique du panier Shopify ne s'applique plus.",
     cartPricesAdjusted: "Certains articles sont facturés au prix de la boutique, et non au prix affiché dans votre panier.",
-    cartCodeNotApplied: (code: string) => `Le code ${code} de votre panier ne s'applique pas ici.`,
     recoTitle: "Complétez votre commande",
     recoAdd: "Ajouter",
-    recoAddLabel: (name: string, price: string) => `Ajouter ${name} à la commande, ${price}`,
-    recoAdded: (name: string) => `${name} ajouté à la commande`,
     recoUnavailable: "Ce produit n'est plus disponible.",
     recoWas: "Au lieu de",
-    localEstimate: (amount: string, currency: string) => `Vous serez débité en ${currency} ; montant indicatif ≈ ${amount} (taux BCE, le montant final dépend de votre banque)`,
-    chargedIn: (amount: string, currency: string) => `Vous serez débité de ${amount} (prix en ${currency} converti au taux de référence BCE du jour)`,
-    volumeNudge: (n: number, pct: string) => (n === 1 ? `Plus qu'un article pour −${pct} %` : `Plus que ${n} articles pour −${pct} %`),
-    volumeAddOne: (name: string) => `Ajouter 1 ${name}`,
-    volumeApplied: (pct: string) => `Remise quantité −${pct} % appliquée`,
-    volumeRow: (pct: string) => `Remise quantité (−${pct} %)`,
-    dealAmountUnit: (amount: string) => `−${amount} par article`,
-    dealAmountBundle: (amount: string, n: number) => `−${amount} par lot de ${n}`,
-    dealPrice: (n: number, amount: string) => `${n} pour ${amount}`,
-    dealBxgy: (buy: number, free: number) => `${buy} acheté${buy > 1 ? "s" : ""}, ${free} offert${free > 1 ? "s" : ""}`,
-    volumeNudgeDeal: (n: number, deal: string) => (n === 1 ? `Plus qu'un article pour « ${deal} »` : `Plus que ${n} articles pour « ${deal} »`),
-    volumeAppliedDeal: (deal: string) => `Offre « ${deal} » appliquée`,
-    volumeRowDeal: (deal: string) => `Offre quantité (${deal})`,
     automaticDiscount: "Remise automatique",
     otpPrompt: "Déjà client ? Recevez un code par e-mail",
     otpSend: "Recevoir un code",
@@ -314,7 +204,6 @@ export const LABELS = {
     claimEmailRequired: "Saisissez l'e-mail utilisé pour la commande.",
     claimEmailInvalid: "Saisissez une adresse e-mail valide (ex. nom@exemple.fr).",
     claimEmailMismatch: "Cet e-mail ne correspond pas à celui de la commande.",
-    claimEmailHint: (masked: string) => `Commande passée avec ${masked} — confirmez cet e-mail.`,
     claimPhotoInvalid: "Le lien doit commencer par https://",
     claimPhotos: "Photos (facultatif)",
     claimPhotosHint: "Jusqu'à 3 photos du colis ou de l'article (JPEG, PNG, WebP ; compressées automatiquement avant l'envoi).",
@@ -324,9 +213,6 @@ export const LABELS = {
     claimPhotoType: "Ce fichier n'est pas une image (JPEG, PNG, WebP, HEIC).",
     claimPhotosAdd: "Ajouter des photos",
     claimPhotosAddMore: "Ajouter une photo",
-    claimPhotosCount: (n: number, max: number) => `${n}/${max} photo${n > 1 ? "s" : ""}`,
-    claimPhotoRemove: (i: number) => `Retirer la photo ${i}`,
-    claimPhotoPreview: (i: number) => `Photo ${i}`,
     claimAlreadyPending: "Un signalement est déjà en cours d'examen pour cette commande.",
     pickupTitle: "Point relais",
     pickupZip: "Code postal du point relais",
@@ -335,11 +221,9 @@ export const LABELS = {
     pickupEmpty: "Aucun point relais trouvé près de ce code postal. Essayez un code postal voisin.",
     pickupError: "Recherche des points relais impossible pour le moment. Réessayez.",
     pickupUnsupported: "Le retrait en point relais n'est pas proposé dans ce pays.",
-    pickupFound: (n: number) => `${n} point${n > 1 ? "s" : ""} relais trouvé${n > 1 ? "s" : ""}`,
     pickupList: "Points relais proches",
     pickupChoose: "Choisissez votre point relais",
     pickupField: "Point relais",
-    pickupDeliveredAt: (name: string) => `Livré chez ${name}`,
     pickupChange: "Modifier",
     pickupToday: "Aujourd'hui",
     pickupClosedToday: "Fermé aujourd'hui",
@@ -352,7 +236,6 @@ export const LABELS = {
     upsellNextOffer: "Une autre offre vous attend",
     upsellDeclined: "Offre refusée",
     shippingAddress: "Adresse de livraison",
-    emailSuggest: (email: string) => `Vouliez-vous dire ${email} ?`,
     errEmail: "Saisissez une adresse e-mail",
     errEmailInvalid: "Saisissez une adresse e-mail valide (ex. : nom@exemple.fr)",
     errCountry: "Sélectionnez un pays",
@@ -361,15 +244,12 @@ export const LABELS = {
     errAddress: "Saisissez une adresse",
     errZip: "Saisissez un code postal",
     errCity: "Saisissez une ville",
-    errZipFor: (country: string, example: string) => `Code postal invalide pour le pays choisi (${country}, ex. : ${example})`,
     trackOrder: "Suivre ma commande",
     needHelp: "Besoin d'aide ?",
     contactUs: "Contactez-nous",
-    offerValidFor: (min: number) => `Offre valable encore ${min} min`,
     language: "Langue",
     rememberMe: "Se souvenir de mes coordonnées sur cet appareil",
     rememberHint: "Enregistrées uniquement dans ce navigateur, jamais vos données de paiement.",
-    continueAs: (email: string) => `Continuer en tant que ${email}`,
     useSaved: "Utiliser mes coordonnées",
     notMe: "Ce n'est pas moi",
     forgetMe: "Oublier",
@@ -377,15 +257,11 @@ export const LABELS = {
     savedForgotten: "Coordonnées oubliées sur cet appareil.",
     savedRegion: "Coordonnées enregistrées sur cet appareil",
     giftFree: "Cadeau offert",
-    giftNudgeAmount: (amount: string, gift: string) => `Plus que ${amount} pour recevoir ${gift}`,
-    giftNudgeItems: (n: number, gift: string) => (n === 1 ? `Plus qu'un article pour recevoir ${gift}` : `Plus que ${n} articles pour recevoir ${gift}`),
-    giftEarned: (gift: string) => `${gift} offert avec votre commande`,
     protectionTitle: "Protection colis (perte, vol, casse)",
     protectionText: "Colis perdu, volé ou abîmé : renvoyé ou remboursé.",
     protectionRow: "Protection colis",
     protectionOn: "Colis protégé",
     protectionDefault: "Colis perdu, volé ou abîmé ? La boutique vous le renvoie ou vous rembourse.",
-    upsellOff: (pct: string) => `−${pct} %`,
     surveyQuestion: "Comment nous avez-vous connu ?",
     surveyOptions: { facebook: "Facebook", instagram: "Instagram", tiktok: "TikTok", google: "Google", youtube: "YouTube", friend: "Un proche", other: "Autre" } as Record<string, string>,
     surveyOtherLabel: "Précisez (facultatif)",
@@ -431,6 +307,7 @@ export const LABELS = {
     } as Record<string, string>,
   },
   en: {
+    ...ERROR_SCREEN_TEXTS.en,
     contact: "Contact",
     email: "Email",
     marketing: "Email me with news and offers",
@@ -494,23 +371,19 @@ export const LABELS = {
     discountCode: "Discount code",
     apply: "Apply",
     remove: "Remove",
-    removeCode: (code: string) => `Remove code ${code}`,
     subtotal: "Subtotal",
     discount: "Discount",
     shipping: "Shipping",
     addonsTotal: "Add-ons",
     total: "Total",
-    items: (n: number) => `${n} item${n > 1 ? "s" : ""}`,
     summary: "Order summary",
     showSummary: "Show order summary",
     hideSummary: "Hide order summary",
     endsIn: "Ends in",
-    thankYou: (name: string) => (name ? `Thank you, ${name}!` : "Thank you!"),
     orderConfirmed: "Your order is confirmed.",
     orderProcessing: "Payment received, confirming your order…",
     orderPaymentFailed: "The payment didn't go through: your order wasn't placed. Try again or choose another payment method.",
     backToCheckout: "Back to payment",
-    confirmationSent: (email: string) => `Confirmation sent to ${email}`,
     order: "Order",
     shipTo: "Ship to",
     continueShopping: "Continue shopping",
@@ -524,16 +397,13 @@ export const LABELS = {
       "Right of withdrawal: you have 14 days from receiving your order to return it, without giving any reason.",
     /** Linked to the store's contact (hidden when there is none). */
     withdrawalContact: "Contact us to exercise this right.",
-    upsellAdded: (name: string) => `Added! Order ${name} confirmed.`,
     upsellAddedPending: "Confirming your addition…",
     upsellPendingTitle: "Confirming your offer…",
     upsellPendingText: "Please wait a few seconds and don't reload the page.",
     upsellFailedRetry: "The offer payment didn't go through: nothing was charged. You can safely try again.",
     upsellStillPending: "Confirmation is taking longer than usual. If the offer was charged, it will be added to your order automatically and you'll receive an email.",
     upsellNoCard: "Nothing to type: your saved payment method will be used.",
-    upsellShopCurrency: (shop: string, paid: string) => `Charged in ${shop}, the shop's currency (your order was paid in ${paid}).`,
     statementNote: "The charge will appear on your bank statement under our payment provider's name, Whop.",
-    youSave: (amount: string) => `You save ${amount}`,
     testMode: "Test mode: Whop sandbox payment, no real money is charged.",
     error: "Something went wrong. Please try again.",
     stepOrdered: "Ordered",
@@ -542,43 +412,27 @@ export const LABELS = {
     stepDone: "Confirmed",
     stepUpcoming: "Upcoming",
     video: "Video",
-    totalUpdatedLive: (amount: string) => `New total: ${amount}`,
     checkoutTitle: "Checkout",
     thankYouTitle: "Order confirmed",
-    completeFields: (f: string) => `Complete: ${f}`,
     termsShort: "terms",
     /** Pay button hint when the terms box is the only thing missing. */
     acceptTermsToContinue: "Accept the terms to continue",
     invalidZip: "Invalid postal code",
     paymentLoading: "Loading secure payment…",
     paymentProcessing: "Processing payment…",
-    retry: "Try again",
     shippingCalculated: "Calculated once you enter your address",
     goToPayment: "Continue to payment",
     verifiedPurchase: "Verified purchase",
     prevReview: "Previous review",
     nextReview: "Next review",
-    reviewN: (n: number) => `Review ${n}`,
     reviewsCarousel: "reviews carousel",
     reviewSlide: "review",
-    reviewsCount: (n: string, count?: number) => `${n} ${count === 1 ? "review" : "reviews"}`,
     reviewPhoto: "Customer photo",
-    reviewsSummary: (score: string, n: string, count?: number) => `Average rating: ${score} out of 5, ${n} ${count === 1 ? "review" : "reviews"}`,
-    starsOutOf5: (n: string, count: number) => `${n} ${count === 1 ? "star" : "stars"} out of 5`,
-    moreReviews: (n: number) => (n === 1 ? "Show 1 more review" : `Show ${n} more reviews`),
-    importedReviewsNote: (app: string | null, o: { mixed?: boolean; summary?: ReviewsNoteSummary } = {}) =>
-      `${o.mixed ? "A selection of reviews, some imported" : "A selection of reviews imported"} from ${app ?? "the store's review app"}; “Verified purchase” means the purchase was confirmed by the app.` +
-      (o.summary ? ` ${AVERAGE_SCOPE.en(o.summary)}` : ""),
-    averageScope: AVERAGE_SCOPE.en,
     daysShort: "d",
     estimatedDelivery: "Estimated delivery",
     orderNumberPending: "Your order number is being assigned…",
-    quantity: (n: number) => `Quantity: ${n}`,
     notFoundTitle: "Payment link not found",
     notFoundText: "This payment link is invalid or has expired. Go back to the store and start again from your cart.",
-    errorTitle: "Something went wrong",
-    errorBody: "The checkout page couldn't load. You have not been charged.",
-    backToStore: "Back to store",
     securePayment: "Secure checkout",
     reference: "Ref.",
     paymentUnavailable: "Payment is temporarily unavailable",
@@ -600,38 +454,16 @@ export const LABELS = {
     backToCart: "Back to cart",
     addressHint: "Start typing your address",
     fieldValid: "Valid",
-    addressSuggestions: (n: number) => `${n} suggested address${n > 1 ? "es" : ""}: use the arrow keys, Enter to select`,
-    qtyDecrease: (name: string) => `Decrease quantity of ${name}`,
-    qtyIncrease: (name: string) => `Increase quantity of ${name}`,
-    qtyRemove: (name: string) => `Remove ${name} from cart`,
-    qtyChanged: (name: string, n: number) => `${name}: quantity ${n}`,
-    qtyRemoved: (name: string) => `${name} removed from cart`,
     qtyMax: "Maximum quantity reached",
     lockedLineEdit: "Edit this bundle from your cart",
     lockedLineQty: "Quantity set by your cart",
     qtyError: "The quantity couldn't be changed. Please try again.",
     automaticDiscountLost: "Your cart changed: the Shopify cart's automatic discount no longer applies.",
     cartPricesAdjusted: "Some items are charged at the store's price, not the price shown in your cart.",
-    cartCodeNotApplied: (code: string) => `Your cart's code ${code} doesn't apply here.`,
     recoTitle: "Complete your order",
     recoAdd: "Add",
-    recoAddLabel: (name: string, price: string) => `Add ${name} to your order, ${price}`,
-    recoAdded: (name: string) => `${name} added to your order`,
     recoUnavailable: "This product is no longer available.",
     recoWas: "Was",
-    localEstimate: (amount: string, currency: string) => `You will be charged in ${currency}; indicative amount ≈ ${amount} (ECB rate, the final amount depends on your bank)`,
-    chargedIn: (amount: string, currency: string) => `You will be charged ${amount} (${currency} price converted at today's ECB reference rate)`,
-    volumeNudge: (n: number, pct: string) => `Add ${n} more item${n > 1 ? "s" : ""} to save ${pct}%`,
-    volumeAddOne: (name: string) => `Add 1 ${name}`,
-    volumeApplied: (pct: string) => `${pct}% volume discount applied`,
-    volumeRow: (pct: string) => `Volume discount (−${pct}%)`,
-    dealAmountUnit: (amount: string) => `${amount} off each item`,
-    dealAmountBundle: (amount: string, n: number) => `${amount} off every ${n}`,
-    dealPrice: (n: number, amount: string) => `${n} for ${amount}`,
-    dealBxgy: (buy: number, free: number) => `Buy ${buy}, get ${free} free`,
-    volumeNudgeDeal: (n: number, deal: string) => `Add ${n} more item${n > 1 ? "s" : ""} for “${deal}”`,
-    volumeAppliedDeal: (deal: string) => `“${deal}” applied`,
-    volumeRowDeal: (deal: string) => `Bundle deal (${deal})`,
     automaticDiscount: "Automatic discount",
     otpPrompt: "Already a customer? Get a code by e-mail",
     otpSend: "Send me a code",
@@ -664,7 +496,6 @@ export const LABELS = {
     claimEmailRequired: "Enter the e-mail used for the order.",
     claimEmailInvalid: "Enter a valid e-mail address (e.g. name@example.com).",
     claimEmailMismatch: "This e-mail doesn't match the order's.",
-    claimEmailHint: (masked: string) => `Order placed with ${masked} — confirm this e-mail.`,
     claimPhotoInvalid: "The link must start with https://",
     claimPhotos: "Photos (optional)",
     claimPhotosHint: "Up to 3 photos of the parcel or item (JPEG, PNG, WebP; compressed automatically before sending).",
@@ -674,9 +505,6 @@ export const LABELS = {
     claimPhotoType: "This file is not an image (JPEG, PNG, WebP, HEIC).",
     claimPhotosAdd: "Add photos",
     claimPhotosAddMore: "Add a photo",
-    claimPhotosCount: (n: number, max: number) => `${n}/${max} photo${n > 1 ? "s" : ""}`,
-    claimPhotoRemove: (i: number) => `Remove photo ${i}`,
-    claimPhotoPreview: (i: number) => `Photo ${i}`,
     claimAlreadyPending: "A report is already being reviewed for this order.",
     pickupTitle: "Pickup point",
     pickupZip: "Pickup point postcode",
@@ -685,11 +513,9 @@ export const LABELS = {
     pickupEmpty: "No pickup point found near this postcode. Try a nearby postcode.",
     pickupError: "Pickup points can't be loaded right now. Please try again.",
     pickupUnsupported: "Pickup point delivery isn't available in this country.",
-    pickupFound: (n: number) => `${n} pickup point${n > 1 ? "s" : ""} found`,
     pickupList: "Nearby pickup points",
     pickupChoose: "Choose your pickup point",
     pickupField: "Pickup point",
-    pickupDeliveredAt: (name: string) => `Delivered to ${name}`,
     pickupChange: "Change",
     pickupToday: "Today",
     pickupClosedToday: "Closed today",
@@ -702,7 +528,6 @@ export const LABELS = {
     upsellNextOffer: "Another offer for you",
     upsellDeclined: "Offer declined",
     shippingAddress: "Shipping address",
-    emailSuggest: (email: string) => `Did you mean ${email}?`,
     errEmail: "Enter an email address",
     errEmailInvalid: "Enter a valid email address (e.g. name@example.com)",
     errCountry: "Select a country",
@@ -711,15 +536,12 @@ export const LABELS = {
     errAddress: "Enter an address",
     errZip: "Enter a postal code",
     errCity: "Enter a city",
-    errZipFor: (country: string, example: string) => `Enter a valid postal code for ${country} (e.g. ${example})`,
     trackOrder: "Track my order",
     needHelp: "Need help?",
     contactUs: "Contact us",
-    offerValidFor: (min: number) => `Offer valid for ${min} more min`,
     language: "Language",
     rememberMe: "Remember my details on this device",
     rememberHint: "Stored only in this browser, never your payment details.",
-    continueAs: (email: string) => `Continue as ${email}`,
     useSaved: "Use my details",
     notMe: "Not me",
     forgetMe: "Forget",
@@ -727,15 +549,11 @@ export const LABELS = {
     savedForgotten: "Details forgotten on this device.",
     savedRegion: "Details saved on this device",
     giftFree: "Free gift",
-    giftNudgeAmount: (amount: string, gift: string) => `Only ${amount} more to get ${gift}`,
-    giftNudgeItems: (n: number, gift: string) => `Add ${n} more item${n > 1 ? "s" : ""} to get ${gift}`,
-    giftEarned: (gift: string) => `${gift} free with your order`,
     protectionTitle: "Package protection (loss, theft, damage)",
     protectionText: "Lost, stolen or damaged parcel: reshipped or refunded.",
     protectionRow: "Package protection",
     protectionOn: "Package protected",
     protectionDefault: "Parcel lost, stolen or damaged? The shop reships it or refunds you.",
-    upsellOff: (pct: string) => `−${pct}%`,
     surveyQuestion: "How did you hear about us?",
     surveyOptions: { facebook: "Facebook", instagram: "Instagram", tiktok: "TikTok", google: "Google", youtube: "YouTube", friend: "A friend or family", other: "Other" } as Record<string, string>,
     surveyOtherLabel: "Tell us more (optional)",
@@ -781,6 +599,7 @@ export const LABELS = {
     } as Record<string, string>,
   },
   de: {
+    ...ERROR_SCREEN_TEXTS.de,
     contact: "Kontakt",
     email: "E-Mail",
     marketing: "Angebote und Neuigkeiten per E-Mail erhalten",
@@ -844,23 +663,19 @@ export const LABELS = {
     discountCode: "Rabattcode",
     apply: "Anwenden",
     remove: "Entfernen",
-    removeCode: (code: string) => `Code ${code} entfernen`,
     subtotal: "Zwischensumme",
     discount: "Rabatt",
     shipping: "Versand",
     addonsTotal: "Optionen",
     total: "Gesamt",
-    items: (n: number) => `${n} Artikel`,
     summary: "Bestellübersicht",
     showSummary: "Bestellübersicht anzeigen",
     hideSummary: "Bestellübersicht ausblenden",
     endsIn: "Endet in",
-    thankYou: (name: string) => (name ? `Danke, ${name}!` : "Danke!"),
     orderConfirmed: "Ihre Bestellung ist bestätigt.",
     orderProcessing: "Zahlung erhalten, Ihre Bestellung wird bestätigt…",
     orderPaymentFailed: "Die Zahlung ist nicht durchgegangen: Ihre Bestellung wurde nicht aufgegeben. Versuchen Sie es erneut oder wählen Sie eine andere Zahlungsart.",
     backToCheckout: "Zurück zur Zahlung",
-    confirmationSent: (email: string) => `Bestätigung gesendet an ${email}`,
     order: "Bestellung",
     shipTo: "Lieferung an",
     continueShopping: "Weiter einkaufen",
@@ -874,16 +689,13 @@ export const LABELS = {
       "Widerrufsrecht: Sie können Ihre Bestellung innerhalb von 14 Tagen nach Erhalt ohne Angabe von Gründen zurücksenden.",
     /** Linked to the store's contact (hidden when there is none). */
     withdrawalContact: "Kontaktieren Sie uns dazu.",
-    upsellAdded: (name: string) => `Hinzugefügt! Bestellung ${name} bestätigt.`,
     upsellAddedPending: "Ihre Ergänzung wird bestätigt…",
     upsellPendingTitle: "Ihr Angebot wird bestätigt…",
     upsellPendingText: "Bitte warten Sie einige Sekunden und laden Sie die Seite nicht neu.",
     upsellFailedRetry: "Die Zahlung für das Angebot ist nicht erfolgt: Es wurde nichts abgebucht. Sie können es bedenkenlos erneut versuchen.",
     upsellStillPending: "Die Bestätigung dauert länger als üblich. Falls das Angebot abgebucht wurde, wird es Ihrer Bestellung automatisch hinzugefügt und Sie erhalten eine E-Mail.",
     upsellNoCard: "Keine Eingabe nötig: Ihre gespeicherte Zahlungsmethode wird verwendet.",
-    upsellShopCurrency: (shop: string, paid: string) => `Abbuchung in ${shop}, der Währung des Shops (Ihre Bestellung wurde in ${paid} bezahlt).`,
     statementNote: "Die Zahlung erscheint auf Ihrem Kontoauszug unter dem Namen unseres Zahlungsdienstleisters Whop.",
-    youSave: (amount: string) => `Sie sparen ${amount}`,
     testMode: "Testmodus: Whop-Sandbox-Zahlung, es wird kein echtes Geld abgebucht.",
     error: "Ein Fehler ist aufgetreten. Bitte erneut versuchen.",
     stepOrdered: "Bestellt",
@@ -892,44 +704,27 @@ export const LABELS = {
     stepDone: "Bestätigt",
     stepUpcoming: "Ausstehend",
     video: "Video",
-    totalUpdatedLive: (amount: string) => `Neuer Gesamtbetrag: ${amount}`,
     checkoutTitle: "Kasse",
     thankYouTitle: "Bestellung bestätigt",
-    completeFields: (f: string) => `Bitte ergänzen: ${f}`,
     termsShort: "AGB",
     /** Pay button hint when the terms box is the only thing missing. */
     acceptTermsToContinue: "Bitte akzeptieren Sie die AGB, um fortzufahren",
     invalidZip: "Ungültige Postleitzahl",
     paymentLoading: "Sichere Zahlung wird geladen…",
     paymentProcessing: "Zahlung wird verarbeitet…",
-    retry: "Erneut versuchen",
     shippingCalculated: "Wird nach Eingabe der Adresse berechnet",
     goToPayment: "Weiter zur Zahlung",
     verifiedPurchase: "Verifizierter Kauf",
     prevReview: "Vorherige Bewertung",
     nextReview: "Nächste Bewertung",
-    reviewN: (n: number) => `Bewertung ${n}`,
     reviewsCarousel: "Bewertungskarussell",
     reviewSlide: "Bewertung",
-    reviewsCount: (n: string, count?: number) => `${n} ${count === 1 ? "Bewertung" : "Bewertungen"}`,
     reviewPhoto: "Foto des Kunden",
-    reviewsSummary: (score: string, n: string, count?: number) => `Durchschnittliche Bewertung: ${score} von 5, ${n} ${count === 1 ? "Bewertung" : "Bewertungen"}`,
-    // "von 5 Sternen": the noun counts the 5 (always plural), not the rating (1 von 5 Sternen).
-    starsOutOf5: (n: string) => `${n} von 5 Sternen`,
-    moreReviews: (n: number) => (n === 1 ? "1 weitere Bewertung anzeigen" : `${n} weitere Bewertungen anzeigen`),
-    importedReviewsNote: (app: string | null, o: { mixed?: boolean; summary?: ReviewsNoteSummary } = {}) =>
-      `${o.mixed ? "Auswahl von Bewertungen, teils importiert" : "Auswahl von Bewertungen, importiert"} aus ${app ?? "der Bewertungs-App des Shops"}; „Verifizierter Kauf“ bedeutet, dass die App den Kauf bestätigt hat.` +
-      (o.summary ? ` ${AVERAGE_SCOPE.de(o.summary)}` : ""),
-    averageScope: AVERAGE_SCOPE.de,
     daysShort: "T",
     estimatedDelivery: "Voraussichtliche Lieferung",
     orderNumberPending: "Ihre Bestellnummer wird vergeben…",
-    quantity: (n: number) => `Menge: ${n}`,
     notFoundTitle: "Zahlungslink nicht gefunden",
     notFoundText: "Dieser Zahlungslink ist ungültig oder abgelaufen. Kehren Sie zum Shop zurück und starten Sie erneut über den Warenkorb.",
-    errorTitle: "Ein Problem ist aufgetreten",
-    errorBody: "Die Zahlungsseite konnte nicht geladen werden. Es wurde nichts abgebucht.",
-    backToStore: "Zurück zum Shop",
     securePayment: "Sichere Zahlung",
     reference: "Ref.",
     paymentUnavailable: "Die Zahlung ist vorübergehend nicht verfügbar",
@@ -951,38 +746,16 @@ export const LABELS = {
     backToCart: "Zurück zum Warenkorb",
     addressHint: "Adresse eingeben",
     fieldValid: "Gültig",
-    addressSuggestions: (n: number) => `${n} ${n > 1 ? "Adressvorschläge" : "Adressvorschlag"}: Pfeiltasten zum Auswählen, Eingabe zum Bestätigen`,
-    qtyDecrease: (name: string) => `Menge von ${name} verringern`,
-    qtyIncrease: (name: string) => `Menge von ${name} erhöhen`,
-    qtyRemove: (name: string) => `${name} aus dem Warenkorb entfernen`,
-    qtyChanged: (name: string, n: number) => `${name}: Menge ${n}`,
-    qtyRemoved: (name: string) => `${name} aus dem Warenkorb entfernt`,
     qtyMax: "Höchstmenge erreicht",
     lockedLineEdit: "Dieses Set im Warenkorb ändern",
     lockedLineQty: "Menge im Warenkorb festgelegt",
     qtyError: "Die Menge konnte nicht geändert werden. Bitte versuchen Sie es erneut.",
     automaticDiscountLost: "Ihr Warenkorb hat sich geändert: Der automatische Rabatt des Shopify-Warenkorbs gilt nicht mehr.",
     cartPricesAdjusted: "Einige Artikel werden zum Shop-Preis berechnet, nicht zum Preis in Ihrem Warenkorb.",
-    cartCodeNotApplied: (code: string) => `Der Code ${code} Ihres Warenkorbs gilt hier nicht.`,
     recoTitle: "Vervollständigen Sie Ihre Bestellung",
     recoAdd: "Hinzufügen",
-    recoAddLabel: (name: string, price: string) => `${name} zur Bestellung hinzufügen, ${price}`,
-    recoAdded: (name: string) => `${name} zur Bestellung hinzugefügt`,
     recoUnavailable: "Dieses Produkt ist nicht mehr verfügbar.",
     recoWas: "Statt",
-    localEstimate: (amount: string, currency: string) => `Die Abbuchung erfolgt in ${currency}; Richtwert ≈ ${amount} (EZB-Kurs, der Endbetrag hängt von Ihrer Bank ab)`,
-    chargedIn: (amount: string, currency: string) => `Ihnen werden ${amount} belastet (${currency}-Preis zum heutigen EZB-Referenzkurs umgerechnet)`,
-    volumeNudge: (n: number, pct: string) => `Noch ${n} Artikel für −${pct} %`,
-    volumeAddOne: (name: string) => `1 × ${name} hinzufügen`,
-    volumeApplied: (pct: string) => `Mengenrabatt −${pct} % angewendet`,
-    volumeRow: (pct: string) => `Mengenrabatt (−${pct} %)`,
-    dealAmountUnit: (amount: string) => `−${amount} pro Artikel`,
-    dealAmountBundle: (amount: string, n: number) => `−${amount} je ${n} Stück`,
-    dealPrice: (n: number, amount: string) => `${n} für ${amount}`,
-    dealBxgy: (buy: number, free: number) => `${buy} kaufen, ${free} gratis`,
-    volumeNudgeDeal: (n: number, deal: string) => `Noch ${n} Artikel für „${deal}“`,
-    volumeAppliedDeal: (deal: string) => `„${deal}“ angewendet`,
-    volumeRowDeal: (deal: string) => `Mengenangebot (${deal})`,
     automaticDiscount: "Automatischer Rabatt",
     otpPrompt: "Schon Kunde? Code per E-Mail erhalten",
     otpSend: "Code senden",
@@ -1015,7 +788,6 @@ export const LABELS = {
     claimEmailRequired: "Geben Sie die E-Mail der Bestellung ein.",
     claimEmailInvalid: "Geben Sie eine gültige E-Mail-Adresse ein (z. B. name@beispiel.de).",
     claimEmailMismatch: "Diese E-Mail stimmt nicht mit der der Bestellung überein.",
-    claimEmailHint: (masked: string) => `Bestellt mit ${masked} — bestätigen Sie diese E-Mail.`,
     claimPhotoInvalid: "Der Link muss mit https:// beginnen",
     claimPhotos: "Fotos (optional)",
     claimPhotosHint: "Bis zu 3 Fotos vom Paket oder Artikel (JPEG, PNG, WebP; werden vor dem Senden automatisch verkleinert).",
@@ -1025,9 +797,6 @@ export const LABELS = {
     claimPhotoType: "Diese Datei ist kein Bild (JPEG, PNG, WebP, HEIC).",
     claimPhotosAdd: "Fotos hinzufügen",
     claimPhotosAddMore: "Foto hinzufügen",
-    claimPhotosCount: (n: number, max: number) => `${n}/${max} ${n === 1 ? "Foto" : "Fotos"}`,
-    claimPhotoRemove: (i: number) => `Foto ${i} entfernen`,
-    claimPhotoPreview: (i: number) => `Foto ${i}`,
     claimAlreadyPending: "Für diese Bestellung wird bereits eine Meldung geprüft.",
     pickupTitle: "Abholstation",
     pickupZip: "Postleitzahl der Abholstation",
@@ -1036,11 +805,9 @@ export const LABELS = {
     pickupEmpty: "Keine Abholstation in der Nähe dieser Postleitzahl gefunden. Versuchen Sie eine benachbarte Postleitzahl.",
     pickupError: "Abholstationen können gerade nicht geladen werden. Bitte versuchen Sie es erneut.",
     pickupUnsupported: "Die Lieferung an eine Abholstation ist in diesem Land nicht verfügbar.",
-    pickupFound: (n: number) => `${n} Abholstation${n > 1 ? "en" : ""} gefunden`,
     pickupList: "Abholstationen in der Nähe",
     pickupChoose: "Wählen Sie Ihre Abholstation",
     pickupField: "Abholstation",
-    pickupDeliveredAt: (name: string) => `Lieferung an ${name}`,
     pickupChange: "Ändern",
     pickupToday: "Heute",
     pickupClosedToday: "Heute geschlossen",
@@ -1053,7 +820,6 @@ export const LABELS = {
     upsellNextOffer: "Ein weiteres Angebot für Sie",
     upsellDeclined: "Angebot abgelehnt",
     shippingAddress: "Lieferadresse",
-    emailSuggest: (email: string) => `Meinten Sie ${email}?`,
     errEmail: "Geben Sie eine E-Mail-Adresse ein",
     errEmailInvalid: "Geben Sie eine gültige E-Mail-Adresse ein (z. B. name@beispiel.de)",
     errCountry: "Wählen Sie ein Land aus",
@@ -1062,15 +828,12 @@ export const LABELS = {
     errAddress: "Geben Sie eine Adresse ein",
     errZip: "Geben Sie eine Postleitzahl ein",
     errCity: "Geben Sie einen Ort ein",
-    errZipFor: (country: string, example: string) => `Ungültige Postleitzahl für ${country} (z. B. ${example})`,
     trackOrder: "Sendung verfolgen",
     needHelp: "Brauchen Sie Hilfe?",
     contactUs: "Kontaktieren Sie uns",
-    offerValidFor: (min: number) => `Angebot noch ${min} Min. gültig`,
     language: "Sprache",
     rememberMe: "Meine Daten auf diesem Gerät speichern",
     rememberHint: "Nur in diesem Browser gespeichert, niemals Ihre Zahlungsdaten.",
-    continueAs: (email: string) => `Weiter als ${email}`,
     useSaved: "Meine Daten verwenden",
     notMe: "Das bin ich nicht",
     forgetMe: "Vergessen",
@@ -1078,15 +841,11 @@ export const LABELS = {
     savedForgotten: "Daten auf diesem Gerät gelöscht.",
     savedRegion: "Auf diesem Gerät gespeicherte Daten",
     giftFree: "Gratis-Geschenk",
-    giftNudgeAmount: (amount: string, gift: string) => `Nur noch ${amount} bis ${gift} gratis`,
-    giftNudgeItems: (n: number, gift: string) => `Noch ${n} Artikel bis ${gift} gratis`,
-    giftEarned: (gift: string) => `${gift} gratis zu Ihrer Bestellung`,
     protectionTitle: "Paketschutz (Verlust, Diebstahl, Bruch)",
     protectionText: "Paket verloren, gestohlen oder beschädigt: neu versendet oder erstattet.",
     protectionRow: "Paketschutz",
     protectionOn: "Paket geschützt",
     protectionDefault: "Paket verloren, gestohlen oder beschädigt? Der Shop sendet es erneut oder erstattet Ihnen den Betrag.",
-    upsellOff: (pct: string) => `−${pct} %`,
     surveyQuestion: "Wie haben Sie von uns erfahren?",
     surveyOptions: { facebook: "Facebook", instagram: "Instagram", tiktok: "TikTok", google: "Google", youtube: "YouTube", friend: "Familie oder Freunde", other: "Sonstiges" } as Record<string, string>,
     surveyOtherLabel: "Bitte angeben (optional)",
@@ -1132,6 +891,7 @@ export const LABELS = {
     } as Record<string, string>,
   },
   es: {
+    ...ERROR_SCREEN_TEXTS.es,
     contact: "Contacto",
     email: "Correo electrónico",
     marketing: "Recibir ofertas y novedades por correo",
@@ -1195,23 +955,19 @@ export const LABELS = {
     discountCode: "Código de descuento",
     apply: "Aplicar",
     remove: "Quitar",
-    removeCode: (code: string) => `Quitar el código ${code}`,
     subtotal: "Subtotal",
     discount: "Descuento",
     shipping: "Envío",
     addonsTotal: "Extras",
     total: "Total",
-    items: (n: number) => `${n} artículo${n > 1 ? "s" : ""}`,
     summary: "Resumen del pedido",
     showSummary: "Mostrar resumen del pedido",
     hideSummary: "Ocultar resumen del pedido",
     endsIn: "Termina en",
-    thankYou: (name: string) => (name ? `¡Gracias, ${name}!` : "¡Gracias!"),
     orderConfirmed: "Tu pedido está confirmado.",
     orderProcessing: "Pago recibido, confirmando tu pedido…",
     orderPaymentFailed: "El pago no se ha completado: tu pedido no se ha realizado. Inténtalo de nuevo o elige otro método de pago.",
     backToCheckout: "Volver al pago",
-    confirmationSent: (email: string) => `Confirmación enviada a ${email}`,
     order: "Pedido",
     shipTo: "Enviar a",
     continueShopping: "Seguir comprando",
@@ -1225,16 +981,13 @@ export const LABELS = {
       "Derecho de desistimiento: dispones de 14 días desde la recepción de tu pedido para devolverlo sin justificación.",
     /** Linked to the store's contact (hidden when there is none). */
     withdrawalContact: "Contáctanos para ejercerlo.",
-    upsellAdded: (name: string) => `¡Añadido! Pedido ${name} confirmado.`,
     upsellAddedPending: "Confirmando tu añadido…",
     upsellPendingTitle: "Confirmando tu oferta…",
     upsellPendingText: "Espera unos segundos y no recargues la página.",
     upsellFailedRetry: "El pago de la oferta no se ha completado: no se ha cobrado nada. Puedes volver a intentarlo con total seguridad.",
     upsellStillPending: "La confirmación está tardando más de lo habitual. Si la oferta se ha cobrado, se añadirá automáticamente a tu pedido y recibirás un e-mail.",
     upsellNoCard: "Sin nada que escribir: se usará tu método de pago guardado.",
-    upsellShopCurrency: (shop: string, paid: string) => `Cargado en ${shop}, la moneda de la tienda (tu pedido se pagó en ${paid}).`,
     statementNote: "El cargo aparecerá en tu extracto bancario con el nombre de nuestro proveedor de pagos, Whop.",
-    youSave: (amount: string) => `Ahorras ${amount}`,
     testMode: "Modo de prueba: pago sandbox de Whop, no se cobra dinero real.",
     error: "Se ha producido un error. Inténtalo de nuevo.",
     stepOrdered: "Pedido",
@@ -1243,44 +996,27 @@ export const LABELS = {
     stepDone: "Confirmado",
     stepUpcoming: "Próximamente",
     video: "Vídeo",
-    totalUpdatedLive: (amount: string) => `Nuevo total: ${amount}`,
     checkoutTitle: "Pago",
     thankYouTitle: "Pedido confirmado",
-    completeFields: (f: string) => `Completa: ${f}`,
     termsShort: "condiciones",
     /** Pay button hint when the terms box is the only thing missing. */
     acceptTermsToContinue: "Acepta las condiciones para continuar",
     invalidZip: "Código postal no válido",
     paymentLoading: "Cargando el pago seguro…",
     paymentProcessing: "Procesando el pago…",
-    retry: "Reintentar",
     shippingCalculated: "Se calcula al introducir la dirección",
     goToPayment: "Continuar al pago",
     verifiedPurchase: "Compra verificada",
     prevReview: "Opinión anterior",
     nextReview: "Opinión siguiente",
-    reviewN: (n: number) => `Opinión ${n}`,
     reviewsCarousel: "carrusel de opiniones",
     reviewSlide: "opinión",
-    reviewsCount: (n: string, count?: number) => `${n} ${count === 1 ? "opinión" : "opiniones"}`,
     reviewPhoto: "Foto del cliente",
-    reviewsSummary: (score: string, n: string, count?: number) => `Valoración media: ${score} de 5, ${n} ${count === 1 ? "opinión" : "opiniones"}`,
-    // "de 5 estrellas": the noun counts the 5 (always plural): 1 de 5 estrellas.
-    starsOutOf5: (n: string) => `${n} de 5 estrellas`,
-    moreReviews: (n: number) => (n === 1 ? "Ver 1 opinión más" : `Ver ${n} opiniones más`),
-    importedReviewsNote: (app: string | null, o: { mixed?: boolean; summary?: ReviewsNoteSummary } = {}) =>
-      `${o.mixed ? "Selección de opiniones, algunas importadas" : "Selección de opiniones importadas"} de ${app ?? "la aplicación de opiniones de la tienda"}; «Compra verificada» indica una compra confirmada por la aplicación.` +
-      (o.summary ? ` ${AVERAGE_SCOPE.es(o.summary)}` : ""),
-    averageScope: AVERAGE_SCOPE.es,
     daysShort: "d",
     estimatedDelivery: "Entrega estimada",
     orderNumberPending: "Asignando tu número de pedido…",
-    quantity: (n: number) => `Cantidad: ${n}`,
     notFoundTitle: "Enlace de pago no encontrado",
     notFoundText: "Este enlace de pago no es válido o ha caducado. Vuelve a la tienda y empieza de nuevo desde tu carrito.",
-    errorTitle: "Se ha producido un problema",
-    errorBody: "No se pudo cargar la página de pago. No se ha realizado ningún cargo.",
-    backToStore: "Volver a la tienda",
     securePayment: "Pago seguro",
     reference: "Ref.",
     paymentUnavailable: "El pago no está disponible en este momento",
@@ -1302,38 +1038,16 @@ export const LABELS = {
     backToCart: "Volver al carrito",
     addressHint: "Empieza a escribir tu dirección",
     fieldValid: "Válido",
-    addressSuggestions: (n: number) => `${n} ${n > 1 ? "direcciones sugeridas" : "dirección sugerida"}: usa las flechas e Intro para elegir`,
-    qtyDecrease: (name: string) => `Reducir la cantidad de ${name}`,
-    qtyIncrease: (name: string) => `Aumentar la cantidad de ${name}`,
-    qtyRemove: (name: string) => `Quitar ${name} del carrito`,
-    qtyChanged: (name: string, n: number) => `${name}: cantidad ${n}`,
-    qtyRemoved: (name: string) => `${name} quitado del carrito`,
     qtyMax: "Cantidad máxima alcanzada",
     lockedLineEdit: "Modifica este lote desde el carrito",
     lockedLineQty: "Cantidad fijada por el carrito",
     qtyError: "No se pudo cambiar la cantidad. Inténtalo de nuevo.",
     automaticDiscountLost: "Tu carrito ha cambiado: el descuento automático del carrito de Shopify ya no se aplica.",
     cartPricesAdjusted: "Algunos artículos se cobran al precio de la tienda, no al precio mostrado en tu carrito.",
-    cartCodeNotApplied: (code: string) => `El código ${code} de tu carrito no se aplica aquí.`,
     recoTitle: "Completa tu pedido",
     recoAdd: "Añadir",
-    recoAddLabel: (name: string, price: string) => `Añadir ${name} al pedido, ${price}`,
-    recoAdded: (name: string) => `${name} añadido al pedido`,
     recoUnavailable: "Este producto ya no está disponible.",
     recoWas: "Antes",
-    localEstimate: (amount: string, currency: string) => `Se te cobrará en ${currency}; importe orientativo ≈ ${amount} (tipo del BCE, el importe final depende de tu banco)`,
-    chargedIn: (amount: string, currency: string) => `Se te cobrarán ${amount} (precio en ${currency} convertido al tipo de referencia del BCE de hoy)`,
-    volumeNudge: (n: number, pct: string) => `Añade ${n} artículo${n > 1 ? "s" : ""} más para −${pct} %`,
-    volumeAddOne: (name: string) => `Añadir 1 ${name}`,
-    volumeApplied: (pct: string) => `Descuento por cantidad −${pct} % aplicado`,
-    volumeRow: (pct: string) => `Descuento por cantidad (−${pct} %)`,
-    dealAmountUnit: (amount: string) => `−${amount} por artículo`,
-    dealAmountBundle: (amount: string, n: number) => `−${amount} por cada ${n}`,
-    dealPrice: (n: number, amount: string) => `${n} por ${amount}`,
-    dealBxgy: (buy: number, free: number) => `Compra ${buy} y llévate ${free} gratis`,
-    volumeNudgeDeal: (n: number, deal: string) => `Añade ${n} artículo${n > 1 ? "s" : ""} más para «${deal}»`,
-    volumeAppliedDeal: (deal: string) => `«${deal}» aplicado`,
-    volumeRowDeal: (deal: string) => `Oferta por cantidad (${deal})`,
     automaticDiscount: "Descuento automático",
     otpPrompt: "¿Ya eres cliente? Recibe un código por e-mail",
     otpSend: "Recibir un código",
@@ -1366,7 +1080,6 @@ export const LABELS = {
     claimEmailRequired: "Introduce el e-mail usado en el pedido.",
     claimEmailInvalid: "Introduce una dirección de e-mail válida (p. ej. nombre@ejemplo.es).",
     claimEmailMismatch: "Este e-mail no coincide con el del pedido.",
-    claimEmailHint: (masked: string) => `Pedido realizado con ${masked} — confirma este e-mail.`,
     claimPhotoInvalid: "El enlace debe empezar por https://",
     claimPhotos: "Fotos (opcional)",
     claimPhotosHint: "Hasta 3 fotos del paquete o del artículo (JPEG, PNG, WebP; se comprimen automáticamente antes de enviarlas).",
@@ -1376,9 +1089,6 @@ export const LABELS = {
     claimPhotoType: "Este archivo no es una imagen (JPEG, PNG, WebP, HEIC).",
     claimPhotosAdd: "Añadir fotos",
     claimPhotosAddMore: "Añadir una foto",
-    claimPhotosCount: (n: number, max: number) => `${n}/${max} foto${n === 1 ? "" : "s"}`,
-    claimPhotoRemove: (i: number) => `Quitar la foto ${i}`,
-    claimPhotoPreview: (i: number) => `Foto ${i}`,
     claimAlreadyPending: "Ya se está revisando una incidencia de este pedido.",
     pickupTitle: "Punto de recogida",
     pickupZip: "Código postal del punto de recogida",
@@ -1387,11 +1097,9 @@ export const LABELS = {
     pickupEmpty: "No hay puntos de recogida cerca de este código postal. Prueba con uno cercano.",
     pickupError: "No se pueden cargar los puntos de recogida ahora. Inténtalo de nuevo.",
     pickupUnsupported: "La entrega en punto de recogida no está disponible en este país.",
-    pickupFound: (n: number) => `${n} punto${n > 1 ? "s" : ""} de recogida encontrado${n > 1 ? "s" : ""}`,
     pickupList: "Puntos de recogida cercanos",
     pickupChoose: "Elige tu punto de recogida",
     pickupField: "Punto de recogida",
-    pickupDeliveredAt: (name: string) => `Entrega en ${name}`,
     pickupChange: "Cambiar",
     pickupToday: "Hoy",
     pickupClosedToday: "Cerrado hoy",
@@ -1404,7 +1112,6 @@ export const LABELS = {
     upsellNextOffer: "Otra oferta para ti",
     upsellDeclined: "Oferta rechazada",
     shippingAddress: "Dirección de envío",
-    emailSuggest: (email: string) => `¿Quisiste decir ${email}?`,
     errEmail: "Introduce una dirección de correo electrónico",
     errEmailInvalid: "Introduce un correo electrónico válido (p. ej. nombre@ejemplo.es)",
     errCountry: "Selecciona un país",
@@ -1413,15 +1120,12 @@ export const LABELS = {
     errAddress: "Introduce una dirección",
     errZip: "Introduce un código postal",
     errCity: "Introduce una ciudad",
-    errZipFor: (country: string, example: string) => `Código postal no válido para ${country} (p. ej. ${example})`,
     trackOrder: "Seguir mi pedido",
     needHelp: "¿Necesitas ayuda?",
     contactUs: "Contáctanos",
-    offerValidFor: (min: number) => `Oferta válida ${min} min más`,
     language: "Idioma",
     rememberMe: "Recordar mis datos en este dispositivo",
     rememberHint: "Se guardan solo en este navegador, nunca tus datos de pago.",
-    continueAs: (email: string) => `Continuar como ${email}`,
     useSaved: "Usar mis datos",
     notMe: "No soy yo",
     forgetMe: "Olvidar",
@@ -1429,15 +1133,11 @@ export const LABELS = {
     savedForgotten: "Datos olvidados en este dispositivo.",
     savedRegion: "Datos guardados en este dispositivo",
     giftFree: "Regalo",
-    giftNudgeAmount: (amount: string, gift: string) => `Solo ${amount} más para recibir ${gift}`,
-    giftNudgeItems: (n: number, gift: string) => `Añade ${n} artículo${n > 1 ? "s" : ""} más para recibir ${gift}`,
-    giftEarned: (gift: string) => `${gift} de regalo con tu pedido`,
     protectionTitle: "Protección del paquete (pérdida, robo, rotura)",
     protectionText: "Paquete perdido, robado o dañado: reenviado o reembolsado.",
     protectionRow: "Protección del paquete",
     protectionOn: "Paquete protegido",
     protectionDefault: "¿Paquete perdido, robado o dañado? La tienda te lo reenvía o te reembolsa.",
-    upsellOff: (pct: string) => `−${pct} %`,
     surveyQuestion: "¿Cómo nos has conocido?",
     surveyOptions: { facebook: "Facebook", instagram: "Instagram", tiktok: "TikTok", google: "Google", youtube: "YouTube", friend: "Un familiar o amigo", other: "Otro" } as Record<string, string>,
     surveyOtherLabel: "Especifica (opcional)",
@@ -1483,6 +1183,7 @@ export const LABELS = {
     } as Record<string, string>,
   },
   it: {
+    ...ERROR_SCREEN_TEXTS.it,
     contact: "Contatto",
     email: "E-mail",
     marketing: "Ricevi offerte e novità via e-mail",
@@ -1546,23 +1247,19 @@ export const LABELS = {
     discountCode: "Codice sconto",
     apply: "Applica",
     remove: "Rimuovi",
-    removeCode: (code: string) => `Rimuovi il codice ${code}`,
     subtotal: "Subtotale",
     discount: "Sconto",
     shipping: "Spedizione",
     addonsTotal: "Opzioni",
     total: "Totale",
-    items: (n: number) => `${n} articol${n > 1 ? "i" : "o"}`,
     summary: "Riepilogo ordine",
     showSummary: "Mostra riepilogo ordine",
     hideSummary: "Nascondi riepilogo ordine",
     endsIn: "Termina tra",
-    thankYou: (name: string) => (name ? `Grazie, ${name}!` : "Grazie!"),
     orderConfirmed: "Il tuo ordine è confermato.",
     orderProcessing: "Pagamento ricevuto, conferma dell'ordine in corso…",
     orderPaymentFailed: "Il pagamento non è andato a buon fine: il tuo ordine non è stato effettuato. Riprova o scegli un altro metodo di pagamento.",
     backToCheckout: "Torna al pagamento",
-    confirmationSent: (email: string) => `Conferma inviata a ${email}`,
     order: "Ordine",
     shipTo: "Spedizione a",
     continueShopping: "Continua lo shopping",
@@ -1576,16 +1273,13 @@ export const LABELS = {
       "Diritto di recesso: hai 14 giorni dal ricevimento dell'ordine per restituirlo senza doverne indicare il motivo.",
     /** Linked to the store's contact (hidden when there is none). */
     withdrawalContact: "Contattaci per esercitarlo.",
-    upsellAdded: (name: string) => `Aggiunto! Ordine ${name} confermato.`,
     upsellAddedPending: "Conferma dell'aggiunta in corso…",
     upsellPendingTitle: "Conferma della tua offerta in corso…",
     upsellPendingText: "Attendi qualche secondo e non ricaricare la pagina.",
     upsellFailedRetry: "Il pagamento dell'offerta non è andato a buon fine: non è stato addebitato nulla. Puoi riprovare in tutta sicurezza.",
     upsellStillPending: "La conferma sta richiedendo più tempo del solito. Se l'offerta è stata addebitata, verrà aggiunta automaticamente al tuo ordine e riceverai un'e-mail.",
     upsellNoCard: "Niente da inserire: verrà usato il tuo metodo di pagamento salvato.",
-    upsellShopCurrency: (shop: string, paid: string) => `Addebitato in ${shop}, la valuta del negozio (il tuo ordine è stato pagato in ${paid}).`,
     statementNote: "L'addebito apparirà sull'estratto conto con il nome del nostro fornitore di pagamenti, Whop.",
-    youSave: (amount: string) => `Risparmi ${amount}`,
     testMode: "Modalità test: pagamento sandbox Whop, nessun addebito reale.",
     error: "Si è verificato un errore. Riprova.",
     stepOrdered: "Ordinato",
@@ -1594,43 +1288,27 @@ export const LABELS = {
     stepDone: "Confermato",
     stepUpcoming: "In arrivo",
     video: "Video",
-    totalUpdatedLive: (amount: string) => `Nuovo totale: ${amount}`,
     checkoutTitle: "Pagamento",
     thankYouTitle: "Ordine confermato",
-    completeFields: (f: string) => `Completa: ${f}`,
     termsShort: "condizioni",
     /** Pay button hint when the terms box is the only thing missing. */
     acceptTermsToContinue: "Accetta le condizioni per continuare",
     invalidZip: "CAP non valido",
     paymentLoading: "Caricamento del pagamento sicuro…",
     paymentProcessing: "Elaborazione del pagamento…",
-    retry: "Riprova",
     shippingCalculated: "Calcolata dopo l'inserimento dell'indirizzo",
     goToPayment: "Continua al pagamento",
     verifiedPurchase: "Acquisto verificato",
     prevReview: "Recensione precedente",
     nextReview: "Recensione successiva",
-    reviewN: (n: number) => `Recensione ${n}`,
     reviewsCarousel: "carosello di recensioni",
     reviewSlide: "recensione",
-    reviewsCount: (n: string, count?: number) => `${n} ${count === 1 ? "recensione" : "recensioni"}`,
     reviewPhoto: "Foto del cliente",
-    reviewsSummary: (score: string, n: string, count?: number) => `Valutazione media: ${score} su 5, ${n} ${count === 1 ? "recensione" : "recensioni"}`,
-    starsOutOf5: (n: string, count: number) => `${n} ${count === 1 ? "stella" : "stelle"} su 5`,
-    moreReviews: (n: number) => (n === 1 ? "Mostra un'altra recensione" : `Mostra altre ${n} recensioni`),
-    importedReviewsNote: (app: string | null, o: { mixed?: boolean; summary?: ReviewsNoteSummary } = {}) =>
-      `${o.mixed ? "Selezione di recensioni, alcune importate" : "Selezione di recensioni importate"} ${app ? `da ${app}` : "dall'app di recensioni del negozio"}; «Acquisto verificato» indica un acquisto confermato dall'app.` +
-      (o.summary ? ` ${AVERAGE_SCOPE.it(o.summary)}` : ""),
-    averageScope: AVERAGE_SCOPE.it,
     daysShort: "g",
     estimatedDelivery: "Consegna stimata",
     orderNumberPending: "Assegnazione del numero d'ordine in corso…",
-    quantity: (n: number) => `Quantità: ${n}`,
     notFoundTitle: "Link di pagamento non trovato",
     notFoundText: "Questo link di pagamento non è valido o è scaduto. Torna al negozio e ricomincia dal carrello.",
-    errorTitle: "Si è verificato un problema",
-    errorBody: "Impossibile caricare la pagina di pagamento. Non è stato effettuato alcun addebito.",
-    backToStore: "Torna al negozio",
     securePayment: "Pagamento sicuro",
     reference: "Rif.",
     paymentUnavailable: "Il pagamento è momentaneamente non disponibile",
@@ -1652,38 +1330,16 @@ export const LABELS = {
     backToCart: "Torna al carrello",
     addressHint: "Inizia a digitare l'indirizzo",
     fieldValid: "Valido",
-    addressSuggestions: (n: number) => `${n} ${n > 1 ? "indirizzi suggeriti" : "indirizzo suggerito"}: frecce per scegliere, Invio per confermare`,
-    qtyDecrease: (name: string) => `Diminuisci la quantità di ${name}`,
-    qtyIncrease: (name: string) => `Aumenta la quantità di ${name}`,
-    qtyRemove: (name: string) => `Rimuovi ${name} dal carrello`,
-    qtyChanged: (name: string, n: number) => `${name}: quantità ${n}`,
-    qtyRemoved: (name: string) => `${name} rimosso dal carrello`,
     qtyMax: "Quantità massima raggiunta",
     lockedLineEdit: "Modifica questo lotto dal carrello",
     lockedLineQty: "Quantità fissata dal carrello",
     qtyError: "Impossibile modificare la quantità. Riprova.",
     automaticDiscountLost: "Il carrello è cambiato: lo sconto automatico del carrello Shopify non si applica più.",
     cartPricesAdjusted: "Alcuni articoli sono addebitati al prezzo del negozio, non al prezzo mostrato nel carrello.",
-    cartCodeNotApplied: (code: string) => `Il codice ${code} del tuo carrello non si applica qui.`,
     recoTitle: "Completa il tuo ordine",
     recoAdd: "Aggiungi",
-    recoAddLabel: (name: string, price: string) => `Aggiungi ${name} all'ordine, ${price}`,
-    recoAdded: (name: string) => `${name} aggiunto all'ordine`,
     recoUnavailable: "Questo prodotto non è più disponibile.",
     recoWas: "Invece di",
-    localEstimate: (amount: string, currency: string) => `L'addebito avverrà in ${currency}; importo indicativo ≈ ${amount} (cambio BCE, l'importo finale dipende dalla tua banca)`,
-    chargedIn: (amount: string, currency: string) => `Ti verranno addebitati ${amount} (prezzo in ${currency} convertito al cambio di riferimento BCE di oggi)`,
-    volumeNudge: (n: number, pct: string) => `Ancora ${n} articol${n > 1 ? "i" : "o"} per −${pct}%`,
-    volumeAddOne: (name: string) => `Aggiungi 1 ${name}`,
-    volumeApplied: (pct: string) => `Sconto quantità −${pct}% applicato`,
-    volumeRow: (pct: string) => `Sconto quantità (−${pct}%)`,
-    dealAmountUnit: (amount: string) => `−${amount} per articolo`,
-    dealAmountBundle: (amount: string, n: number) => `−${amount} ogni ${n}`,
-    dealPrice: (n: number, amount: string) => `${n} a ${amount}`,
-    dealBxgy: (buy: number, free: number) => `Compri ${buy}, ${free} in omaggio`,
-    volumeNudgeDeal: (n: number, deal: string) => `Ancora ${n} articol${n > 1 ? "i" : "o"} per «${deal}»`,
-    volumeAppliedDeal: (deal: string) => `«${deal}» applicata`,
-    volumeRowDeal: (deal: string) => `Offerta quantità (${deal})`,
     automaticDiscount: "Sconto automatico",
     otpPrompt: "Sei già cliente? Ricevi un codice via e-mail",
     otpSend: "Ricevi un codice",
@@ -1716,7 +1372,6 @@ export const LABELS = {
     claimEmailRequired: "Inserisci l'e-mail usata per l'ordine.",
     claimEmailInvalid: "Inserisci un indirizzo e-mail valido (es. nome@esempio.it).",
     claimEmailMismatch: "Questa e-mail non corrisponde a quella dell'ordine.",
-    claimEmailHint: (masked: string) => `Ordine effettuato con ${masked} — conferma questa e-mail.`,
     claimPhotoInvalid: "Il link deve iniziare con https://",
     claimPhotos: "Foto (facoltative)",
     claimPhotosHint: "Fino a 3 foto del pacco o dell'articolo (JPEG, PNG, WebP; compresse automaticamente prima dell'invio).",
@@ -1726,9 +1381,6 @@ export const LABELS = {
     claimPhotoType: "Questo file non è un'immagine (JPEG, PNG, WebP, HEIC).",
     claimPhotosAdd: "Aggiungi foto",
     claimPhotosAddMore: "Aggiungi una foto",
-    claimPhotosCount: (n: number, max: number) => `${n}/${max} foto`,
-    claimPhotoRemove: (i: number) => `Rimuovi la foto ${i}`,
-    claimPhotoPreview: (i: number) => `Foto ${i}`,
     claimAlreadyPending: "Una segnalazione per questo ordine è già in fase di verifica.",
     pickupTitle: "Punto di ritiro",
     pickupZip: "CAP del punto di ritiro",
@@ -1737,11 +1389,9 @@ export const LABELS = {
     pickupEmpty: "Nessun punto di ritiro vicino a questo CAP. Prova un CAP vicino.",
     pickupError: "Impossibile caricare i punti di ritiro al momento. Riprova.",
     pickupUnsupported: "La consegna in un punto di ritiro non è disponibile in questo paese.",
-    pickupFound: (n: number) => `${n} punt${n > 1 ? "i" : "o"} di ritiro trovat${n > 1 ? "i" : "o"}`,
     pickupList: "Punti di ritiro vicini",
     pickupChoose: "Scegli il tuo punto di ritiro",
     pickupField: "Punto di ritiro",
-    pickupDeliveredAt: (name: string) => `Consegna presso ${name}`,
     pickupChange: "Modifica",
     pickupToday: "Oggi",
     pickupClosedToday: "Chiuso oggi",
@@ -1754,7 +1404,6 @@ export const LABELS = {
     upsellNextOffer: "Un'altra offerta per te",
     upsellDeclined: "Offerta rifiutata",
     shippingAddress: "Indirizzo di spedizione",
-    emailSuggest: (email: string) => `Intendevi ${email}?`,
     errEmail: "Inserisci un indirizzo email",
     errEmailInvalid: "Inserisci un indirizzo email valido (es. nome@esempio.it)",
     errCountry: "Seleziona un paese",
@@ -1763,15 +1412,12 @@ export const LABELS = {
     errAddress: "Inserisci un indirizzo",
     errZip: "Inserisci un CAP",
     errCity: "Inserisci una città",
-    errZipFor: (country: string, example: string) => `CAP non valido per il paese scelto (${country}, es. ${example})`,
     trackOrder: "Traccia il mio ordine",
     needHelp: "Serve aiuto?",
     contactUs: "Contattaci",
-    offerValidFor: (min: number) => `Offerta valida ancora ${min} min`,
     language: "Lingua",
     rememberMe: "Ricorda i miei dati su questo dispositivo",
     rememberHint: "Salvati solo in questo browser, mai i tuoi dati di pagamento.",
-    continueAs: (email: string) => `Continua come ${email}`,
     useSaved: "Usa i miei dati",
     notMe: "Non sono io",
     forgetMe: "Dimentica",
@@ -1779,15 +1425,11 @@ export const LABELS = {
     savedForgotten: "Dati dimenticati su questo dispositivo.",
     savedRegion: "Dati salvati su questo dispositivo",
     giftFree: "Omaggio",
-    giftNudgeAmount: (amount: string, gift: string) => `Ancora ${amount} per ricevere ${gift}`,
-    giftNudgeItems: (n: number, gift: string) => (n === 1 ? `Ancora un articolo per ricevere ${gift}` : `Ancora ${n} articoli per ricevere ${gift}`),
-    giftEarned: (gift: string) => `${gift} in omaggio con il tuo ordine`,
     protectionTitle: "Protezione pacco (smarrimento, furto, rottura)",
     protectionText: "Pacco smarrito, rubato o danneggiato: rispedito o rimborsato.",
     protectionRow: "Protezione pacco",
     protectionOn: "Pacco protetto",
     protectionDefault: "Pacco perso, rubato o danneggiato? Il negozio te lo rispedisce o ti rimborsa.",
-    upsellOff: (pct: string) => `−${pct}%`,
     surveyQuestion: "Come ci hai conosciuto?",
     surveyOptions: { facebook: "Facebook", instagram: "Instagram", tiktok: "TikTok", google: "Google", youtube: "YouTube", friend: "Un amico o parente", other: "Altro" } as Record<string, string>,
     surveyOtherLabel: "Specifica (facoltativo)",
@@ -1833,6 +1475,7 @@ export const LABELS = {
     } as Record<string, string>,
   },
   nl: {
+    ...ERROR_SCREEN_TEXTS.nl,
     contact: "Contact",
     email: "E-mail",
     marketing: "Ontvang aanbiedingen en nieuws per e-mail",
@@ -1896,23 +1539,19 @@ export const LABELS = {
     discountCode: "Kortingscode",
     apply: "Toepassen",
     remove: "Verwijderen",
-    removeCode: (code: string) => `Code ${code} verwijderen`,
     subtotal: "Subtotaal",
     discount: "Korting",
     shipping: "Verzending",
     addonsTotal: "Opties",
     total: "Totaal",
-    items: (n: number) => `${n} artikel${n > 1 ? "en" : ""}`,
     summary: "Besteloverzicht",
     showSummary: "Besteloverzicht tonen",
     hideSummary: "Besteloverzicht verbergen",
     endsIn: "Eindigt over",
-    thankYou: (name: string) => (name ? `Bedankt, ${name}!` : "Bedankt!"),
     orderConfirmed: "Je bestelling is bevestigd.",
     orderProcessing: "Betaling ontvangen, je bestelling wordt bevestigd…",
     orderPaymentFailed: "De betaling is niet gelukt: je bestelling is niet geplaatst. Probeer het opnieuw of kies een andere betaalmethode.",
     backToCheckout: "Terug naar betalen",
-    confirmationSent: (email: string) => `Bevestiging verstuurd naar ${email}`,
     order: "Bestelling",
     shipTo: "Verzenden naar",
     continueShopping: "Verder winkelen",
@@ -1926,16 +1565,13 @@ export const LABELS = {
       "Herroepingsrecht: je hebt 14 dagen na ontvangst om je bestelling zonder opgave van reden terug te sturen.",
     /** Linked to the store's contact (hidden when there is none). */
     withdrawalContact: "Neem contact met ons op om dit te doen.",
-    upsellAdded: (name: string) => `Toegevoegd! Bestelling ${name} bevestigd.`,
     upsellAddedPending: "Je toevoeging wordt bevestigd…",
     upsellPendingTitle: "Je aanbod wordt bevestigd…",
     upsellPendingText: "Wacht een paar seconden en laad de pagina niet opnieuw.",
     upsellFailedRetry: "De betaling van het aanbod is niet gelukt: er is niets afgeschreven. Je kunt het veilig opnieuw proberen.",
     upsellStillPending: "De bevestiging duurt langer dan normaal. Als het aanbod is afgeschreven, wordt het automatisch aan je bestelling toegevoegd en ontvang je een e-mail.",
     upsellNoCard: "Niets in te vullen: je opgeslagen betaalmethode wordt gebruikt.",
-    upsellShopCurrency: (shop: string, paid: string) => `Afgeschreven in ${shop}, de valuta van de winkel (je bestelling is betaald in ${paid}).`,
     statementNote: "De betaling verschijnt op je afschrift onder de naam van onze betaalprovider, Whop.",
-    youSave: (amount: string) => `Je bespaart ${amount}`,
     testMode: "Testmodus: Whop-sandboxbetaling, er wordt geen echt geld afgeschreven.",
     error: "Er is iets misgegaan. Probeer het opnieuw.",
     stepOrdered: "Besteld",
@@ -1944,44 +1580,27 @@ export const LABELS = {
     stepDone: "Bevestigd",
     stepUpcoming: "Binnenkort",
     video: "Video",
-    totalUpdatedLive: (amount: string) => `Nieuw totaal: ${amount}`,
     checkoutTitle: "Afrekenen",
     thankYouTitle: "Bestelling bevestigd",
-    completeFields: (f: string) => `Vul aan: ${f}`,
     termsShort: "voorwaarden",
     /** Pay button hint when the terms box is the only thing missing. */
     acceptTermsToContinue: "Accepteer de voorwaarden om verder te gaan",
     invalidZip: "Ongeldige postcode",
     paymentLoading: "Veilige betaling wordt geladen…",
     paymentProcessing: "Betaling wordt verwerkt…",
-    retry: "Opnieuw proberen",
     shippingCalculated: "Berekend na invullen van je adres",
     goToPayment: "Verder naar betalen",
     verifiedPurchase: "Geverifieerde aankoop",
     prevReview: "Vorige review",
     nextReview: "Volgende review",
-    reviewN: (n: number) => `Review ${n}`,
     reviewsCarousel: "reviewcarrousel",
     reviewSlide: "review",
-    reviewsCount: (n: string, count?: number) => `${n} ${count === 1 ? "review" : "reviews"}`,
     reviewPhoto: "Foto van de klant",
-    reviewsSummary: (score: string, n: string, count?: number) => `Gemiddelde beoordeling: ${score} van 5, ${n} ${count === 1 ? "review" : "reviews"}`,
-    // "van 5 sterren": the noun counts the 5 (always plural): 1 van 5 sterren.
-    starsOutOf5: (n: string) => `${n} van 5 sterren`,
-    moreReviews: (n: number) => (n === 1 ? "Toon nog 1 review" : `Toon nog ${n} reviews`),
-    importedReviewsNote: (app: string | null, o: { mixed?: boolean; summary?: ReviewsNoteSummary } = {}) =>
-      `${o.mixed ? "Selectie van reviews, deels geïmporteerd" : "Selectie van reviews geïmporteerd"} uit ${app ?? "de review-app van de winkel"}; ‘Geverifieerde aankoop’ betekent dat de app de aankoop heeft bevestigd.` +
-      (o.summary ? ` ${AVERAGE_SCOPE.nl(o.summary)}` : ""),
-    averageScope: AVERAGE_SCOPE.nl,
     daysShort: "d",
     estimatedDelivery: "Verwachte levering",
     orderNumberPending: "Je bestelnummer wordt toegekend…",
-    quantity: (n: number) => `Aantal: ${n}`,
     notFoundTitle: "Betaallink niet gevonden",
     notFoundText: "Deze betaallink is ongeldig of verlopen. Ga terug naar de winkel en begin opnieuw vanuit je winkelwagen.",
-    errorTitle: "Er is een probleem opgetreden",
-    errorBody: "De betaalpagina kon niet worden geladen. Er is niets afgeschreven.",
-    backToStore: "Terug naar de winkel",
     securePayment: "Veilig afrekenen",
     reference: "Ref.",
     paymentUnavailable: "Betalen is tijdelijk niet mogelijk",
@@ -2003,38 +1622,16 @@ export const LABELS = {
     backToCart: "Terug naar winkelwagen",
     addressHint: "Begin je adres te typen",
     fieldValid: "Geldig",
-    addressSuggestions: (n: number) => `${n} ${n > 1 ? "voorgestelde adressen" : "voorgesteld adres"}: pijltjestoetsen om te kiezen, Enter om te bevestigen`,
-    qtyDecrease: (name: string) => `Aantal van ${name} verlagen`,
-    qtyIncrease: (name: string) => `Aantal van ${name} verhogen`,
-    qtyRemove: (name: string) => `${name} uit winkelwagen verwijderen`,
-    qtyChanged: (name: string, n: number) => `${name}: aantal ${n}`,
-    qtyRemoved: (name: string) => `${name} uit winkelwagen verwijderd`,
     qtyMax: "Maximaal aantal bereikt",
     lockedLineEdit: "Wijzig deze bundel in je winkelwagen",
     lockedLineQty: "Aantal vastgelegd in je winkelwagen",
     qtyError: "Het aantal kon niet worden gewijzigd. Probeer het opnieuw.",
     automaticDiscountLost: "Je winkelwagen is gewijzigd: de automatische korting van de Shopify-winkelwagen geldt niet meer.",
     cartPricesAdjusted: "Sommige artikelen worden tegen de winkelprijs berekend, niet tegen de prijs in je winkelwagen.",
-    cartCodeNotApplied: (code: string) => `De code ${code} van je winkelwagen geldt hier niet.`,
     recoTitle: "Maak je bestelling compleet",
     recoAdd: "Toevoegen",
-    recoAddLabel: (name: string, price: string) => `${name} toevoegen aan je bestelling, ${price}`,
-    recoAdded: (name: string) => `${name} toegevoegd aan je bestelling`,
     recoUnavailable: "Dit product is niet meer beschikbaar.",
     recoWas: "Van",
-    localEstimate: (amount: string, currency: string) => `Je betaalt in ${currency}; indicatief bedrag ≈ ${amount} (ECB-koers, het eindbedrag hangt af van je bank)`,
-    chargedIn: (amount: string, currency: string) => `Er wordt ${amount} afgeschreven (${currency}-prijs omgerekend tegen de ECB-referentiekoers van vandaag)`,
-    volumeNudge: (n: number, pct: string) => `Nog ${n} artikel${n > 1 ? "en" : ""} voor −${pct}%`,
-    volumeAddOne: (name: string) => `1 ${name} toevoegen`,
-    volumeApplied: (pct: string) => `Staffelkorting −${pct}% toegepast`,
-    volumeRow: (pct: string) => `Staffelkorting (−${pct}%)`,
-    dealAmountUnit: (amount: string) => `−${amount} per artikel`,
-    dealAmountBundle: (amount: string, n: number) => `−${amount} per ${n} stuks`,
-    dealPrice: (n: number, amount: string) => `${n} voor ${amount}`,
-    dealBxgy: (buy: number, free: number) => `${buy} kopen, ${free} gratis`,
-    volumeNudgeDeal: (n: number, deal: string) => `Nog ${n} artikel${n > 1 ? "en" : ""} voor „${deal}”`,
-    volumeAppliedDeal: (deal: string) => `„${deal}” toegepast`,
-    volumeRowDeal: (deal: string) => `Staffelaanbod (${deal})`,
     automaticDiscount: "Automatische korting",
     otpPrompt: "Al klant? Ontvang een code per e-mail",
     otpSend: "Code ontvangen",
@@ -2067,7 +1664,6 @@ export const LABELS = {
     claimEmailRequired: "Vul het e-mailadres van de bestelling in.",
     claimEmailInvalid: "Vul een geldig e-mailadres in (bijv. naam@voorbeeld.nl).",
     claimEmailMismatch: "Dit e-mailadres komt niet overeen met dat van de bestelling.",
-    claimEmailHint: (masked: string) => `Besteld met ${masked} — bevestig dit e-mailadres.`,
     claimPhotoInvalid: "De link moet beginnen met https://",
     claimPhotos: "Foto's (optioneel)",
     claimPhotosHint: "Maximaal 3 foto's van het pakket of artikel (JPEG, PNG, WebP; automatisch verkleind voor het verzenden).",
@@ -2077,9 +1673,6 @@ export const LABELS = {
     claimPhotoType: "Dit bestand is geen afbeelding (JPEG, PNG, WebP, HEIC).",
     claimPhotosAdd: "Foto's toevoegen",
     claimPhotosAddMore: "Foto toevoegen",
-    claimPhotosCount: (n: number, max: number) => `${n}/${max} ${n === 1 ? "foto" : "foto's"}`,
-    claimPhotoRemove: (i: number) => `Foto ${i} verwijderen`,
-    claimPhotoPreview: (i: number) => `Foto ${i}`,
     claimAlreadyPending: "Er wordt al een melding voor deze bestelling bekeken.",
     pickupTitle: "Afhaalpunt",
     pickupZip: "Postcode van het afhaalpunt",
@@ -2088,11 +1681,9 @@ export const LABELS = {
     pickupEmpty: "Geen afhaalpunt gevonden bij deze postcode. Probeer een postcode in de buurt.",
     pickupError: "Afhaalpunten kunnen nu niet worden geladen. Probeer het opnieuw.",
     pickupUnsupported: "Levering aan een afhaalpunt is in dit land niet beschikbaar.",
-    pickupFound: (n: number) => `${n} afhaalpunt${n > 1 ? "en" : ""} gevonden`,
     pickupList: "Afhaalpunten in de buurt",
     pickupChoose: "Kies je afhaalpunt",
     pickupField: "Afhaalpunt",
-    pickupDeliveredAt: (name: string) => `Levering bij ${name}`,
     pickupChange: "Wijzigen",
     pickupToday: "Vandaag",
     pickupClosedToday: "Vandaag gesloten",
@@ -2105,7 +1696,6 @@ export const LABELS = {
     upsellNextOffer: "Nog een aanbod voor jou",
     upsellDeclined: "Aanbod afgewezen",
     shippingAddress: "Bezorgadres",
-    emailSuggest: (email: string) => `Bedoelde je ${email}?`,
     errEmail: "Vul een e-mailadres in",
     errEmailInvalid: "Vul een geldig e-mailadres in (bijv. naam@voorbeeld.nl)",
     errCountry: "Selecteer een land",
@@ -2114,15 +1704,12 @@ export const LABELS = {
     errAddress: "Vul een adres in",
     errZip: "Vul een postcode in",
     errCity: "Vul een plaats in",
-    errZipFor: (country: string, example: string) => `Ongeldige postcode voor ${country} (bijv. ${example})`,
     trackOrder: "Mijn bestelling volgen",
     needHelp: "Hulp nodig?",
     contactUs: "Neem contact op",
-    offerValidFor: (min: number) => `Aanbod nog ${min} min geldig`,
     language: "Taal",
     rememberMe: "Mijn gegevens op dit apparaat onthouden",
     rememberHint: "Alleen in deze browser opgeslagen, nooit je betaalgegevens.",
-    continueAs: (email: string) => `Doorgaan als ${email}`,
     useSaved: "Mijn gegevens gebruiken",
     notMe: "Dit ben ik niet",
     forgetMe: "Vergeten",
@@ -2130,15 +1717,11 @@ export const LABELS = {
     savedForgotten: "Gegevens op dit apparaat vergeten.",
     savedRegion: "Op dit apparaat opgeslagen gegevens",
     giftFree: "Gratis cadeau",
-    giftNudgeAmount: (amount: string, gift: string) => `Nog ${amount} voor ${gift} gratis`,
-    giftNudgeItems: (n: number, gift: string) => `Nog ${n} artikel${n > 1 ? "en" : ""} voor ${gift} gratis`,
-    giftEarned: (gift: string) => `${gift} gratis bij je bestelling`,
     protectionTitle: "Pakketbescherming (verlies, diefstal, breuk)",
     protectionText: "Pakket kwijt, gestolen of beschadigd: opnieuw verzonden of terugbetaald.",
     protectionRow: "Pakketbescherming",
     protectionOn: "Pakket beschermd",
     protectionDefault: "Pakket kwijt, gestolen of beschadigd? De winkel verstuurt het opnieuw of betaalt je terug.",
-    upsellOff: (pct: string) => `−${pct}%`,
     surveyQuestion: "Hoe heb je ons leren kennen?",
     surveyOptions: { facebook: "Facebook", instagram: "Instagram", tiktok: "TikTok", google: "Google", youtube: "YouTube", friend: "Via vrienden of familie", other: "Anders" } as Record<string, string>,
     surveyOtherLabel: "Toelichting (optioneel)",
@@ -2185,162 +1768,110 @@ export const LABELS = {
   },
 };
 
-export type Labels = (typeof LABELS)["fr"];
+export type LabelText = (typeof LABEL_TEXTS)["fr"];
 
-export type Lang = keyof typeof LABELS;
-export const LANGS: { code: Lang; label: string }[] = [
-  { code: "fr", label: "Français" },
-  { code: "en", label: "English" },
-  { code: "de", label: "Deutsch" },
-  { code: "es", label: "Español" },
-  { code: "it", label: "Italiano" },
-  { code: "nl", label: "Nederlands" },
-];
+/** Every text of the checkout, per language. */
+export const LABELS = {
+  fr: { ...LABEL_TEXTS.fr, ...LABEL_FNS.fr },
+  en: { ...LABEL_TEXTS.en, ...LABEL_FNS.en },
+  de: { ...LABEL_TEXTS.de, ...LABEL_FNS.de },
+  es: { ...LABEL_TEXTS.es, ...LABEL_FNS.es },
+  it: { ...LABEL_TEXTS.it, ...LABEL_FNS.it },
+  nl: { ...LABEL_TEXTS.nl, ...LABEL_FNS.nl },
+} satisfies Record<Lang, LabelText & LabelFns>;
+
+export type Labels = (typeof LABELS)["fr"];
 
 export function labelsFor(lang: Lang): Labels {
   return (LABELS[lang] ?? LABELS.fr) as Labels;
 }
 
-/** BCP-47 locale for number/date formatting. */
-export function localeOf(lang: Lang): string {
-  return { fr: "fr-FR", en: "en-US", de: "de-DE", es: "es-ES", it: "it-IT", nl: "nl-NL" }[lang] ?? "fr-FR";
-}
-
-/** Localized message for an API error code, falling back to the server text. */
-export function errorText(L: Labels, body: { code?: string; error?: string } | null | undefined): string {
-  return (body?.code && L.errors[body.code]) || body?.error || L.error;
-}
-
-/** Brand names of payment methods (same in every language). */
-const METHOD_BRANDS: Record<string, string> = {
-  apple_pay: "Apple Pay",
-  google_pay: "Google Pay",
-  paypal: "PayPal",
-  klarna: "Klarna",
-  afterpay_clearpay: "Afterpay / Clearpay",
-  affirm: "Affirm",
-  alma: "Alma",
-  oney_3x: "Oney 3x",
-  oney_4x: "Oney 4x",
-  scalapay: "Scalapay",
-  bancontact: "Bancontact",
-  ideal: "iDEAL",
-  twint: "TWINT",
-  eps: "EPS",
-  p24: "Przelewy24",
-  blik: "BLIK",
-  crypto: "Crypto",
-  whop_pay: "Whop Pay",
-  cashapp: "Cash App Pay",
-};
-
-/** Buyer-facing name of a Whop payment method type ("card" → "Carte bancaire"). */
-export function paymentMethodName(type: string | null | undefined, L: Labels): string | null {
-  if (!type) return null;
-  const t = type.toLowerCase();
-  if (t === "card" || t === "credit_card" || t === "debit_card") return L.methodCard;
-  if (t === "sepa_debit" || t === "sepa") return L.methodSepa;
-  if (t === "bank_transfer" || t === "customer_balance") return L.methodBank;
-  return METHOD_BRANDS[t] ?? t.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase());
-}
-
-/** Countries offered when a shipping rate covers "all countries". */
-export const DEFAULT_COUNTRIES = [
-  "FR", "BE", "CH", "LU", "MC", "DE", "AT", "NL", "ES", "PT", "IT", "IE", "GB", "DK", "SE", "NO", "FI",
-  "PL", "CZ", "SK", "HU", "RO", "BG", "GR", "HR", "SI", "EE", "LV", "LT", "CY", "MT", "IS",
-  "US", "CA", "AU", "NZ", "JP", "SG", "HK", "AE", "IL", "MA", "TN", "DZ", "SN", "CI", "RE", "GP", "MQ", "GF", "YT", "NC", "PF",
-];
-
-// Server (Node ICU) and browsers disagree on a few names: pin them to avoid hydration mismatches.
-const PINNED_NAMES: Record<string, string> = { HK: "Hong Kong", MO: "Macao", PS: "Palestine" };
-
-export function countryName(code: string, lang: Lang) {
-  if (PINNED_NAMES[code]) return PINNED_NAMES[code];
-  try {
-    return new Intl.DisplayNames([lang], { type: "region" }).of(code) ?? code;
-  } catch {
-    return code;
-  }
-}
-
-/** First supported language in an Accept-Language header (or navigator.languages), French by default. */
-export function pickLang(prefs: string | readonly string[] | null | undefined): Lang {
-  const list = typeof prefs === "string" ? prefs.split(",").map((p) => p.split(";")[0]) : (prefs ?? []);
-  for (const raw of list) {
-    const code = raw.trim().slice(0, 2).toLowerCase();
-    if (code in LABELS) return code as Lang;
-  }
-  return "fr";
-}
-
-/** True for one of the six checkout languages. */
-export function isLang(v: unknown): v is Lang {
-  return typeof v === "string" && Object.prototype.hasOwnProperty.call(LABELS, v);
-}
-
 /**
- * Best supported language of an Accept-Language header, honouring q-values
- * ("de-CH;q=0.9, en;q=0.8" → "de"); null when none of the six is accepted.
+ * The texts of the other pages (thank-you, protection claim, page not found, the page's title) and the
+ * few no page shows any more: never sent with the checkout page. A checkout component reading one of
+ * them does not compile (its labels are CheckoutLabels).
  */
-export function matchAcceptLanguage(header: string | null | undefined): Lang | null {
-  if (!header) return null;
-  const prefs = header
-    .split(",")
-    .map((part, i) => {
-      const [tag, ...params] = part.trim().split(";");
-      const qp = params.map((p) => p.trim()).find((p) => p.startsWith("q="));
-      const q = qp ? Number(qp.slice(2)) : 1;
-      return { code: tag.trim().slice(0, 2).toLowerCase(), q: Number.isFinite(q) ? q : 0, i };
-    })
-    .filter((p) => p.q > 0)
-    .sort((a, b) => b.q - a.q || a.i - b.i);
-  return prefs.find((p) => isLang(p.code))?.code as Lang | undefined ?? null;
-}
+export const NOT_ON_CHECKOUT = [
+  // Thank-you page.
+  "thankYouTitle",
+  "orderConfirmed",
+  "orderProcessing",
+  "orderPaymentFailed",
+  "orderNumberPending",
+  "estimatedDelivery",
+  "backToCheckout",
+  "continueShopping",
+  "shipTo",
+  "pickupShipTo",
+  "paymentMethod",
+  "statementNote",
+  "withdrawal",
+  "withdrawalContact",
+  "stepDone",
+  "stepUpcoming",
+  "upsellDeclined",
+  "trackOrder",
+  "needHelp",
+  "contactUs",
+  "protectionOn",
+  "protectionDefault",
+  // Protection claim form (thank-you page).
+  "claimCta",
+  "claimReason",
+  "claimLost",
+  "claimStolen",
+  "claimDamaged",
+  "claimWrong",
+  "claimOther",
+  "claimEmail",
+  "claimDetails",
+  "claimPhoto",
+  "claimSubmit",
+  "claimCancel",
+  "claimSent",
+  "claimPending",
+  "claimApproved",
+  "claimRejected",
+  "claimError",
+  "claimEmailRequired",
+  "claimEmailInvalid",
+  "claimEmailMismatch",
+  "claimPhotoInvalid",
+  "claimPhotos",
+  "claimPhotosHint",
+  "claimPhotosTooMany",
+  "claimPhotoTooBig",
+  "claimPhotoHeic",
+  "claimPhotoType",
+  "claimPhotosAdd",
+  "claimPhotosAddMore",
+  "claimAlreadyPending",
+  // Page not found; the page's title (set by the server).
+  "notFoundTitle",
+  "notFoundText",
+  "notFoundHelp",
+  "goBack",
+  "securePayment",
+  // Shown by no page any more.
+  "shippingPending",
+  "endsIn",
+  "required",
+  "invalidEmail",
+  "fieldValid",
+  "stepInformation",
+] as const satisfies readonly (keyof LabelText)[];
+type NotOnCheckout = (typeof NOT_ON_CHECKOUT)[number];
 
-/** Cookie remembering the language a buyer picked with the footer switcher (checkout origin, /c). */
-export const LANG_COOKIE = "wc_lang";
+/** The checkout page's plain texts (sent by the server in the buyer's language: see checkoutCopy). */
+export type CheckoutText = Omit<LabelText, NotOnCheckout>;
+/** The checkout page's texts: its plain texts and every formula (labelsOf). */
+export type CheckoutLabels = Omit<Labels, NotOnCheckout>;
 
-/**
- * Checkout language: `?lang=` → the buyer's earlier choice (cookie) → Accept-Language
- * best match → the store's default.
- */
-export function resolveCheckoutLang(input: {
-  query?: string | string[] | null;
-  cookie?: string | null;
-  acceptLanguage?: string | null;
-  fallback: Lang;
-}): Lang {
-  const q = Array.isArray(input.query) ? input.query[0] : input.query;
-  if (isLang(q)) return q;
-  if (isLang(input.cookie)) return input.cookie;
-  return matchAcceptLanguage(input.acceptLanguage) ?? input.fallback;
-}
+const CHECKOUT_TEXTS = Object.fromEntries(
+  Object.entries(LABEL_TEXTS).map(([lang, texts]) => [lang, Object.fromEntries(Object.entries(texts).filter(([k]) => !(NOT_ON_CHECKOUT as readonly string[]).includes(k)))]),
+) as Record<Lang, CheckoutText>;
 
-/**
- * Countries named by the browser's locales, most preferred first: "de-DE,de;q=0.9,en-US;q=0.8"
- * → ["DE", "US"]. Language-only tags ("de") and script/numeric regions ("zh-Hant", "es-419")
- * name no country. Used to pre-select the shipping country when the IP country is unknown.
- */
-export function localeCountries(acceptLanguage: string | null | undefined): string[] {
-  if (!acceptLanguage) return [];
-  const tags = acceptLanguage
-    .split(",")
-    .map((part, i) => {
-      const [tag, ...params] = part.trim().split(";");
-      const qParam = params.map((p) => p.trim()).find((p) => p.startsWith("q="));
-      const q = qParam ? Number(qParam.slice(2)) : 1;
-      return { tag: tag.trim(), q: Number.isFinite(q) ? q : 0, i };
-    })
-    .filter((t) => t.tag && t.q > 0)
-    .sort((a, b) => b.q - a.q || a.i - b.i);
-  const out: string[] = [];
-  for (const { tag } of tags) {
-    const region = tag
-      .split(/[-_]/)
-      .slice(1)
-      .find((s) => /^[a-z]{2}$/i.test(s));
-    const code = region?.toUpperCase();
-    if (code && !out.includes(code)) out.push(code);
-  }
-  return out;
+/** The checkout page's plain texts in `lang` (one object per language). */
+export function checkoutTextFor(lang: Lang): CheckoutText {
+  return CHECKOUT_TEXTS[lang] ?? CHECKOUT_TEXTS.fr;
 }

@@ -1,4 +1,4 @@
-import { countryName, DEFAULT_COUNTRIES, localeCountries, type Lang } from "@/components/checkout/i18n";
+import { countryName, DEFAULT_COUNTRIES, localeCountries, type Lang } from "@/components/checkout/i18n-core";
 
 /**
  * The country a checkout language falls back to (last resort of the pre-selected country). English

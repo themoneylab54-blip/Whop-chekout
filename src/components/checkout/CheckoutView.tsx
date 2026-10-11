@@ -15,7 +15,7 @@ import {
 } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Check, ChevronDown, ChevronRight, Gift, Info, Lock, Minus, Package, Plus, ShieldCheck, Tag, TrendingDown, UserRound, X } from "lucide-react";
-import type { Block, BlockOf, BlockType, Layout, Theme } from "@/lib/layout";
+import type { Block, BlockOf, BlockType, Theme } from "@/lib/layout";
 import { cartShippable, expressMethodsShown, headerModeOf, offeredWalletsFor, type ExpressWallet } from "@/lib/layout-shared";
 import { fieldBorderColor, HEADER_PLACEHOLDER_ON_DARK } from "@/lib/contrast";
 import { buttonVars } from "@/lib/button-colors";
@@ -42,9 +42,12 @@ import {
   StyledBlock,
   type ContentContext,
 } from "./blocks";
-import { countryName, errorText, labelsFor, localeOf, type Labels } from "./i18n";
+import { countryName, errorText, localeOf } from "./i18n-core";
+import { labelsOf } from "./i18n-fns";
+import type { CheckoutLabels } from "./i18n";
+import type { CheckoutCopy } from "./checkoutCopy";
 import { checkoutCountries, pickFirstCountry, storeMarketOf } from "@/lib/first-country";
-import { localizeDeliveryTime, localizeLayout, localizeTheme } from "./localize";
+import { localizeDeliveryTime } from "./deliveryTime";
 import { suggestEmail } from "./emailSuggest";
 import { LanguageSwitcher } from "./LanguageSwitcher";
 import { clearSavedBuyer, maskEmail, parseSavedBuyer, readSavedBuyerRaw, subscribeSavedBuyer, writeSavedBuyer } from "./savedBuyer";
@@ -56,7 +59,7 @@ import { sampleRecommendations, visibleRecommendations, type RecommendationView 
 import { AddressAutocomplete } from "./AddressAutocomplete";
 import { SafeImg } from "./SafeImg";
 import { PickupPicker, pickupPayload, type PickupPointView } from "./PickupPicker";
-import { cartProductsOf } from "@/lib/reviews-import";
+import { cartProductsOf } from "@/lib/reviews-order";
 import {
   ExpressCheckout,
   ExpressPreview,
@@ -107,8 +110,8 @@ export type CheckoutMode =
   | { kind: "live"; sessionId: string; testMode: boolean; saveCard?: boolean; paymentFailed?: boolean };
 
 type Props = {
-  theme: Theme;
-  layout: Layout;
+  /** The theme, the layout and the page's plain texts, all in the buyer's language (checkoutCopy). */
+  copy: CheckoutCopy;
   currency: string;
   lines: CartLine[];
   rates: RateInput[];
@@ -411,9 +414,12 @@ function storeHomeUrl(cartUrl: string | null | undefined): string | null {
   return /^https?:$/.test(u.protocol) ? `${u.origin}/` : null;
 }
 
-/** Checkout / thank-you footer: trust line, legal links and (live pages) the language picker. */
-export function Footer({ theme, languageSwitcher = false }: { theme: Theme; languageSwitcher?: boolean }) {
-  if (!theme.trustLine && theme.policyLinks.length === 0 && !languageSwitcher) return null;
+/**
+ * Checkout / thank-you footer: trust line, legal links and (live pages) the language picker, labelled
+ * `languageLabel` (none: no picker).
+ */
+export function Footer({ theme, languageLabel }: { theme: Theme; languageLabel?: string }) {
+  if (!theme.trustLine && theme.policyLinks.length === 0 && !languageLabel) return null;
   return (
     <footer className="mt-8 border-t border-neutral-200 pt-4 text-xs text-neutral-600">
       {theme.trustLine && (
@@ -423,7 +429,7 @@ export function Footer({ theme, languageSwitcher = false }: { theme: Theme; lang
           <span>{theme.trustLine}</span>
         </p>
       )}
-      {(theme.policyLinks.length > 0 || languageSwitcher) && (
+      {(theme.policyLinks.length > 0 || languageLabel) && (
         <div className="mt-1 flex flex-wrap items-center gap-x-4">
           {theme.policyLinks.length > 0 && (
             <nav className="flex flex-wrap gap-x-4">
@@ -440,9 +446,9 @@ export function Footer({ theme, languageSwitcher = false }: { theme: Theme; lang
               ))}
             </nav>
           )}
-          {languageSwitcher && (
+          {languageLabel && (
             <div className="ml-auto">
-              <LanguageSwitcher lang={theme.language} label={labelsFor(theme.language).language} />
+              <LanguageSwitcher lang={theme.language} label={languageLabel} />
             </div>
           )}
         </div>
@@ -699,8 +705,7 @@ function fieldId(k: string) {
 }
 
 export function CheckoutView({
-  theme: themeProp,
-  layout: layoutProp,
+  copy: { theme, layout, labelText },
   currency,
   lines,
   rates,
@@ -736,10 +741,10 @@ export function CheckoutView({
     // Once per page.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  // Buyer-language copy: merchant translations, then shipped French defaults translated.
-  const theme = useMemo(() => localizeTheme(themeProp), [themeProp]);
-  const layout = useMemo(() => localizeLayout(layoutProp, themeProp.language), [layoutProp, themeProp.language]);
-  const L = labelsFor(theme.language);
+  // The page's texts, one object per language: a new copy of the same texts (another render, a refresh)
+  // never makes a new one, so what depends on them runs again on a change of language only.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const L: CheckoutLabels = useMemo(() => labelsOf(labelText, theme.language), [theme.language]);
   const router = useRouter();
   const live = mode.kind === "live";
   const money = useCallback(
@@ -2747,7 +2752,7 @@ export function CheckoutView({
                 </div>
               )}
               {arranged.after.map((b) => wrap(b, <ContentBlock block={b} ctx={ctx} />))}
-              <Footer theme={theme} languageSwitcher={live} />
+              <Footer theme={theme} languageLabel={live ? L.language : undefined} />
             </div>
           </main>
           <aside
@@ -2934,7 +2939,7 @@ function Field({
 
 function OrderSummary(props: {
   showImages: boolean;
-  L: Labels;
+  L: CheckoutLabels;
   lines: CartLine[];
   totals: Totals;
   money: (c: number) => string;
@@ -3204,7 +3209,7 @@ function OrderSummary(props: {
 }
 
 type PromoProps = {
-  L: Labels;
+  L: CheckoutLabels;
   codeInput: string;
   setCodeInput: (v: string) => void;
   appliedCode: string | null;
@@ -3341,7 +3346,7 @@ function TermsText({
   theme,
   express,
 }: {
-  L: Labels;
+  L: CheckoutLabels;
   theme: Theme;
   express?: boolean;
 }) {
@@ -3386,7 +3391,7 @@ function TermsText({
  * "Panier › Paiement" on wide screens (one-page checkout: the cart step links back to the
  * Shopify cart); a single "Back to cart" link on small screens.
  */
-function CheckoutSteps({ L, cartUrl }: { L: Labels; cartUrl: string | null }) {
+function CheckoutSteps({ L, cartUrl }: { L: CheckoutLabels; cartUrl: string | null }) {
   const current = "payment";
   const steps = [
     { key: "cart", label: L.stepCart },

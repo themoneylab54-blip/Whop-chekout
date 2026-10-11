@@ -1,4 +1,4 @@
-import { localeOf, type Lang } from "./i18n";
+import { localeOf, type Lang } from "./i18n-core";
 
 /*
  * "≈ 52,30 CHF" under the total for buyers whose country pays in another currency.

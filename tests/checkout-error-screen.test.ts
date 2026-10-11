@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement as h } from "react";
 import { cleanup, render, screen } from "@testing-library/react";
 import { ERROR_SCREEN_FLAG, healthPath } from "@/components/checkout/inlineWatchdog";
-import { labelsFor, pickLang } from "@/components/checkout/i18n";
+import { pickLang } from "@/components/checkout/i18n-core";
+import { ERROR_SCREEN_TEXTS } from "@/components/checkout/errorScreenTexts";
+import { labelsFor } from "@/components/checkout/i18n";
 
 /*
  * The checkout's error screen (app/c/[id]/error): in the browser's language with its own texts, it
@@ -36,10 +38,14 @@ afterEach(() => {
 const boom = Object.assign(new Error("x".repeat(500)), { digest: "1234" });
 
 describe("the checkout's error screen", () => {
+  it("its own texts are the checkout's, in every language", () => {
+    for (const [lang, t] of Object.entries(ERROR_SCREEN_TEXTS)) for (const [k, v] of Object.entries(t)) expect(labelsFor(lang as keyof typeof ERROR_SCREEN_TEXTS)[k as keyof typeof t]).toBe(v);
+  });
+
   it("on the checkout page: shown, the watchdog stood down, reported (message cut short, digest)", () => {
     window.history.pushState({}, "", "/c/cmv3o4asm000pia06oes69f3i");
     render(h(CheckoutError, { error: boom, reset: () => undefined }));
-    expect(screen.getByText(labelsFor(pickLang(navigator.languages)).errorTitle)).toBeTruthy();
+    expect(screen.getByText(ERROR_SCREEN_TEXTS[pickLang(navigator.languages)].errorTitle)).toBeTruthy();
     expect((window as unknown as Record<string, unknown>)[ERROR_SCREEN_FLAG]).toBe(true);
     expect(beacons).toEqual([{ url: healthPath("cmv3o4asm000pia06oes69f3i"), body: expect.objectContaining({ kind: "page_error", msg: "x".repeat(300), digest: "1234" }) }]);
   });
@@ -47,7 +53,7 @@ describe("the checkout's error screen", () => {
   it("on the thank-you page: shown, never reported", () => {
     window.history.pushState({}, "", "/c/cmv3o4asm000pia06oes69f3i/merci");
     render(h(CheckoutError, { error: boom, reset: () => undefined }));
-    expect(screen.getByText(labelsFor(pickLang(navigator.languages)).retry)).toBeTruthy();
+    expect(screen.getByText(ERROR_SCREEN_TEXTS[pickLang(navigator.languages)].retry)).toBeTruthy();
     expect(beacons).toHaveLength(0);
   });
 

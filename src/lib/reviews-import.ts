@@ -1,5 +1,9 @@
 import type { ReviewItem, ReviewSummary } from "./layout";
 import { MAX_REVIEW_ITEMS, REVIEW_LIMITS } from "./layout-shared";
+import { productIdOf } from "./reviews-order";
+
+// The browser-side helpers live apart (the payment page never loads this module): re-exported here.
+export { cartProductsOf, importedReviewsOrigin, orderReviewsForCart, productIdOf, type CartProducts } from "./reviews-order";
 
 /*
  * Real customer reviews for the "Avis clients" block: parsing of review apps' CSV exports
@@ -401,12 +405,6 @@ export function plainText(v: string | undefined | null, max: number): string {
   return `${s.slice(0, max - 1).trimEnd()}…`;
 }
 
-/** Numeric Shopify product id ("gid://shopify/Product/123", "123"), or undefined. */
-export function productIdOf(v: string | number | undefined | null): string | undefined {
-  const m = /(\d{1,20})\s*$/.exec(String(v ?? "").trim());
-  return m ? m[1] : undefined;
-}
-
 function handleOf(handle: string | undefined, url: string | undefined): string | undefined {
   const h = String(handle ?? "").trim().toLowerCase();
   if (/^[a-z0-9][a-z0-9_-]{0,254}$/.test(h)) return h;
@@ -737,17 +735,6 @@ export function floorScore(avg: number): number {
 }
 
 /**
- * Where the imported reviews among `items` come from, for the buyer-facing transparency line:
- * "judgeme" when they all come from the Judge.me API, "app" when any comes from a CSV export
- * (a review app not named), null when none is imported (hand-typed only: no line).
- */
-export function importedReviewsOrigin(items: Pick<ReviewItem, "source">[]): "judgeme" | "app" | null {
-  const imported = items.filter((r) => r.source === "csv" || r.source === "judgeme");
-  if (imported.length === 0) return null;
-  return imported.every((r) => r.source === "judgeme") ? "judgeme" : "app";
-}
-
-/**
  * What an imported average covers, told next to it in the builder, by source: a CSV every review
  * of the file; Judge.me every published review, or only the N read when the import stopped
  * early; Shopify (active products' metafields) every published review of the store, or part of
@@ -831,37 +818,4 @@ function shopifyProductRating(p: { rating?: string | null; count?: string | null
   const on5 = scaleMax === 5 ? value : (value / scaleMax) * 5;
   if (on5 < 1) return null;
   return { on5, count };
-}
-
-/* ------------------------------------------------------------------ */
-/* Per-cart order                                                      */
-/* ------------------------------------------------------------------ */
-
-export type CartProducts = { handles: string[]; productIds: string[] };
-
-/** The cart's products, as the reviews name them (handles lowercased, numeric ids). */
-export function cartProductsOf(lines: { productHandle?: string | null; productId?: string | null; gift?: boolean }[]): CartProducts {
-  const buyer = lines.filter((l) => !l.gift);
-  return {
-    handles: [...new Set(buyer.map((l) => String(l.productHandle ?? "").toLowerCase()).filter(Boolean))],
-    productIds: [...new Set(buyer.map((l) => productIdOf(l.productId)).filter((v): v is string => !!v))],
-  };
-}
-
-/**
- * Reviews of the products in the cart first, then the general ones (no product), then the other
- * products'. Stable: the merchant's order is kept within each group.
- */
-export function orderReviewsForCart<T extends Pick<ReviewItem, "productHandle" | "productId">>(items: T[], cart: CartProducts | null | undefined): T[] {
-  if (!cart || (cart.handles.length === 0 && cart.productIds.length === 0)) return items;
-  const handles = new Set(cart.handles.map((h) => h.toLowerCase()));
-  const ids = new Set(cart.productIds);
-  const rank = (r: T) => {
-    if ((r.productHandle && handles.has(r.productHandle.toLowerCase())) || (r.productId && ids.has(r.productId))) return 0;
-    return r.productHandle || r.productId ? 2 : 1;
-  };
-  return items
-    .map((r, i) => ({ r, i, k: rank(r) }))
-    .sort((a, b) => a.k - b.k || a.i - b.i)
-    .map((x) => x.r);
 }

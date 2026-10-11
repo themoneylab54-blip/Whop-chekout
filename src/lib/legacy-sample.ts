@@ -1,5 +1,5 @@
 import type { Block } from "./layout";
-import { DEFAULT_TEXTS } from "@/components/checkout/localize";
+import { SAMPLE_DEFAULTS, type SampleKey } from "@/components/checkout/sampleDefaults";
 
 /**
  * Example content earlier versions shipped, recognised by its exact values: the example reviews
@@ -13,8 +13,8 @@ import { DEFAULT_TEXTS } from "@/components/checkout/localize";
  * A shipped default in any buyer language, plus the French value earlier versions shipped (kept
  * literally: the loader must recognise old example content even if the current defaults change).
  */
-const shipped = (key: string, fr: string) =>
-  new Set<string>([fr, ...Object.values(DEFAULT_TEXTS).map((t) => (t as Record<string, string | undefined>)[key]?.trim() ?? "")].filter(Boolean));
+const shipped = (key: SampleKey, fr: string) =>
+  new Set<string>([fr, ...Object.values(SAMPLE_DEFAULTS).map((t) => t[key].trim())].filter(Boolean));
 const SAMPLE_REVIEWS: { name: string; texts: Set<string> }[] = [
   { name: "Camille R.", texts: shipped("review1", "Commande reçue en 3 jours, qualité au top. Je recommande !") },
   { name: "Yanis B.", texts: shipped("review2", "Service client réactif et produit conforme aux photos.") },

@@ -35,10 +35,11 @@ import {
   ratingIsSet,
 } from "@/lib/layout-shared";
 import type { Block, BlockOf, BlockStyle, ReviewItem, ReviewSummary } from "@/lib/layout";
-import { importedReviewsOrigin, orderReviewsForCart, type CartProducts } from "@/lib/reviews-import";
+import { importedReviewsOrigin, orderReviewsForCart, type CartProducts } from "@/lib/reviews-order";
 import { BlockIcon, ICONS, IconTile } from "@/components/icons";
 import { honestReviewItems, isSampleReview, liveReviewItems, liveStatItems, liveTextParts, liveWhyUsRows } from "@/lib/sample-content";
-import { errorText, localeOf, type Labels, type Lang, type ReviewsNoteSummary } from "./i18n";
+import { errorText, localeOf, type Lang, type ReviewsNoteSummary } from "./i18n-core";
+import type { CheckoutLabels } from "./i18n";
 import { SafeImg } from "./SafeImg";
 import { browserStorage, evergreenRemaining, evergreenStart, evergreenStorageKey, formatTimer, spokenTimer, splitTimerText } from "./countdown";
 import { parseSimpleText, withFirstName, type SimpleInline } from "@/lib/simple-text";
@@ -227,7 +228,7 @@ function Faq({ items }: BlockOf<"faq">["props"]) {
   );
 }
 
-type CountdownProps = BlockOf<"countdown">["props"] & { blockId: string; storeKey?: string | null; labels: Labels; preview: boolean };
+type CountdownProps = BlockOf<"countdown">["props"] & { blockId: string; storeKey?: string | null; labels: CheckoutLabels; preview: boolean };
 
 /**
  * The countdown band: the text with the timer at {timer} (inline), else text left and timer right.
@@ -423,7 +424,7 @@ const REVIEWS_PAGE = 10;
 /** Carousel cards in the DOM at once (the page holding the current one): 300 reviews stay light. */
 const CAROUSEL_WINDOW = 10;
 
-function ReviewCard({ r, labels, lang }: { r: ReviewItem; labels: Labels; lang: Lang }) {
+function ReviewCard({ r, labels, lang }: { r: ReviewItem; labels: CheckoutLabels; lang: Lang }) {
   const date = r.date ? reviewDate(r.date, lang) : "";
   return (
     <figure className="flex h-full flex-col rounded-[var(--radius)] border border-[var(--border)] bg-white p-4 text-left text-neutral-900 shadow-[0_1px_2px_rgba(15,23,42,.04)]">
@@ -457,7 +458,7 @@ function ReviewCard({ r, labels, lang }: { r: ReviewItem; labels: Labels; lang: 
 }
 
 /** "★★★★★ 4,8/5 · 1 234 avis": only from real data (all the store's published reviews). */
-function ReviewsSummary({ summary, labels, lang }: { summary: ReviewSummary; labels: Labels; lang: Lang }) {
+function ReviewsSummary({ summary, labels, lang }: { summary: ReviewSummary; labels: CheckoutLabels; lang: Lang }) {
   const score = formatRatingScore(summary.score, localeOf(lang));
   const count = summary.count.toLocaleString(localeOf(lang));
   // A paragraph with an aria-label is not read out: the sentence is real (screen-reader only)
@@ -477,7 +478,7 @@ function ReviewsSummary({ summary, labels, lang }: { summary: ReviewSummary; lab
 /** More reviews than this: a "3 / 20" counter instead of one dot per review. */
 const CAROUSEL_MAX_DOTS = 6;
 
-function ReviewsCarousel({ items, labels, lang, title }: { items: ReviewItem[]; labels: Labels; lang: Lang; title?: string }) {
+function ReviewsCarousel({ items, labels, lang, title }: { items: ReviewItem[]; labels: CheckoutLabels; lang: Lang; title?: string }) {
   // Back to the first review whenever the list changes (reordered, removed, cart order).
   const sig = items.map((r) => `${r.name}\u0001${r.text}`).join("\u0002");
   const [state, setState] = useState({ sig, i: 0 });
@@ -547,7 +548,7 @@ function ReviewsCarousel({ items, labels, lang, title }: { items: ReviewItem[]; 
   );
 }
 
-function ReviewsList({ items, labels, lang }: { items: ReviewItem[]; labels: Labels; lang: Lang }) {
+function ReviewsList({ items, labels, lang }: { items: ReviewItem[]; labels: CheckoutLabels; lang: Lang }) {
   const [count, setCount] = useState(REVIEWS_SHOWN);
   const shown = items.slice(0, count);
   return (
@@ -581,7 +582,7 @@ function noteSummary(summary: ReviewSummary | null | undefined, lang: Lang): Rev
   return summary.source === "csv" ? "file" : true;
 }
 
-function Reviews({ title, layout, items, summary, labels, lang }: BlockOf<"reviews">["props"] & { labels: Labels; lang: Lang }) {
+function Reviews({ title, layout, items, summary, labels, lang }: BlockOf<"reviews">["props"] & { labels: CheckoutLabels; lang: Lang }) {
   if (items.length === 0) return null;
   // EU Omnibus: where the shown reviews come from and what "Verified purchase" means, only when
   // imported reviews are among them (hand-typed only: nothing to disclose about an app).
@@ -709,7 +710,7 @@ function videoEmbed(url: string): { kind: "iframe" | "video"; src: string } | nu
 /* ------------------------------------------------------------------ */
 
 export type ContentContext = {
-  labels: Labels;
+  labels: CheckoutLabels;
   lang: Lang;
   /** lowest tracked inventory among cart items (null in the builder without data) */
   lowestInventory: number | null;
@@ -1434,7 +1435,7 @@ export function Recommendations({
 }: {
   title: string;
   items: CartLine[];
-  labels: Labels;
+  labels: CheckoutLabels;
   money: (cents: number) => string;
   showImages: boolean;
   idPrefix: string;

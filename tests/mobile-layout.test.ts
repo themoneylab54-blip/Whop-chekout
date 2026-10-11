@@ -25,6 +25,7 @@ vi.mock("@whop/checkout/react", () => ({
 }));
 
 const { createBlock, defaultCheckoutLayout, defaultTheme, loadTheme, themeSchema } = await import("@/lib/layout");
+const { checkoutCopy } = await import("@/components/checkout/localize");
 const { CheckoutView, StoreHeader, bannerBox, BANNER_PHONE_MEDIA, BANNER_MAX_HEIGHT } = await import("@/components/checkout/CheckoutView");
 const { ContentBlock } = await import("@/components/checkout/blocks");
 const { labelsFor } = await import("@/components/checkout/i18n");
@@ -53,8 +54,7 @@ afterEach(cleanup);
 describe("checkout page: one column never wider than the phone", () => {
   it("the page grid has an explicit minmax(0, 1fr) track and its columns can shrink", () => {
     const props: ComponentProps<typeof CheckoutView> = {
-      theme: theme(),
-      layout: { ...defaultCheckoutLayout(), blocks: [createBlock("countdown"), ...defaultCheckoutLayout().blocks] },
+      copy: checkoutCopy(theme(), { ...defaultCheckoutLayout(), blocks: [createBlock("countdown"), ...defaultCheckoutLayout().blocks] }),
       currency: "EUR",
       lines: SAMPLE_LINES,
       rates: [],

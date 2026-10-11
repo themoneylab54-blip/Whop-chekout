@@ -12,7 +12,7 @@ import type { Theme } from "@/lib/layout";
 import { fontHref } from "@/lib/layout-shared";
 import { stripeExpressAny, stripeExpressPaymentMethods, stripePaymentWallets } from "./stripe-options";
 import { contrastRatio, fieldBorderColor, mix } from "@/lib/contrast";
-import type { Labels } from "./i18n";
+import type { CheckoutLabels } from "./i18n";
 import { Divider, LockIcon, PaymentSkeleton, SERVER_WAIT_POLL_MS, serverWaitNext, type BuyerForPayment, type ConfirmResult, type PaidCheck, type PanelLock, type Prepared } from "./Payment";
 
 /*
@@ -197,7 +197,7 @@ const STRIPE_CODE_GROUPS: Record<string, string> = {
  */
 export function stripeErrorText(
   error: Pick<StripeError, "type" | "message" | "code"> & { decline_code?: string } | null | undefined,
-  labels: Pick<Labels, "paymentFailed" | "paymentRedirectFailed"> & Partial<Pick<Labels, "stripeErrors">>,
+  labels: Pick<CheckoutLabels, "paymentFailed" | "paymentRedirectFailed"> & Partial<Pick<CheckoutLabels, "stripeErrors">>,
 ): string {
   if (!error) return labels.paymentFailed;
   if (error.code === "payment_intent_authentication_failure") return labels.paymentRedirectFailed;
@@ -227,7 +227,7 @@ type PanelProps = {
   preparing: boolean;
   prepareError: string | null;
   theme: Theme;
-  labels: Labels;
+  labels: CheckoutLabels;
   payLabel: string;
   /** The thank-you page (absolute): Stripe comes back there after a redirect (3-D Secure, bank page). */
   returnUrl: string;
@@ -672,7 +672,7 @@ export function StripeExpress({
 }: {
   prepared: Prepared;
   theme: Theme;
-  labels: Labels;
+  labels: CheckoutLabels;
   returnUrl: string;
   confirmExpress: (buyer: WalletBuyer) => Promise<ConfirmResult>;
   onPaid: () => void;
@@ -749,7 +749,7 @@ function ExpressButtons({
 }: {
   prepared: Prepared;
   theme: Theme;
-  labels: Labels;
+  labels: CheckoutLabels;
   returnUrl: string;
   confirmExpress: (buyer: WalletBuyer) => Promise<ConfirmResult>;
   onPaid: () => void;
