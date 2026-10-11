@@ -543,15 +543,8 @@ async function degradationItems(
       href: `${base}/journal`,
     });
   }
-  // Buyers left without a payment form (the page's own reports): their own tile, a lost sale each.
-  const formMissing = counts["checkout.form_missing"] ?? 0;
-  items.push({
-    key: "payment_form",
-    label: "Formulaire de paiement chez vos clients",
-    ok: formMissing ? false : true,
-    detail: formMissing ? incidentLines(counts, (k) => k === "checkout.form_missing").join(" · ") : "Aucun blocage signalé sur 24 h",
-    href: `${base}/journal`,
-  });
+  // Buyers whose payment form was reported missing (the checkout page's own reports): their own tile.
+  items.push(paymentFormItem(counts["checkout.form_missing"] ? await formMissingBuyers(store.id) : { unpaid: 0, total: 0 }, base));
   // Google Ads incidents are shown on the "Pub & pixels" tile, stuck imports and missing payment
   // forms on their own.
   const lines = incidentLines(counts, (k) => !k.startsWith("google.") && !k.startsWith("import.") && k !== "checkout.form_missing");
@@ -569,6 +562,33 @@ async function degradationItems(
     href: `${base}/journal`,
   });
   return items;
+}
+
+/**
+ * The buyers of the last 24 h whose checkout page reported its payment form missing (journal rows of
+ * "checkout.form_missing", one buyer per session), and among them those who did not pay afterwards.
+ */
+export async function formMissingBuyers(storeId: string): Promise<{ unpaid: number; total: number }> {
+  const rows = await db.eventLog.findMany({
+    where: { storeId, kind: "checkout.form_missing", createdAt: { gt: new Date(Date.now() - 24 * 3600_000) } },
+    select: { sessionId: true },
+  });
+  const ids = [...new Set(rows.map((r) => r.sessionId).filter((id): id is string => !!id))];
+  if (!ids.length) return { unpaid: 0, total: 0 };
+  const unpaid = await db.checkoutSession.count({ where: { id: { in: ids }, status: { not: "PAID" } } });
+  return { unpaid, total: ids.length };
+}
+
+/**
+ * The tile of those buyers. Red from two buyers who did not pay afterwards: one report alone is often
+ * a slow phone or a tab closed early, and a buyer who paid in the end found a way. Pure.
+ */
+export function paymentFormItem(n: { unpaid: number; total: number }, base: string): HealthItem {
+  const paid = n.total - n.unpaid;
+  const detail = !n.total
+    ? "Aucun signalement sur 24 h"
+    : `${n.total} client(s) dont la page n'a pas affiché le formulaire de paiement sur 24 h${paid ? `, dont ${paid} ont payé ensuite` : ""}`;
+  return { key: "payment_form", label: "Formulaire de paiement chez vos clients", ok: n.unpaid >= 2 ? false : n.total ? null : true, detail, href: `${base}/journal` };
 }
 
 export type GaveUpItem = {

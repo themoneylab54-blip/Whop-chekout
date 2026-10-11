@@ -633,6 +633,7 @@ export function PaymentPanel({
   onLockChange,
   inFlightAtLoad = false,
   whopFooterLang = null,
+  onReady,
   onNotReady,
 }: {
   prepared: Prepared | null;
@@ -680,11 +681,14 @@ export function PaymentPanel({
    * server checked Whop's form in (see WhopFooterClip). Null: shown.
    */
   whopFooterLang?: string | null;
+  /** Whop's card form said it is ready (once per checkout). */
+  onReady?: () => void;
   /**
    * Whop's card form on screen WHOP_READY_GRACE_MS without saying it is ready (a frame that never
-   * loads, a screen of Whop's own): told once per frame, nothing changes on screen (a health report).
+   * loads, a screen of Whop's own): told once per checkout, with whether its frame is on the page and
+   * the last state it said; nothing changes on screen (a health report).
    */
-  onNotReady?: (waitedMs: number) => void;
+  onNotReady?: (info: { waitedMs: number; frame: boolean; lastState: string | null }) => void;
 }) {
   const controls = useCheckoutEmbedControls();
   const paypalOn = !!paypal?.active;
@@ -704,23 +708,28 @@ export function PaymentPanel({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showBillingForm, setShowBillingForm] = useState(false);
-  // The card form never saying "ready": the page is told once per checkout (see onNotReady). Settled
-  // for good once it said "ready" (its "disabled" afterwards is the pay button's state) or was told.
-  const notReadyRef = useRef(onNotReady);
+  // The card form ready, or never saying so: the page is told once per checkout (see onReady,
+  // onNotReady). Settled for good once it said "ready" (its "disabled" afterwards is the pay button's
+  // state) or was reported.
+  const healthRef = useRef({ onReady, onNotReady });
   useEffect(() => {
-    notReadyRef.current = onNotReady;
+    healthRef.current = { onReady, onNotReady };
   });
+  const lastState = useRef<string | null>(null);
   const settledFrame = useRef<string | null>(null);
   const cardFrame = !paypalOn && !showBillingForm ? (current?.configId ?? null) : null;
   useEffect(() => {
     if (!cardFrame || settledFrame.current === cardFrame) return;
     if (ready) {
       settledFrame.current = cardFrame;
+      healthRef.current.onReady?.();
       return;
     }
     const t = setTimeout(() => {
       settledFrame.current = cardFrame;
-      notReadyRef.current?.(WHOP_READY_GRACE_MS);
+      // Whop's card frame (its embed's own title): on the page or not.
+      const frame = !!document.querySelector('iframe[title="Whop Embedded Checkout"]');
+      healthRef.current.onNotReady?.({ waitedMs: WHOP_READY_GRACE_MS, frame, lastState: lastState.current });
     }, WHOP_READY_GRACE_MS);
     return () => clearTimeout(t);
   }, [cardFrame, ready]);
@@ -1378,7 +1387,10 @@ export function PaymentPanel({
               setupFutureUsage={saveCard ? "off_session" : undefined}
               skipRedirect
               returnUrl={returnUrl}
-              onStateChange={(s) => setReadyFor(s === "ready" ? current.configId : null)}
+              onStateChange={(s) => {
+                lastState.current = s;
+                setReadyFor(s === "ready" ? current.configId : null);
+              }}
               onComplete={paid}
               onPaymentError={(e) => {
                 if (!paypalOn) cardDeclinedAt.current = Date.now();

@@ -1,3 +1,5 @@
+import { scriptJson } from "./inlineScript";
+
 /*
  * The page's first /prepare, sent by an inline script while the server HTML is parsed — before the
  * page's JavaScript is downloaded and hydrated (half a second to a second on a phone): the payment
@@ -57,19 +59,21 @@ export function firstPrepareProtection(blocks: readonly { type: string; hidden?:
 /** An inline answer older than this is not taken (a page left in the background, restored). */
 const MAX_AGE_MS = 30_000;
 /**
- * A taken answer still not in this long after the page looked at it is given up (the page asks
- * itself): a request hanging on a dead connection never holds the payment form.
+ * An inline request still unanswered this long after it was sent is given up (the page asks itself):
+ * a request hanging on a dead connection never holds the payment form. Past the prepare function's
+ * own 60 s budget: the server's request is over, so the page's own one never waits on it (a wait
+ * that runs out counts as a Whop failure, see SNAPSHOT_WAIT_MS in lib/checkout).
  */
-export const INLINE_WAIT_MS = 15_000;
+export const INLINE_WAIT_MS = 65_000;
+
+/** The inline request given up (INLINE_WAIT_MS), as takeInlinePrepare rejects with it. */
+export function isInlineTimeout(err: unknown): boolean {
+  return err instanceof Error && (err as Error & { inlineTimeout?: boolean }).inlineTimeout === true;
+}
 
 type InlineAnswer = { status: number; text: string; ref: string | null };
 type InlinePrepare = { id: string; body: string; at: number; p: Promise<InlineAnswer> };
 type WithInline = { __wcPrepare?: InlinePrepare };
-
-/** A JSON value written inside an inline <script> (never closes the tag, never breaks the line). */
-function scriptJson(v: unknown): string {
-  return JSON.stringify(v).replace(/</g, "\\u003c").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
-}
 
 /**
  * The inline script (server HTML): sends the first prepare at once and keeps its answer (status, text,
@@ -88,8 +92,8 @@ export function inlinePrepareScript(sessionId: string, body: string): string {
 /**
  * The inline prepare's answer as a Response, for the page's first prepare when that one was sent for
  * this session with exactly this body less than 30 s ago; else null. Looked at once: gone afterwards,
- * taken or not. Rejects (the page then asks itself) when the request failed or is still not answered
- * INLINE_WAIT_MS after this call.
+ * taken or not. Rejects (the page then asks itself) when the request failed, or is still unanswered
+ * INLINE_WAIT_MS after it was sent (isInlineTimeout).
  */
 export function takeInlinePrepare(sessionId: string, body: string, now = Date.now()): Promise<Response> | null {
   if (typeof window === "undefined") return null;
@@ -99,7 +103,10 @@ export function takeInlinePrepare(sessionId: string, body: string, now = Date.no
   if (!inline || inline.id !== sessionId || inline.body !== body || !(now - inline.at >= 0 && now - inline.at < MAX_AGE_MS)) return null;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const late = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`inline prepare unanswered after ${INLINE_WAIT_MS / 1000} s`)), INLINE_WAIT_MS);
+    timer = setTimeout(
+      () => reject(Object.assign(new Error(`inline prepare unanswered after ${INLINE_WAIT_MS / 1000} s`), { inlineTimeout: true })),
+      Math.max(0, inline.at + INLINE_WAIT_MS - now),
+    );
   });
   const answer = inline.p.then((a) => new Response(a.text, { status: a.status, headers: a.ref ? { "x-request-id": a.ref } : undefined }));
   return Promise.race([answer, late]).finally(() => clearTimeout(timer));

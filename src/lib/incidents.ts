@@ -25,7 +25,7 @@ export const INCIDENT_KINDS = {
   "reconcile.whop_slow": "vérification(s) Whop (paiements, remboursements, litiges) reportée(s) : Whop lent ou indisponible",
   "reconcile.stripe_slow": "vérification(s) Stripe (paiements, remboursements, litiges) reportée(s) : Stripe lent ou indisponible",
   "import.background_failed": "import(s) en arrière-plan en échec depuis plus de 48 h (historique clients, commandes hors checkout ou dépenses pub)",
-  "checkout.form_missing": "paiement(s) bloqué(s) chez un client (page de paiement qui ne démarre pas, en erreur, ou formulaire de carte toujours absent après 12 à 30 s)",
+  "checkout.form_missing": "signalement(s) d'une page de paiement sans formulaire chez un client (page qui ne démarre pas, en erreur, ou formulaire de carte toujours absent après 12 à 30 s)",
 } as const;
 export type IncidentKind = keyof typeof INCIDENT_KINDS;
 

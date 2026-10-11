@@ -6,6 +6,7 @@ import { labelsFor, pickLang } from "@/components/checkout/i18n";
 import { StatusPage, statusPrimaryCls, statusSecondaryCls } from "@/components/checkout/StatusPage";
 import { HtmlLang } from "@/components/checkout/HtmlLang";
 import { reportHealth } from "@/components/checkout/paymentHealth";
+import { ERROR_SCREEN_FLAG } from "@/components/checkout/inlineWatchdog";
 
 const noopSubscribe = () => () => {};
 
@@ -34,6 +35,8 @@ export default function CheckoutError({ error, reset }: { error: Error & { diges
 
   useEffect(() => {
     console.error(error);
+    // The page's watchdog stands down (this screen reports itself, below; no reload over it).
+    (window as unknown as Record<string, unknown>)[ERROR_SCREEN_FLAG] = true;
     // The buyer is before an error screen instead of the payment form: told to the server (the
     // checkout page only; the thank-you page's errors are no lost payment).
     try {

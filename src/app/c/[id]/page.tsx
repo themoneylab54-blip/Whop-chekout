@@ -43,6 +43,11 @@ export const dynamic = "force-dynamic";
 // link, and this page's function and database connection are awake before the click.
 const loadSession = cache((id: string) => db.checkoutSession.findUnique({ where: { id }, include: { store: true } }));
 
+/** The version that serves this page (Vercel's deployment, else its commit): in the watchdog's reports. */
+function deploymentId(): string | null {
+  return process.env.VERCEL_DEPLOYMENT_ID || process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 12) || null;
+}
+
 /** Tab title "<Store> · Paiement" in the checkout's language (no app suffix). */
 type PageProps = { params: Promise<{ id: string }>; searchParams: Promise<{ lang?: string | string[]; via?: string | string[]; payment?: string | string[] }> };
 
@@ -258,7 +263,7 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
       <CheckoutHtmlLang lang={theme.language} />
       <script dangerouslySetInnerHTML={{ __html: inlinePrepareScript(session.id, firstPrepare) }} />
       {/* The page's watchdog: a page whose scripts never start is reported and reloaded once (see inlineWatchdog). */}
-      <script dangerouslySetInnerHTML={{ __html: inlineWatchdogScript(session.id) }} />
+      <script dangerouslySetInnerHTML={{ __html: inlineWatchdogScript(session.id, deploymentId()) }} />
       {preconnects.map((p) => (
         <link key={p.href} rel="preconnect" href={p.href} crossOrigin={p.crossOrigin} />
       ))}

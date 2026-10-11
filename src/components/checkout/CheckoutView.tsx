@@ -49,8 +49,8 @@ import { suggestEmail } from "./emailSuggest";
 import { LanguageSwitcher } from "./LanguageSwitcher";
 import { clearSavedBuyer, maskEmail, parseSavedBuyer, readSavedBuyerRaw, subscribeSavedBuyer, writeSavedBuyer } from "./savedBuyer";
 import { localEstimate, type LocalRates } from "./localCurrency";
-import { firstPrepareProtection, prepareBody, takeInlinePrepare } from "./inlinePrepare";
-import { reportHealth, usePaymentWatchdog } from "./paymentHealth";
+import { firstPrepareProtection, isInlineTimeout, prepareBody, takeInlinePrepare } from "./inlinePrepare";
+import { paymentFormMissing, reportHealth, usePaymentWatchdog } from "./paymentHealth";
 import { ReturningBuyerCode, type CodeBuyer } from "./ReturningBuyerCode";
 import { sampleRecommendations, visibleRecommendations, type RecommendationView } from "./recommendations";
 import { AddressAutocomplete } from "./AddressAutocomplete";
@@ -617,6 +617,16 @@ export type PaypalChoiceReset = { mode: false; prepared: null; doneSig: null; au
  */
 /** The page's silent /prepare retries stop this long after its first attempt (then « réessayer »). */
 export const PREPARE_RETRY_MAX_MS = 30_000;
+/**
+ * A /prepare request still unanswered this long is given up (a dead connection): past the prepare
+ * function's own 60 s budget, so the server's request is over and a retry never waits on it.
+ */
+export const PREPARE_REQUEST_MAX_MS = 65_000;
+
+/** `signal`, also aborted after `ms` where the browser can combine signals (else `signal` alone). */
+function boundedSignal(signal: AbortSignal, ms: number): AbortSignal {
+  return typeof AbortSignal.any === "function" && typeof AbortSignal.timeout === "function" ? AbortSignal.any([signal, AbortSignal.timeout(ms)]) : signal;
+}
 
 /**
  * Whether a failed /prepare is retried silently: a server error (5xx), except Whop unavailable with
@@ -1181,8 +1191,16 @@ export function CheckoutView({
       for (let attempt = 0; ; attempt++) {
         try {
           const requestBody = attempt === 0 ? firstBody : bodyNow();
-          const ask = () => fetch(`/api/public/sessions/${liveSessionId}/prepare`, { method: "POST", headers: { "Content-Type": "application/json" }, body: requestBody, signal: ctrl.signal });
-          const res = attempt === 0 && early ? await early.catch(ask) : await ask();
+          const ask = () =>
+            fetch(`/api/public/sessions/${liveSessionId}/prepare`, { method: "POST", headers: { "Content-Type": "application/json" }, body: requestBody, signal: boundedSignal(ctrl.signal, PREPARE_REQUEST_MAX_MS) });
+          const res =
+            attempt === 0 && early
+              ? await early.catch((err: unknown) => {
+                  // The inline request failed or never answered: told to the server, asked again.
+                  if (!ctrl.signal.aborted) reportHealth(liveSessionId, { kind: "inline_prepare_failed", reason: isInlineTimeout(err) ? "timeout" : "network" });
+                  return ask();
+                })
+              : await ask();
           if (ctrl.signal.aborted) return;
           const body = await res.json().catch(() => ({}));
           // Its PaymentIntent already paid (marked so by the server): the thank-you page.
@@ -1561,10 +1579,17 @@ export function CheckoutView({
   // The page started (the inline watchdog stands down) and, well after, a card form neither shown
   // nor on its way nor explained (no error, no blocking quote, no payment in flight, PayPal not
   // chosen): reported to the server and asked again, once (see paymentHealth).
+  // Whop's card form said it is ready (Stripe's form loads within its panel): leaving the page
+  // before that is reported.
+  const [whopFormReady, setWhopFormReady] = useState(false);
   usePaymentWatchdog(
     liveSessionId,
-    !prepared && !preparing && !qtyPending && !prepareError && !quoteBlocking && !inFlightAtLoad && !paypalActive,
-    () => ({ kind: "prepare_stuck", provider: initialProvider ?? "unknown", quote: !!quote, paypal: !!paypalMode }),
+    {
+      missing: paymentFormMissing({ prepared: !!prepared, preparing, qtyPending, prepareError: !!prepareError, quoteBlocking, inFlightAtLoad, paypalActive }),
+      preparing,
+      formReady: whopFormReady || prepared?.provider === "stripe",
+      describe: (kind) => ({ kind, provider: prepared?.provider ?? initialProvider ?? "unknown", prepared: !!prepared, preparing, quote: !!quote, paypal: !!paypalMode }),
+    },
     () => {
       setPrepareError(null);
       setRetryKey((k) => k + 1);
@@ -2475,8 +2500,9 @@ export function CheckoutView({
                 noShipping={prepareNoShipping}
                 onLockChange={setPanelLock}
                 whopFooterLang={whopFooterLang}
-                // Whop's card form never saying "ready": a health report (see paymentHealth).
-                onNotReady={(waitedMs) => liveSessionId && reportHealth(liveSessionId, { kind: "form_not_ready", waitedMs })}
+                // Whop's card form ready, or never saying so: the page's health reports (see paymentHealth).
+                onReady={() => setWhopFormReady(true)}
+                onNotReady={(info) => liveSessionId && reportHealth(liveSessionId, { kind: "form_not_ready", ...info })}
                 paypal={{
                   active: paypalActive,
                   prepared: paypalPrepared,

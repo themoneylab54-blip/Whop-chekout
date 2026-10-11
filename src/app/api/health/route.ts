@@ -154,7 +154,11 @@ async function handle(req: Request) {
     scopeMissing ? `${scopeMissing} store(s) accept Shopify discount codes without the read_discounts scope` : null,
     stuck.length ? `${stuck.length} background import(s) failing for > 48 h (${[...new Set(stuck.map((x) => x.what))].join(", ")})` : null,
     google.uploadsOverdue ? `${google.uploadsOverdue} Google Ads offline conversion(s) paid > ${UPLOAD_OVERDUE_MS / 3600_000} h ago still not uploaded` : null,
-    ...(Object.entries(incidents) as [string, number][]).filter(([kind, n]) => n > 0 && !accountKinds.includes(kind) && !(kind === "import.background_failed" && stuck.length)).map(([kind, n]) => `${kind}: ${n} in 24 h`),
+    // The checkout page's own reports of a missing payment form are a buyer-side signal (one slow
+    // phone, a closed tab): on the store's tile, never the operator's probe.
+    ...(Object.entries(incidents) as [string, number][])
+      .filter(([kind, n]) => n > 0 && !accountKinds.includes(kind) && kind !== "checkout.form_missing" && !(kind === "import.background_failed" && stuck.length))
+      .map(([kind, n]) => `${kind}: ${n} in 24 h`),
     ...providers.filter((p) => p.degraded).map((p) => `provider ${p.provider} degraded over the last hour (${p.errors}/${p.calls} errors, p95 ${p.p95Ms ?? "?"} ms)`),
     ...failing.map((f) => `provider ${f.provider} failing for 15 min (${f.errors}/${f.calls} errors)`),
     starvedOthers.length ? `background job(s) skipped for lack of time for > 6 h: ${starvedOthers.map((s) => s.name).join(", ")}` : null,

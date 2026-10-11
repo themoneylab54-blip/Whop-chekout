@@ -34,7 +34,7 @@ const { WHOP_READY_GRACE_MS } = await import("@/components/checkout/WhopFooterCl
 const { LABELS } = await import("@/components/checkout/i18n");
 const theme = { language: "fr", accentColor: "#000", radius: 8, requireTerms: false } as unknown as ComponentProps<typeof PaymentPanel>["theme"];
 
-function panel(o: { whopFooterLang?: string | null; paypalActive?: boolean; onNotReady?: (waitedMs: number) => void } = {}) {
+function panel(o: { whopFooterLang?: string | null; paypalActive?: boolean; onReady?: () => void; onNotReady?: (info: { waitedMs: number; frame: boolean; lastState: string | null }) => void } = {}) {
   return h(PaymentPanel, {
     prepared: { configId: "cfg_card", environment: "sandbox" },
     preparing: false,
@@ -47,6 +47,7 @@ function panel(o: { whopFooterLang?: string | null; paypalActive?: boolean; onNo
     confirm: async () => ({ ok: true as const, buyer: { email: "a@b.co", address: { name: "A B", line1: "1 rue", city: "Paris", state: "", postalCode: "75001", country: "FR" } } }),
     onPaid: () => undefined,
     whopFooterLang: o.whopFooterLang,
+    onReady: o.onReady,
     onNotReady: o.onNotReady,
     paypal: {
       active: o.paypalActive ?? false,
@@ -176,16 +177,17 @@ describe("PaymentPanel: « Propulsé par Whop » clipped off Whop's card form on
 });
 
 describe("PaymentPanel: Whop's card form never saying \"ready\" (a health report)", () => {
-  it("told once after the grace period, the time waited given; nothing changes on screen", async () => {
+  it("told once after the grace period, with the frame's presence and its last state; nothing changes on screen", async () => {
     vi.useFakeTimers();
     try {
       const onNotReady = vi.fn();
       render(panel({ onNotReady }));
+      act(() => whop.last?.onStateChange?.("loading"));
       await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS - 1)));
       expect(onNotReady).not.toHaveBeenCalled();
       await act(async () => void (await vi.advanceTimersByTimeAsync(1)));
       expect(onNotReady).toHaveBeenCalledTimes(1);
-      expect(onNotReady).toHaveBeenCalledWith(WHOP_READY_GRACE_MS);
+      expect(onNotReady).toHaveBeenCalledWith({ waitedMs: WHOP_READY_GRACE_MS, frame: true, lastState: "loading" });
       expect(screen.getByTestId("embed").getAttribute("data-config")).toBe("cfg_card");
       await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS * 3)));
       expect(onNotReady).toHaveBeenCalledTimes(1);
@@ -194,16 +196,21 @@ describe("PaymentPanel: Whop's card form never saying \"ready\" (a health report
     }
   });
 
-  it("ready in time: never told, even long after", async () => {
+  it("ready in time: the page told it is ready (once), never told otherwise, even long after", async () => {
     vi.useFakeTimers();
     try {
       const onNotReady = vi.fn();
-      render(panel({ onNotReady }));
+      const onReady = vi.fn();
+      render(panel({ onNotReady, onReady }));
       await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS - 1_000)));
+      expect(onReady).not.toHaveBeenCalled();
       act(() => whop.last?.onStateChange?.("ready"));
+      expect(onReady).toHaveBeenCalledTimes(1);
       act(() => whop.last?.onStateChange?.("disabled"));
+      act(() => whop.last?.onStateChange?.("ready"));
       await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS * 3)));
       expect(onNotReady).not.toHaveBeenCalled();
+      expect(onReady).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }

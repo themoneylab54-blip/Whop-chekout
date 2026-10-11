@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { INLINE_WAIT_MS, firstPrepareBody, inlinePrepareScript, prepareBody, takeInlinePrepare } from "@/components/checkout/inlinePrepare";
+import { INLINE_WAIT_MS, firstPrepareBody, inlinePrepareScript, isInlineTimeout, prepareBody, takeInlinePrepare } from "@/components/checkout/inlinePrepare";
 import { firstLoadInput } from "@/lib/early-prepare";
 import { quoteSchema } from "@/lib/checkout";
 
@@ -114,17 +114,35 @@ describe("the inline script and the page's first prepare", () => {
     expect(takeInlinePrepare("cmsess1", body)).toBeNull();
   });
 
-  it("an answer still not in 15 s after the page looked at it: given up (the page asks itself)", async () => {
+  it("an answer still not in INLINE_WAIT_MS after the request was sent: given up (the page asks itself)", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)));
     new Function(inlinePrepareScript("cmsess1", body))();
+    // The page looks at it 20 s after the request left (a slow phone): the limit still counts from the request.
+    await vi.advanceTimersByTimeAsync(20_000);
     const taken = takeInlinePrepare("cmsess1", body)!;
     const settled = vi.fn();
     taken.then(settled, settled);
-    await vi.advanceTimersByTimeAsync(INLINE_WAIT_MS - 1);
+    await vi.advanceTimersByTimeAsync(INLINE_WAIT_MS - 20_000 - 1);
     expect(settled).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
-    await expect(taken).rejects.toThrow(/unanswered/);
+    const err = await taken.catch((e: unknown) => e);
+    expect(isInlineTimeout(err)).toBe(true);
+    // Past the prepare function's 60 s: the server's own request is over when the page asks again.
+    expect(INLINE_WAIT_MS).toBeGreaterThan(60_000);
+  });
+
+  it("a network failure is not taken for that give-up", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("Failed to fetch");
+      }),
+    );
+    new Function(inlinePrepareScript("cmsess1", body))();
+    const err = await takeInlinePrepare("cmsess1", body)!.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TypeError);
+    expect(isInlineTimeout(err)).toBe(false);
   });
 
   it("an answer in time: taken, the limit gone with it", async () => {
