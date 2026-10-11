@@ -161,6 +161,38 @@ describe("the checkout page's inline watchdog", () => {
     expect(reload).not.toHaveBeenCalled();
   });
 
+  it("that page brought back as it was (the back-forward cache), still not started: decided again, reloaded", () => {
+    document.body.innerHTML = '<input id="email" value="">';
+    const field = document.getElementById("email") as HTMLInputElement;
+    field.focus();
+    run();
+    loaded();
+    vi.advanceTimersByTime(WATCHDOG_AFTER_LOAD_MS + 300);
+    window.dispatchEvent(new Event("pagehide"));
+    // Back: the page as it was, its field no longer in use.
+    field.blur();
+    window.dispatchEvent(Object.assign(new Event("pageshow"), { persisted: true }));
+    vi.advanceTimersByTime(WATCHDOG_AFTER_LOAD_MS + 1_300);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(beacons.map((b) => [b.body.kind, b.body.reloading, b.body.left])).toEqual([
+      ["not_booted", false, true],
+      ["not_booted", true, undefined],
+    ]);
+    expect(sessionStorage.getItem(`${RELOAD_MARK}cmsess1`)).toBe("1");
+  });
+
+  it("a page brought back from that cache otherwise (started, or no reload given up): nothing more", () => {
+    run();
+    loaded();
+    win()[BOOT_FLAG] = true;
+    vi.advanceTimersByTime(WATCHDOG_AFTER_LOAD_MS);
+    window.dispatchEvent(new Event("pagehide"));
+    window.dispatchEvent(Object.assign(new Event("pageshow"), { persisted: true }));
+    vi.advanceTimersByTime(WATCHDOG_AFTER_LOAD_MS * 3);
+    expect(beacons).toHaveLength(0);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
   it("left the field, but the page started meanwhile: no reload", () => {
     document.body.innerHTML = '<input id="email" value="">';
     const field = document.getElementById("email") as HTMLInputElement;

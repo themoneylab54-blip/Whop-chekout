@@ -1597,7 +1597,9 @@ export function CheckoutView({
     {
       missing: paymentFormMissing({ prepared: !!prepared, preparing, qtyPending, prepareError: !!prepareError, quoteBlocking, inFlightAtLoad, paypalActive }),
       preparing,
-      formReady: whopFormReady || prepared?.provider === "stripe",
+      // A way to pay on screen: Whop's card form ready (once), Stripe's own form, or PayPal chosen (its
+      // window puts the page in the background: no buyer leaving without a form).
+      formReady: whopFormReady || prepared?.provider === "stripe" || paypalActive,
       describe: (kind) => ({ kind, provider: prepared?.provider ?? initialProvider ?? "unknown", prepared: !!prepared, preparing, quote: !!quote, paypal: !!paypalMode }),
     },
     () => {

@@ -48,7 +48,7 @@ export type WatchState = { errors: Record<string, string | number>[]; dropped: n
  */
 export function inlineWatchdogScript(sessionId: string, deployment: string | null): string {
   return (
-    `(function(){try{var id=${scriptJson(sessionId)},u=${scriptJson(healthPath(sessionId))},k=${scriptJson(RELOAD_MARK)}+id,done=false,slow=false,after=null,pending=false;` +
+    `(function(){try{var id=${scriptJson(sessionId)},u=${scriptJson(healthPath(sessionId))},k=${scriptJson(RELOAD_MARK)}+id,done=false,slow=false,after=null,pending=false,cancelled=false;` +
     `var w={errors:[],dropped:0,dpl:${scriptJson(deployment)}};window[${scriptJson(WATCH_FLAG)}]=w;` +
     // This load comes right after the watchdog's own reload (null: the browser's storage is blocked).
     `try{after=sessionStorage.getItem(k)==="1"}catch(x){}` +
@@ -78,8 +78,10 @@ export function inlineWatchdogScript(sessionId: string, deployment: string | nul
     `function reload(){if(!pending)return;if(started()){pending=false;setMark(null);send("started_late",{});return}` +
     `if(inField()){document.addEventListener("focusout",function f(){document.removeEventListener("focusout",f);setTimeout(reload,1000)});return}` +
     `pending=false;send("not_booted",{reloading:true,typed:typed()});location.reload()}` +
-    // Leaving while the reload waits for the buyer to leave a field: reported, no reload done.
-    `addEventListener("pagehide",function(){if(pending){pending=false;setMark(null);send("not_booted",{reloading:false,left:true,typed:typed()})}});` +
+    // Leaving while the reload waits for the buyer to leave a field: reported, no reload done. The page
+    // brought back as it was (the browser's back-forward cache), still not started: decided again.
+    `addEventListener("pagehide",function(){if(pending){pending=false;cancelled=true;setMark(null);send("not_booted",{reloading:false,left:true,typed:typed()})}});` +
+    `addEventListener("pageshow",function(e){if(e&&e.persisted&&cancelled&&!started()){cancelled=false;done=false;arm()}});` +
     `function check(){if(done)return;done=true;if(started()){if(after===true&&window[${scriptJson(BOOT_FLAG)}]){setMark("2");send("recovered",{})}return}` +
     `var again=false;try{again=sessionStorage.getItem(k)===null}catch(x){}` +
     `if(again&&setMark("1")){pending=true;setTimeout(reload,300);return}` +
