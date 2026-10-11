@@ -631,11 +631,51 @@
     body.requestKey = key;
     return postSession({ method: "POST", headers: { "Content-Type": SIMPLE_TYPE }, body: JSON.stringify(body) });
   }
-  // One session request, as a later attempt checks it: its body (without key), key, ad identifiers, answer.
-  function ask(body, key, track) {
-    var request = { key: key, track: track, text: JSON.stringify(body), at: Date.now() };
+  // One session request, as a later attempt checks it: what it compares (see compared), key, ad identifiers,
+  // answer, and when it went (`t`: on the clock of the cart changes seen, see seeCartRequests).
+  function ask(body, text, key, track) {
+    var request = { key: key, track: track, text: text, at: Date.now(), t: perfNow() };
     request.answer = postBody(body, key);
     return request;
+  }
+  // What two session requests compare: the body (without key) and the cart's discount codes, which the server
+  // takes from the cart itself when it makes the session (never sent).
+  function compared(body, cart) {
+    return JSON.stringify(body) + " " + cartCodes(cart).join(",");
+  }
+  // The cart's discount codes as the server reads them: the applicable codes, the codes' allocations.
+  function cartCodes(cart) {
+    var codes = [];
+    function add(code) {
+      code = typeof code === "string" ? code.trim().toUpperCase() : "";
+      if (code && codes.indexOf(code) === -1) codes.push(code);
+    }
+    function list(v) {
+      return Array.isArray(v) ? v : [];
+    }
+    list(cart.discount_codes).forEach(function (d) {
+      if (d && d.applicable !== false) add(d.code);
+    });
+    list(cart.items).forEach(function (i) {
+      list(i && i.line_level_discount_allocations).forEach(function (a) {
+        if (a && a.discount_application && a.discount_application.type === "discount_code") add(a.discount_application.title);
+      });
+    });
+    list(cart.cart_level_discount_applications).forEach(function (a) {
+      if (a && a.type === "discount_code") add(a.title);
+    });
+    return codes.sort();
+  }
+  function perfNow() {
+    try {
+      return performance.now();
+    } catch (e) {
+      return 0;
+    }
+  }
+  // The same consent to ad tracking (Shopify's banner): conversions follow the session's.
+  function sameConsent(a, b) {
+    return (a || {}).marketing === (b || {}).marketing;
   }
   function answerBody(res) {
     try {
@@ -654,8 +694,9 @@
     return res.status >= 500 || answerBody(res).retryable === true;
   }
   // The last session request of a click that failed, never opened: the next click making the same body opens
-  // its session or asks under its key (no second session for one cart). Kept 10 min at most: an older session
-  // is never opened without asking the server, which expires them.
+  // its session or asks under its key (no second session for one cart). Kept 10 min at most (an older session
+  // is never opened without asking the server, which expires them), and never after a cart change seen since
+  // it went (see goToCheckout).
   var unopened = null;
   var UNOPENED_MS = 10 * 60 * 1000;
   // At the click: the session of the cart read ahead (see preReadCart), asked as soon as that read is in (at
@@ -675,8 +716,9 @@
       } catch (e) {
         return; // empty, excluded, a subscription: left to the click's own read
       }
-      ahead.text = JSON.stringify(body);
+      ahead.text = compared(body, cart);
       ahead.at = Date.now();
+      ahead.t = perfNow();
       ahead.answer = postBody(body, key);
       ahead.answer.catch(function () {}); // never read when the click's own read finds another cart
       log("session asked ahead, from the cart read asked", Date.now() - pre.at, "ms ago");
@@ -698,9 +740,14 @@
   function goToCheckout(items, retried, key, ahead) {
     if (busy) return;
     busy = true;
-    // A new click after one that failed: that click's last request, still recent, goes with it.
+    // The click's own ad identifiers, read once (an fbc made from an fbclid carries the time).
+    var own = retried ? null : clickTracking();
+    // A new click after one that failed: that click's last request goes with it, if recent, with no cart change
+    // seen since it went (a code applied or removed…, one the observer still holds included) and under the same
+    // consent to ad tracking.
+    seeHeldCartRequests();
     var age = unopened ? Date.now() - unopened.at : -1;
-    if (!retried && !ahead && age >= 0 && age < UNOPENED_MS) {
+    if (!retried && !ahead && age >= 0 && age < UNOPENED_MS && unopened.t > cartChangedAt && sameConsent(unopened.track, own)) {
       ahead = unopened;
       key = ahead.key;
     }
@@ -711,9 +758,8 @@
     var startedAt = Date.now();
     overlay(true);
     var carried = !!ahead;
-    // Read once per click, and kept with its requests (an fbc made from an fbclid carries the time): the same
-    // cart makes the same body as an earlier request.
-    var track = ahead ? ahead.track : clickTracking();
+    // A carried request's ad identifiers, kept with it so the same cart makes the same body; else the click's.
+    var track = ahead ? ahead.track : own || clickTracking();
     var cartPromise = items
       ? Promise.resolve({ items: items })
       : readCart().then(function (cart) {
@@ -729,10 +775,11 @@
         // This read is in: nothing more is asked ahead, whatever the cart.
         if (ahead) ahead.done = true;
         var body = sessionBody(cart, items, track);
+        var text = compared(body, cart);
         if (ahead) {
           var earlier = ahead;
           ahead = null;
-          if (earlier.text === JSON.stringify(body)) {
+          if (earlier.text === text) {
             last = earlier;
             // The cart sent ahead, confirmed: its answer, as it comes.
             if (!carried) return earlier.answer;
@@ -742,11 +789,11 @@
             return earlier.answer.then(
               function (res) {
                 if (opened(res) || (retried && !passing(res))) return res;
-                last = ask(body, key, track);
+                last = ask(body, text, key, track);
                 return last.answer;
               },
               function () {
-                last = ask(body, key, track);
+                last = ask(body, text, key, track);
                 return last.answer;
               }
             );
@@ -756,9 +803,15 @@
             log("cart changed since its session was asked: asked again");
             preRead = null;
             key = requestKey();
+            // A carried request's ad identifiers only served to compare: a new request takes the click's own.
+            if (carried) {
+              track = own || clickTracking();
+              body = sessionBody(cart, items, track);
+              text = compared(body, cart);
+            }
           }
         }
-        last = ask(body, key, track);
+        last = ask(body, text, key, track);
         return last.answer;
       })
       .then(function (res) {
@@ -813,6 +866,8 @@
         busy = false;
         log("checkout failed:", err && err.message);
         unopened = asked;
+        // The cart's changes from now on are seen, so the next click never reuses a request they outdated.
+        if (asked) watchCart();
         failed(err && err.message, items);
       });
   }
@@ -1248,6 +1303,7 @@
   function warm() {
     if (!config || !config.enabled) return;
     intentAt = Date.now();
+    fastRereads = 0;
     // The cart read ahead asks the shop, not our servers: its own throttle, not their minute (landing on the
     // cart page reads it even right after the last page's warm-up).
     preReadCart();
@@ -1304,7 +1360,8 @@
   var PRE_READ_MS = 20000; // sent ahead within 20 s of the read
   var PRE_READ_EVERY_MS = 5000; // one read ahead every 5 s at most
   var REREAD_MS = 300; // after the last cart change seen
-  var REREAD_EVERY_MS = 3000; // a read again 3 s at least after the last read again
+  var FAST_REREADS = 3; // read again that soon 3 times after each warm() (a drawer's quick edits)…
+  var REREAD_EVERY_MS = 3000; // …then 3 s at least after the last read
   var INTENT_MS = 20000; // read again only within 20 s of the buyer heading for the checkout
   var CART_CHANGE = /\/cart\/(add|change|update|clear)(\.js)?\/?$|\/discount\//i;
   // The last read ahead: { at: Date.now(), t: performance.now(), both when it was asked; promise; cart once in }.
@@ -1312,7 +1369,7 @@
   var cartChangedAt = -1; // performance.now() time the last cart change seen ended
   var cartWatch = null; // the PerformanceObserver, made for the first read ahead (false: none here)
   var rereadTimer = null;
-  var rereadAt = 0; // the last read again after changes
+  var fastRereads = 0; // reads again since the last warm()
   var intentAt = 0; // the last warm(): a pointer or touch on a checkout button, the cart opened, the cart page
   function seeCartRequests(entries) {
     var seen = false;
@@ -1328,6 +1385,12 @@
     }
     return seen;
   }
+  // Cart changes the observer holds but hasn't handed over yet: a click decides on all it can know.
+  function seeHeldCartRequests() {
+    try {
+      if (cartWatch && cartWatch.takeRecords) seeCartRequests(cartWatch.takeRecords());
+    } catch (e) {}
+  }
   function headingForCheckout() {
     var age = Date.now() - intentAt;
     return age >= 0 && age < INTENT_MS;
@@ -1337,7 +1400,7 @@
   function rereadCart() {
     rereadTimer = null;
     if (!(preRead && preRead.t <= cartChangedAt && headingForCheckout())) return;
-    rereadAt = Date.now();
+    fastRereads++;
     preReadCart(true);
   }
   function watchCart() {
@@ -1346,12 +1409,14 @@
     try {
       if (typeof PerformanceObserver === "function") {
         var observer = new PerformanceObserver(function (list) {
-          // A read ahead outdated by a change: read again once the changes stop (debounced). The 3 s gap counts
-          // from the last read again, not from the buyer's own read (a drawer's quantities changed right after
-          // opening it are read 300 ms later), and keeps a script writing the cart after each read from looping.
+          // A read ahead outdated by a change: read again once the changes stop (debounced), 300 ms later for a
+          // drawer's first quick edits after the buyer's own read, then 3 s at least after the last read (by then
+          // a read again: any warm() gives the quick ones back), so a script writing the cart after each read
+          // never makes it loop.
           if (seeCartRequests(list.getEntries()) && preRead && headingForCheckout()) {
             clearTimeout(rereadTimer);
-            rereadTimer = setTimeout(rereadCart, Math.max(REREAD_MS, rereadAt + REREAD_EVERY_MS - Date.now()));
+            var soon = fastRereads < FAST_REREADS;
+            rereadTimer = setTimeout(rereadCart, soon ? REREAD_MS : Math.max(REREAD_MS, preRead.at + REREAD_EVERY_MS - Date.now()));
           }
         });
         observer.observe({ entryTypes: ["resource"] });
@@ -1384,9 +1449,7 @@
   // The read ahead (in, or on its way), if less than 20 s old and no cart change ended since it was asked (one
   // that ended before is in it). Changes the observer holds but hasn't handed over yet count too.
   function freshPreRead() {
-    try {
-      if (cartWatch && cartWatch.takeRecords) seeCartRequests(cartWatch.takeRecords());
-    } catch (e) {}
+    seeHeldCartRequests();
     var pre = preRead;
     var age = pre ? Date.now() - pre.at : -1;
     return pre && !pre.failed && age >= 0 && age < PRE_READ_MS && pre.t > cartChangedAt ? pre : null;

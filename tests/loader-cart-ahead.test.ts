@@ -32,7 +32,7 @@ const settle = async () => {
 
 type Line = { variant_id: number; quantity: number; handle: string; selling_plan_allocation?: unknown };
 const cartOf = (quantity: number, line: Partial<Line> = {}) => ({ token: "cart-token-1", items: [{ variant_id: 1, quantity, handle: "jacket", ...line }] });
-type Body = { store: string; items: { variant_id: number; quantity: number }[]; cartToken?: string; requestKey: string; tracking?: Record<string, string> };
+type Body = { store: string; items: { variant_id: number | string; quantity: number }[]; cartToken?: string; requestKey: string; tracking?: Record<string, unknown> };
 
 // The shop and our servers as one test's loader sees them.
 const fresh = () => ({
@@ -157,9 +157,12 @@ const boot = async (setup: Partial<ReturnType<typeof fresh>> = {}, path = "/") =
   document.head.querySelectorAll("link").forEach((l) => l.remove());
   document.body.innerHTML = `
     <script src="${API}/loader.js?store=st_1"></script>
-    <form action="/cart/add" id="product-form"><input type="hidden" name="id" value="111"><button type="submit" id="add-btn">Add to cart</button></form>
+    <form action="/cart/add" id="product-form"><input type="hidden" name="id" value="111"><button type="submit" id="add-btn">Add to cart</button>
+      <div class="shopify-payment-button"><button type="button" class="shopify-payment-button__button" id="buy-now">Buy it now</button></div>
+    </form>
     <form action="/cart" method="post"><button type="button" name="checkout" id="checkout-btn">Checkout</button></form>`;
   delete (window as { __whopco?: boolean }).__whopco;
+  delete (window as { Shopify?: unknown }).Shopify;
   // Where the buyer is sent: the loader's `location`, its href recorded (jsdom doesn't navigate).
   const navigations = s.navigations;
   const recorder = {
@@ -209,8 +212,25 @@ const hover = async () => {
 const touch = () => button().dispatchEvent(new Event("touchstart", { bubbles: true }));
 // Back from the checkout (back/forward cache): the next click is decided again.
 const back = () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+const buyNow = () => document.getElementById("buy-now")!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+// Shopify's cookie banner: the buyer's consent to marketing tracking, as the loader reads it.
+let consent = true;
+const banner = () => ((window as unknown as { Shopify: unknown }).Shopify = { customerPrivacy: { marketingAllowed: () => consent } });
 const tryAgain = () => (document.querySelector("#whopco-error button") as HTMLButtonElement).click();
 const closeDialog = () => (document.querySelector("#whopco-error button[aria-label='Fermer']") as HTMLButtonElement).click();
+// A click whose session was asked ahead (answered, or `reply`) while both its reads failed: the message, closed (×).
+const failedClick = async (reply?: number) => {
+  await hover();
+  if (reply) s.replies.push(reply);
+  s.cartFails = 2;
+  click();
+  await settle();
+  await vi.advanceTimersByTimeAsync(800);
+  await settle();
+  expect(errorShown()).toBe(true);
+  expect(s.posts).toHaveLength(1);
+  closeDialog();
+};
 const quantities = () => s.posts.map((p) => p.body.items[0].quantity);
 const errorShown = () => !!document.getElementById("whopco-error");
 const overlayShown = () => !!document.getElementById("whopco-overlay");
@@ -415,26 +435,70 @@ describe("loader: a click after the cart was read ahead", () => {
     expect(s.navigations).toEqual([`${DOMAIN}/c/s_1`]);
   });
 
-  it("read again 300 ms after the changes, 3 s at least after the last read again, and only within 20 s of heading for the checkout", async () => {
+  it("read again 300 ms after the changes 3 times after the buyer's read, then 3 s apart at least, and only within 20 s of heading for the checkout", async () => {
     await boot();
     await hover();
-    await vi.advanceTimersByTimeAsync(100);
-    cartRequestEnded("/cart/change.js");
-    await vi.advanceTimersByTimeAsync(300);
-    await settle();
-    expect(s.readTimes[1] - s.readTimes[0]).toBe(400); // right after the buyer's own read: no wait
+    for (let n = 1; n <= 3; n++) {
+      await vi.advanceTimersByTimeAsync(100);
+      cartRequestEnded("/cart/change.js");
+      await vi.advanceTimersByTimeAsync(300);
+      await settle();
+      expect(s.cartReads).toBe(n + 1); // the drawer's quick edits: no wait
+    }
     await vi.advanceTimersByTimeAsync(100);
     cartRequestEnded("/cart/change.js");
     await vi.advanceTimersByTimeAsync(2_899);
-    expect(s.cartReads).toBe(2);
+    expect(s.cartReads).toBe(4);
     await vi.advanceTimersByTimeAsync(1);
     await settle();
-    expect(s.readTimes[2] - s.readTimes[1]).toBe(3_000);
+    expect(s.readTimes[4] - s.readTimes[3]).toBe(3_000);
     // 20 s after the buyer headed for the checkout, a change is only marked: not read again.
-    await vi.advanceTimersByTimeAsync(17_100);
+    await vi.advanceTimersByTimeAsync(16_400);
     cartRequestEnded("/cart/change.js");
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(s.cartReads).toBe(3);
+    expect(s.cartReads).toBe(5);
+  });
+
+  it("each warm() gives the quick reads again: 3 of them spent, the buyer heading for the checkout again (5 s on) edits twice quickly, both read 300 ms later", async () => {
+    await boot();
+    await hover();
+    for (let n = 1; n <= 3; n++) {
+      await vi.advanceTimersByTimeAsync(100);
+      cartRequestEnded("/cart/change.js");
+      await vi.advanceTimersByTimeAsync(300);
+    }
+    await settle();
+    expect(s.cartReads).toBe(4);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await hover(); // read too (5 s since the last read)
+    expect(s.cartReads).toBe(5);
+    for (let n = 1; n <= 2; n++) {
+      await vi.advanceTimersByTimeAsync(100);
+      cartRequestEnded("/cart/change.js");
+      await vi.advanceTimersByTimeAsync(300);
+      await settle();
+      expect(s.cartReads).toBe(5 + n);
+    }
+  });
+
+  it("two quick drawer edits (0.5 s and 1.2 s after the buyer's read), a click at 2.2 s: sent ahead with the last quantity", async () => {
+    await boot();
+    await hover();
+    await vi.advanceTimersByTimeAsync(500);
+    s.cart = cartOf(2);
+    cartRequestEnded("/cart/change.js");
+    await vi.advanceTimersByTimeAsync(700);
+    s.cart = cartOf(3);
+    cartRequestEnded("/cart/change.js");
+    await vi.advanceTimersByTimeAsync(1_000);
+    s.hold = true;
+    click();
+    await settle();
+    expect(quantities()).toEqual([3]); // sent ahead
+    release();
+    await settle();
+    expect(s.posts).toHaveLength(1);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_1`]);
   });
 
   it("the drawer's +/- a second after the buyer's read, the pointer back on « Checkout », a click at 2.2 s: sent ahead with the new quantity", async () => {
@@ -485,19 +549,19 @@ describe("loader: a click after the cart was read ahead", () => {
     expect(s.cartReads).toBe(2);
   });
 
-  it("an app's script writing the cart after each read can't make it loop: read again 3 s apart, within 20 s of the intent, then nothing", async () => {
+  it("an app's script writing the cart after each read can't make it loop: 3 quick reads again, then 3 s apart, within 20 s of the intent, then nothing", async () => {
     await boot();
     await hover();
     s.writesOnRead = true;
     cartRequestEnded("/cart/update.js");
     await vi.advanceTimersByTimeAsync(60_000);
     await settle();
-    const again = s.readTimes.slice(1); // after the buyer's own read
-    const gaps = again.slice(1).map((t, i) => t - again[i]);
+    const floored = s.readTimes.slice(3); // after the buyer's own read and 3 quick reads again
+    const gaps = floored.slice(1).map((t, i) => t - floored[i]);
     expect(gaps.length).toBeGreaterThan(0);
     expect(gaps.every((gap) => gap >= 3_000)).toBe(true);
     expect(s.readTimes.at(-1)! - s.readTimes[0]).toBeLessThan(20_000);
-    expect(s.cartReads).toBeLessThanOrEqual(8);
+    expect(s.cartReads).toBeLessThanOrEqual(10);
     expect(vi.getTimerCount()).toBe(0); // nothing left to read again
   });
 
@@ -880,6 +944,124 @@ describe("loader: one session per cart across the retries and the next click", (
     expect(s.posts).toHaveLength(2);
     expect(s.posts[1].body.requestKey).not.toBe(s.posts[0].body.requestKey);
     expect(s.navigations).toEqual([`${DOMAIN}/c/s_2`]);
+  });
+
+  it("a discount code applied in this tab after the failure (/discount/… seen): the next click asks a new session, never the one made without it", async () => {
+    await boot();
+    await failedClick();
+    cartRequestEnded("/discount/SUMMER10");
+    click();
+    await settle();
+    expect(s.posts).toHaveLength(2);
+    expect(s.posts[1].body.requestKey).not.toBe(s.posts[0].body.requestKey);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_2`]);
+  });
+
+  it("…the same with the change the observer still holds, and after a lost answer (never asked again under the old key)", async () => {
+    await boot();
+    await failedClick(502);
+    cartRequestEnded("/discount/SUMMER10", false);
+    click();
+    await settle();
+    expect(s.posts).toHaveLength(2);
+    expect(s.posts[1].body.requestKey).not.toBe(s.posts[0].body.requestKey);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_2`]);
+  });
+
+  it("a failed click with nothing read ahead watches the cart from then on: a code applied before the next click makes a new session", async () => {
+    await boot();
+    s.replies.push(502, 502);
+    click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(800);
+    await settle();
+    expect(errorShown()).toBe(true);
+    closeDialog();
+    cartRequestEnded("/discount/SUMMER10");
+    click();
+    await settle();
+    expect(s.posts).toHaveLength(3);
+    expect(s.posts[1].body.requestKey).toBe(s.posts[0].body.requestKey);
+    expect(s.posts[2].body.requestKey).not.toBe(s.posts[0].body.requestKey);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_3`]);
+  });
+
+  it("a code applied in another tab (only in the cart the click reads): a new session too", async () => {
+    await boot();
+    await failedClick();
+    s.cart = { ...cartOf(1), cart_level_discount_applications: [{ type: "discount_code", title: "SUMMER10", total_allocated_amount: 500 }] };
+    click();
+    await settle();
+    expect(s.posts).toHaveLength(2);
+    expect(s.posts[1].body.requestKey).not.toBe(s.posts[0].body.requestKey);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_2`]);
+  });
+
+  it("the cart's codes count as the server reads them: an applicable code, a code's allocation, a cart-level code (not an inapplicable code)", async () => {
+    const withCode = [
+      { ...cartOf(1), discount_codes: [{ code: "summer10", applicable: true }] },
+      { token: "cart-token-1", items: [{ variant_id: 1, quantity: 1, handle: "jacket", line_level_discount_allocations: [{ amount: 500, discount_application: { type: "discount_code", title: "SUMMER10" } }] }] },
+      { ...cartOf(1), cart_level_discount_applications: [{ type: "discount_code", title: "SUMMER10", total_allocated_amount: 500 }] },
+    ];
+    for (const cart of [...withCode, { ...cartOf(1), discount_codes: [{ code: "EXPIRED", applicable: false }] }]) {
+      await boot();
+      await hover();
+      s.hold = true;
+      click();
+      await settle();
+      s.cart = cart;
+      release();
+      await settle();
+      // The session asked ahead (no code) opens only when the click's own read has no code either.
+      expect(s.posts, JSON.stringify(cart)).toHaveLength(withCode.includes(cart) ? 2 : 1);
+    }
+  });
+
+  it("consent to ad tracking withdrawn after the failure (Shopify's banner): the session made with it isn't reused, a new one goes without", async () => {
+    await boot();
+    consent = true;
+    banner();
+    await failedClick();
+    expect(s.posts[0].body.tracking?.marketing).toBe(true);
+    consent = false;
+    click();
+    await settle();
+    expect(s.posts).toHaveLength(2);
+    expect(s.posts[1].body.requestKey).not.toBe(s.posts[0].body.requestKey);
+    expect(s.posts[1].body.tracking?.marketing).toBe(false);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_2`]);
+  });
+
+  it("another cart or a « buy now » after the failure: a new key and the click's own ad identifiers (a new fbc from ?fbclid=)", async () => {
+    await boot({}, "/?fbclid=fb_click_1");
+    await failedClick();
+    await vi.advanceTimersByTimeAsync(1_000);
+    s.cart = cartOf(2);
+    click();
+    await settle();
+    expect(quantities()).toEqual([1, 2]);
+    expect(s.posts[1].body.requestKey).not.toBe(s.posts[0].body.requestKey);
+    expect(s.posts[1].body.tracking?.fbc).not.toBe(s.posts[0].body.tracking?.fbc);
+
+    await boot({}, "/?fbclid=fb_click_1");
+    await failedClick();
+    await vi.advanceTimersByTimeAsync(1_000);
+    buyNow();
+    await settle();
+    expect(s.posts).toHaveLength(2);
+    expect(s.posts[1].body.items).toEqual([{ variant_id: "111", quantity: 1 }]);
+    expect(s.posts[1].body.requestKey).not.toBe(s.posts[0].body.requestKey);
+    expect(s.posts[1].body.tracking?.fbc).not.toBe(s.posts[0].body.tracking?.fbc);
+  });
+
+  it("the same cart a second later keeps the failed click's ad identifiers (?fbclid=, no _fbc cookie): the same body, its session opens", async () => {
+    await boot({}, "/?fbclid=fb_click_1");
+    await failedClick();
+    await vi.advanceTimersByTimeAsync(1_000);
+    click();
+    await settle();
+    expect(s.posts).toHaveLength(1);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_1`]);
   });
 
   it("the automatic retry doesn't ask again after a refusal of the session asked ahead (429: the message; native: Shopify's checkout)", async () => {
