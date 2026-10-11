@@ -78,9 +78,10 @@ export function inlineWatchdogScript(sessionId: string, deployment: string | nul
     `function reload(){if(!pending)return;if(started()){pending=false;setMark(null);send("started_late",{});return}` +
     `if(inField()){document.addEventListener("focusout",function f(){document.removeEventListener("focusout",f);setTimeout(reload,1000)});return}` +
     `pending=false;send("not_booted",{reloading:true,typed:typed()});location.reload()}` +
-    // Leaving while the reload waits for the buyer to leave a field: reported, no reload done. The page
-    // brought back as it was (the browser's back-forward cache), still not started: decided again.
-    `addEventListener("pagehide",function(){if(pending){pending=false;cancelled=true;setMark(null);send("not_booted",{reloading:false,left:true,typed:typed()})}});` +
+    // Leaving while the reload waits for the buyer to leave a field: reported, no reload done (a page
+    // that started meanwhile is said to the logs, as at the reload). The page brought back as it was
+    // (the browser's back-forward cache), still not started: decided again.
+    `addEventListener("pagehide",function(){if(pending){pending=false;setMark(null);if(started()){send("started_late",{});return}cancelled=true;send("not_booted",{reloading:false,left:true,typed:typed()})}});` +
     `addEventListener("pageshow",function(e){if(e&&e.persisted&&cancelled&&!started()){cancelled=false;done=false;arm()}});` +
     `function check(){if(done)return;done=true;if(started()){if(after===true&&window[${scriptJson(BOOT_FLAG)}]){setMark("2");send("recovered",{})}return}` +
     `var again=false;try{again=sessionStorage.getItem(k)===null}catch(x){}` +

@@ -161,6 +161,23 @@ describe("the checkout page's inline watchdog", () => {
     expect(reload).not.toHaveBeenCalled();
   });
 
+  it("the page started while the reload waited on the buyer's field, then they left from it: said started late, never \"not started\"", () => {
+    document.body.innerHTML = '<input id="email" value="">';
+    (document.getElementById("email") as HTMLInputElement).focus();
+    run();
+    loaded();
+    vi.advanceTimersByTime(WATCHDOG_AFTER_LOAD_MS + 300);
+    win()[BOOT_FLAG] = true;
+    window.dispatchEvent(new Event("pagehide"));
+    expect(beacons.map((b) => b.body.kind)).toEqual(["started_late"]);
+    expect(sessionStorage.getItem(`${RELOAD_MARK}cmsess1`)).toBeNull();
+    // Back from the cache: a started page, nothing more.
+    window.dispatchEvent(Object.assign(new Event("pageshow"), { persisted: true }));
+    vi.advanceTimersByTime(WATCHDOG_AFTER_LOAD_MS * 3);
+    expect(beacons.map((b) => b.body.kind)).toEqual(["started_late"]);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
   it("that page brought back as it was (the back-forward cache), still not started: decided again, reloaded", () => {
     document.body.innerHTML = '<input id="email" value="">';
     const field = document.getElementById("email") as HTMLInputElement;
