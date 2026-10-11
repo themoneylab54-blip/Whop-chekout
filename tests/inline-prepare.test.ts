@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { firstPrepareBody, inlinePrepareScript, prepareBody, takeInlinePrepare } from "@/components/checkout/inlinePrepare";
+import { INLINE_WAIT_MS, firstPrepareBody, inlinePrepareScript, prepareBody, takeInlinePrepare } from "@/components/checkout/inlinePrepare";
 import { firstLoadInput } from "@/lib/early-prepare";
 import { quoteSchema } from "@/lib/checkout";
 
@@ -112,5 +112,31 @@ describe("the inline script and the page's first prepare", () => {
 
   it("a page without the script asks the server itself", () => {
     expect(takeInlinePrepare("cmsess1", body)).toBeNull();
+  });
+
+  it("an answer still not in 15 s after the page looked at it: given up (the page asks itself)", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)));
+    new Function(inlinePrepareScript("cmsess1", body))();
+    const taken = takeInlinePrepare("cmsess1", body)!;
+    const settled = vi.fn();
+    taken.then(settled, settled);
+    await vi.advanceTimersByTimeAsync(INLINE_WAIT_MS - 1);
+    expect(settled).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(taken).rejects.toThrow(/unanswered/);
+  });
+
+  it("an answer in time: taken, the limit gone with it", async () => {
+    vi.useFakeTimers();
+    let answerNow: (r: Response) => void = () => undefined;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => (answerNow = resolve))));
+    new Function(inlinePrepareScript("cmsess1", body))();
+    const taken = takeInlinePrepare("cmsess1", body)!;
+    await vi.advanceTimersByTimeAsync(INLINE_WAIT_MS - 1_000);
+    answerNow(new Response('{"ok":true}', { status: 200 }));
+    const res = await taken;
+    expect(await res.json()).toEqual({ ok: true });
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

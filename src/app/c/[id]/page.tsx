@@ -32,6 +32,7 @@ import { canReadShopifyDiscounts } from "@/lib/shopify-discounts";
 // The main market: shared with the early prepare (its first quote is this page's first input).
 import { primaryCountryOf } from "@/lib/early-prepare";
 import { firstPrepareBody, firstPrepareProtection, inlinePrepareScript } from "@/components/checkout/inlinePrepare";
+import { inlineWatchdogScript } from "@/components/checkout/inlineWatchdog";
 import { refreshWhopFooterCheck, whopFooterClipped, whopHostOf } from "@/lib/whop-footer";
 import { checkoutCountries, countryHints, pickFirstCountry, storeMarketOf } from "@/lib/first-country";
 
@@ -256,6 +257,8 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
     <>
       <CheckoutHtmlLang lang={theme.language} />
       <script dangerouslySetInnerHTML={{ __html: inlinePrepareScript(session.id, firstPrepare) }} />
+      {/* The page's watchdog: a page whose scripts never start is reported and reloaded once (see inlineWatchdog). */}
+      <script dangerouslySetInnerHTML={{ __html: inlineWatchdogScript(session.id) }} />
       {preconnects.map((p) => (
         <link key={p.href} rel="preconnect" href={p.href} crossOrigin={p.crossOrigin} />
       ))}

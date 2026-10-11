@@ -50,6 +50,7 @@ import { LanguageSwitcher } from "./LanguageSwitcher";
 import { clearSavedBuyer, maskEmail, parseSavedBuyer, readSavedBuyerRaw, subscribeSavedBuyer, writeSavedBuyer } from "./savedBuyer";
 import { localEstimate, type LocalRates } from "./localCurrency";
 import { firstPrepareProtection, prepareBody, takeInlinePrepare } from "./inlinePrepare";
+import { reportHealth, usePaymentWatchdog } from "./paymentHealth";
 import { ReturningBuyerCode, type CodeBuyer } from "./ReturningBuyerCode";
 import { sampleRecommendations, visibleRecommendations, type RecommendationView } from "./recommendations";
 import { AddressAutocomplete } from "./AddressAutocomplete";
@@ -1557,6 +1558,19 @@ export function CheckoutView({
   // The same reset as stopPaypal (a later PayPal click prepares afresh), its message kept.
   if (paypalMode && !paypalOffered && panelLock === null) endPaypal(paypalChoiceReset({ keepError: true }));
 
+  // The page started (the inline watchdog stands down) and, well after, a card form neither shown
+  // nor on its way nor explained (no error, no blocking quote, no payment in flight, PayPal not
+  // chosen): reported to the server and asked again, once (see paymentHealth).
+  usePaymentWatchdog(
+    liveSessionId,
+    !prepared && !preparing && !qtyPending && !prepareError && !quoteBlocking && !inFlightAtLoad && !paypalActive,
+    () => ({ kind: "prepare_stuck", provider: initialProvider ?? "unknown", quote: !!quote, paypal: !!paypalMode }),
+    () => {
+      setPrepareError(null);
+      setRetryKey((k) => k + 1);
+    },
+  );
+
   // A PayPal window signal to the paypal-window route ({ blocked | beat | closed }): same-origin,
   // best effort, survives the page going away (keepalive).
   function paypalWindowSignal(body: { blocked: true } | { beat: true } | { closed: true }) {
@@ -2461,6 +2475,8 @@ export function CheckoutView({
                 noShipping={prepareNoShipping}
                 onLockChange={setPanelLock}
                 whopFooterLang={whopFooterLang}
+                // Whop's card form never saying "ready": a health report (see paymentHealth).
+                onNotReady={(waitedMs) => liveSessionId && reportHealth(liveSessionId, { kind: "form_not_ready", waitedMs })}
                 paypal={{
                   active: paypalActive,
                   prepared: paypalPrepared,

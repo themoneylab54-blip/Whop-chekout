@@ -56,6 +56,11 @@ export function firstPrepareProtection(blocks: readonly { type: string; hidden?:
 
 /** An inline answer older than this is not taken (a page left in the background, restored). */
 const MAX_AGE_MS = 30_000;
+/**
+ * A taken answer still not in this long after the page looked at it is given up (the page asks
+ * itself): a request hanging on a dead connection never holds the payment form.
+ */
+export const INLINE_WAIT_MS = 15_000;
 
 type InlineAnswer = { status: number; text: string; ref: string | null };
 type InlinePrepare = { id: string; body: string; at: number; p: Promise<InlineAnswer> };
@@ -83,7 +88,8 @@ export function inlinePrepareScript(sessionId: string, body: string): string {
 /**
  * The inline prepare's answer as a Response, for the page's first prepare when that one was sent for
  * this session with exactly this body less than 30 s ago; else null. Looked at once: gone afterwards,
- * taken or not.
+ * taken or not. Rejects (the page then asks itself) when the request failed or is still not answered
+ * INLINE_WAIT_MS after this call.
  */
 export function takeInlinePrepare(sessionId: string, body: string, now = Date.now()): Promise<Response> | null {
   if (typeof window === "undefined") return null;
@@ -91,5 +97,10 @@ export function takeInlinePrepare(sessionId: string, body: string, now = Date.no
   const inline = w.__wcPrepare;
   w.__wcPrepare = undefined;
   if (!inline || inline.id !== sessionId || inline.body !== body || !(now - inline.at >= 0 && now - inline.at < MAX_AGE_MS)) return null;
-  return inline.p.then((a) => new Response(a.text, { status: a.status, headers: a.ref ? { "x-request-id": a.ref } : undefined }));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`inline prepare unanswered after ${INLINE_WAIT_MS / 1000} s`)), INLINE_WAIT_MS);
+  });
+  const answer = inline.p.then((a) => new Response(a.text, { status: a.status, headers: a.ref ? { "x-request-id": a.ref } : undefined }));
+  return Promise.race([answer, late]).finally(() => clearTimeout(timer));
 }

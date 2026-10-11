@@ -543,8 +543,18 @@ async function degradationItems(
       href: `${base}/journal`,
     });
   }
-  // Google Ads incidents are shown on the "Pub & pixels" tile, stuck imports on their own.
-  const lines = incidentLines(counts, (k) => !k.startsWith("google.") && !k.startsWith("import."));
+  // Buyers left without a payment form (the page's own reports): their own tile, a lost sale each.
+  const formMissing = counts["checkout.form_missing"] ?? 0;
+  items.push({
+    key: "payment_form",
+    label: "Formulaire de paiement chez vos clients",
+    ok: formMissing ? false : true,
+    detail: formMissing ? incidentLines(counts, (k) => k === "checkout.form_missing").join(" · ") : "Aucun blocage signalé sur 24 h",
+    href: `${base}/journal`,
+  });
+  // Google Ads incidents are shown on the "Pub & pixels" tile, stuck imports and missing payment
+  // forms on their own.
+  const lines = incidentLines(counts, (k) => !k.startsWith("google.") && !k.startsWith("import.") && k !== "checkout.form_missing");
   const fxStale = !!fx && !fx.fresh;
   items.push({
     key: "degraded",

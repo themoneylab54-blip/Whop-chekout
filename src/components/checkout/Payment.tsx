@@ -7,7 +7,7 @@ import type { Theme } from "@/lib/layout";
 import { EXPRESS_WALLETS, type ExpressWallet } from "@/lib/layout-shared";
 import { PAYPAL_AFTER_WINDOW_MS, PAYPAL_SERVER_IN_FLIGHT_MS } from "@/lib/paypal-timing";
 import type { Labels } from "./i18n";
-import { WhopFooterClip } from "./WhopFooterClip";
+import { WHOP_READY_GRACE_MS, WhopFooterClip } from "./WhopFooterClip";
 
 type ExpressMethod = ExpressWallet;
 
@@ -633,6 +633,7 @@ export function PaymentPanel({
   onLockChange,
   inFlightAtLoad = false,
   whopFooterLang = null,
+  onNotReady,
 }: {
   prepared: Prepared | null;
   preparing: boolean;
@@ -679,6 +680,11 @@ export function PaymentPanel({
    * server checked Whop's form in (see WhopFooterClip). Null: shown.
    */
   whopFooterLang?: string | null;
+  /**
+   * Whop's card form on screen WHOP_READY_GRACE_MS without saying it is ready (a frame that never
+   * loads, a screen of Whop's own): told once per frame, nothing changes on screen (a health report).
+   */
+  onNotReady?: (waitedMs: number) => void;
 }) {
   const controls = useCheckoutEmbedControls();
   const paypalOn = !!paypal?.active;
@@ -698,6 +704,26 @@ export function PaymentPanel({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showBillingForm, setShowBillingForm] = useState(false);
+  // The card form never saying "ready": the page is told once per checkout (see onNotReady). Settled
+  // for good once it said "ready" (its "disabled" afterwards is the pay button's state) or was told.
+  const notReadyRef = useRef(onNotReady);
+  useEffect(() => {
+    notReadyRef.current = onNotReady;
+  });
+  const settledFrame = useRef<string | null>(null);
+  const cardFrame = !paypalOn && !showBillingForm ? (current?.configId ?? null) : null;
+  useEffect(() => {
+    if (!cardFrame || settledFrame.current === cardFrame) return;
+    if (ready) {
+      settledFrame.current = cardFrame;
+      return;
+    }
+    const t = setTimeout(() => {
+      settledFrame.current = cardFrame;
+      notReadyRef.current?.(WHOP_READY_GRACE_MS);
+    }, WHOP_READY_GRACE_MS);
+    return () => clearTimeout(t);
+  }, [cardFrame, ready]);
   // The PayPal window was opened by code (no click of the buyer's): a browser may block it.
   const [paypalTried, setPaypalTried] = useState(false);
   // A PayPal payment was submitted and may still go through (its window may be open or just closed):

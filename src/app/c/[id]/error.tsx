@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { labelsFor, pickLang } from "@/components/checkout/i18n";
 import { StatusPage, statusPrimaryCls, statusSecondaryCls } from "@/components/checkout/StatusPage";
 import { HtmlLang } from "@/components/checkout/HtmlLang";
+import { reportHealth } from "@/components/checkout/paymentHealth";
 
 const noopSubscribe = () => () => {};
 
@@ -33,6 +34,14 @@ export default function CheckoutError({ error, reset }: { error: Error & { diges
 
   useEffect(() => {
     console.error(error);
+    // The buyer is before an error screen instead of the payment form: told to the server (the
+    // checkout page only; the thank-you page's errors are no lost payment).
+    try {
+      const m = /^\/c\/([^/]+)\/?$/.exec(window.location.pathname);
+      if (m) reportHealth(decodeURIComponent(m[1]), { kind: "page_error", msg: String(error?.message ?? "").slice(0, 300), digest: error?.digest });
+    } catch {
+      /* a malformed address: nothing to report against */
+    }
   }, [error]);
 
   return (

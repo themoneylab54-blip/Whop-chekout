@@ -34,7 +34,7 @@ const { WHOP_READY_GRACE_MS } = await import("@/components/checkout/WhopFooterCl
 const { LABELS } = await import("@/components/checkout/i18n");
 const theme = { language: "fr", accentColor: "#000", radius: 8, requireTerms: false } as unknown as ComponentProps<typeof PaymentPanel>["theme"];
 
-function panel(o: { whopFooterLang?: string | null; paypalActive?: boolean } = {}) {
+function panel(o: { whopFooterLang?: string | null; paypalActive?: boolean; onNotReady?: (waitedMs: number) => void } = {}) {
   return h(PaymentPanel, {
     prepared: { configId: "cfg_card", environment: "sandbox" },
     preparing: false,
@@ -47,6 +47,7 @@ function panel(o: { whopFooterLang?: string | null; paypalActive?: boolean } = {
     confirm: async () => ({ ok: true as const, buyer: { email: "a@b.co", address: { name: "A B", line1: "1 rue", city: "Paris", state: "", postalCode: "75001", country: "FR" } } }),
     onPaid: () => undefined,
     whopFooterLang: o.whopFooterLang,
+    onNotReady: o.onNotReady,
     paypal: {
       active: o.paypalActive ?? false,
       prepared: { configId: "cfg_paypal", environment: "sandbox" },
@@ -168,6 +169,77 @@ describe("PaymentPanel: « Propulsé par Whop » clipped off Whop's card form on
       // The reloaded frame never says "ready" (another screen): given up after the grace.
       await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS + 10)));
       expect(clip()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("PaymentPanel: Whop's card form never saying \"ready\" (a health report)", () => {
+  it("told once after the grace period, the time waited given; nothing changes on screen", async () => {
+    vi.useFakeTimers();
+    try {
+      const onNotReady = vi.fn();
+      render(panel({ onNotReady }));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS - 1)));
+      expect(onNotReady).not.toHaveBeenCalled();
+      await act(async () => void (await vi.advanceTimersByTimeAsync(1)));
+      expect(onNotReady).toHaveBeenCalledTimes(1);
+      expect(onNotReady).toHaveBeenCalledWith(WHOP_READY_GRACE_MS);
+      expect(screen.getByTestId("embed").getAttribute("data-config")).toBe("cfg_card");
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS * 3)));
+      expect(onNotReady).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ready in time: never told, even long after", async () => {
+    vi.useFakeTimers();
+    try {
+      const onNotReady = vi.fn();
+      render(panel({ onNotReady }));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS - 1_000)));
+      act(() => whop.last?.onStateChange?.("ready"));
+      act(() => whop.last?.onStateChange?.("disabled"));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS * 3)));
+      expect(onNotReady).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the PayPal-only checkout or Whop's billing form on screen: not the card form, never told", async () => {
+    vi.useFakeTimers();
+    try {
+      const onNotReady = vi.fn();
+      render(panel({ onNotReady, paypalActive: true }));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS * 2)));
+      expect(onNotReady).not.toHaveBeenCalled();
+      cleanup();
+      render(panel({ onNotReady }));
+      act(() => whop.last?.onAddressValidationError?.({ error_message: "Adresse invalide" }));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS * 2)));
+      expect(onNotReady).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the card frame reloaded (back from PayPal): its own grace, told at most once for that checkout", async () => {
+    vi.useFakeTimers();
+    try {
+      const onNotReady = vi.fn();
+      const { rerender } = render(panel({ onNotReady }));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS / 2)));
+      rerender(panel({ onNotReady, paypalActive: true }));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS)));
+      expect(onNotReady).not.toHaveBeenCalled();
+      rerender(panel({ onNotReady, paypalActive: false }));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS - 1)));
+      expect(onNotReady).not.toHaveBeenCalled();
+      await act(async () => void (await vi.advanceTimersByTimeAsync(1)));
+      expect(onNotReady).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
