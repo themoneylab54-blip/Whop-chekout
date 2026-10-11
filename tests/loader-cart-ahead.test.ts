@@ -44,6 +44,9 @@ const fresh = () => ({
   hold: false, // reads wait for release()
   held: [] as (() => void)[],
   cartReads: 0,
+  readTimes: [] as number[],
+  writesOnRead: false, // an app's script that writes the cart after each /cart.js read
+  appDown: false, // the app's API unreachable too
   posts: [] as { body: Body; headers?: HeadersInit }[], // session requests to the checkout domain
   appPosts: [] as Body[], // to the app's API
   replies: [] as number[], // statuses of the next session answers (then 200)
@@ -68,6 +71,8 @@ vi.stubGlobal(
     if (u.startsWith(`${DOMAIN}/checkout-icon.svg`)) return new Response("", { status: 200 });
     if (u === "/cart.js") {
       shop.cartReads++;
+      shop.readTimes.push(Date.now());
+      if (shop.writesOnRead) setTimeout(() => cartRequestEnded("/cart/update.js"), 50);
       const answer = () => {
         if (shop.cartFails > 0) {
           shop.cartFails--;
@@ -94,6 +99,7 @@ vi.stubGlobal(
       return new Promise<Response>((resolve, reject) => shop.heldPosts.push((networkError) => (networkError ? reject(new TypeError("Failed to fetch")) : resolve(answer()))));
     }
     if (u === `${API}/api/public/sessions`) {
+      if (shop.appDown) throw new TypeError("Failed to fetch");
       shop.appPosts.push(JSON.parse(String(init?.body)));
       // The server names the store's checkout domain: the loader keeps the checkout on the app's host.
       return new Response(JSON.stringify({ url: `${DOMAIN}/c/app_${shop.appPosts.length}`, visitorId: "v_visitor_app" }));
@@ -122,8 +128,9 @@ vi.stubGlobal(
     }
   },
 );
-const cartRequestEnded = (path: string, handedOver = true) => {
-  const entry = { name: `${location.origin}${path}`, entryType: "resource", responseEnd: performance.now() };
+// A request that ended now (or at `endedAt`): the storefront's, unless `path` is another origin's URL.
+const cartRequestEnded = (path: string, handedOver = true, endedAt = performance.now()) => {
+  const entry = { name: /^https?:/.test(path) ? path : `${location.origin}${path}`, entryType: "resource", responseEnd: endedAt };
   if (handedOver) handOver({ getEntries: () => [entry] });
   else queued.push(entry);
 };
@@ -199,6 +206,9 @@ const hover = async () => {
   await settle();
 };
 const touch = () => button().dispatchEvent(new Event("touchstart", { bubbles: true }));
+// Back from the checkout (back/forward cache): the next click is decided again.
+const back = () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+const tryAgain = () => (document.querySelector("#whopco-error button") as HTMLButtonElement).click();
 const quantities = () => s.posts.map((p) => p.body.items[0].quantity);
 const errorShown = () => !!document.getElementById("whopco-error");
 const overlayShown = () => !!document.getElementById("whopco-overlay");
@@ -314,6 +324,26 @@ describe("loader: a click after the cart was read ahead", () => {
     expect(s.navigations).toEqual([`${DOMAIN}/c/s_2`]);
   });
 
+  it("a read ahead the click's own read contradicted is dropped: the next click (back from the checkout) reads first", async () => {
+    await boot();
+    await hover();
+    s.hold = true;
+    click();
+    await settle();
+    s.cart = cartOf(2);
+    release();
+    await settle();
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_2`]);
+    back();
+    click();
+    await settle();
+    expect(s.posts).toHaveLength(2); // nothing sent ahead from the dropped read
+    release();
+    await settle();
+    expect(quantities()).toEqual([1, 2, 2]);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_2`, `${DOMAIN}/c/s_3`]);
+  });
+
   it("a cart change seen after the read ahead (the theme's /cart/change.js): the click reads the cart first, as before", async () => {
     await boot();
     await hover();
@@ -362,7 +392,7 @@ describe("loader: a click after the cart was read ahead", () => {
   it("after cart changes (a drawer's quantities) the cart is read again once they stop (300 ms): the next click is sent ahead again", async () => {
     await boot();
     await hover();
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(4_000);
     s.cart = cartOf(2);
     cartRequestEnded("/cart/change.js");
     await vi.advanceTimersByTimeAsync(200);
@@ -380,6 +410,83 @@ describe("loader: a click after the cart was read ahead", () => {
     release();
     await settle();
     expect(s.posts).toHaveLength(1);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_1`]);
+  });
+
+  it("read again 3 s at least after the last read, and only within 20 s of heading for the checkout", async () => {
+    await boot();
+    await hover();
+    await vi.advanceTimersByTimeAsync(100);
+    cartRequestEnded("/cart/change.js");
+    await vi.advanceTimersByTimeAsync(2_899);
+    expect(s.cartReads).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await settle();
+    expect(s.readTimes[1] - s.readTimes[0]).toBe(3_000);
+    // 20 s after the buyer headed for the checkout, a change is only marked: not read again.
+    await vi.advanceTimersByTimeAsync(17_500);
+    cartRequestEnded("/cart/change.js");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(s.cartReads).toBe(2);
+  });
+
+  it("a read made since the changes (heading for the checkout again) leaves nothing to read again", async () => {
+    await boot();
+    await hover();
+    await vi.advanceTimersByTimeAsync(4_900);
+    cartRequestEnded("/cart/change.js"); // to be read again 300 ms later…
+    await vi.advanceTimersByTimeAsync(100);
+    await hover(); // …but the pointer over « Checkout » reads it first (5 s on)
+    expect(s.cartReads).toBe(2);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(s.cartReads).toBe(2);
+  });
+
+  it("an app's script writing the cart after each read can't make it loop: 3 s apart, within 20 s of the intent, then nothing", async () => {
+    await boot();
+    await hover();
+    s.writesOnRead = true;
+    cartRequestEnded("/cart/update.js");
+    await vi.advanceTimersByTimeAsync(60_000);
+    await settle();
+    const gaps = s.readTimes.slice(1).map((t, i) => t - s.readTimes[i]);
+    expect(gaps.length).toBeGreaterThan(0);
+    expect(gaps.every((gap) => gap >= 3_000)).toBe(true);
+    expect(s.readTimes.at(-1)! - s.readTimes[0]).toBeLessThan(20_000);
+    expect(s.cartReads).toBeLessThanOrEqual(7);
+  });
+
+  it("only the storefront's own requests are cart changes: another site's /api/discount/… neither outdates the read ahead nor reads again", async () => {
+    await boot();
+    await hover();
+    await vi.advanceTimersByTimeAsync(100);
+    cartRequestEnded("https://reviews-app.example/api/discount/badge.json");
+    cartRequestEnded("https://reviews-app.example/cart/add.js", false);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(s.cartReads).toBe(1);
+    s.hold = true;
+    click();
+    await settle();
+    expect(s.posts).toHaveLength(1); // sent ahead
+    release();
+    await settle();
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_1`]);
+  });
+
+  it("a change handed over late but ended before the read ahead was asked is in that read: sent ahead", async () => {
+    await boot();
+    await hover();
+    await vi.advanceTimersByTimeAsync(6_000);
+    cartRequestEnded("/cart/change.js", false); // ended now, the observer still holds it
+    await vi.advanceTimersByTimeAsync(1);
+    await hover(); // read again (5 s on), after that change
+    expect(s.cartReads).toBe(2);
+    s.hold = true;
+    click();
+    await settle();
+    expect(s.posts).toHaveLength(1);
+    release();
+    await settle();
     expect(s.navigations).toEqual([`${DOMAIN}/c/s_1`]);
   });
 
@@ -489,6 +596,43 @@ describe("loader: a cart read still on its way at the click (a touch)", () => {
     expect(s.navigations).toEqual([`${DOMAIN}/c/s_1`]);
   });
 
+  it("nor once the click's own read failed: landing during the retry's pause, it isn't sent (the retry asks once, for its own read)", async () => {
+    await boot();
+    s.hold = true;
+    touch();
+    click();
+    await settle();
+    expect(s.cartReads).toBe(2);
+    s.cartFails = 1;
+    s.held.pop()!(); // the click's own read: 503
+    await settle();
+    s.held.shift()!(); // the read ahead lands while the retry waits
+    await settle();
+    expect(s.posts).toHaveLength(0);
+    s.hold = false;
+    await vi.advanceTimersByTimeAsync(800);
+    await settle();
+    expect(s.cartReads).toBe(3);
+    expect(s.posts).toHaveLength(1);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_1`]);
+  });
+
+  it("a read ahead that fails (503) is never sent: the click goes on with its own read", async () => {
+    await boot();
+    s.hold = true;
+    touch();
+    click();
+    await settle();
+    s.cartFails = 1;
+    s.held.shift()!(); // the read ahead: 503
+    await settle();
+    expect(s.posts).toHaveLength(0);
+    release(); // the click's own: fine
+    await settle();
+    expect(s.posts).toHaveLength(1);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_1`]);
+  });
+
   it("nor once a cart change ended after it was asked", async () => {
     await boot();
     s.hold = true;
@@ -554,6 +698,91 @@ describe("loader: the click's own read failing after a session was asked ahead",
     await settle();
     expect(s.posts).toHaveLength(2);
     expect(s.posts[1].body.requestKey).toBe(s.posts[0].body.requestKey);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_2`]);
+  });
+
+  it("that session lost on the network (the checkout domain, then the app's API): asked again under its key for the same cart", async () => {
+    await boot();
+    await hover();
+    s.holdPosts = true;
+    s.appDown = true;
+    s.cartFails = 1;
+    click();
+    await settle();
+    expect(s.posts).toHaveLength(1);
+    s.heldPosts[0](true); // the checkout domain: a network error, then the app's API: one too
+    await settle();
+    s.appDown = false;
+    await vi.advanceTimersByTimeAsync(800);
+    await settle();
+    // The domain known unreachable now: straight to the app's API, under the key of the session asked ahead.
+    expect(s.appPosts).toHaveLength(1);
+    expect(s.appPosts[0].requestKey).toBe(s.posts[0].body.requestKey);
+    expect(s.navigations).toEqual([`${API}/c/app_1?via=app`]);
+  });
+
+  it("the retry waits for that session when it's still on its way: one session", async () => {
+    await boot();
+    await hover();
+    s.holdPosts = true;
+    s.cartFails = 1;
+    click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(800);
+    await settle();
+    expect(s.cartReads).toBe(3);
+    expect(s.posts).toHaveLength(1);
+    expect(s.navigations).toEqual([]);
+    s.heldPosts[0](false);
+    await settle();
+    expect(s.posts).toHaveLength(1);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_1`]);
+  });
+
+  it("every read failing, then « Réessayer » on the same cart: the session asked ahead opens, no second one", async () => {
+    await boot();
+    await hover();
+    s.cartFails = 2;
+    click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(800);
+    await settle();
+    expect(errorShown()).toBe(true);
+    expect(s.posts).toHaveLength(1);
+    tryAgain();
+    await settle();
+    expect(s.posts).toHaveLength(1);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_1`]);
+  });
+
+  it("…that session having failed (502): « Réessayer » asks again under its key; another cart gets a new key", async () => {
+    await boot();
+    await hover();
+    s.replies.push(502);
+    s.cartFails = 2;
+    click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(800);
+    await settle();
+    expect(errorShown()).toBe(true);
+    tryAgain();
+    await settle();
+    expect(s.posts).toHaveLength(2);
+    expect(s.posts[1].body.requestKey).toBe(s.posts[0].body.requestKey);
+    expect(s.navigations).toEqual([`${DOMAIN}/c/s_2`]);
+
+    await boot();
+    await hover();
+    s.cartFails = 2;
+    click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(800);
+    await settle();
+    s.cart = cartOf(2);
+    tryAgain();
+    await settle();
+    expect(quantities()).toEqual([1, 2]);
+    expect(s.posts[1].body.requestKey).not.toBe(s.posts[0].body.requestKey);
     expect(s.navigations).toEqual([`${DOMAIN}/c/s_2`]);
   });
 

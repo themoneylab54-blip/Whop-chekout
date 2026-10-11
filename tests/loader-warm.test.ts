@@ -92,7 +92,11 @@ describe("loader: warm-up", () => {
   });
 
   it("at most once a minute; « buy now » doesn't warm when it isn't intercepted, a checkout button does", async () => {
+    // Within the minute, no cart read ahead to make here (no PerformanceObserver): no selector work at all.
+    const closest = vi.spyOn(Element.prototype, "closest");
     over("checkout-btn");
+    expect(closest).not.toHaveBeenCalled();
+    closest.mockRestore();
     await settle();
     expect(warms).toHaveLength(1);
     expect(wakes).toHaveLength(2);

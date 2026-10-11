@@ -638,7 +638,7 @@
   function sendAhead(track, key) {
     var pre = freshPreRead();
     if (!pre) return null;
-    var ahead = { track: track, text: null, answer: null, done: false };
+    var ahead = { track: track, key: key, text: null, answer: null, done: false };
     function send(cart) {
       // Landed after the click: still no cart change ended since it was asked.
       if (ahead.done || freshPreRead() !== pre) return;
@@ -666,7 +666,7 @@
     }
   }
 
-  // `ahead`: on the automatic retry, the session the click asked ahead before its own read failed.
+  // `ahead`: on the automatic retry or « Réessayer », the session a click asked ahead before its own read failed.
   function goToCheckout(items, retried, key, ahead) {
     if (busy) return;
     busy = true;
@@ -674,6 +674,7 @@
     key = key || requestKey();
     var startedAt = Date.now();
     overlay(true);
+    var carried = !!ahead;
     // Read once per click, and kept by a retry that checks a session asked ahead (an fbc made from an fbclid
     // carries the time): the same cart makes the same body as the one sent ahead.
     var track = ahead ? ahead.track : clickTracking();
@@ -696,9 +697,10 @@
           var answer = ahead.answer;
           var same = sent && JSON.stringify(body) === ahead.text;
           ahead = null;
-          // On the retry (the click's read had failed): the session asked ahead when it was made, else asked
-          // again under its key (the server answers that session if it made it since, never a second one).
-          if (same && retried) {
+          // After a failed read (the automatic retry, « Réessayer »): the session asked ahead when it was made,
+          // else asked again under its key (the server answers that session if it made it since, never a
+          // second one).
+          if (same && carried) {
             return answer.then(
               function (res) {
                 return res.ok ? res : postBody(body, key);
@@ -745,8 +747,8 @@
         location.href = body.url;
       })
       .catch(function (err) {
-        // The click's own read failed: a session it asked ahead goes to the retry with its key, opened there
-        // only for the same cart (another cart gets a new key); one not asked yet never is.
+        // The click's own read failed: a session it asked ahead goes to the retry, then « Réessayer », with its
+        // key, opened there only for the same cart (another cart gets a new key); one not asked yet never is.
         var asked = null;
         if (ahead) {
           ahead.done = true;
@@ -777,7 +779,7 @@
         }
         busy = false;
         log("checkout failed:", err && err.message);
-        failed(err && err.message, items);
+        failed(err && err.message, items, asked);
       });
   }
 
@@ -788,8 +790,9 @@
   }
 
   // The checkout couldn't open: the buyer stays on the shop with a way to try again (never
-  // Shopify's checkout). With ?whopco_debug=1 the reason shows too.
-  function failed(reason, items) {
+  // Shopify's checkout). With ?whopco_debug=1 the reason shows too. `asked`: a session asked ahead that
+  // no read confirmed, for « Réessayer » to check (no second session for the same cart).
+  function failed(reason, items, asked) {
     overlay(false);
     if (DEBUG) badge("Whop Checkout : échec — " + (reason || "erreur inconnue"), false);
     var id = "whopco-error";
@@ -813,7 +816,8 @@
     retry.style.cssText = "background:#111;color:#fff;border:0;border-radius:8px;padding:10px 18px;font:600 15px system-ui,sans-serif;cursor:pointer";
     retry.addEventListener("click", function () {
       el.remove();
-      goToCheckout(items);
+      // A new click: a new key, unless it makes the same body as the session asked ahead (that one's key).
+      goToCheckout(items, false, asked && asked.key, asked);
     });
     var close = document.createElement("button");
     close.type = "button";
@@ -1211,6 +1215,7 @@
   }
   function warm() {
     if (!config || !config.enabled) return;
+    intentAt = Date.now();
     // The cart read ahead asks the shop, not our servers: its own throttle, not their minute (landing on the
     // cart page reads it even right after the last page's warm-up).
     preReadCart();
@@ -1258,29 +1263,46 @@
    * Cart read ahead: Shopify's cart is read while the buyer heads for the checkout (at most every 5 s), and
    * a click within 20 s of a read asks that cart's session as soon as the read is in, while the click's own
    * read of the cart runs as before: the checkout opens once both are in, only if they make the same body
-   * (see goToCheckout). A read is never sent ahead once a cart change ended after it was asked (the theme's
-   * or an app's add / change / update / clear request, a discount code, any language prefix), as a
-   * PerformanceObserver sees them; the cart is then read again once the changes stop (a drawer's
-   * quantities). Without a PerformanceObserver, changes can't be seen and nothing is read ahead.
+   * (see goToCheckout). A read is never sent ahead once a cart change ended after it was asked (the
+   * storefront's own add / change / update / clear request, a discount code, any language prefix), as a
+   * PerformanceObserver sees them; while the buyer heads for the checkout, the cart is then read again once
+   * the changes stop (a drawer's quantities). Without a PerformanceObserver, changes can't be seen and
+   * nothing is read ahead.
    */
   var PRE_READ_MS = 20000; // sent ahead within 20 s of the read
   var PRE_READ_EVERY_MS = 5000; // one read ahead every 5 s at most
   var REREAD_MS = 300; // after the last cart change seen
+  var REREAD_EVERY_MS = 3000; // a read again 3 s at least after the last read
+  var INTENT_MS = 20000; // read again only within 20 s of the buyer heading for the checkout
   var CART_CHANGE = /\/cart\/(add|change|update|clear)(\.js)?\/?$|\/discount\//i;
   // The last read ahead: { at: Date.now(), t: performance.now(), both when it was asked; promise; cart once in }.
   var preRead = null;
   var cartChangedAt = -1; // performance.now() time the last cart change seen ended
   var cartWatch = null; // the PerformanceObserver, made for the first read ahead (false: none here)
   var rereadTimer = null;
+  var intentAt = 0; // the last warm(): a pointer or touch on a checkout button, the cart opened, the cart page
   function seeCartRequests(entries) {
     var seen = false;
+    var shop = location.origin;
     for (var i = 0; i < entries.length; i++) {
-      if (CART_CHANGE.test(String(entries[i].name).split(/[?#]/)[0])) {
+      var name = String(entries[i].name);
+      // The storefront's own requests only: an app's /api/discount/… on its own domain isn't the cart.
+      if (name.slice(0, shop.length + 1) !== shop + "/") continue;
+      if (CART_CHANGE.test(name.slice(shop.length).split(/[?#]/)[0])) {
         cartChangedAt = Math.max(cartChangedAt, entries[i].responseEnd || performance.now());
         seen = true;
       }
     }
     return seen;
+  }
+  function headingForCheckout() {
+    var age = Date.now() - intentAt;
+    return age >= 0 && age < INTENT_MS;
+  }
+  // The cart read again after changes: only while the read ahead is older than them and the buyer still heads
+  // for the checkout.
+  function rereadCart() {
+    if (preRead && preRead.t <= cartChangedAt && headingForCheckout()) preReadCart(true);
   }
   function watchCart() {
     if (cartWatch !== null) return cartWatch;
@@ -1288,12 +1310,11 @@
     try {
       if (typeof PerformanceObserver === "function") {
         var observer = new PerformanceObserver(function (list) {
-          // A read ahead outdated by a change: read again once the changes stop (debounced).
-          if (seeCartRequests(list.getEntries()) && preRead) {
+          // A read ahead outdated by a change: read again once the changes stop (debounced), 3 s at least after
+          // the last read, so a script writing the cart after each read never makes it loop.
+          if (seeCartRequests(list.getEntries()) && preRead && headingForCheckout()) {
             clearTimeout(rereadTimer);
-            rereadTimer = setTimeout(function () {
-              preReadCart(true);
-            }, REREAD_MS);
+            rereadTimer = setTimeout(rereadCart, Math.max(REREAD_MS, preRead.at + REREAD_EVERY_MS - Date.now()));
           }
         });
         observer.observe({ entryTypes: ["resource"] });
@@ -1310,7 +1331,7 @@
     var age = preRead ? Date.now() - preRead.at : -1;
     return !(age >= 0 && age < PRE_READ_EVERY_MS);
   }
-  // `again`: after a cart change, whatever the throttle.
+  // `again`: after cart changes, whatever the intents' 5 s (see rereadCart).
   function preReadCart(again) {
     if ((!again && !readAheadDue()) || !watchCart()) return;
     var pre = { at: Date.now(), t: performance.now() };
