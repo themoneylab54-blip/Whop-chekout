@@ -1,7 +1,15 @@
 "use client";
 
-import { useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { whopFooterFit } from "./whopFooterFit";
+
+/**
+ * How long Whop's frame may take to say "ready" (from its mount) with its footer clipped: past it,
+ * the screen in the frame may be another of Whop's (an expired checkout's error) and is shown whole,
+ * for good (no second move when a late "ready" comes). Whop's form says "ready" 4 to 5 s after its
+ * mount on a fast connection (1 to 3 s after drawing itself).
+ */
+export const WHOP_READY_GRACE_MS = 30_000;
 
 /**
  * Whop's form without its « Propulsé par Whop » footer (see whopFooterFit): the frame narrowed only
@@ -17,11 +25,23 @@ import { whopFooterFit } from "./whopFooterFit";
  * The language is the frame's own: Whop's frame keeps the one it was opened in (a language switch on
  * the page doesn't reload it), and this box remounts with it. `checkedLang` is the language the server
  * checked Whop's form in: the clip applies only while the frame shows that one.
+ *
+ * From the frame's mount (waiting for Whop's "ready", 1 to 3 s after it draws its form, would show
+ * the footer at each load, then move the page), kept once `ready` was seen; given up for good if it
+ * isn't within WHOP_READY_GRACE_MS. Per frame load: this box remounts with each checkout.
  */
-export function WhopFooterClip({ on, lang: langProp, checkedLang, children }: { on: boolean; lang: string; checkedLang: string | null; children: ReactNode }) {
+export function WhopFooterClip({ on, lang: langProp, checkedLang, ready, children }: { on: boolean; lang: string; checkedLang: string | null; ready: boolean; children: ReactNode }) {
   const box = useRef<HTMLDivElement>(null);
   const [lang] = useState(langProp);
-  const active = on && checkedLang === lang;
+  const [wasReady, setWasReady] = useState(false);
+  const [gaveUp, setGaveUp] = useState(false);
+  if (ready && !wasReady && !gaveUp) setWasReady(true);
+  useEffect(() => {
+    if (wasReady || gaveUp) return;
+    const t = setTimeout(() => setGaveUp(true), WHOP_READY_GRACE_MS);
+    return () => clearTimeout(t);
+  }, [wasReady, gaveUp]);
+  const active = on && checkedLang === lang && !gaveUp;
   const [width, setWidth] = useState(0);
   useLayoutEffect(() => {
     const el = box.current;

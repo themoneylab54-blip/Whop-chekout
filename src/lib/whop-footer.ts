@@ -142,12 +142,12 @@ const FOOTER = new RegExp(
 const POWERED = new RegExp(
   "^[^<]{1,60}" +
     lit('<span class="ml-1 inline-flex items-center align-middle"><svg class="text-gray-10 h-[1.1em] w-auto opacity-70 grayscale" fill="none" height="26" viewBox="0 0 119 26" width="119" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">') +
-    "[\\s\\S]*" +
+    "([\\s\\S]*)" +
     lit('</svg><span class="sr-only">Whop</span></span></span>') +
     "$",
 );
-/** What the logo is drawn with: nothing else (no text, link or box) may hide in it, nothing styled or hidden. */
-const LOGO_TAGS = new Set(["span", "svg", "g", "path", "defs", "clippath", "rect"]);
+/** What the logo is drawn with, inside its svg: nothing else (no text, link or box) may hide in it, nothing styled or hidden. */
+const LOGO_TAGS = new Set(["g", "path", "defs", "clippath", "rect"]);
 /** Whop's padding around its form, as measured (16 px each side, none under the spacer). */
 const CONTAINER = '<div style="padding-top:32px;padding-bottom:0px;padding-left:16px;padding-right:16px" class="flex w-full flex-col gap-6">';
 const SEGMENT = '<div hidden id="S:';
@@ -175,8 +175,10 @@ function nothingDrawnAfter(html: string, at: number): boolean {
   let pos = at;
   for (let level = 0; level < 4; level++) {
     const open = html.lastIndexOf(SEGMENT, pos);
-    // In the page shell (no segment holds it: none before it, or a script since, which ends a segment).
-    if (open < 0 || html.slice(open, pos).includes("<script")) return true;
+    // Up in the page shell (before every segment): done. The form itself is always streamed in one.
+    if (open < 0) return level > 0;
+    // A script since that segment's start: not inside it (unsure where it is): no.
+    if (html.slice(open, pos).includes("<script")) return false;
     const id = /^<div hidden id="S:(\d+)">/.exec(html.slice(open, open + 40))?.[1];
     if (!id) return false;
     const moved = [...html.matchAll(new RegExp(`\\$RS\\("S:${id}","(P:\\d+)"\\)`, "g"))];
@@ -212,8 +214,9 @@ export function footerVerdict(html: string, lang: string): { ok: true } | { ok: 
   if (!html.includes(CONTAINER)) return { ok: false, reason: "container" };
   const m = FOOTER.exec(html);
   if (!m) return { ok: false, reason: "footer_markup" };
-  const tags = [...m[1].matchAll(/<\/?([a-zA-Z][\w-]*)/g)].map((t) => t[1].toLowerCase());
-  if (!POWERED.test(m[1]) || tags.some((t) => !LOGO_TAGS.has(t)) || /\s(?:style|hidden)[\s=>]/i.test(m[1])) return { ok: false, reason: "footer_content" };
+  const logo = POWERED.exec(m[1]);
+  const tags = logo ? [...logo[1].matchAll(/<\/?([a-zA-Z][\w-]*)/g)].map((t) => t[1].toLowerCase()) : [];
+  if (!logo || tags.some((t) => !LOGO_TAGS.has(t)) || /\s(?:style|hidden)[\s=>]/i.test(m[1])) return { ok: false, reason: "footer_content" };
   if (textOf(m[1]) !== words.powered || textOf(m[2]) !== words.terms || textOf(m[3]) !== words.privacy) return { ok: false, reason: "footer_words" };
   if (!nothingDrawnAfter(html, m.index)) return { ok: false, reason: "after_form" };
   return { ok: true };

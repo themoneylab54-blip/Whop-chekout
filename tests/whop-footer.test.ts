@@ -177,6 +177,7 @@ describe("footerVerdict on Whop's own pages", () => {
         "another gap above the footer": fr.replace(/<div class="flex flex-col gap-2">(?=(?:<span class="fui-Text text-gray-11 mt-2[^>]*>[^<]*<\/span>)?<div class="mt-3)/, '<div class="flex flex-col gap-0">'),
         "the logo resized": fr.replace(LOGO_SVG, LOGO_SVG.replace('aria-hidden="true">', 'aria-hidden="true" style="width:4px">')),
         "a path styled in the logo": fr.replace("<defs>", '<g style="display:none"></g><defs>'),
+        "a box inside the logo": fr.replace("<defs>", '<span class="-ml-16 inline-block"></span><defs>'),
       };
       for (const [what, page] of Object.entries(changed)) {
         expect(page, `${name}: ${what} (the change applied)`).not.toBe(fr);
@@ -197,6 +198,9 @@ describe("footerVerdict on Whop's own pages", () => {
     expect(footerVerdict(fr.replace(shellTail, '$1<div class="px-4">Aide</div>$2'), "fr")).toEqual({ ok: false, reason: "after_form" });
     // A boundary still streaming in after the placeholder.
     expect(footerVerdict(fr.replace('<template id="P:2"></template><!--$-->', '<template id="P:2"></template><!--$?--><template id="B:9"></template>'), "fr")).toEqual({ ok: false, reason: "after_form" });
+    // The form not inside its segment as expected (a script before it there), or not streamed at all: shown.
+    expect(footerVerdict(fr.replace('<div hidden id="S:2">', '<div hidden id="S:2"><script>void 0</script>').replace('<template id="P:2"></template>', '<template id="P:2"></template><div>Aide</div>'), "fr")).toEqual({ ok: false, reason: "after_form" });
+    expect(footerVerdict(fr.replace('<div hidden id="S:2">', "<div>"), "fr")).toEqual({ ok: false, reason: "after_form" });
     // React's moves not found (another way of streaming the page), or the form placed twice: shown.
     expect(footerVerdict(fr.replace('$RS("S:2","P:2")', '$RX("S:2","P:2")'), "fr")).toEqual({ ok: false, reason: "after_form" });
     expect(footerVerdict(fr.replace('$RC("B:1","S:1")', '$RX("B:1","S:1")'), "fr")).toEqual({ ok: false, reason: "after_form" });

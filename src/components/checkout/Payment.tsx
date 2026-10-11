@@ -687,16 +687,6 @@ export function PaymentPanel({
   const currentPreparing = paypalOn ? paypal.preparing : preparing;
   // Ready = the embed on screen said so (switching checkouts remounts it: not ready until it says so).
   const [readyFor, setReadyFor] = useState<string | null>(null);
-  // Whop's footer clip (see WhopFooterClip): from the frame's mount, kept once Whop said "ready";
-  // dropped if it never does within WHOP_READY_GRACE_MS (another screen of Whop's, maybe).
-  const [everReadyFor, setEverReadyFor] = useState<string | null>(null);
-  const [graceOverFor, setGraceOverFor] = useState<string | null>(null);
-  const embedConfigId = current?.configId ?? null;
-  useEffect(() => {
-    if (!embedConfigId) return;
-    const t = setTimeout(() => setGraceOverFor(embedConfigId), WHOP_READY_GRACE_MS);
-    return () => clearTimeout(t);
-  }, [embedConfigId]);
   const ready = !!current && readyFor === current.configId;
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1334,10 +1324,9 @@ export function PaymentPanel({
             // PayPal button in it), nor Whop's billing address form (after an address error). Whop's
             // "disabled" state is not another screen but its pay button's (an incomplete form, a payment
             // going through): the clip stays on, so the frame never jumps while the buyer types or pays.
-            // From the frame's mount (Whop says "ready" 1 to 3 s after drawing its form: waiting for it
-            // would show the footer at every load, then move the page); off if Whop never says it within
-            // WHOP_READY_GRACE_MS (an expired checkout's error screen, say: never cut).
-            on={!paypalOn && !showBillingForm && (everReadyFor === current.configId || graceOverFor !== current.configId)}
+            // From the frame's mount, given up for good on a frame that never says "ready" (see WhopFooterClip).
+            on={!paypalOn && !showBillingForm}
+            ready={ready}
             lang={theme.language}
             checkedLang={whopFooterLang}
           >
@@ -1356,10 +1345,7 @@ export function PaymentPanel({
               setupFutureUsage={saveCard ? "off_session" : undefined}
               skipRedirect
               returnUrl={returnUrl}
-              onStateChange={(s) => {
-                setReadyFor(s === "ready" ? current.configId : null);
-                if (s === "ready") setEverReadyFor(current.configId);
-              }}
+              onStateChange={(s) => setReadyFor(s === "ready" ? current.configId : null)}
               onComplete={paid}
               onPaymentError={(e) => {
                 if (!paypalOn) cardDeclinedAt.current = Date.now();
@@ -1536,12 +1522,6 @@ export function PaymentPanel({
 
 /** A card declined this recently makes a server wait say so (its attempt is what is in flight). */
 export const CARD_DECLINED_RECENT_MS = 30_000;
-/**
- * How long Whop's frame may stay short of "ready" (from its mount) with its footer clipped: past it,
- * the screen in the frame may be another of Whop's (an expired checkout's error) and is shown whole.
- * Whop's form says "ready" about 4 to 5 s after its mount on a fast connection.
- */
-export const WHOP_READY_GRACE_MS = 20_000;
 
 /** Status checks during the server wait (another payment of the session still going through). */
 export const SERVER_WAIT_POLL_MS = 2500;

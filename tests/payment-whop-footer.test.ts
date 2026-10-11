@@ -29,7 +29,8 @@ vi.mock("@whop/checkout/react", async () => {
   return { WhopCheckoutEmbed, WhopExpressCheckoutButton: () => null, useCheckoutEmbedControls: () => React.useRef(null) };
 });
 
-const { PaymentPanel, WHOP_READY_GRACE_MS } = await import("@/components/checkout/Payment");
+const { PaymentPanel } = await import("@/components/checkout/Payment");
+const { WHOP_READY_GRACE_MS } = await import("@/components/checkout/WhopFooterClip");
 const { LABELS } = await import("@/components/checkout/i18n");
 const theme = { language: "fr", accentColor: "#000", radius: 8, requireTerms: false } as unknown as ComponentProps<typeof PaymentPanel>["theme"];
 
@@ -110,7 +111,7 @@ describe("PaymentPanel: « Propulsé par Whop » clipped off Whop's card form on
     expect(clip()).toBeNull();
   });
 
-  it("Whop never says \"ready\" (another screen of its own, an expired checkout's error, say): shown whole after the grace period; once ready, clipped for good", async () => {
+  it("Whop never says \"ready\" (another screen of its own, an expired checkout's error, say): shown whole after the grace period, for good; once ready, clipped for good", async () => {
     vi.useFakeTimers();
     try {
       const first = render(panel({ whopFooterLang: "fr" }));
@@ -119,11 +120,36 @@ describe("PaymentPanel: « Propulsé par Whop » clipped off Whop's card form on
       expect(clip()).toBe("86");
       await act(async () => void (await vi.advanceTimersByTimeAsync(20)));
       expect(clip()).toBeNull();
+      // A late "ready" (a very slow connection): no second move.
+      act(() => whop.last?.onStateChange?.("ready"));
+      expect(clip()).toBeNull();
       first.unmount();
       render(panel({ whopFooterLang: "fr" }));
       act(() => whop.last?.onStateChange?.("ready"));
       act(() => whop.last?.onStateChange?.("disabled"));
       await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS * 2)));
+      expect(clip()).toBe("86");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("back to the card after PayPal (the card frame reloaded): clipped from its new mount, never shown then moved", async () => {
+    vi.useFakeTimers();
+    try {
+      const { rerender } = render(panel({ whopFooterLang: "fr" }));
+      act(() => whop.last?.onStateChange?.("ready"));
+      // The buyer fills the form for a while, then picks PayPal…
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS + 1_000)));
+      rerender(panel({ whopFooterLang: "fr", paypalActive: true }));
+      expect(screen.getByTestId("embed").getAttribute("data-config")).toBe("cfg_paypal");
+      act(() => whop.last?.onStateChange?.("ready"));
+      expect(clip()).toBeNull();
+      // …and goes back to the card: the same checkout, a new frame.
+      rerender(panel({ whopFooterLang: "fr", paypalActive: false }));
+      expect(screen.getByTestId("embed").getAttribute("data-config")).toBe("cfg_card");
+      expect(clip()).toBe("86");
+      act(() => whop.last?.onStateChange?.("ready"));
       expect(clip()).toBe("86");
     } finally {
       vi.useRealTimers();
