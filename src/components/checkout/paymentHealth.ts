@@ -24,8 +24,9 @@ export type HealthReport =
   | ({ kind: "prepare_stuck" } & PageState)
   // A request for the payment form on its way for SLOW_AFTER_MS without a break (logs only).
   | ({ kind: "prepare_slow" } & PageState)
-  // The buyer left the page (after LEFT_MIN_MS) without the payment form ever ready (logs only).
-  | ({ kind: "left_without_form" } & PageState)
+  // The buyer left the page, or put it in the background (after LEFT_MIN_MS), without the payment form
+  // ever ready (logs only; `how`: pagehide, or hidden, as phones often never fire pagehide).
+  | ({ kind: "left_without_form"; how?: "pagehide" | "hidden" } & PageState)
   // Whop's card form on the page this long without saying it is ready (a frame that never loads, a
   // screen of Whop's own): whether its frame is there, the last state it said.
   | { kind: "form_not_ready"; waitedMs: number; frame: boolean; lastState: string | null }
@@ -51,6 +52,42 @@ export function reportHealth(sessionId: string, report: HealthReport): void {
   } catch {
     /* no beacon, no fetch: nothing to do */
   }
+}
+
+/**
+ * Calls `fn` once the page has been visible `ms` in all, and returns its cancel: time in the
+ * background never counts (a phone suspends a page in the background, and its overdue timers fire
+ * at once on its return, before the page could catch up).
+ */
+export function afterVisibleTime(ms: number, fn: () => void): () => void {
+  let left = ms;
+  let since = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let over = false;
+  const pause = () => {
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    timer = undefined;
+    left = Math.max(0, left - (performance.now() - since));
+  };
+  const run = () => {
+    if (over || timer !== undefined || document.visibilityState === "hidden") return;
+    since = performance.now();
+    timer = setTimeout(() => {
+      timer = undefined;
+      stop();
+      fn();
+    }, left);
+  };
+  const onVisibility = () => (document.visibilityState === "hidden" ? pause() : run());
+  const stop = () => {
+    over = true;
+    pause();
+    document.removeEventListener("visibilitychange", onVisibility);
+  };
+  document.addEventListener("visibilitychange", onVisibility);
+  run();
+  return stop;
 }
 
 /** How long a payment form may stay missing (without a break) before it is taken for stuck. */
@@ -82,8 +119,9 @@ type WatchedKind = "prepare_stuck" | "prepare_slow" | "left_without_form";
 /**
  * The page started (the inline watchdog stands down, see inlineWatchdog). Then, once each per page:
  * a payment form `missing` for STUCK_AFTER_MS without a break is reported and asked again (`retry`); a
- * request `preparing` for SLOW_AFTER_MS without a break is reported; leaving the page (after
- * LEFT_MIN_MS) without the form ever `formReady` is reported. `describe` says the page's state.
+ * request `preparing` for SLOW_AFTER_MS without a break is reported (both in visible time only, see
+ * afterVisibleTime); leaving the page or putting it in the background (after LEFT_MIN_MS) without the
+ * form ever `formReady` is reported. `describe` says the page's state.
  */
 export function usePaymentWatchdog(
   sessionId: string | null,
@@ -101,30 +139,34 @@ export function usePaymentWatchdog(
   }, []);
   useEffect(() => {
     if (!sessionId || !s.missing || fired.current.stuck) return;
-    const t = setTimeout(() => {
+    return afterVisibleTime(STUCK_AFTER_MS, () => {
       fired.current.stuck = true;
       reportHealth(sessionId, latest.current.s.describe("prepare_stuck"));
       latest.current.retry();
-    }, STUCK_AFTER_MS);
-    return () => clearTimeout(t);
+    });
   }, [sessionId, s.missing]);
   useEffect(() => {
     if (!sessionId || !s.preparing || fired.current.slow) return;
-    const t = setTimeout(() => {
+    return afterVisibleTime(SLOW_AFTER_MS, () => {
       fired.current.slow = true;
       reportHealth(sessionId, latest.current.s.describe("prepare_slow"));
-    }, SLOW_AFTER_MS);
-    return () => clearTimeout(t);
+    });
   }, [sessionId, s.preparing]);
   useEffect(() => {
     if (!sessionId) return;
-    const onHide = () => {
+    const left = (how: "pagehide" | "hidden") => {
       const l = latest.current.s;
       if (fired.current.left || l.formReady || performance.now() < LEFT_MIN_MS) return;
       fired.current.left = true;
-      reportHealth(sessionId, l.describe("left_without_form"));
+      reportHealth(sessionId, { ...l.describe("left_without_form"), how } as Extract<HealthReport, { kind: "left_without_form" }>);
     };
+    const onHide = () => left("pagehide");
+    const onVisibility = () => document.visibilityState === "hidden" && left("hidden");
     window.addEventListener("pagehide", onHide);
-    return () => window.removeEventListener("pagehide", onHide);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("pagehide", onHide);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [sessionId]);
 }

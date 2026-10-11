@@ -3,22 +3,32 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement as h } from "react";
 import { act, cleanup, render } from "@testing-library/react";
 import { BOOT_FLAG, WATCH_FLAG, healthPath } from "@/components/checkout/inlineWatchdog";
-import { LEFT_MIN_MS, SLOW_AFTER_MS, STUCK_AFTER_MS, paymentFormMissing, reportHealth, usePaymentWatchdog } from "@/components/checkout/paymentHealth";
+import { LEFT_MIN_MS, SLOW_AFTER_MS, STUCK_AFTER_MS, afterVisibleTime, paymentFormMissing, reportHealth, usePaymentWatchdog } from "@/components/checkout/paymentHealth";
 
 /*
  * The page's own health reports: a beacon (a fetch with keepalive where there is none), never an
  * error, with the page's clock, visibility, connection and what the inline watchdog kept (its first
- * errors, the version). The watchdog hook marks the page started at once, then, once each per page:
- * a form missing for STUCK_AFTER_MS without a break is reported and asked again (never on a moment of
- * missing between two requests); a request on its way SLOW_AFTER_MS without a break is reported;
- * leaving the page without the form ever ready is reported (not a bounce under LEFT_MIN_MS). The
+ * errors, the version). Its timers count visible time only (afterVisibleTime: a phone suspends a page
+ * in the background). The watchdog hook marks the page started at once, then, once each per page: a
+ * form missing for STUCK_AFTER_MS without a break is reported and asked again (never on a moment of
+ * missing between two requests, never for time spent in the background); a request on its way
+ * SLOW_AFTER_MS without a break is reported; leaving the page, or putting it in the background,
+ * without the form ever ready is reported, saying which (not a bounce under LEFT_MIN_MS). The
  * "missing" rule's every input is checked.
  */
 
 type Win = Window & Record<string, unknown>;
 let beacons: { url: string; body: Record<string, unknown> }[] = [];
+let visibility: DocumentVisibilityState;
+/** The page put in the background, or back (as a browser says it). */
+const setVisibility = (v: DocumentVisibilityState) => {
+  visibility = v;
+  document.dispatchEvent(new Event("visibilitychange"));
+};
 beforeEach(() => {
   beacons = [];
+  visibility = "visible";
+  vi.spyOn(document, "visibilityState", "get").mockImplementation(() => visibility);
   delete (window as unknown as Win)[BOOT_FLAG];
   delete (window as unknown as Win)[WATCH_FLAG];
   Object.defineProperty(navigator, "sendBeacon", {
@@ -66,6 +76,48 @@ describe("reportHealth", () => {
       }),
     );
     expect(() => reportHealth("cmsess1", { kind: "page_error", msg: "boom" })).not.toThrow();
+  });
+});
+
+describe("afterVisibleTime", () => {
+  it("counts visible time only: paused in the background, resumed on return; then over", () => {
+    vi.useFakeTimers();
+    const fn = vi.fn();
+    afterVisibleTime(10_000, fn);
+    vi.advanceTimersByTime(4_000);
+    setVisibility("hidden");
+    vi.advanceTimersByTime(60_000);
+    expect(fn).not.toHaveBeenCalled();
+    setVisibility("visible");
+    vi.advanceTimersByTime(5_999);
+    expect(fn).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fn).toHaveBeenCalledTimes(1);
+    setVisibility("hidden");
+    setVisibility("visible");
+    vi.advanceTimersByTime(60_000);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("started in the background: counts from the page's return; cancelled: never called", () => {
+    vi.useFakeTimers();
+    visibility = "hidden";
+    const fn = vi.fn();
+    afterVisibleTime(10_000, fn);
+    vi.advanceTimersByTime(60_000);
+    setVisibility("visible");
+    vi.advanceTimersByTime(9_999);
+    expect(fn).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fn).toHaveBeenCalledTimes(1);
+    const other = vi.fn();
+    const cancel = afterVisibleTime(10_000, other);
+    vi.advanceTimersByTime(5_000);
+    cancel();
+    setVisibility("hidden");
+    setVisibility("visible");
+    vi.advanceTimersByTime(60_000);
+    expect(other).not.toHaveBeenCalled();
   });
 });
 
@@ -123,6 +175,22 @@ describe("usePaymentWatchdog", () => {
     expect(retry).not.toHaveBeenCalled();
   });
 
+  it("time in the background never counts (a phone suspends the page): reported after 12 s of it in view", () => {
+    vi.useFakeTimers();
+    const retry = vi.fn();
+    render(probe({ missing: true, retry }));
+    act(() => void vi.advanceTimersByTime(6_000));
+    act(() => setVisibility("hidden"));
+    act(() => void vi.advanceTimersByTime(10 * 60_000));
+    act(() => setVisibility("visible"));
+    act(() => void vi.advanceTimersByTime(STUCK_AFTER_MS - 6_000 - 1));
+    expect(beacons.filter((b) => b.body.kind === "prepare_stuck")).toHaveLength(0);
+    expect(retry).not.toHaveBeenCalled();
+    act(() => void vi.advanceTimersByTime(1));
+    expect(beacons.filter((b) => b.body.kind === "prepare_stuck")).toHaveLength(1);
+    expect(retry).toHaveBeenCalledTimes(1);
+  });
+
   it("missing only after a while (a stall later on): still seen", () => {
     vi.useFakeTimers();
     const retry = vi.fn();
@@ -155,16 +223,31 @@ describe("usePaymentWatchdog", () => {
     clock.mockReturnValue(LEFT_MIN_MS - 1);
     const view = render(probe());
     window.dispatchEvent(new Event("pagehide"));
+    setVisibility("hidden");
     expect(beacons).toHaveLength(0);
+    setVisibility("visible");
     clock.mockReturnValue(LEFT_MIN_MS + 1_000);
     window.dispatchEvent(new Event("pagehide"));
     window.dispatchEvent(new Event("pagehide"));
-    expect(beacons.map((b) => b.body.kind)).toEqual(["left_without_form"]);
+    setVisibility("hidden");
+    expect(beacons.map((b) => b.body)).toEqual([expect.objectContaining({ kind: "left_without_form", how: "pagehide", provider: "whop" })]);
     view.unmount();
     beacons = [];
+    setVisibility("visible");
     render(probe({ formReady: true }));
     window.dispatchEvent(new Event("pagehide"));
+    setVisibility("hidden");
     expect(beacons).toHaveLength(0);
+  });
+
+  it("the page put in the background without the form ever ready (phones often never say pagehide): reported, once", () => {
+    vi.spyOn(performance, "now").mockReturnValue(LEFT_MIN_MS + 1_000);
+    render(probe());
+    setVisibility("hidden");
+    setVisibility("visible");
+    setVisibility("hidden");
+    window.dispatchEvent(new Event("pagehide"));
+    expect(beacons.map((b) => b.body)).toEqual([expect.objectContaining({ kind: "left_without_form", how: "hidden", visible: "hidden" })]);
   });
 
   it("no live session (a preview): never reported", () => {
@@ -173,6 +256,7 @@ describe("usePaymentWatchdog", () => {
     render(probe({ id: null, missing: true, preparing: true, retry }));
     act(() => void vi.advanceTimersByTime(10 * SLOW_AFTER_MS));
     window.dispatchEvent(new Event("pagehide"));
+    setVisibility("hidden");
     expect(beacons).toHaveLength(0);
     expect(retry).not.toHaveBeenCalled();
   });

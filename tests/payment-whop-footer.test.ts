@@ -17,13 +17,14 @@ type EmbedProps = {
   onAddressValidationError?: (e: { error_message: string }) => void;
 };
 
-const whop = vi.hoisted(() => ({ last: null as EmbedProps | null }));
+const whop = vi.hoisted(() => ({ last: null as EmbedProps | null, noFrame: false }));
 
 vi.mock("@whop/checkout/react", async () => {
   const React = await import("react");
   function WhopCheckoutEmbed(props: EmbedProps & { ref?: React.Ref<unknown> }) {
     React.useImperativeHandle(props.ref, () => ({ submit: async () => undefined, setEmail: async () => undefined, setAddress: async () => undefined }));
     whop.last = props;
+    if (whop.noFrame) return null;
     return React.createElement("iframe", { "data-testid": "embed", "data-config": props.sessionId, title: "Whop Embedded Checkout" });
   }
   return { WhopCheckoutEmbed, WhopExpressCheckoutButton: () => null, useCheckoutEmbedControls: () => React.useRef(null) };
@@ -63,9 +64,18 @@ function panel(o: { whopFooterLang?: string | null; paypalActive?: boolean; onRe
 }
 
 const clip = () => screen.getByTestId("wc-whop-clip").getAttribute("data-clip");
+let visibility: DocumentVisibilityState;
+/** The page put in the background, or back (as a browser says it). */
+const setVisibility = (v: DocumentVisibilityState) => {
+  visibility = v;
+  document.dispatchEvent(new Event("visibilitychange"));
+};
 
 beforeEach(() => {
   whop.last = null;
+  whop.noFrame = false;
+  visibility = "visible";
+  vi.spyOn(document, "visibilityState", "get").mockImplementation(() => visibility);
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -192,6 +202,76 @@ describe("PaymentPanel: Whop's card form never saying \"ready\" (a health report
       await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS * 3)));
       expect(onNotReady).toHaveBeenCalledTimes(1);
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("its time in the background never counts (a phone suspends the page)", async () => {
+    vi.useFakeTimers();
+    try {
+      const onNotReady = vi.fn();
+      render(panel({ onNotReady }));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS / 2)));
+      act(() => setVisibility("hidden"));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(10 * 60_000)));
+      act(() => setVisibility("visible"));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS / 2 - 1)));
+      expect(onNotReady).not.toHaveBeenCalled();
+      await act(async () => void (await vi.advanceTimersByTimeAsync(1)));
+      expect(onNotReady).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the state told is the frame's own: a frame mounted again (back from PayPal) starts without one", async () => {
+    vi.useFakeTimers();
+    try {
+      // The PayPal frame's word, then back to the card: the new card frame said nothing.
+      let onNotReady = vi.fn();
+      const view = render(panel({ onNotReady }));
+      act(() => whop.last?.onStateChange?.("loading"));
+      view.rerender(panel({ onNotReady, paypalActive: true }));
+      act(() => whop.last?.onStateChange?.("ready"));
+      view.rerender(panel({ onNotReady, paypalActive: false }));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS)));
+      expect(onNotReady.mock.calls).toEqual([[{ waitedMs: WHOP_READY_GRACE_MS, frame: true, lastState: null }]]);
+      cleanup();
+      // The old card frame's word, nothing from PayPal's, then back to the card: still none.
+      onNotReady = vi.fn();
+      const again = render(panel({ onNotReady }));
+      act(() => whop.last?.onStateChange?.("loading"));
+      again.rerender(panel({ onNotReady, paypalActive: true }));
+      again.rerender(panel({ onNotReady, paypalActive: false }));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS)));
+      expect(onNotReady.mock.calls).toEqual([[{ waitedMs: WHOP_READY_GRACE_MS, frame: true, lastState: null }]]);
+      cleanup();
+      // The new card frame's own word: told.
+      onNotReady = vi.fn();
+      const own = render(panel({ onNotReady }));
+      own.rerender(panel({ onNotReady, paypalActive: true }));
+      own.rerender(panel({ onNotReady, paypalActive: false }));
+      act(() => whop.last?.onStateChange?.("loading"));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS)));
+      expect(onNotReady.mock.calls).toEqual([[{ waitedMs: WHOP_READY_GRACE_MS, frame: true, lastState: "loading" }]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the frame looked for in the panel only: none there (another Whop frame elsewhere on the page) → frame: false", async () => {
+    vi.useFakeTimers();
+    const elsewhere = document.createElement("iframe");
+    elsewhere.title = "Whop Embedded Checkout";
+    document.body.append(elsewhere);
+    try {
+      whop.noFrame = true;
+      const onNotReady = vi.fn();
+      render(panel({ onNotReady }));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS)));
+      expect(onNotReady.mock.calls).toEqual([[{ waitedMs: WHOP_READY_GRACE_MS, frame: false, lastState: null }]]);
+    } finally {
+      elsewhere.remove();
       vi.useRealTimers();
     }
   });

@@ -1,20 +1,20 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /*
  * The checkout page's health reports (api/public/sessions/[id]/health), without a database: a report
- * from the page itself (same origin, with its Origin) of a hard failure becomes the store's
- * "checkout.form_missing" incident (each one journaled, no alert), with the page's known fields only,
- * cut short, and the browser; the softer signals go to the logs only. Another site's request, a
- * request without Origin, a malformed id, a flood or an oversized body is refused before any read; an
- * unknown session, a foreign host or a session over its quota is answered the same empty 204 without
- * anything recorded. The session is read once.
+ * from the page itself (same origin, with its Origin) of a hard failure is journaled for the store as
+ * "checkout.form_missing" (each one, level warn, no alert), with the page's known fields only, cut
+ * short, the browser and the version answering; the softer signals go to the logs only. Another
+ * site's request, a request without Origin, a malformed id, a flood or an oversized body is refused
+ * before any read; an unknown session, a foreign host or a session over its quota (one for each of
+ * the two kinds) is answered the same empty 204 without anything recorded. The session is read once.
  */
 
 const mocks = vi.hoisted(() => ({
   findSession: vi.fn<(args: unknown) => Promise<unknown>>(async () => ({ storeId: "st_1", store: { id: "st_1", checkoutDomain: null } })),
   foreign: vi.fn<(req: Request, store: unknown) => Promise<boolean>>(async () => false),
   rateLimit: vi.fn<(key: string, limit: number, windowMs?: number) => Promise<boolean>>(async () => true),
-  recordIncident: vi.fn<(e: unknown) => Promise<void>>(async () => undefined),
+  recordEvent: vi.fn<(e: unknown) => Promise<void>>(async () => undefined),
   warn: vi.fn(),
 }));
 
@@ -23,13 +23,12 @@ vi.mock("@/lib/db", () => ({ db: { checkoutSession: { findUnique: mocks.findSess
 vi.mock("@/lib/log", () => ({
   log: { info: vi.fn(), warn: mocks.warn, error: vi.fn() },
   withLogContext: (_fields: unknown, fn: () => unknown) => fn(),
-  recordEvent: vi.fn(),
+  recordEvent: mocks.recordEvent,
 }));
 vi.mock("@/lib/metrics", () => ({ flushProviderMetrics: vi.fn() }));
 vi.mock("@/lib/sentry", () => ({ captureException: vi.fn() }));
 vi.mock("@/lib/checkout-domain-check", () => ({ isForeignCheckoutHost: mocks.foreign }));
 vi.mock("@/lib/ratelimit", () => ({ rateLimit: mocks.rateLimit, clientIp: () => "10.1.2.3" }));
-vi.mock("@/lib/incidents", () => ({ recordIncident: mocks.recordIncident }));
 
 const { POST, healthReport } = await import("@/app/api/public/sessions/[id]/health/route");
 
@@ -48,6 +47,11 @@ beforeEach(() => {
   mocks.findSession.mockImplementation(async () => ({ storeId: "st_1", store: { id: "st_1", checkoutDomain: null } }));
   mocks.foreign.mockImplementation(async () => false);
   mocks.rateLimit.mockImplementation(async () => true);
+  vi.stubEnv("VERCEL_DEPLOYMENT_ID", "");
+  vi.stubEnv("VERCEL_GIT_COMMIT_SHA", "");
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 describe("healthReport (what the page said, its known fields only)", () => {
@@ -60,6 +64,7 @@ describe("healthReport (what the page said, its known fields only)", () => {
       online: true,
       afterReload: false,
       reloading: true,
+      left: false,
       typed: false,
       dpl: "dpl_" + "x".repeat(100),
       errors: [{ res: "https://x/_next/a.js", extra: "no" }, { msg: "m".repeat(500), at: "f.js:1" }, "junk", null],
@@ -77,6 +82,7 @@ describe("healthReport (what the page said, its known fields only)", () => {
         online: true,
         afterReload: false,
         reloading: true,
+        left: false,
         typed: false,
         dpl: ("dpl_" + "x".repeat(100)).slice(0, 64),
         errors: [{ res: "https://x/_next/a.js" }, { msg: "m".repeat(160), at: "f.js:1" }],
@@ -105,49 +111,69 @@ describe("healthReport (what the page said, its known fields only)", () => {
 });
 
 describe("POST /api/public/sessions/[id]/health", () => {
-  it("a hard failure from the checkout page: the store's incident, journaled each time, no alert, with the browser; an empty 204", async () => {
-    const res = await send({ kind: "not_booted", t: 10_500, state: "complete", afterReload: false, reloading: true, errors: [], failed: [] });
+  it("a hard failure from the checkout page: journaled for the store each time (warn, no alert), with the browser and the version answering; an empty 204", async () => {
+    vi.stubEnv("VERCEL_DEPLOYMENT_ID", "dpl_server");
+    const res = await send({ kind: "not_booted", t: 10_500, state: "complete", afterReload: false, reloading: true, dpl: "dpl_page", errors: [], failed: [] });
     expect(res.status).toBe(204);
     expect(await res.text()).toBe("");
     expect(mocks.findSession).toHaveBeenCalledTimes(1);
     expect(mocks.foreign).toHaveBeenCalledWith(expect.any(Request), { id: "st_1", checkoutDomain: null });
-    expect(mocks.recordIncident.mock.calls[0][0]).toEqual({
-      storeId: "st_1",
-      sessionId: ID,
-      kind: "checkout.form_missing",
-      message: expect.stringMatching(/ne s'est pas lancée.*page rechargée automatiquement\.$/),
-      data: { what: "not_booted", t: 10_500, state: "complete", afterReload: false, reloading: true, errors: [], failed: [], ua: "Mozilla/5.0 (iPhone)" },
-      alert: false,
-      everyMs: 1_000,
-    });
+    expect(mocks.recordEvent.mock.calls).toEqual([
+      [
+        {
+          storeId: "st_1",
+          sessionId: ID,
+          level: "warn",
+          kind: "checkout.form_missing",
+          message: expect.stringMatching(/ne s'est pas lancée.*page rechargée automatiquement\.$/),
+          data: { what: "not_booted", t: 10_500, state: "complete", afterReload: false, reloading: true, dpl: "dpl_page", errors: [], failed: [], ua: "Mozilla/5.0 (iPhone)", serverDpl: "dpl_server" },
+          alert: false,
+        },
+      ],
+    ]);
+    // The same report again (the same second): journaled again.
+    await send({ kind: "not_booted", t: 10_600 });
+    expect(mocks.recordEvent).toHaveBeenCalledTimes(2);
   });
 
-  it("says whether the page was reloaded, had been already, or could not be", async () => {
+  it("the version answering: Vercel's deployment, else its commit (12 characters), else none", async () => {
+    vi.stubEnv("VERCEL_GIT_COMMIT_SHA", "0123456789abcdef0123");
+    await send({ kind: "page_error", msg: "boom" });
+    vi.stubEnv("VERCEL_GIT_COMMIT_SHA", "");
+    await send({ kind: "page_error", msg: "boom" });
+    expect(mocks.recordEvent.mock.calls.map((c) => (c[0] as { data: { serverDpl: unknown } }).data.serverDpl)).toEqual(["0123456789ab", null]);
+  });
+
+  it("says whether the page was reloaded, the buyer left before, it had been already, or could not be", async () => {
     await send({ kind: "not_booted", afterReload: false, reloading: true });
     await send({ kind: "not_booted", afterReload: true, reloading: false });
     await send({ kind: "not_booted", afterReload: null, reloading: false });
     await send({ kind: "not_booted", afterReload: false, reloading: false });
-    const messages = mocks.recordIncident.mock.calls.map((c) => (c[0] as { message: string }).message);
+    await send({ kind: "not_booted", afterReload: false, reloading: false, left: true, typed: true });
+    const messages = mocks.recordEvent.mock.calls.map((c) => (c[0] as { message: string }).message);
     expect(messages[0]).toMatch(/page rechargée automatiquement\.$/);
     expect(messages[1]).toMatch(/encore après le rechargement automatique\.$/);
     expect(messages[2]).toMatch(/\(fichiers non chargés ou en erreur\)\.$/);
     expect(messages[3]).toMatch(/\(fichiers non chargés ou en erreur\)\.$/);
+    expect(messages[4]).toMatch(/client parti avant le rechargement automatique\.$/);
+    expect(mocks.recordEvent.mock.calls[4][0]).toMatchObject({ data: { left: true, typed: true } });
   });
 
   it("each hard failure has its own words", async () => {
     await send({ kind: "page_error", msg: "boom" });
     await send({ kind: "prepare_stuck", provider: "whop" });
     await send({ kind: "form_not_ready", waitedMs: 30_000, frame: false, lastState: null });
-    const messages = mocks.recordIncident.mock.calls.map((c) => (c[0] as { message: string }).message);
+    const messages = mocks.recordEvent.mock.calls.map((c) => (c[0] as { message: string }).message);
     expect(messages).toEqual([expect.stringMatching(/écran d'erreur/), expect.stringMatching(/pendant 12 s/), expect.stringMatching(/toujours pas prêt après 30 s/)]);
   });
 
   it("the softer signals: in the logs only, never journaled", async () => {
-    for (const kind of ["still_loading", "prepare_slow", "left_without_form", "inline_prepare_failed", "recovered"]) {
+    for (const kind of ["still_loading", "prepare_slow", "left_without_form", "inline_prepare_failed", "recovered", "started_late"]) {
       expect((await send({ kind, t: 25_000 })).status).toBe(204);
-      expect(mocks.warn).toHaveBeenLastCalledWith(`checkout.health.${kind}`, expect.any(String), expect.objectContaining({ storeId: "st_1", sessionId: ID, what: kind }));
+      expect(mocks.warn).toHaveBeenLastCalledWith(`checkout.health.${kind}`, expect.any(String), expect.objectContaining({ storeId: "st_1", sessionId: ID, what: kind, serverDpl: null }));
     }
-    expect(mocks.recordIncident).not.toHaveBeenCalled();
+    expect(mocks.warn).toHaveBeenCalledTimes(6);
+    expect(mocks.recordEvent).not.toHaveBeenCalled();
   });
 
   it("another site's request, or one without Origin: 403, nothing read", async () => {
@@ -169,8 +195,20 @@ describe("POST /api/public/sessions/[id]/health", () => {
     expect((await send({ kind: "not_booted" })).status).toBe(429);
     mocks.rateLimit.mockImplementation(async (key) => !key.startsWith("health:s:"));
     expect((await send({ kind: "not_booted" })).status).toBe(204);
-    expect(mocks.recordIncident).not.toHaveBeenCalled();
-    expect(mocks.rateLimit).toHaveBeenCalledWith(`health:s:${ID}`, 5, 600_000);
+    expect((await send({ kind: "still_loading" })).status).toBe(204);
+    expect(mocks.recordEvent).not.toHaveBeenCalled();
+    expect(mocks.warn).not.toHaveBeenCalled();
+    expect(mocks.findSession).not.toHaveBeenCalled();
+    expect(mocks.rateLimit).toHaveBeenCalledWith(`health:s:j:${ID}`, 5, 600_000);
+    expect(mocks.rateLimit).toHaveBeenCalledWith(`health:s:l:${ID}`, 8, 600_000);
+  });
+
+  it("each kind its own quota: the logs' signals never crowd out a failure", async () => {
+    mocks.rateLimit.mockImplementation(async (key) => !key.startsWith("health:s:l:"));
+    await send({ kind: "still_loading" });
+    expect(mocks.warn).not.toHaveBeenCalled();
+    await send({ kind: "not_booted" });
+    expect(mocks.recordEvent).toHaveBeenCalledTimes(1);
   });
 
   it("an oversized body (declared or not): 413; not a report: 400; nothing recorded", async () => {
@@ -179,7 +217,7 @@ describe("POST /api/public/sessions/[id]/health", () => {
     expect((await send("x".repeat(9_000))).status).toBe(413);
     expect((await send("not json")).status).toBe(400);
     expect((await send({ kind: "unknown" })).status).toBe(400);
-    expect(mocks.recordIncident).not.toHaveBeenCalled();
+    expect(mocks.recordEvent).not.toHaveBeenCalled();
   });
 
   it("an unknown session or a foreign checkout host: the same empty 204, nothing recorded", async () => {
@@ -188,6 +226,6 @@ describe("POST /api/public/sessions/[id]/health", () => {
     mocks.findSession.mockImplementation(async () => ({ storeId: "st_1", store: { id: "st_1", checkoutDomain: "checkout.shop.test" } }));
     mocks.foreign.mockImplementation(async () => true);
     expect((await send({ kind: "not_booted" })).status).toBe(204);
-    expect(mocks.recordIncident).not.toHaveBeenCalled();
+    expect(mocks.recordEvent).not.toHaveBeenCalled();
   });
 });

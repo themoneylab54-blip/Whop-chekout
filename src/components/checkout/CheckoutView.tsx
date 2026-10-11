@@ -1170,6 +1170,9 @@ export function CheckoutView({
       // PREPARE_RETRY_MAX_MS since the first attempt (a hanging processor makes each one slow), and
       // never Whop's "unavailable" (the server already waited its longest): « réessayer » instead.
       const delays = [800, 2000, 4000];
+      // A request given up after PREPARE_REQUEST_MAX_MS (a dead connection) is asked again once at
+      // once, whatever the time already spent: the server's own request is over by then.
+      let timeoutRetried = false;
       const firstAt = Date.now();
       const bodyNow = () =>
         prepareBody({
@@ -1243,6 +1246,10 @@ export function CheckoutView({
           break;
         } catch (err) {
           if (ctrl.signal.aborted) return;
+          if (!timeoutRetried && (err as { name?: unknown } | null)?.name === "TimeoutError") {
+            timeoutRetried = true;
+            continue;
+          }
           const retry = !(err instanceof Error) || (err as Error & { retry?: boolean }).retry !== false;
           if (retry && attempt < delays.length && Date.now() - firstAt + delays[attempt] < PREPARE_RETRY_MAX_MS) {
             try {
@@ -1252,7 +1259,10 @@ export function CheckoutView({
             }
             continue;
           }
-          setPrepareError(err instanceof Error && err.message ? err.message : L.error);
+          // The server's answers carry the buyer's words (localized); a transport failure (the network, a
+          // request given up) gets the plain one, never the browser's own English.
+          const ours = err instanceof Error && typeof (err as { retry?: unknown }).retry === "boolean";
+          setPrepareError(ours && err.message ? err.message : L.error);
           setPrepareRef((err as { ref?: string | null }).ref ?? null);
           setPrepareNoShipping((err as { code?: string }).code === "no_shipping");
           break;

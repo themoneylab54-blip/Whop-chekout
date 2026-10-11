@@ -1,10 +1,11 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 /*
- * The checkout page's reports of a missing payment form against a real Postgres: a report from the
- * page (the health route) is journaled for the store; the store's "payment form" tile counts the
- * buyers (one per session), grey for one, red from two who did not pay afterwards, grey again once
- * one of them paid; the operator's probe (/api/health) never lists these reports.
+ * The checkout page's reports of a missing payment form against a real Postgres: each report from the
+ * page (the health route) is journaled for the store, two in the same second included; the store's
+ * "payment form" tile counts the buyers (one per session), grey for one, red from two who did not pay
+ * afterwards, grey again once one of them paid; the operator's probe (/api/health) never lists these
+ * reports.
  */
 
 const hasDb = !!process.env.DATABASE_URL;
@@ -59,15 +60,22 @@ describe.skipIf(!hasDb)("payment form reports (integration)", async () => {
     expect(await tile(store.id)).toMatchObject({ ok: true });
 
     expect((await report(s1.id, { kind: "not_booted", afterReload: false, reloading: true, errors: [], failed: [] })).status).toBe(204);
+    // The same buyer again, the same second (the page after its reload): journaled too, one buyer still.
+    expect((await report(s1.id, { kind: "not_booted", afterReload: true, reloading: false })).status).toBe(204);
     // A softer signal: in the logs only.
     expect((await report(s1.id, { kind: "still_loading" })).status).toBe(204);
-    expect(await db.eventLog.count({ where: { storeId: store.id, kind: "checkout.form_missing" } })).toBe(1);
+    const rows = await db.eventLog.findMany({ where: { storeId: store.id, kind: "checkout.form_missing" } });
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => [r.sessionId, r.level, r.message])).toEqual(
+      expect.arrayContaining([
+        [s1.id, "warn", expect.stringMatching(/page rechargée automatiquement\.$/)],
+        [s1.id, "warn", expect.stringMatching(/encore après le rechargement automatique\.$/)],
+      ]),
+    );
     expect(await tile(store.id)).toMatchObject({ ok: null, detail: expect.stringMatching(/^1 client\(s\)/) });
 
-    // The journal takes one row a second per store.
-    await new Promise((r) => setTimeout(r, 1_100));
     expect((await report(s2.id, { kind: "prepare_stuck", provider: "whop" })).status).toBe(204);
-    expect(await db.eventLog.count({ where: { storeId: store.id, kind: "checkout.form_missing" } })).toBe(2);
+    expect(await db.eventLog.count({ where: { storeId: store.id, kind: "checkout.form_missing" } })).toBe(3);
     expect(await tile(store.id)).toMatchObject({ ok: false, detail: expect.stringMatching(/^2 client\(s\)/) });
 
     await db.checkoutSession.update({ where: { id: s2.id }, data: { status: "PAID" } });

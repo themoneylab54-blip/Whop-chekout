@@ -8,6 +8,7 @@ import { EXPRESS_WALLETS, type ExpressWallet } from "@/lib/layout-shared";
 import { PAYPAL_AFTER_WINDOW_MS, PAYPAL_SERVER_IN_FLIGHT_MS } from "@/lib/paypal-timing";
 import type { Labels } from "./i18n";
 import { WHOP_READY_GRACE_MS, WhopFooterClip } from "./WhopFooterClip";
+import { afterVisibleTime } from "./paymentHealth";
 
 type ExpressMethod = ExpressWallet;
 
@@ -715,7 +716,12 @@ export function PaymentPanel({
   useEffect(() => {
     healthRef.current = { onReady, onNotReady };
   });
+  // The last state Whop's frame said: a new frame (another checkout, or the card's again after PayPal)
+  // starts without one.
   const lastState = useRef<string | null>(null);
+  useEffect(() => {
+    lastState.current = null;
+  }, [current?.configId]);
   const settledFrame = useRef<string | null>(null);
   const cardFrame = !paypalOn && !showBillingForm ? (current?.configId ?? null) : null;
   useEffect(() => {
@@ -725,13 +731,12 @@ export function PaymentPanel({
       healthRef.current.onReady?.();
       return;
     }
-    const t = setTimeout(() => {
+    // Visible time only: a page in the background (a phone suspends it) is not a frame that never loads.
+    return afterVisibleTime(WHOP_READY_GRACE_MS, () => {
       settledFrame.current = cardFrame;
-      // Whop's card frame (its embed's own title): on the page or not.
-      const frame = !!document.querySelector('iframe[title="Whop Embedded Checkout"]');
-      healthRef.current.onNotReady?.({ waitedMs: WHOP_READY_GRACE_MS, frame, lastState: lastState.current });
-    }, WHOP_READY_GRACE_MS);
-    return () => clearTimeout(t);
+      // Whop's frame in the panel: on the page or not.
+      healthRef.current.onNotReady?.({ waitedMs: WHOP_READY_GRACE_MS, frame: !!embedBox.current?.querySelector("iframe"), lastState: lastState.current });
+    });
   }, [cardFrame, ready]);
   // The PayPal window was opened by code (no click of the buyer's): a browser may block it.
   const [paypalTried, setPaypalTried] = useState(false);

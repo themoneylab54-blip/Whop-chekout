@@ -1,8 +1,7 @@
 import { db } from "@/lib/db";
 import { isForeignCheckoutHost } from "@/lib/checkout-domain-check";
 import { isSameSiteRequest } from "@/lib/host-guard";
-import { recordIncident } from "@/lib/incidents";
-import { log } from "@/lib/log";
+import { log, recordEvent } from "@/lib/log";
 import { clientIp, rateLimit } from "@/lib/ratelimit";
 import { route } from "@/lib/route";
 
@@ -10,11 +9,13 @@ import { route } from "@/lib/route";
  * The checkout page reporting its payment form missing in the buyer's browser (inlineWatchdog,
  * paymentHealth), with what the page said, kept to its known fields and cut short. A page that never
  * started, its error screen, a form missing for 12 s without a break or never ready after 30 s are
- * the store's "checkout.form_missing" incidents (each journaled, no alert: the store's tile reads
+ * the store's "checkout.form_missing" incidents (each one journaled, no alert: the store's tile reads
  * them, red from two buyers who didn't pay afterwards); the rest (a page still loading, a slow
- * request, a buyer leaving before the form was ready, the first prepare given up, a page started after
- * its reload) goes to the logs only. Same-origin beacons from the page only (with its Origin); the
- * answer is always empty, even for an unknown session (nothing to learn from it).
+ * request, a buyer leaving before the form was ready, the first prepare given up, a page that started
+ * just before its reload or after it) goes to the logs only. Same-origin beacons from the page only
+ * (with its Origin), a few per session for each of the two kinds; the answer is always empty, even
+ * for an unknown session (nothing to learn from it). The version that answers is logged beside the
+ * page's (a page of one version whose files came from another shows in one line).
  */
 
 const JOURNALED = {
@@ -29,6 +30,7 @@ const LOGGED = {
   left_without_form: "Buyer left the checkout page before its payment form was ever ready",
   inline_prepare_failed: "The page's first prepare (sent with its HTML) failed or never answered: asked again",
   recovered: "Checkout page started after the watchdog's reload",
+  started_late: "Checkout page started just before the watchdog's reload (no reload)",
 } as const;
 type Kind = keyof typeof JOURNALED | keyof typeof LOGGED;
 const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
@@ -63,6 +65,7 @@ export function healthReport(raw: unknown): { kind: Kind; data: Record<string, u
     online: flag(r.online),
     afterReload: r.afterReload === null ? null : flag(r.afterReload),
     reloading: flag(r.reloading),
+    left: flag(r.left),
     typed: flag(r.typed),
     dpl: text(r.dpl, 64),
     errors: records(r.errors, ["res", "msg", "at"]),
@@ -85,6 +88,9 @@ export function healthReport(raw: unknown): { kind: Kind; data: Record<string, u
 
 const empty = () => new Response(null, { status: 204 });
 
+/** The version answering (Vercel's deployment, else its commit), beside the page's own `dpl`. */
+const deploymentId = () => process.env.VERCEL_DEPLOYMENT_ID || process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 12) || null;
+
 async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
   // The checkout page's own beacon: same origin, with its Origin (a browser always sends it here).
@@ -102,21 +108,32 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
   }
   const report = healthReport(raw);
   if (!report) return new Response(null, { status: 400 });
-  // A few reports per session (a page reporting each of its steps), never a flood.
-  if (!(await rateLimit(`health:s:${id}`, 5, 10 * 60_000))) return empty();
+  // A few reports per session (a page reporting each of its steps), each kind its own quota (the logs'
+  // signals never crowd out a failure), never a flood.
+  const journaled = !has(LOGGED, report.kind);
+  if (!(await rateLimit(`health:s:${journaled ? "j" : "l"}:${id}`, journaled ? 5 : 8, 10 * 60_000))) return empty();
   const session = await db.checkoutSession.findUnique({ where: { id }, select: { storeId: true, store: { select: { id: true, checkoutDomain: true } } } });
   if (!session || (await isForeignCheckoutHost(req, session.store))) return empty();
-  const data = { ...report.data, ua: text(req.headers.get("user-agent"), 200) };
-  if (has(LOGGED, report.kind)) {
+  const data = { ...report.data, ua: text(req.headers.get("user-agent"), 200), serverDpl: deploymentId() };
+  if (!journaled) {
     log.warn(`checkout.health.${report.kind}`, LOGGED[report.kind as keyof typeof LOGGED], { storeId: session.storeId, sessionId: id, ...data });
     return empty();
   }
-  // The watchdog's one reload: done with this report, already done (this load came after it), or
-  // none (the buyer's storage blocked: no way to do it only once).
-  const reload = report.data.reloading === true ? " : page rechargée automatiquement" : report.data.afterReload === true ? " : encore après le rechargement automatique" : "";
+  // The watchdog's one reload: done with this report, not done (the buyer left while it waited for
+  // them to leave a field), already done (this load came after it), or none (the buyer's storage
+  // blocked: no way to do it only once).
+  const reload =
+    report.data.reloading === true
+      ? " : page rechargée automatiquement"
+      : report.data.left === true
+        ? " : client parti avant le rechargement automatique"
+        : report.data.afterReload === true
+          ? " : encore après le rechargement automatique"
+          : "";
   const message = `${JOURNALED[report.kind as keyof typeof JOURNALED]}${report.kind === "not_booted" ? reload : ""}.`;
-  // Every report journaled (the tile counts buyers; this route's own limits bound the rows).
-  await recordIncident({ storeId: session.storeId, sessionId: id, kind: "checkout.form_missing", message, data, alert: false, everyMs: 1_000 });
+  // Every report journaled (the tile counts buyers: a burst of them, say a deploy reaching several at
+  // once, is the case to see; this route's own limits bound the rows).
+  await recordEvent({ storeId: session.storeId, sessionId: id, level: "warn", kind: "checkout.form_missing", message, data, alert: false });
   return empty();
 }
 

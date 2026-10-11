@@ -62,7 +62,9 @@ const MAX_AGE_MS = 30_000;
  * An inline request still unanswered this long after it was sent is given up (the page asks itself):
  * a request hanging on a dead connection never holds the payment form. Past the prepare function's
  * own 60 s budget: the server's request is over, so the page's own one never waits on it (a wait
- * that runs out counts as a Whop failure, see SNAPSHOT_WAIT_MS in lib/checkout).
+ * that runs out counts as a Whop failure, see SNAPSHOT_WAIT_MS in lib/checkout). The trade-off: a
+ * request hanging that long keeps the form away until then (the page reports it at 20 s:
+ * prepare_slow); one that fails, as most dead connections do, is asked again at once.
  */
 export const INLINE_WAIT_MS = 65_000;
 
