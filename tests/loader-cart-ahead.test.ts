@@ -1017,6 +1017,24 @@ describe("loader: one session per cart across the retries and the next click", (
     }
   });
 
+  it("a cart carrying a code, read ahead and the same at the click: sent ahead, that session opens with one request (the codes compared on both sides)", async () => {
+    for (const coded of [
+      { ...cartOf(1), cart_level_discount_applications: [{ type: "discount_code", title: "SUMMER10", total_allocated_amount: 500 }] },
+      { ...cartOf(1), discount_codes: [{ code: "summer10", applicable: true }] },
+    ]) {
+      await boot({ cart: coded });
+      await hover();
+      s.hold = true;
+      click();
+      await settle();
+      expect(s.posts).toHaveLength(1);
+      release();
+      await settle();
+      expect(s.posts, JSON.stringify(coded)).toHaveLength(1);
+      expect(s.navigations).toEqual([`${DOMAIN}/c/s_1`]);
+    }
+  });
+
   it("consent to ad tracking withdrawn after the failure (Shopify's banner): the session made with it isn't reused, a new one goes without", async () => {
     await boot();
     consent = true;
