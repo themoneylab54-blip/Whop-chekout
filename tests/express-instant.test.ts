@@ -567,6 +567,33 @@ describe("the first /prepare sent by the page's inline script while its HTML is 
     for (const layout of [on, off, hidden, defaultCheckoutLayout()]) expect(await pageFirstBody({ layout })).toBe(firstPrepareBody("FR", firstPrepareProtection(layout.blocks)));
   });
 
+  it("the country the server sent the inline prepare for is the page's first address (one request for both), when shipped to", async () => {
+    // The hints would pick FR; the server's pick (passed down) wins.
+    expect(await pageFirstBody({ firstCountry: "BE" })).toBe(firstPrepareBody("BE", undefined));
+    // A country the store doesn't ship to: the page picks as usual.
+    expect(await pageFirstBody({ firstCountry: "US" })).toBe(firstPrepareBody("FR", undefined));
+  });
+
+  it("a field changed while the inline answer is on its way: that late answer is dropped, the new prepare's checkout used", async () => {
+    const sent = await pageFirstBody();
+    inlineSent(sent);
+    render(page());
+    await sleep(20);
+    expect(prepares).toHaveLength(1);
+    // The buyer picks another country before the inline answer lands.
+    fireEvent.change(screen.getByLabelText(L.country), { target: { value: "BE" } });
+    await sleep(600);
+    expect(prepares).toHaveLength(2);
+    expect(prepares[1].body).toMatchObject({ countryCode: "BE" });
+    // The FR answer lands late: never on the page.
+    await answer(0, { checkoutConfigurationId: "cfg_stale", environment: "sandbox", provider: "whop", paypal: true });
+    await sleep(20);
+    expect(whop.buttons.some((b) => b.checkoutConfigurationId === "cfg_stale")).toBe(false);
+    await answer(1, { checkoutConfigurationId: "cfg_be", environment: "sandbox", provider: "whop", paypal: true });
+    expect(whop.buttons.some((b) => b.checkoutConfigurationId === "cfg_be")).toBe(true);
+    expect(whop.buttons.some((b) => b.checkoutConfigurationId === "cfg_stale")).toBe(false);
+  });
+
   it("the page takes the inline script's answer: no second request, its checkout on the page", async () => {
     const sent = await pageFirstBody();
     inlineSent(sent);

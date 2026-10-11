@@ -66,7 +66,8 @@ const isClient = (file: string) => directiveOf(file) === "use client";
 function clientPackage(spec: string, from: string): boolean {
   try {
     const entry = createRequire(from).resolve(spec);
-    return /^\s*(?:\/\/[^\n]*\n\s*|\/\*[\s\S]*?\*\/\s*)*["']use client["']/.test(readFileSync(entry, "utf8").slice(0, 2_000));
+    // Comments and other directives ("use strict") may come first.
+    return /^\s*(?:(?:\/\/[^\n]*\n|\/\*[\s\S]*?\*\/|["']use strict["'];?)\s*)*["']use client["']/.test(readFileSync(entry, "utf8").slice(0, 2_000));
   } catch {
     return false;
   }
@@ -129,9 +130,12 @@ function segmentFiles(route: string): string[] {
   return out.filter((f) => existsSync(f));
 }
 
-/** The browser instrumentation Next bundles into every page (instrumentation-client), when there is one: client code. */
+/** The browser instrumentation Next bundles into every page (instrumentation-client, in src/ or at the root), when there is one: client code. */
 const instrumentationClient = (): { file: string; client: true }[] =>
-  ["instrumentation-client.ts", "instrumentation-client.tsx", "instrumentation-client.js"].map((f) => path.join(SRC, f)).filter((f) => existsSync(f)).map((file) => ({ file, client: true as const }));
+  [SRC, ROOT]
+    .flatMap((dir) => ["instrumentation-client.ts", "instrumentation-client.tsx", "instrumentation-client.js"].map((f) => path.join(dir, f)))
+    .filter((f) => existsSync(f))
+    .map((file) => ({ file, client: true as const }));
 
 describe("the checkout page's browser bundle", () => {
   const route = "c/[id]";

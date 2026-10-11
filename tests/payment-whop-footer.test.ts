@@ -6,8 +6,9 @@ import { act, cleanup, render, screen } from "@testing-library/react";
 /*
  * The payment panel's part in clipping « Propulsé par Whop » (Whop's embed mocked): only Whop's card
  * form, in the language the server checked it in; never the PayPal-only checkout nor Whop's billing
- * address form; and Whop's "disabled" state (its pay button's: an incomplete form, a payment going
- * through) never turns the clip off, so the frame never jumps while the buyer types or pays.
+ * address form; Whop's "disabled" state (its pay button's: an incomplete form, a payment going
+ * through) never turns the clip off, so the frame never jumps while the buyer types or pays; a frame
+ * that never says "ready" (another screen of Whop's) is shown whole after a grace period.
  */
 
 type EmbedProps = {
@@ -28,7 +29,7 @@ vi.mock("@whop/checkout/react", async () => {
   return { WhopCheckoutEmbed, WhopExpressCheckoutButton: () => null, useCheckoutEmbedControls: () => React.useRef(null) };
 });
 
-const { PaymentPanel } = await import("@/components/checkout/Payment");
+const { PaymentPanel, WHOP_READY_GRACE_MS } = await import("@/components/checkout/Payment");
 const { LABELS } = await import("@/components/checkout/i18n");
 const theme = { language: "fr", accentColor: "#000", radius: 8, requireTerms: false } as unknown as ComponentProps<typeof PaymentPanel>["theme"];
 
@@ -107,5 +108,25 @@ describe("PaymentPanel: « Propulsé par Whop » clipped off Whop's card form on
     expect(clip()).toBe("86");
     act(() => whop.last?.onAddressValidationError?.({ error_message: "Adresse invalide" }));
     expect(clip()).toBeNull();
+  });
+
+  it("Whop never says \"ready\" (another screen of its own, an expired checkout's error, say): shown whole after the grace period; once ready, clipped for good", async () => {
+    vi.useFakeTimers();
+    try {
+      const first = render(panel({ whopFooterLang: "fr" }));
+      expect(clip()).toBe("86");
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS - 10)));
+      expect(clip()).toBe("86");
+      await act(async () => void (await vi.advanceTimersByTimeAsync(20)));
+      expect(clip()).toBeNull();
+      first.unmount();
+      render(panel({ whopFooterLang: "fr" }));
+      act(() => whop.last?.onStateChange?.("ready"));
+      act(() => whop.last?.onStateChange?.("disabled"));
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS * 2)));
+      expect(clip()).toBe("86");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

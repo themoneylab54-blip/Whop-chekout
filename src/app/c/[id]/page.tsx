@@ -307,6 +307,8 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
         returningCode={returningCode}
         // The language Whop's form was checked in: the clip applies to a frame in that language only.
         whopFooterLang={footerClipped ? theme.language : null}
+        // The inline first prepare's country: the page's first address (one request for both).
+        firstCountry={prepareCountry}
       />
     </>
   );

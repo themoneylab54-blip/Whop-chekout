@@ -164,6 +164,45 @@ describe("footerVerdict on Whop's own pages", () => {
     expect(footerVerdict(fr.replace("<defs>", '<text x="0" y="10">Whop</text><defs>'), "fr")).toEqual({ ok: false, reason: "footer_content" });
   });
 
+  it("every tag of the footer exactly as measured: a class, a style or a `hidden` more (a link hidden, a smaller text), or another gap above it: shown", () => {
+    const LOGO_SVG = 'viewBox="0 0 119 26" width="119" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">';
+    for (const name of ["fr-hidden", "fr-tos"]) {
+      const fr = fixture(name);
+      expect(fr).toContain(LOGO_SVG);
+      const changed = {
+        "a link shown on wide screens only": fr.replace('fui-r-size-1" href="https://whop.com/tos">', 'fui-r-size-1 hidden sm:inline" href="https://whop.com/tos">'),
+        "a link hidden": fr.replace('href="https://whop.com/privacy/">', 'href="https://whop.com/privacy/" hidden>'),
+        "smaller links": fr.replaceAll("!text-gray-10 leading-[1.2] whitespace-nowrap", "!text-gray-10 !text-[9px] leading-[1.2] whitespace-nowrap"),
+        "the « Propulsé » link styled away": fr.replace('class="inline-flex items-center" href="https://whop.com">', 'class="inline-flex items-center" style="display:none" href="https://whop.com">'),
+        "another gap above the footer": fr.replace(/<div class="flex flex-col gap-2">(?=(?:<span class="fui-Text text-gray-11 mt-2[^>]*>[^<]*<\/span>)?<div class="mt-3)/, '<div class="flex flex-col gap-0">'),
+        "the logo resized": fr.replace(LOGO_SVG, LOGO_SVG.replace('aria-hidden="true">', 'aria-hidden="true" style="width:4px">')),
+        "a path styled in the logo": fr.replace("<defs>", '<g style="display:none"></g><defs>'),
+      };
+      for (const [what, page] of Object.entries(changed)) {
+        expect(page, `${name}: ${what} (the change applied)`).not.toBe(fr);
+        expect(footerVerdict(page, "fr").ok, `${name}: ${what}`).toBe(false);
+      }
+    }
+  });
+
+  it("nothing drawn after the form anywhere React puts it (after its placeholder, after the shell's boundary), React's moves as expected: else shown", () => {
+    const fr = fixture("fr-hidden");
+    expect(footerVerdict(fr, "fr")).toEqual({ ok: true });
+    expect(fr).toContain('<template id="P:2"></template><!--$--><!--/$--></div><script');
+    // After the form's placeholder, in the segment React moves it into.
+    expect(footerVerdict(fr.replace('<template id="P:2"></template>', '<template id="P:2"></template><div class="px-4 pb-6 text-xs">Mention légale</div>'), "fr")).toEqual({ ok: false, reason: "after_form" });
+    // After the page shell's boundary that receives that segment.
+    const shellTail = /(<!--\/\$-->)(<\/div><!--\$--><!--\/\$--><script>requestAnimationFrame)/;
+    expect(fr).toMatch(shellTail);
+    expect(footerVerdict(fr.replace(shellTail, '$1<div class="px-4">Aide</div>$2'), "fr")).toEqual({ ok: false, reason: "after_form" });
+    // A boundary still streaming in after the placeholder.
+    expect(footerVerdict(fr.replace('<template id="P:2"></template><!--$-->', '<template id="P:2"></template><!--$?--><template id="B:9"></template>'), "fr")).toEqual({ ok: false, reason: "after_form" });
+    // React's moves not found (another way of streaming the page), or the form placed twice: shown.
+    expect(footerVerdict(fr.replace('$RS("S:2","P:2")', '$RX("S:2","P:2")'), "fr")).toEqual({ ok: false, reason: "after_form" });
+    expect(footerVerdict(fr.replace('$RC("B:1","S:1")', '$RX("B:1","S:1")'), "fr")).toEqual({ ok: false, reason: "after_form" });
+    expect(footerVerdict(fr.replace('$RS("S:2","P:2")', '$RS("S:2","P:2");$RS("S:2","P:7")'), "fr")).toEqual({ ok: false, reason: "after_form" });
+  });
+
   it("a page that isn't the checkout form at all (renamed, an error page): shown", () => {
     expect(footerVerdict("<html><body>Checkout not found</body></html>", "fr")).toEqual({ ok: false, reason: "page" });
     expect(footerVerdict(fixture("fr-hidden").replace(/embedded-checkout-container/g, "checkout-root"), "fr")).toEqual({ ok: false, reason: "page" });
@@ -200,7 +239,10 @@ describe("the verdict kept per store, Whop account, language and form", () => {
   });
   const stored = (value: object, key = KEY) => ({ key, value: JSON.stringify(value) });
   const hoursAgo = (h: number) => new Date(Date.now() - h * 3600_000).toISOString();
-  const saved = () => JSON.parse((mocks.upsert.mock.calls[0][0] as { create: { value: string } }).create.value);
+  type Write = { where: { key: string; value: string }; data: { value: string } };
+  /** The verdicts written (over the check's own mark: never a mark itself, which carries attemptAt). */
+  const verdictWrites = () => mocks.updateMany.mock.calls.map(([a]) => a as Write).filter((a) => !("attemptAt" in JSON.parse(a.data.value)));
+  const saved = () => JSON.parse(verdictWrites()[0].data.value);
 
   it("clipped only when the store chose it, on a good verdict of the last 24 h, for its own form, account and a measured language", async () => {
     mocks.findSetting.mockResolvedValueOnce(stored({ ok: true, at: hoursAgo(20) }));
@@ -245,16 +287,19 @@ describe("the verdict kept per store, Whop account, language and form", () => {
     expect(params).toMatchObject({ h: "https://checkout.shop.fr", t: "checkout.shop.fr", locale: "fr", session: "ch_1", hide_submit_button: "true", hide_tos: "true", "email.hidden": "1", "address.hidden": "1", v: "3" });
     expect(params.setup_future_usage).toBeUndefined();
     expect(saved()).toMatchObject({ ok: true });
-    expect((mocks.upsert.mock.calls[0][0] as { where: { key: string } }).where.key).toBe(KEY);
+    // Written over this check's own mark (the row it created).
+    const mark = (mocks.createMany.mock.calls[0][0] as { data: { key: string; value: string }[] }).data[0];
+    expect(mark.key).toBe(KEY);
+    expect(verdictWrites()[0].where).toEqual({ key: KEY, value: mark.value });
     // The store's other form: its terms line shown, the card kept for an offer; a test-mode store reads Whop's sandbox.
-    mocks.upsert.mockClear();
+    mocks.updateMany.mockClear();
     html = fixture("fr-sfu");
     await check({ variant: { hideTos: false, saveCard: true }, store: { ...store, testMode: true } });
     const other = new URL(fetched[1]);
     expect(other.host).toBe("sandbox.whop.com");
     expect(other.searchParams.get("hide_tos")).toBeNull();
     expect(other.searchParams.get("setup_future_usage")).toBe("off_session");
-    expect((mocks.upsert.mock.calls[0][0] as { where: { key: string } }).where.key).toBe("whop:footer:st_1:fr:-s:sandbox.whop.com:biz_1");
+    expect(verdictWrites()[0].where.key).toBe("whop:footer:st_1:fr:-s:sandbox.whop.com:biz_1");
   });
 
   it("a recent verdict, a check already running, or a session without a card checkout: Whop isn't asked, nothing marked", async () => {
@@ -263,11 +308,14 @@ describe("the verdict kept per store, Whop account, language and form", () => {
     mocks.findSetting.mockResolvedValue(stored({ ok: true, at: hoursAgo(5), attemptAt: new Date(Date.now() - 60_000).toISOString() }));
     await check();
     // Another request marked the attempt between the read and the mark.
-    mocks.findSetting.mockResolvedValue(stored({ ok: true, at: hoursAgo(5) }));
+    const row = stored({ ok: true, at: hoursAgo(5) });
+    mocks.findSetting.mockResolvedValue(row);
     mocks.updateMany.mockResolvedValueOnce({ count: 0 });
     await check();
+    // One check at a time: the mark is taken only over the row as it was read.
+    expect(mocks.updateMany).toHaveBeenLastCalledWith({ where: { key: KEY, value: row.value }, data: { value: expect.stringContaining('"attemptAt"') } });
     expect(fetched).toEqual([]);
-    expect(mocks.upsert).not.toHaveBeenCalled();
+    expect(verdictWrites()).toEqual([]);
     // No card checkout to read (a page that never prepared one; only its PayPal-only one, should the
     // database hand it over): nothing marked, the next page may ask.
     vi.useFakeTimers();
@@ -291,10 +339,10 @@ describe("the verdict kept per store, Whop account, language and form", () => {
     mocks.findSetting.mockResolvedValue(stored({ ok: true, at: hoursAgo(5) }));
     html = fixture("fr-hidden").replace(/embedded-checkout-container/g, "checkout-root");
     await check();
-    expect(JSON.parse((mocks.upsert.mock.calls[0][0] as { update: { value: string } }).update.value)).toMatchObject({ ok: false, reason: "page" });
+    expect(saved()).toMatchObject({ ok: false, reason: "page" });
     expect(mocks.warn).toHaveBeenCalledWith("whop.footer_not_clipped", expect.any(String), expect.objectContaining({ reason: "page", wasOk: true }));
 
-    mocks.upsert.mockClear();
+    mocks.updateMany.mockClear();
     const cancelled: boolean[] = [];
     const busy = () => {
       const body = new ReadableStream({ cancel: () => void cancelled.push(true) });
@@ -304,22 +352,37 @@ describe("the verdict kept per store, Whop account, language and form", () => {
       vi.stubGlobal("fetch", vi.fn(async () => res()));
       await check();
     }
-    expect(mocks.upsert).not.toHaveBeenCalled();
+    expect(verdictWrites()).toEqual([]);
     // The 503's body is never read: the connection is let go at once.
     expect(cancelled).toEqual([true]);
     expect(mocks.info).toHaveBeenCalledWith("whop.footer_check_unreachable", expect.any(String), expect.objectContaining({ keptOk: true, why: "status_503" }));
     expect(mocks.info).toHaveBeenCalledWith("whop.footer_check_unreachable", expect.any(String), expect.objectContaining({ why: "status_302" }));
   });
 
-  it("the settings page: the latest check per language, for the store's current Whop account; shown again, the checks are forgotten", async () => {
+  it("a check that started before the merchant showed the footer again (the checks forgotten meanwhile): its verdict isn't written back", async () => {
+    mocks.findSetting.mockResolvedValue(stored({ ok: true, at: hoursAgo(5) }));
+    html = fixture("fr-hidden").replace(/embedded-checkout-container/g, "checkout-root");
+    // The mark taken; the row gone (or replaced) by the time Whop's page is read.
+    mocks.updateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 });
+    await check();
+    expect(verdictWrites()).toHaveLength(1);
+    expect(mocks.createMany).not.toHaveBeenCalled();
+    expect(mocks.upsert).not.toHaveBeenCalled();
+    expect(mocks.warn).not.toHaveBeenCalled();
+  });
+
+  it("the settings page: the check per language of the form the checkout now shows, for the store's current Whop account (exact keys); shown again, the checks are forgotten", async () => {
     mocks.findSettings.mockResolvedValue([
       stored({ ok: true, at: hoursAgo(1) }, "whop:footer:st_1:fr:t-:whop.com:biz_1"),
-      stored({ ok: false, at: hoursAgo(5), reason: "footer_words" }, "whop:footer:st_1:fr:--:whop.com:biz_1"),
+      // The store's other form (its terms line shown): not the one its checkout now shows.
+      stored({ ok: false, at: hoursAgo(0.5), reason: "footer_words" }, "whop:footer:st_1:fr:--:whop.com:biz_1"),
+      // Another account whose id differs by the character a LIKE pattern reads as "any".
+      stored({ ok: false, at: hoursAgo(0.2), reason: "page" }, "whop:footer:st_1:fr:t-:whop.com:bizX1"),
       stored({ ok: false, at: hoursAgo(2), reason: "branding_flag" }, "whop:footer:st_1:de:t-:whop.com:biz_1"),
       stored({ ok: false, at: new Date(0).toISOString(), attemptAt: hoursAgo(0) }, "whop:footer:st_1:es:t-:whop.com:biz_1"),
     ]);
-    const v = await whopFooterVerdicts(store);
-    expect(mocks.findSettings).toHaveBeenCalledWith({ where: { key: { startsWith: "whop:footer:st_1:", endsWith: ":whop.com:biz_1" } } });
+    const v = await whopFooterVerdicts(store, variant);
+    expect(mocks.findSettings).toHaveBeenCalledWith({ where: { key: { startsWith: "whop:footer:st_1:" } } });
     expect(v.fr).toMatchObject({ ok: true, clips: true });
     expect(v.de).toMatchObject({ ok: false, reason: "branding_flag", clips: false });
     // An attempt mark alone (never answered): no line.

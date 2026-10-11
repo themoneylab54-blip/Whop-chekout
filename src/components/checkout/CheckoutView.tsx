@@ -151,6 +151,11 @@ type Props = {
   stripeWarm?: { publishableKey: string; stripeAccount: string } | null;
   /** Live: Whop's « Propulsé par Whop » footer clipped off its card form in this language (the one the server checked Whop's form in); null: shown. */
   whopFooterLang?: string | null;
+  /**
+   * Live: the country the server picked for the page's first prepare (the inline one, see
+   * inlinePrepare): the first address's, so both send the same request. Ignored when not shipped to.
+   */
+  firstCountry?: string | null;
 };
 
 type Address = {
@@ -705,6 +710,7 @@ export function CheckoutView({
   initialProvider = null,
   stripeWarm = null,
   whopFooterLang = null,
+  firstCountry = null,
 }: Props) {
   // "Complétez votre commande" streamed by the server (a promise): none until it lands.
   const recommendationsStream = isPromise(recommendationsProp) ? recommendationsProp : null;
@@ -756,10 +762,13 @@ export function CheckoutView({
     // country (de-DE → Germany), else the store's main market (paid orders), else the language's
     // country (English: the dedicated country first), else its shipping setup's dedicated country, else the most common market it ships to — never just
     // the alphabetically first country. The early prepare picks it the same way.
-    countryCode: pickFirstCountry(
-      countries.map((c) => c.code),
-      { initialCountry, localeCountry, primaryCountry, rateCountry: storeMarketOf(rates), language: theme.language },
-    ),
+    countryCode:
+      firstCountry && countries.some((c) => c.code === firstCountry)
+        ? firstCountry
+        : pickFirstCountry(
+            countries.map((c) => c.code),
+            { initialCountry, localeCountry, primaryCountry, rateCountry: storeMarketOf(rates), language: theme.language },
+          ),
   }));
   const [rateId, setRateId] = useState<string | null>(null);
   const [codeInput, setCodeInput] = useState("");

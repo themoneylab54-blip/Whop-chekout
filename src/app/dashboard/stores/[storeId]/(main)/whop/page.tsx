@@ -15,6 +15,8 @@ import { ConfirmButton } from "@/components/dashboard/ConfirmButton";
 import { formatDate, formatDateTime } from "@/components/dashboard/format";
 import { paypalHiddenLines, paypalRefusals } from "@/lib/checkout";
 import { whopFooterVerdicts } from "@/lib/whop-footer";
+import { activeUpsells } from "@/lib/upsell";
+import { loadTheme } from "@/lib/layout";
 import { LANGS } from "@/components/checkout/i18n";
 import {
   connectWhopAction,
@@ -68,8 +70,9 @@ export default async function WhopPage({
     connected && applePayFile ? applePayDomainStatuses(store, applePayHosts) : null,
     // Whop's own buyer e-mails (account-wide): true = Whop sends its receipt too, null = unknown (cached).
     connected ? whopCustomerEmailsStatus(store) : null,
-    // « Propulsé par Whop »: the last checks of Whop's form, per checkout language (lib/whop-footer).
-    connected && store.whopFooterHidden ? whopFooterVerdicts(store) : null,
+    // « Propulsé par Whop »: the checks of the form the checkout now shows (its terms line hidden or
+    // not, the card kept for an offer or not), per checkout language (lib/whop-footer).
+    connected && store.whopFooterHidden ? whopFooterVerdicts(store, { hideTos: loadTheme(store.theme, store.name).requireTerms, saveCard: activeUpsells(store).length > 0 }) : null,
   ]);
   // Hidden only once Whop's form was checked in some language (until then, still shown everywhere).
   const footerBadge = !store.whopFooterHidden

@@ -73,16 +73,20 @@ export async function whopFooterClipped(store: WhopAccountOf & { whopFooterHidde
   return verdictClips(row?.value);
 }
 
-/** The store's last verdicts per language for its current Whop account, for the settings page ("Whop changed its form"…). */
-export async function whopFooterVerdicts(store: WhopAccountOf): Promise<Record<string, { ok: boolean; at: string; reason?: string; clips: boolean }>> {
-  const rows = await db.appSetting.findMany({ where: { key: { startsWith: PREFIX(store.id), endsWith: accountSuffix(store) } } }).catch(() => []);
+/**
+ * The store's verdicts per language for the form its checkout now shows (that variant, its current
+ * Whop account), for the settings page ("Whop changed its form"…): a language without one isn't
+ * checked yet for this form.
+ */
+export async function whopFooterVerdicts(store: WhopAccountOf, variant: FooterVariant): Promise<Record<string, { ok: boolean; at: string; reason?: string; clips: boolean }>> {
+  const rows = await db.appSetting.findMany({ where: { key: { startsWith: PREFIX(store.id) } } }).catch(() => []);
   const out: Record<string, { ok: boolean; at: string; reason?: string; clips: boolean }> = {};
   for (const r of rows) {
-    const v = parse(r.value);
     const lang = r.key.slice(PREFIX(store.id).length).split(":")[0];
-    // One line per language: its latest check (the store's form may have had another variant before).
-    if (v && WHOP_FOOTER_WORDS[lang] && Date.parse(v.at) > 0 && !(out[lang] && Date.parse(out[lang].at) >= Date.parse(v.at)))
-      out[lang] = { ok: v.ok, at: v.at, ...(v.reason ? { reason: v.reason } : {}), clips: verdictClips(r.value) };
+    // Its exact key (compared here: a LIKE pattern would read `_` in an account id as any character).
+    if (r.key !== keyOf(store, lang, variant)) continue;
+    const v = parse(r.value);
+    if (v && WHOP_FOOTER_WORDS[lang] && Date.parse(v.at) > 0) out[lang] = { ok: v.ok, at: v.at, ...(v.reason ? { reason: v.reason } : {}), clips: verdictClips(r.value) };
   }
   return out;
 }
@@ -103,22 +107,98 @@ const decode = (s: string) =>
     .replace(/&amp;/g, "&");
 const textOf = (html: string) => decode(html.replace(/<[^>]*>/g, "")).replace(/\s+/g, " ").trim();
 
+/** A literal piece of a regular expression. */
+const lit = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+/** After a piece of the page: only closing tags and React's empty boundaries up to a script (nothing drawn after it). */
+const NOTHING_AFTER = "(?:</div>|<!--/?\\$-->)*<script\\b";
+const LINK = (href: string) =>
+  lit(`<a rel="noopener noreferrer" target="_blank" data-accent-color="gray" class="fui-Text fui-reset fui-Link !text-gray-10 leading-[1.2] whitespace-nowrap decoration-dotted underline-offset-2 hover:underline fui-underline-auto fui-r-size-1" href="${href}">`);
+
 /*
- * The footer as measured, then the form's end: Whop's centered wrapping row (mt-3, gap-4, 12 px text at
- * line-height 1.2, the h-4 divider) holding exactly « <powered> Whop », the divider, the terms and the
- * privacy links, as the last element of its section (after Whop's own pay button and terms line when
- * they show), that section the form's last, then Whop's empty spacer, last in the form's column: after
- * it, only closing tags and React's empty boundaries up to the page's scripts (nothing drawn below).
+ * The footer as measured, every opening tag exactly as Whop draws it (a class, a style or a `hidden`
+ * more could change its size or hide part of it): its section (gap-2), after Whop's own pay button and
+ * terms line when they show; Whop's centered wrapping row (mt-3, gap-4, 12 px text at line-height 1.2,
+ * the h-4 divider) holding exactly « <powered> Whop », the divider, the terms and the privacy links;
+ * that section the form's last, then Whop's empty spacer, last in the form's column: after it, only
+ * closing tags and React's empty boundaries up to the next script (nothing drawn below).
  */
-const FOOTER =
-  /<div class="mt-3 flex w-full flex-wrap items-center gap-4 justify-center"><a [^>]*href="https:\/\/whop\.com"[^>]*><span class="fui-Text text-gray-10 leading-\[1\.2\] fui-r-size-1">([\s\S]{1,12000}?)<\/a><div class="border-stroke h-4 w-\[1px\] border-r"><\/div><a [^>]*class="[^"]*leading-\[1\.2\][^"]*fui-r-size-1"[^>]*href="https:\/\/whop\.com\/tos"[^>]*>([^<]{1,80})<\/a><a [^>]*class="[^"]*leading-\[1\.2\][^"]*fui-r-size-1"[^>]*href="https:\/\/whop\.com\/privacy\/"[^>]*>([^<]{1,80})<\/a><\/div><\/div><\/div><div class="embedded-checkout-spacer w-full shrink-0"><\/div><\/div>(?:<\/div>|<!--\/?\$-->)*<script\b/;
+const FOOTER = new RegExp(
+  lit('<div class="flex flex-col gap-2">') +
+    '(?:<button type="submit"[^>]*>[^<]{0,80}</button>)?' +
+    `(?:${lit('<span class="fui-Text text-gray-11 mt-2 text-center !text-[13px] !leading-[1.2] !tracking-[-0.09px] fui-r-size-1">')}[^<]{1,400}</span>)?` +
+    lit('<div class="mt-3 flex w-full flex-wrap items-center gap-4 justify-center">') +
+    lit('<a rel="noopener noreferrer" target="_blank" class="inline-flex items-center" href="https://whop.com">') +
+    lit('<span class="fui-Text text-gray-10 leading-[1.2] fui-r-size-1">') +
+    "([\\s\\S]{1,12000}?)</a>" +
+    lit('<div class="border-stroke h-4 w-[1px] border-r"></div>') +
+    LINK("https://whop.com/tos") +
+    "([^<]{1,80})</a>" +
+    LINK("https://whop.com/privacy/") +
+    "([^<]{1,80})</a>" +
+    lit('</div></div></div><div class="embedded-checkout-spacer w-full shrink-0"></div></div>') +
+    NOTHING_AFTER,
+);
 /** The first item as measured: its words, then Whop's logo (1.1em high, 119 × 26) with its name for screen readers only. */
-const POWERED =
-  /^[^<]{1,60}<span class="ml-1 inline-flex items-center align-middle"><svg class="text-gray-10 h-\[1\.1em\] w-auto opacity-70 grayscale"[^>]*\sviewBox="0 0 119 26"[^>]*>[\s\S]*<\/svg><span class="sr-only">Whop<\/span><\/span><\/span>$/;
-/** What the logo is drawn with: nothing else (no text, link or box) may hide in it. */
+const POWERED = new RegExp(
+  "^[^<]{1,60}" +
+    lit('<span class="ml-1 inline-flex items-center align-middle"><svg class="text-gray-10 h-[1.1em] w-auto opacity-70 grayscale" fill="none" height="26" viewBox="0 0 119 26" width="119" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">') +
+    "[\\s\\S]*" +
+    lit('</svg><span class="sr-only">Whop</span></span></span>') +
+    "$",
+);
+/** What the logo is drawn with: nothing else (no text, link or box) may hide in it, nothing styled or hidden. */
 const LOGO_TAGS = new Set(["span", "svg", "g", "path", "defs", "clippath", "rect"]);
 /** Whop's padding around its form, as measured (16 px each side, none under the spacer). */
 const CONTAINER = '<div style="padding-top:32px;padding-bottom:0px;padding-left:16px;padding-right:16px" class="flex w-full flex-col gap-6">';
+const SEGMENT = '<div hidden id="S:';
+
+/** Where the React boundary opening at `start` (`<!--$?-->`) ends, after its closing marker; -1 if never. */
+function boundaryEnd(html: string, start: number): number {
+  const re = /<!--(\$[?!]?|\/\$)-->/g;
+  re.lastIndex = start;
+  let depth = 0;
+  for (let m = re.exec(html); m; m = re.exec(html)) {
+    depth += m[1] === "/$" ? -1 : 1;
+    if (depth === 0) return m.index + m[0].length;
+  }
+  return -1;
+}
+
+/**
+ * React streams Whop's page: the form arrives in a hidden segment that React moves into a placeholder
+ * of another segment ($RS), which completes a boundary of the page shell ($RC). Nothing may be drawn
+ * after the form's place at any of these levels: that, not the footer, is what the clip would hide.
+ * From the form (at `at`) up to the page shell, 4 levels at most; an unknown structure says no. Pure.
+ */
+function nothingDrawnAfter(html: string, at: number): boolean {
+  const after = new RegExp(`^${NOTHING_AFTER}`);
+  let pos = at;
+  for (let level = 0; level < 4; level++) {
+    const open = html.lastIndexOf(SEGMENT, pos);
+    // In the page shell (no segment holds it: none before it, or a script since, which ends a segment).
+    if (open < 0 || html.slice(open, pos).includes("<script")) return true;
+    const id = /^<div hidden id="S:(\d+)">/.exec(html.slice(open, open + 40))?.[1];
+    if (!id) return false;
+    const moved = [...html.matchAll(new RegExp(`\\$RS\\("S:${id}","(P:\\d+)"\\)`, "g"))];
+    const completes = [...html.matchAll(new RegExp(`\\$RC\\("(B:\\d+)","S:${id}"\\)`, "g"))];
+    if (moved.length + completes.length !== 1) return false;
+    let place: number;
+    let end: number;
+    if (moved.length) {
+      const tag = `<template id="${moved[0][1]}"></template>`;
+      place = html.indexOf(tag);
+      if (place < 0 || html.indexOf(tag, place + 1) >= 0) return false;
+      end = place + tag.length;
+    } else {
+      place = html.indexOf(`<!--$?--><template id="${completes[0][1]}"></template>`);
+      end = place < 0 ? -1 : boundaryEnd(html, place);
+      if (end < 0) return false;
+    }
+    if (!after.test(html.slice(end, end + 4000))) return false;
+    pos = place;
+  }
+  return false;
+}
 
 /**
  * Whop's page for one of the store's own checkouts (a live one, made minutes ago): may the footer be
@@ -133,8 +213,9 @@ export function footerVerdict(html: string, lang: string): { ok: true } | { ok: 
   const m = FOOTER.exec(html);
   if (!m) return { ok: false, reason: "footer_markup" };
   const tags = [...m[1].matchAll(/<\/?([a-zA-Z][\w-]*)/g)].map((t) => t[1].toLowerCase());
-  if (!POWERED.test(m[1]) || tags.some((t) => !LOGO_TAGS.has(t))) return { ok: false, reason: "footer_content" };
+  if (!POWERED.test(m[1]) || tags.some((t) => !LOGO_TAGS.has(t)) || /\s(?:style|hidden)[\s=>]/i.test(m[1])) return { ok: false, reason: "footer_content" };
   if (textOf(m[1]) !== words.powered || textOf(m[2]) !== words.terms || textOf(m[3]) !== words.privacy) return { ok: false, reason: "footer_words" };
+  if (!nothingDrawnAfter(html, m.index)) return { ok: false, reason: "after_form" };
   return { ok: true };
 }
 
@@ -235,7 +316,10 @@ export async function refreshWhopFooterCheck(opts: { store: WhopAccountOf; lang:
     }
     const verdict = footerVerdict(page.html, lang);
     const value: Stored = { ok: verdict.ok, at: new Date().toISOString(), ...(verdict.ok ? {} : { reason: verdict.reason }) };
-    await db.appSetting.upsert({ where: { key }, create: { key, value: JSON.stringify(value) }, update: { value: JSON.stringify(value) } });
+    // Written over this check's own mark only: the merchant showing the footer again meanwhile
+    // (the verdicts forgotten) is never undone by a check that started before.
+    const written = await db.appSetting.updateMany({ where: { key, value: JSON.stringify(mark) }, data: { value: JSON.stringify(value) } });
+    if (!written.count) return;
     if (!verdict.ok) log.warn("whop.footer_not_clipped", "Whop's checkout form isn't the measured one: its footer shows on the checkout", { ...ctx, reason: verdict.reason, wasOk: !!stored?.ok });
   } catch (err) {
     log.warn("whop.footer_check_failed", "Whop footer check failed", { ...ctx, err });
