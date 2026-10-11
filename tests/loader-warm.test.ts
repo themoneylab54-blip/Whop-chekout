@@ -75,15 +75,17 @@ describe("loader: warm-up", () => {
     expect(warms[0].init?.keepalive).toBeUndefined();
     // CORS-simple: no preflight before it (nor before the click's POST).
     expect(warms[0].init?.headers).toEqual({ "Content-Type": TEXT });
-    // The checkout page and its /prepare, on that same server (opaque requests).
-    expect(wakes.map((w) => [w.url, w.init?.method ?? "GET", w.init?.mode])).toEqual([
-      [`${API}/c/warm`, "GET", "no-cors"],
+    // The checkout page (HEAD: no body) and its /prepare, on that same server (opaque requests).
+    expect(wakes.map((w) => [w.url, w.init?.method, w.init?.mode])).toEqual([
+      [`${API}/c/warm`, "HEAD", "no-cors"],
       [`${API}/api/public/sessions/warm/prepare`, "POST", "no-cors"],
     ]);
     expect(wakes[0].init).toMatchObject({ credentials: "omit", cache: "no-store" });
     expect(wakes[1].init).toMatchObject({ credentials: "omit", headers: { "Content-Type": TEXT }, body: '{"warm":true}' });
     expect(sessionStorage.getItem("whopco_warm")).toBe(String(Date.now()));
-    expect(document.querySelector(`link[rel='preconnect'][href='${API}']`)).toBeTruthy();
+    // Anonymous for the requests, plain (cookies) for the checkout page that opens there.
+    expect(document.querySelector(`link[rel='preconnect'][href='${API}'][crossorigin]`)).toBeTruthy();
+    expect(document.querySelector(`link[rel='preconnect'][href='${API}']:not([crossorigin])`)).toBeTruthy();
     expect(document.querySelector(`link[rel='preconnect'][href='${CHECKOUT_ORIGIN}']`)).toBeNull();
     // No PerformanceObserver: nothing read ahead.
     expect(cartReads).toBe(0);

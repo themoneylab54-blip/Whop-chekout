@@ -5,9 +5,10 @@ import { describe, expect, it, vi } from "vitest";
 
 /*
  * Storefront loader, warm-up throttle kept for the tab (sessionStorage `whopco_warm`): a warm-up made
- * on the previous page holds for the minute (neither the cart landing nor hovering warms again, and a
- * throttled pointerover runs no selector at all), though the cart landing still reads the cart ahead
- * (Shopify's, nothing asked of our servers); once the minute is over, hovering warms once.
+ * on the previous page holds for the minute (neither the cart landing nor hovering warms again), though
+ * the cart landing still reads the cart ahead (Shopify's, nothing asked of our servers), and a pointerover
+ * within both throttles (that read's 5 s, the warm-up's minute) runs no selector at all; once the minute
+ * is over, hovering warms once (the cart read ahead keeps its own 5 s).
  */
 
 const API = "https://app.example.com";
@@ -31,6 +32,17 @@ vi.stubGlobal(
     if (u.endsWith("/api/public/sessions") && init?.body === '{"warm":true}') warmCalls++;
     return new Response("{}");
   }),
+);
+// The browser's PerformanceObserver (jsdom has none): the cart can be read ahead.
+vi.stubGlobal(
+  "PerformanceObserver",
+  class {
+    observe() {}
+    disconnect() {}
+    takeRecords() {
+      return [];
+    }
+  },
 );
 
 history.replaceState(null, "", "/cart");
@@ -62,7 +74,8 @@ describe("loader: warm-up throttle across the tab's pages", () => {
     over();
     await settle();
     expect(warmCalls).toBe(1);
-    expect(cartReads).toBe(2);
+    // The landing's read is less than 5 s old: not read again.
+    expect(cartReads).toBe(1);
     expect(Date.now() - Number(sessionStorage.getItem("whopco_warm"))).toBeLessThan(1000);
   });
 });
