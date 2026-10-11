@@ -687,6 +687,13 @@ export function PaymentPanel({
   const currentPreparing = paypalOn ? paypal.preparing : preparing;
   // Ready = the embed on screen said so (switching checkouts remounts it: not ready until it says so).
   const [readyFor, setReadyFor] = useState<string | null>(null);
+  // A frame mounted for another checkout, or the same one again (back to the card after PayPal): not
+  // ready until it says so itself (never on the word of the frame it replaces).
+  const [frameOf, setFrameOf] = useState<string | null>(current?.configId ?? null);
+  if (frameOf !== (current?.configId ?? null)) {
+    setFrameOf(current?.configId ?? null);
+    setReadyFor(null);
+  }
   const ready = !!current && readyFor === current.configId;
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);

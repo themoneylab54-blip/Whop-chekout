@@ -201,6 +201,8 @@ describe("footerVerdict on Whop's own pages", () => {
     // The form not inside its segment as expected (a script before it there), or not streamed at all: shown.
     expect(footerVerdict(fr.replace('<div hidden id="S:2">', '<div hidden id="S:2"><script>void 0</script>').replace('<template id="P:2"></template>', '<template id="P:2"></template><div>Aide</div>'), "fr")).toEqual({ ok: false, reason: "after_form" });
     expect(footerVerdict(fr.replace('<div hidden id="S:2">', "<div>"), "fr")).toEqual({ ok: false, reason: "after_form" });
+    // The form before any of React's segments (the page not streamed as measured): shown.
+    expect(footerVerdict(fr.slice(fr.indexOf("<div data-embedded-checkout-surface", fr.indexOf('<div hidden id="S:2">'))), "fr")).toEqual({ ok: false, reason: "after_form" });
     // React's moves not found (another way of streaming the page), or the form placed twice: shown.
     expect(footerVerdict(fr.replace('$RS("S:2","P:2")', '$RX("S:2","P:2")'), "fr")).toEqual({ ok: false, reason: "after_form" });
     expect(footerVerdict(fr.replace('$RC("B:1","S:1")', '$RX("B:1","S:1")'), "fr")).toEqual({ ok: false, reason: "after_form" });

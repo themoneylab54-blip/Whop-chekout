@@ -155,4 +155,21 @@ describe("PaymentPanel: « Propulsé par Whop » clipped off Whop's card form on
       vi.useRealTimers();
     }
   });
+
+  it("back to the card before the PayPal frame said anything: the reloaded card frame isn't ready on the old frame's word (given up if it never says so)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { rerender } = render(panel({ whopFooterLang: "fr" }));
+      act(() => whop.last?.onStateChange?.("ready"));
+      rerender(panel({ whopFooterLang: "fr", paypalActive: true }));
+      rerender(panel({ whopFooterLang: "fr", paypalActive: false }));
+      expect(screen.getByTestId("embed").getAttribute("data-config")).toBe("cfg_card");
+      expect(clip()).toBe("86");
+      // The reloaded frame never says "ready" (another screen): given up after the grace.
+      await act(async () => void (await vi.advanceTimersByTimeAsync(WHOP_READY_GRACE_MS + 10)));
+      expect(clip()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
