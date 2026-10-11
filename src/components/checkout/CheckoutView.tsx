@@ -49,6 +49,7 @@ import { suggestEmail } from "./emailSuggest";
 import { LanguageSwitcher } from "./LanguageSwitcher";
 import { clearSavedBuyer, maskEmail, parseSavedBuyer, readSavedBuyerRaw, subscribeSavedBuyer, writeSavedBuyer } from "./savedBuyer";
 import { localEstimate, type LocalRates } from "./localCurrency";
+import { firstPrepareProtection, prepareBody, takeInlinePrepare } from "./inlinePrepare";
 import { ReturningBuyerCode, type CodeBuyer } from "./ReturningBuyerCode";
 import { sampleRecommendations, visibleRecommendations, type RecommendationView } from "./recommendations";
 import { AddressAutocomplete } from "./AddressAutocomplete";
@@ -770,7 +771,8 @@ export function CheckoutView({
     () => layout.blocks.find((b): b is BlockOf<"shipping_protection"> => b.type === "shipping_protection" && !b.hidden) ?? null,
     [layout.blocks],
   );
-  const [protectionOn, setProtectionOn] = useState(() => protectionBlock?.props.defaultOn ?? false);
+  // Its first state is the inline first prepare's (firstPrepareProtection, read on the server too).
+  const [protectionOn, setProtectionOn] = useState(() => firstPrepareProtection(layout.blocks) ?? false);
   // The merchant flips "default on" in the builder: the preview follows.
   const protectionDefault = protectionBlock?.props.defaultOn ?? false;
   const [seenDefault, setSeenDefault] = useState(protectionDefault);
@@ -1137,6 +1139,7 @@ export function CheckoutView({
         });
       });
     const t = setTimeout(async () => {
+      const isFirst = firstPrepare.current;
       firstPrepare.current = false;
       setPreparing(true);
       // Network hiccups and 5xx are retried silently (0.8 s, 2 s, 4 s) before the buyer
@@ -1145,24 +1148,29 @@ export function CheckoutView({
       // never Whop's "unavailable" (the server already waited its longest): « réessayer » instead.
       const delays = [800, 2000, 4000];
       const firstAt = Date.now();
+      const bodyNow = () =>
+        prepareBody({
+          countryCode: address.countryCode,
+          shippingRateId: rateId,
+          discountCode: appliedCode,
+          addOnIds,
+          protection,
+          // The quantities the server last confirmed (already saved on the session).
+          quantities: qtyTouched ? confirmedQty : undefined,
+          // Stripe's form couldn't load here: the server switches this buyer to Whop when it can.
+          clientFailed: stripeClientFailed.current ? "stripe" : undefined,
+        });
+      const firstBody = bodyNow();
+      // The page's first prepare: the same request may already be on its way, sent by the page's
+      // inline script while the HTML was parsed (see inlinePrepare): its answer, once; a failed one
+      // is asked again right away.
+      const early = isFirst ? takeInlinePrepare(liveSessionId, firstBody) : null;
       for (let attempt = 0; ; attempt++) {
         try {
-          const res = await fetch(`/api/public/sessions/${liveSessionId}/prepare`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              countryCode: address.countryCode,
-              shippingRateId: rateId,
-              discountCode: appliedCode,
-              addOnIds,
-              protection,
-              // The quantities the server last confirmed (already saved on the session).
-              ...(qtyTouched ? { quantities: confirmedQty } : {}),
-              // Stripe's form couldn't load here: the server switches this buyer to Whop when it can.
-              ...(stripeClientFailed.current ? { clientFailed: "stripe" } : {}),
-            }),
-            signal: ctrl.signal,
-          });
+          const requestBody = attempt === 0 ? firstBody : bodyNow();
+          const ask = () => fetch(`/api/public/sessions/${liveSessionId}/prepare`, { method: "POST", headers: { "Content-Type": "application/json" }, body: requestBody, signal: ctrl.signal });
+          const res = attempt === 0 && early ? await early.catch(ask) : await ask();
+          if (ctrl.signal.aborted) return;
           const body = await res.json().catch(() => ({}));
           // Its PaymentIntent already paid (marked so by the server): the thank-you page.
           if (body?.code === "already_paid") {

@@ -1,4 +1,4 @@
-import { clientIp, rateLimit } from "@/lib/ratelimit";
+import { clientIp, memoryRateLimit, rateLimit } from "@/lib/ratelimit";
 import { db } from "@/lib/db";
 import { isForeignCheckoutHost } from "@/lib/checkout-domain-check";
 import { json, readJson } from "@/lib/http";
@@ -8,6 +8,9 @@ import { log } from "@/lib/log";
 
 /** A processor slow to answer, then the other one tried in the same request: more than the default budget. */
 export const maxDuration = 60;
+
+/** The session id the storefront script's warm-up uses (never a real id: those are cuids). */
+const WARM_ID = "warm";
 
 /**
  * One-page checkout: returns the checkout for the current total (created or reused): a Whop checkout
@@ -19,6 +22,14 @@ async function handle(req: Request, ctx: { params: Promise<{ id: string }> }) {
   // The request's start: a wait for another request's checkout is bounded from it (prepareSession).
   const startedAt = Date.now();
   const { id } = await ctx.params;
+  // The storefront script's warm-up (the buyer heading for « Checkout »): this function and its
+  // database connection are awake before the page's first prepare. Nothing read or written; capped
+  // per IP in memory (no query), so a flood of warm-ups never reaches the database.
+  if (id === WARM_ID) {
+    if (!memoryRateLimit(`warm:prepare:${clientIp(req)}`, 30)) return new Response(null, { status: 429 });
+    await db.$queryRaw`SELECT 1`.catch(() => undefined);
+    return new Response(null, { status: 204 });
+  }
   // Both limits and the session read in one parallel round (serial queries are time the buyer waits).
   const [byIp, bySession, raw, session] = await Promise.all([
     rateLimit(`prepare:ip:${clientIp(req)}`, 40),

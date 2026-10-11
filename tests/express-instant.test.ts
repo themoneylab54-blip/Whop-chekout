@@ -39,9 +39,10 @@ vi.mock("@/components/checkout/Payment", async (orig) => {
 
 const { CheckoutView } = await import("@/components/checkout/CheckoutView");
 const { ExpressCheckout } = await import("@/components/checkout/Payment");
-const { defaultCheckoutLayout, defaultTheme } = await import("@/lib/layout");
+const { createBlock, defaultCheckoutLayout, defaultTheme } = await import("@/lib/layout");
 const { SAMPLE_LINES } = await import("@/lib/sample");
 const { LABELS } = await import("@/components/checkout/i18n");
+const { firstPrepareBody, firstPrepareProtection, inlinePrepareScript } = await import("@/components/checkout/inlinePrepare");
 const L = LABELS.fr;
 
 type ViewProps = ComponentProps<typeof CheckoutView>;
@@ -523,5 +524,121 @@ describe("the first /prepare's silent retries are bounded", async () => {
     await sleep(1_100);
     expect(prepareCalls()).toBe(1);
     expect(screen.getByTestId("wc-express-unavailable")).toBeTruthy();
+  });
+});
+
+describe("the first /prepare sent by the page's inline script while its HTML is parsed (inlinePrepare)", () => {
+  beforeEach(() => {
+    (window as { __wcPrepare?: unknown }).__wcPrepare = undefined;
+  });
+
+  /** The page's first prepare as it sends it (the request's own text), with no inline script. */
+  async function pageFirstBody(o: Partial<ViewProps> = {}): Promise<string> {
+    render(page(o));
+    await sleep(20);
+    const call = vi.mocked(fetch).mock.calls.find(([u]) => String(u).endsWith("/prepare"));
+    const sent = String((call?.[1] as RequestInit | undefined)?.body);
+    cleanup();
+    prepares = [];
+    vi.mocked(fetch).mockClear();
+    return sent;
+  }
+  const inlineSent = (body: string, session = "s_fast") => new Function(inlinePrepareScript(session, body))();
+
+  it("the page's first body is the one the server writes for the inline script (same text)", async () => {
+    expect(await pageFirstBody()).toBe(firstPrepareBody("FR", undefined));
+    // A protection block on by default, and a country picked from the browser's locale or the main market.
+    const layout = defaultCheckoutLayout();
+    layout.blocks.push(createBlock("shipping_protection", { props: { ...createBlock("shipping_protection").props, defaultOn: true } } as never));
+    expect(await pageFirstBody({ layout, initialCountry: null, localeCountry: "BE" })).toBe(firstPrepareBody("BE", true));
+    expect(await pageFirstBody({ initialCountry: null, localeCountry: null, primaryCountry: "BE" })).toBe(firstPrepareBody("BE", undefined));
+  });
+
+  it("the server reads the protection's first state as the page starts it (firstPrepareProtection, in page.tsx)", async () => {
+    const withBlock = (overrides: Record<string, unknown>) => {
+      const layout = defaultCheckoutLayout();
+      layout.blocks.push(createBlock("shipping_protection", overrides as never));
+      return layout;
+    };
+    const on = withBlock({ props: { ...createBlock("shipping_protection").props, defaultOn: true } });
+    const off = withBlock({});
+    const hidden = withBlock({ hidden: true, props: { ...createBlock("shipping_protection").props, defaultOn: true } });
+    expect([on, off, hidden, defaultCheckoutLayout()].map((l) => firstPrepareProtection(l.blocks))).toEqual([true, false, undefined, undefined]);
+    for (const layout of [on, off, hidden, defaultCheckoutLayout()]) expect(await pageFirstBody({ layout })).toBe(firstPrepareBody("FR", firstPrepareProtection(layout.blocks)));
+  });
+
+  it("the page takes the inline script's answer: no second request, its checkout on the page", async () => {
+    const sent = await pageFirstBody();
+    inlineSent(sent);
+    expect(prepares).toHaveLength(1);
+    render(page());
+    await sleep(20);
+    expect(prepares).toHaveLength(1);
+    await answer(0, { checkoutConfigurationId: "cfg_early", environment: "sandbox", provider: "whop", paypal: true });
+    expect(whop.buttons.some((b) => b.checkoutConfigurationId === "cfg_early")).toBe(true);
+    // A later prepare (another country) asks the server itself.
+    fireEvent.change(screen.getByLabelText(L.country), { target: { value: "BE" } });
+    await sleep(600);
+    expect(prepares).toHaveLength(2);
+    expect(prepares[1].body).toMatchObject({ countryCode: "BE" });
+  });
+
+  it("only the first prepare looks at it: back to the first country later, the server is asked again", async () => {
+    const sent = await pageFirstBody();
+    // An inline answer for another body: the first prepare asks itself, and the answer is gone.
+    inlineSent(firstPrepareBody("BE", undefined));
+    render(page());
+    await sleep(20);
+    expect(prepares).toHaveLength(2);
+    await answer(1, { checkoutConfigurationId: "cfg_1", environment: "sandbox", provider: "whop", paypal: true });
+    fireEvent.change(screen.getByLabelText(L.country), { target: { value: "BE" } });
+    await sleep(600);
+    // The inline answer (for BE) was dropped at the first prepare: this BE prepare is a request of its own.
+    expect(prepares).toHaveLength(3);
+    expect(prepares[2].body).toMatchObject({ countryCode: "BE" });
+    expect(JSON.parse(sent)).toMatchObject({ countryCode: "FR" });
+  });
+
+  it("another session: the page asks the server itself", async () => {
+    const sent = await pageFirstBody();
+    inlineSent(sent, "s_other");
+    render(page());
+    await sleep(20);
+    expect(prepares).toHaveLength(2);
+    expect(prepares[1].body).toMatchObject({ countryCode: "FR" });
+  });
+
+  it("the inline request failed (network), or answered a 5xx: the page asks again (at once, or as its silent retry)", async () => {
+    const sent = await pageFirstBody();
+    const stub = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementationOnce(() => Promise.reject(new TypeError("Failed to fetch")));
+    inlineSent(sent);
+    vi.mocked(fetch).mockImplementation(stub);
+    render(page());
+    await sleep(20);
+    expect(prepares).toHaveLength(1);
+    expect(prepares[0].body).toMatchObject({ countryCode: "FR" });
+    cleanup();
+    prepares = [];
+
+    inlineSent(sent);
+    render(page());
+    await sleep(20);
+    await answer(0, { __status: 502, error: "x", code: "init_failed" });
+    // Not retried from the inline answer: a fresh request, after the silent retry's pause.
+    await sleep(1_000);
+    expect(prepares).toHaveLength(2);
+    await answer(1, { checkoutConfigurationId: "cfg_retry", environment: "sandbox", provider: "whop", paypal: true });
+    expect(whop.buttons.some((b) => b.checkoutConfigurationId === "cfg_retry")).toBe(true);
+  });
+
+  it("the page gone before the inline answer: nothing of it reaches the page", async () => {
+    const sent = await pageFirstBody();
+    inlineSent(sent);
+    render(page());
+    await sleep(20);
+    cleanup();
+    await answer(0, { checkoutConfigurationId: "cfg_late", environment: "sandbox", provider: "whop", paypal: true });
+    expect(whop.buttons.some((b) => b.checkoutConfigurationId === "cfg_late")).toBe(false);
   });
 });

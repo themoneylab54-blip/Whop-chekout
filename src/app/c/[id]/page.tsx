@@ -31,11 +31,14 @@ import { mergeRecommendations, type RecommendationView } from "@/components/chec
 import { canReadShopifyDiscounts } from "@/lib/shopify-discounts";
 // The main market: shared with the early prepare (its first quote is this page's first input).
 import { primaryCountryOf } from "@/lib/early-prepare";
+import { firstPrepareBody, firstPrepareProtection, inlinePrepareScript } from "@/components/checkout/inlinePrepare";
 import { checkoutCountries, countryHints, pickFirstCountry, storeMarketOf } from "@/lib/first-country";
 
 export const dynamic = "force-dynamic";
 
-// Shared by generateMetadata and the page: one query per request.
+// Shared by generateMetadata and the page: one query per request. The storefront script's warm-up
+// asks for /c/warm (the buyer heading for « Checkout »): no such session, answered as an unknown
+// link, and this page's function and database connection are awake before the click.
 const loadSession = cache((id: string) => db.checkoutSession.findUnique({ where: { id }, include: { store: true } }));
 
 /** Tab title "<Store> · Paiement" in the checkout's language (no app suffix). */
@@ -224,16 +227,23 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
       { initialCountry, localeCountry, primaryCountry: primary, rateCountry: storeMarketOf(rates), language: theme.language },
     ),
   );
-  const [localRates, primaryCountry, initialPaypal, returningCode] = await Promise.all([
+  const [localRates, primaryCountry, initialPaypal, returningCode, prepareCountry] = await Promise.all([
     within(loadLocalRates(session.currency), 1500, null),
     primaryLookup,
     firstCountry.then((country) => paypalAtFirstPaint(session, provider, design, store.name, country, subtotal(lines))),
     loginCodeEnabled(session.store),
+    firstCountry,
   ]);
+  // The page's first /prepare exactly as CheckoutView sends it on load (see firstPrepareBody), sent by
+  // an inline script while this HTML is parsed: its answer is waiting for the page once hydrated. Like
+  // the page's own first prepare, it marks the payment form shown (preparedAt), now as the HTML is read.
+  // The protection block's default, as CheckoutView starts it (the block on the page only).
+  const firstPrepare = firstPrepareBody(prepareCountry, firstPrepareProtection(layout.blocks));
 
   return (
     <>
       <CheckoutHtmlLang lang={theme.language} />
+      <script dangerouslySetInnerHTML={{ __html: inlinePrepareScript(session.id, firstPrepare) }} />
       {preconnects.map((p) => (
         <link key={p.href} rel="preconnect" href={p.href} crossOrigin={p.crossOrigin} />
       ))}
