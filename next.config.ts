@@ -30,6 +30,12 @@ const nextConfig: NextConfig = {
         source: "/fonts/:path*",
         headers: [{ key: "Access-Control-Allow-Origin", value: "*" }],
       },
+      {
+        // Whop's script, vendored: its name changes with its version, so it is cached for good (that
+        // file only: its license next to it keeps its name).
+        source: "/vendor/:file(whop-checkout-\\d+\\.\\d+\\.\\d+\\.js)",
+        headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
+      },
       { source: "/c/:path*", headers: noFraming },
       { source: "/dashboard/:path*", headers: noFraming },
       { source: "/login", headers: noFraming },

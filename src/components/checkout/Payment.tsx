@@ -1,14 +1,17 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Clock3, RefreshCw, Truck } from "lucide-react";
 import { WhopCheckoutEmbed, WhopExpressCheckoutButton, useCheckoutEmbedControls } from "@whop/checkout/react";
 import type { Theme } from "@/lib/layout";
 import { EXPRESS_WALLETS, type ExpressWallet } from "@/lib/layout-shared";
 import { PAYPAL_AFTER_WINDOW_MS, PAYPAL_SERVER_IN_FLIGHT_MS } from "@/lib/paypal-timing";
 import type { CheckoutLabels } from "./i18n";
-import { WHOP_READY_GRACE_MS, WhopFooterClip } from "./WhopFooterClip";
+import { WhopFooterClip } from "./WhopFooterClip";
 import { afterVisibleTime } from "./paymentHealth";
+import { EARLY_SLOT_ID, earlyWhopControls, earlyWhopFor, earlyWhopFrame, earlyWhopPageRuns, type EarlyWhopListener } from "./inlineEarlyWhop";
+import { whopEmbedKey, whopEmbedProps, type WhopEmbedOptions } from "./whopEmbed";
+import { PANEL_SPINNER_CLASS, PANEL_SPINNER_RING_CLASS, WHOP_READY_GRACE_MS } from "./whopFrame";
 
 type ExpressMethod = ExpressWallet;
 
@@ -636,6 +639,7 @@ export function PaymentPanel({
   whopFooterLang = null,
   onReady,
   onNotReady,
+  earlyWhop: earlyStarted = false,
 }: {
   prepared: Prepared | null;
   preparing: boolean;
@@ -690,6 +694,12 @@ export function PaymentPanel({
    * the last state it said; nothing changes on screen (a health report).
    */
   onNotReady?: (info: { waitedMs: number; frame: boolean; lastState: string | null }) => void;
+  /**
+   * The server HTML may open Whop's card form in this panel's slot before the page runs (see
+   * inlineEarlyWhop): the slot is rendered from the first HTML on, and the panel takes that frame
+   * over when it is the one it would open.
+   */
+  earlyWhop?: boolean;
 }) {
   const controls = useCheckoutEmbedControls();
   const paypalOn = !!paypal?.active;
@@ -706,6 +716,16 @@ export function PaymentPanel({
     setReadyFor(null);
   }
   const ready = !!current && readyFor === current.configId;
+  // Whop's form opened by the server HTML before the page ran (earlyStarted, see inlineEarlyWhop):
+  // "maybe" while the panel has no checkout yet (the frame may be there, or still to come), then taken
+  // over for that checkout (clipped unless the early start gave its clip up), or dropped for good (its
+  // slot goes, with the frame).
+  const [early, setEarly] = useState<"maybe" | "dropped" | { configId: string; clip: boolean }>(earlyStarted ? "maybe" : "dropped");
+  // An early start begun (its frame there or on its way): it shows its own spinner while "maybe". None
+  // in the server HTML; an early start never begins once the page runs (see earlyWhopPageRuns).
+  const earlyBegun = useSyncExternalStore(noopSubscribe, () => earlyStarted && !!earlyWhopFrame(), () => false);
+  const earlySlot = useRef<HTMLDivElement | null>(null);
+  const takenFor = typeof early === "object" ? early.configId : null;
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showBillingForm, setShowBillingForm] = useState(false);
@@ -984,6 +1004,107 @@ export function PaymentPanel({
   // Whop's own PayPal button (after a blocked window): only for the checkout and details confirmed.
   const whopButtonFor = paypalOn && current ? `${current.configId}|${paypal.formKey ?? ""}` : null;
   const whopButton = !!whopButtonFor && whopButtonKey === whopButtonFor;
+
+  // Whop's form as this panel opens it: the React embed's props, the early frame's key (see whopEmbed).
+  const embedOptions: WhopEmbedOptions | null = current
+    ? {
+        configId: current.configId,
+        environment: current.environment,
+        locale: theme.language,
+        accentColor: theme.accentColor,
+        borderRadius: theme.radius,
+        submitButton: whopButton,
+        addressForm: showBillingForm,
+        hideTerms: theme.requireTerms,
+        saveCard: !!saveCard,
+        returnUrl,
+      }
+    : null;
+  const embedKey = embedOptions ? whopEmbedKey(embedOptions) : null;
+  // Whop's form events, from the React embed or from the early frame taken over: handled alike.
+  const whopEvents = (configId: string) => ({
+    onStateChange: (s: string) => {
+      lastState.current = s;
+      setReadyFor(s === "ready" ? configId : null);
+    },
+    onComplete: paid,
+    onPaymentError: (e: { message?: string }) => {
+      if (!paypalOn) cardDeclinedAt.current = Date.now();
+      setPaypalPending(false);
+      setPaypalWait(false);
+      setCheckFailed(false);
+      setConfirmLeave(null);
+      setSubmitting(false);
+      setError(e.message || labels.paymentFailed);
+    },
+    onAddressValidationError: (e: { error_message?: string }) => {
+      setSubmitting(false);
+      setShowBillingForm(true);
+      setError(e.error_message || labels.checkBillingAddress);
+    },
+  });
+  // The early slot is shown from the first HTML until the panel has a checkout, then while the frame
+  // taken over is the one on screen (PayPal's checkout is another one); once not shown, never again
+  // (the frame went with it).
+  const showEarly = early !== "dropped" && !(prepareError && !prepared) && (early === "maybe" || current?.configId === takenFor);
+  if (early !== "dropped" && !showEarly) setEarly("dropped");
+  // The page runs: an early start not begun yet never begins (this panel opens its own frame); one
+  // begun keeps its own spinner until its frame is taken over (this panel's hidden meanwhile: never two).
+  useLayoutEffect(() => {
+    if (earlyStarted) earlyWhopPageRuns();
+  }, [earlyStarted]);
+  // The panel's first checkout: the early frame taken over when it is the very frame the panel would
+  // open (the card form of this checkout with these options, mounted in this slot, Whop's script
+  // running); else dropped, and the React embed opens its own.
+  useLayoutEffect(() => {
+    if (early !== "maybe" || !current || !embedKey) return;
+    const card = !paypalOn && !showBillingForm && !whopButton;
+    const frame = card ? earlyWhopFor(embedKey, current.configId, earlySlot.current) : null;
+    setEarly(frame ? { configId: current.configId, clip: !frame.clipGaveUp() } : "dropped");
+  }, [early, current, embedKey, paypalOn, showBillingForm, whopButton]);
+  // Dropped (never taken over, or no longer shown): the early start's frame, observers and callbacks go.
+  useLayoutEffect(() => {
+    if (earlyStarted && early === "dropped") earlyWhopFrame()?.drop();
+  }, [earlyStarted, early]);
+  // The panel gone (another provider's panel instead, the page left): dropped all the same. Deferred:
+  // React's StrictMode unmounts and mounts again at once (the mount cancels it). Taken for gone too: a
+  // panel hidden and shown again (a Suspense boundary above it suspending, an <Activity>), none today.
+  const dropOnUnmount = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useLayoutEffect(() => {
+    if (!earlyStarted) return;
+    if (dropOnUnmount.current) clearTimeout(dropOnUnmount.current);
+    dropOnUnmount.current = null;
+    return () => {
+      const frame = earlyWhopFrame();
+      dropOnUnmount.current = setTimeout(() => frame?.drop(), 0);
+    };
+  }, [earlyStarted]);
+  // The frame taken over: its controls are Whop's plain script's, its events (those it sent before
+  // too, in order) handled with the latest handlers; its clip and spinner give way to the panel's own
+  // (WhopFooterClip measures in this same commit: no paint in between).
+  const earlyEvents = useRef<EarlyWhopListener>(() => undefined);
+  useLayoutEffect(() => {
+    if (!takenFor) return;
+    const h = whopEvents(takenFor);
+    earlyEvents.current = (event, args) => {
+      if (event === "state") h.onStateChange(String(args[0]));
+      else if (event === "complete") h.onComplete();
+      else if (event === "payment-error") h.onPaymentError((args[0] ?? {}) as { message?: string });
+      else if (event === "address-validation-error") h.onAddressValidationError((args[0] ?? {}) as { error_message?: string });
+    };
+  });
+  useLayoutEffect(() => {
+    if (!takenFor) return;
+    const frame = earlyWhopFrame();
+    if (!frame) return;
+    const mine = earlyWhopControls(frame.id);
+    controls.current = mine;
+    frame.take((event, args) => earlyEvents.current(event, args));
+    return () => {
+      frame.take(null);
+      if (controls.current === mine) controls.current = null;
+    };
+  }, [takenFor, controls]);
   // Showing it reloads the embed: the saved contact and address go back in once it's ready.
   useEffect(() => {
     const buyer = lastBuyer.current;
@@ -1364,7 +1485,14 @@ export function PaymentPanel({
               </button>
             )}
           </div>
-        ) : current ? (
+        ) : showEarly ? (
+          // Whop's form opened early (see inlineEarlyWhop): its slot from the first HTML on, never rendered
+          // over by React (its content is the early start's); the panel's clip once the frame is taken over
+          // (none when the early start gave its clip up: never clipped again).
+          <WhopFooterClip key="early" on={typeof early === "object" && early.clip && !showBillingForm} ready={!!takenFor && ready} lang={theme.language} checkedLang={whopFooterLang}>
+            <div id={EARLY_SLOT_ID} ref={earlySlot} dangerouslySetInnerHTML={EARLY_SLOT_HTML} suppressHydrationWarning />
+          </WhopFooterClip>
+        ) : current && embedOptions ? (
           <WhopFooterClip
             key={current.configId}
             // Only the form the server checked, the card one: not the PayPal-only checkout (nor Whop's own
@@ -1377,49 +1505,16 @@ export function PaymentPanel({
             lang={theme.language}
             checkedLang={whopFooterLang}
           >
-            <WhopCheckoutEmbed
-              ref={controls}
-              sessionId={current.configId}
-              environment={current.environment}
-              theme="light"
-              locale={theme.language}
-              themeOptions={{ accentColor: theme.accentColor, borderRadius: theme.radius }}
-              hideSubmitButton={!whopButton}
-              hideEmail
-              hideAddressForm={!showBillingForm}
-              // The store's own terms checkbox already covers acceptance: no second "you accept X's terms" line.
-              hideTermsAndConditions={theme.requireTerms}
-              setupFutureUsage={saveCard ? "off_session" : undefined}
-              skipRedirect
-              returnUrl={returnUrl}
-              onStateChange={(s) => {
-                lastState.current = s;
-                setReadyFor(s === "ready" ? current.configId : null);
-              }}
-              onComplete={paid}
-              onPaymentError={(e) => {
-                if (!paypalOn) cardDeclinedAt.current = Date.now();
-                setPaypalPending(false);
-                setPaypalWait(false);
-                setCheckFailed(false);
-                setConfirmLeave(null);
-                setSubmitting(false);
-                setError(e.message || labels.paymentFailed);
-              }}
-              onAddressValidationError={(e) => {
-                setSubmitting(false);
-                setShowBillingForm(true);
-                setError(e.error_message || labels.checkBillingAddress);
-              }}
-              fallback={<PaymentSkeleton />}
-            />
+            {/* Its options (whopEmbedProps): the store's own terms checkbox covers acceptance, no second terms line of Whop's. */}
+            <WhopCheckoutEmbed ref={controls} {...whopEmbedProps(embedOptions)} {...whopEvents(current.configId)} fallback={<PaymentSkeleton />} />
           </WhopFooterClip>
         ) : (
           <PaymentSkeleton />
         )}
-        {!prepareError && (currentPreparing || (current && !ready)) && (
-          <div className="pointer-events-none absolute inset-0 flex items-start justify-end p-3">
-            <span className="h-4 w-4 animate-spin rounded-full border-2 border-neutral-300 border-r-transparent" />
+        {/* Not while an early start shows its own (see earlyBegun). */}
+        {!prepareError && (currentPreparing || (current && !ready)) && !(early === "maybe" && earlyBegun) && (
+          <div className={PANEL_SPINNER_CLASS}>
+            <span className={PANEL_SPINNER_RING_CLASS} />
           </div>
         )}
       </div>
@@ -1805,6 +1900,34 @@ export function PaymentSkeleton() {
     </div>
   );
 }
+
+/**
+ * PaymentSkeleton as HTML (its renderToStaticMarkup), for the page's HTML before React runs: written
+ * out, so no React is needed to get it and Tailwind sees its classes. The two change together
+ * (tests/payment-skeleton-html.test.ts). Exported by a client module: a Server Component importing it
+ * gets a client reference, not the string.
+ */
+export const PAYMENT_SKELETON_HTML =
+  '<div class="space-y-3 p-4" aria-hidden="true">' +
+  '<div class="flex gap-2">' +
+  '<div class="h-10 flex-1 animate-pulse rounded-md bg-neutral-100"></div>' +
+  '<div class="h-10 flex-1 animate-pulse rounded-md bg-neutral-100"></div>' +
+  '<div class="h-10 flex-1 animate-pulse rounded-md bg-neutral-100"></div>' +
+  "</div>" +
+  '<div class="h-11 animate-pulse rounded-md bg-neutral-100"></div>' +
+  '<div class="grid grid-cols-2 gap-3">' +
+  '<div class="h-11 animate-pulse rounded-md bg-neutral-100"></div>' +
+  '<div class="h-11 animate-pulse rounded-md bg-neutral-100"></div>' +
+  "</div>" +
+  '<div class="h-11 animate-pulse rounded-md bg-neutral-100"></div>' +
+  "</div>";
+
+/**
+ * The early slot's content in the server HTML: the skeleton, until Whop's frame takes its place (see
+ * inlineEarlyWhop). Never written by React in the browser: hydrating, it leaves the slot's content as it
+ * finds it (suppressHydrationWarning), and a render writes it only when this string changes (never).
+ */
+const EARLY_SLOT_HTML = { __html: PAYMENT_SKELETON_HTML };
 
 export function LockIcon() {
   return (

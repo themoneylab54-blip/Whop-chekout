@@ -2,14 +2,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { whopFooterFit } from "./whopFooterFit";
-
-/**
- * How long Whop's frame may take to say "ready" (from its mount) with its footer clipped: past it,
- * the screen in the frame may be another of Whop's (an expired checkout's error) and is shown whole,
- * for good (no second move when a late "ready" comes). Whop's form says "ready" 4 to 5 s after its
- * mount on a fast connection (1 to 3 s after drawing itself).
- */
-export const WHOP_READY_GRACE_MS = 30_000;
+import { WHOP_CLIP_CLASS, WHOP_CLIP_FRAME_CLASS, WHOP_READY_GRACE_MS } from "./whopFrame";
 
 /**
  * Whop's form without its « Propulsé par Whop » footer (see whopFooterFit): the frame narrowed only
@@ -62,7 +55,7 @@ export function WhopFooterClip({ on, lang: langProp, checkedLang, ready, childre
       ref={box}
       data-testid="wc-whop-clip"
       data-clip={fit ? fit.clip : undefined}
-      className={fit ? "wc-whop-clip" : undefined}
+      className={fit ? WHOP_CLIP_CLASS : undefined}
       onScroll={
         fit
           ? (e) => {
@@ -75,7 +68,7 @@ export function WhopFooterClip({ on, lang: langProp, checkedLang, ready, childre
     >
       {/* Its own block formatting context: the frame's negative bottom margin shortens this box (never collapses out of it). */}
       <div
-        className={fit ? "flow-root [&_iframe]:block [&_iframe]:mb-[calc(-1*var(--wc-whop-clip))]" : undefined}
+        className={fit ? WHOP_CLIP_FRAME_CLASS : undefined}
         style={fit ? ({ paddingInline: fit.inset, "--wc-whop-clip": `${fit.clip}px` } as CSSProperties) : undefined}
       >
         {children}

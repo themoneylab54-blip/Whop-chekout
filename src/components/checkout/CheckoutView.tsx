@@ -53,6 +53,7 @@ import { LanguageSwitcher } from "./LanguageSwitcher";
 import { clearSavedBuyer, maskEmail, parseSavedBuyer, readSavedBuyerRaw, subscribeSavedBuyer, writeSavedBuyer } from "./savedBuyer";
 import { localEstimate, type LocalRates } from "./localCurrency";
 import { firstPrepareProtection, isInlineTimeout, prepareBody, takeInlinePrepare } from "./inlinePrepare";
+import { thankYouPath } from "./thankYouPath";
 import { paymentFormMissing, reportHealth, usePaymentWatchdog } from "./paymentHealth";
 import { ReturningBuyerCode, type CodeBuyer } from "./ReturningBuyerCode";
 import { sampleRecommendations, visibleRecommendations, type RecommendationView } from "./recommendations";
@@ -160,6 +161,8 @@ type Props = {
    * inlinePrepare): the first address's, so both send the same request. Ignored when not shipped to.
    */
   firstCountry?: string | null;
+  /** Live: the server HTML may open Whop's card form before the page runs (see inlineEarlyWhop): the payment panel takes it over. */
+  earlyWhop?: boolean;
 };
 
 type Address = {
@@ -727,6 +730,7 @@ export function CheckoutView({
   stripeWarm = null,
   whopFooterLang = null,
   firstCountry = null,
+  earlyWhop = false,
 }: Props) {
   // "Complétez votre commande" streamed by the server (a promise): none until it lands.
   const recommendationsStream = isPromise(recommendationsProp) ? recommendationsProp : null;
@@ -1564,7 +1568,7 @@ export function CheckoutView({
     () => new URLSearchParams(window.location.search).get("via") === "app",
     () => false,
   );
-  const thankYouUrl = liveSessionId ? `/c/${liveSessionId}/merci?lang=${theme.language}${viaApp ? "&via=app" : ""}` : "#";
+  const thankYouUrl = liveSessionId ? thankYouPath(liveSessionId, theme.language, viaApp) : "#";
   useEffect(() => {
     thankYouUrlRef.current = thankYouUrl;
   }, [thankYouUrl]);
@@ -2517,6 +2521,7 @@ export function CheckoutView({
                 noShipping={prepareNoShipping}
                 onLockChange={setPanelLock}
                 whopFooterLang={whopFooterLang}
+                earlyWhop={earlyWhop}
                 // Whop's card form ready, or never saying so: the page's health reports (see paymentHealth).
                 onReady={() => setWhopFormReady(true)}
                 onNotReady={(info) => liveSessionId && reportHealth(liveSessionId, { kind: "form_not_ready", ...info })}

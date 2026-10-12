@@ -18,12 +18,12 @@ import { firstPrepareBody, inlinePrepareScript } from "@/components/checkout/inl
  * The checkout page's inline watchdog: a page whose scripts never started 10 s (visible) after it
  * loaded is reloaded once per session in the tab and reported at that moment, never twice (the next
  * load only reports, and says once when it started after all); never over a page that started
- * meanwhile (said to the logs), nor while the buyer is in a field (it waits for them to leave it; a
- * buyer leaving first is reported, no reload done); the error screen stands it down; a page that
- * started says nothing; time in the background never counts; a page still loading after 25 s is
- * reported, never reloaded. Reports carry the page's first errors (the root cause first), its scripts
- * answered with an HTTP error, the version that served it, the page's own clock. Both inline scripts
- * are ES5 and never break out of the <script>.
+ * meanwhile (said to the logs), nor while the buyer is in a field or in Whop's form (it waits for
+ * them to leave it; a buyer leaving first is reported, no reload done); the error screen stands it
+ * down; a page that started says nothing; time in the background never counts; a page still loading
+ * after 25 s is reported, never reloaded. Reports carry the page's first errors (the root cause
+ * first), its scripts answered with an HTTP error, the version that served it, the page's own clock.
+ * Both inline scripts are ES5 and never break out of the <script>.
  */
 
 type Win = Window & Record<string, unknown>;
@@ -147,6 +147,24 @@ describe("the checkout page's inline watchdog", () => {
     vi.advanceTimersByTime(1);
     expect(reload).toHaveBeenCalledTimes(1);
     expect(beacons.map((b) => b.body)).toEqual([expect.objectContaining({ kind: "not_booted", reloading: true, typed: true })]);
+  });
+
+  it("the buyer in Whop's form (a frame, opened before the page's scripts): no reload until they leave it", () => {
+    document.body.innerHTML = '<iframe id="whop" title="Whop Embedded Checkout"></iframe>';
+    const frame = document.getElementById("whop") as HTMLIFrameElement;
+    run();
+    loaded();
+    vi.spyOn(document, "activeElement", "get").mockImplementation(() => frame);
+    vi.advanceTimersByTime(WATCHDOG_AFTER_LOAD_MS + 60_000);
+    expect(reload).not.toHaveBeenCalled();
+    // Back on the page: a browser fires no focusout for a frame left (cross-origin), only the window's focus.
+    vi.spyOn(document, "activeElement", "get").mockImplementation(() => document.body);
+    window.dispatchEvent(new FocusEvent("focus"));
+    vi.advanceTimersByTime(999);
+    expect(reload).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(beacons.map((b) => b.body)).toEqual([expect.objectContaining({ kind: "not_booted", reloading: true })]);
   });
 
   it("the buyer leaves the page while the reload waits on their field: reported, no reload done", () => {
@@ -405,5 +423,120 @@ describe("the checkout page's inline watchdog", () => {
     expect(() => es5(inlinePrepareScript("cmsess1", firstPrepareBody("FR", false)))).not.toThrow();
     // The check itself refuses later syntax.
     expect(() => es5("var f = () => 1;")).toThrow();
+  });
+});
+
+describe("loaded: the window's load event, or the page's HTML read and its own scripts all in", () => {
+  // Whop's form opened before the page's scripts (see inlineEarlyWhop) holds the window's load event
+  // back until its frame has loaded: the page's start never waits on it.
+  const script = (name: string, o: { noModule?: boolean } = {}) => {
+    const s = document.createElement("script");
+    s.src = `https://app.test/_next/static/chunks/${name}`;
+    // A browser that runs modules (jsdom has no noModule): it never fetches a nomodule script.
+    if (o.noModule) Object.defineProperty(s, "noModule", { configurable: true, value: true });
+    document.head.appendChild(s);
+    return s;
+  };
+  const fetched = (s: HTMLScriptElement) => ({ name: s.src, initiatorType: "script", responseStatus: 200 });
+  const reloadMark = () => sessionStorage.getItem(`${RELOAD_MARK}cmsess1`);
+  // Only this test's scripts in the page (an earlier test's one would never be in).
+  const clear = () => {
+    for (const s of document.head.querySelectorAll("script")) s.remove();
+  };
+  beforeEach(clear);
+  afterEach(clear);
+
+  it("each script fetched or failed (a nomodule one never fetched), the load event held back: decided 10 s later", () => {
+    run();
+    const a = script("a.js");
+    const b = script("b.js");
+    const c = script("c.js");
+    script("polyfills.js", { noModule: true });
+    readyState = "interactive";
+    resources = [fetched(a)];
+    c.dispatchEvent(new Event("error"));
+    // b.js still on its way: not loaded, however long it takes.
+    vi.advanceTimersByTime(WATCHDOG_AFTER_LOAD_MS * 2);
+    expect(reloadMark()).toBeNull();
+    resources = [fetched(a), fetched(b)];
+    vi.advanceTimersByTime(500 + WATCHDOG_AFTER_LOAD_MS - 1);
+    expect(reloadMark()).toBeNull();
+    vi.advanceTimersByTime(1 + 300);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(beacons.map((x) => x.body)).toEqual([expect.objectContaining({ kind: "not_booted", state: "interactive", reloading: true })]);
+  });
+
+  it("the page's HTML still being read: not loaded, whatever its scripts (reported at 25 s, never reloaded)", () => {
+    run();
+    resources = [fetched(script("a.js"))];
+    vi.advanceTimersByTime(WATCHDOG_STILL_LOADING_MS);
+    expect(beacons.map((x) => x.body)).toEqual([expect.objectContaining({ kind: "still_loading", state: "loading" })]);
+    vi.advanceTimersByTime(60_000);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("its scripts all in at 20 s, the load event still held back: no 'still loading' at 25 s, decided at 30 s", () => {
+    run();
+    const a = script("a.js");
+    readyState = "interactive";
+    vi.advanceTimersByTime(20_000);
+    resources = [fetched(a)];
+    vi.advanceTimersByTime(500 + WATCHDOG_AFTER_LOAD_MS + 300);
+    expect(beacons.map((x) => x.body.kind)).toEqual(["not_booted"]);
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("its scripts all in, then the load event: one decision", () => {
+    run();
+    readyState = "interactive";
+    vi.advanceTimersByTime(500);
+    loaded();
+    vi.advanceTimersByTime(WATCHDOG_AFTER_LOAD_MS * 3);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(beacons).toHaveLength(1);
+  });
+
+  it("loaded once: its scripts in, then the load event later — a page brought back from the cache still waits its full 10 s", () => {
+    document.body.innerHTML = '<input id="email" value="">';
+    const field = document.getElementById("email") as HTMLInputElement;
+    field.focus();
+    run();
+    readyState = "interactive";
+    // Loaded at 0.5 s (its scripts in), the load event at 6 s (Whop's frame loaded at last): armed once.
+    vi.advanceTimersByTime(6_000);
+    loaded();
+    // Decided at 10.5 s, the reload waiting on the buyer's field; they leave the page, then come back.
+    vi.advanceTimersByTime(4_800);
+    window.dispatchEvent(new Event("pagehide"));
+    field.blur();
+    vi.advanceTimersByTime(1_200);
+    window.dispatchEvent(Object.assign(new Event("pageshow"), { persisted: true }));
+    vi.advanceTimersByTime(WATCHDOG_AFTER_LOAD_MS - 1);
+    expect(reload).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1 + 300);
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("its scripts no longer looked at once the page started", () => {
+    run();
+    script("a.js");
+    readyState = "interactive";
+    vi.advanceTimersByTime(1_000);
+    const looks = vi.mocked(performance.getEntriesByType).mock.calls.length;
+    expect(looks).toBeGreaterThan(0);
+    win()[BOOT_FLAG] = true;
+    vi.advanceTimersByTime(5_000);
+    expect(vi.mocked(performance.getEntriesByType).mock.calls.length).toBe(looks);
+  });
+
+  it("the page started in the meantime: nothing", () => {
+    run();
+    resources = [fetched(script("a.js"))];
+    readyState = "interactive";
+    vi.advanceTimersByTime(500);
+    win()[BOOT_FLAG] = true;
+    vi.advanceTimersByTime(WATCHDOG_AFTER_LOAD_MS * 3);
+    expect(beacons).toHaveLength(0);
+    expect(reload).not.toHaveBeenCalled();
   });
 });

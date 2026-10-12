@@ -26,6 +26,7 @@ export function proxy(request: NextRequest) {
 export const config = {
   // Static build files never need the check (they are served on every host), nor the checkout icon:
   // the storefront loader pings it on the checkout domain to test reachability, served straight from
-  // the CDN (no function invocation per storefront visit).
-  matcher: ["/((?!_next/static|_next/image|checkout-icon\\.svg).*)"],
+  // the CDN (no function invocation per storefront visit). Nor Whop's vendored script (public/vendor),
+  // fetched by every checkout page.
+  matcher: ["/((?!_next/static|_next/image|checkout-icon\\.svg|vendor/).*)"],
 };

@@ -102,3 +102,32 @@ export function whopFooterFit(lang: string, width: number): { inset: number; cli
   }
   return null;
 }
+
+/** Frame widths `from` to `to` (px, both included) with one fit: `inset` and `clip` (see whopFooterFit). */
+export type WhopFooterRun = readonly [from: number, to: number, inset: number, clip: number];
+
+const fitRuns = new Map<string, readonly WhopFooterRun[]>();
+
+/**
+ * whopFooterFit at every whole frame width from 1 to `maxWidth` px, as runs of consecutive widths
+ * with the same fit (the widths without one left out): a few dozen numbers, small enough to go with
+ * the page's HTML (read by the early start's inline script: see inlineEarlyWhop). Worked out once per
+ * language and `maxWidth`: it runs on every checkout render, server side. None for a language never
+ * measured.
+ */
+export function whopFooterFitRuns(lang: string, maxWidth = 4000): readonly WhopFooterRun[] {
+  if (!Object.hasOwn(WHOP_FOOTER, lang)) return [];
+  const key = `${lang}:${maxWidth}`;
+  const known = fitRuns.get(key);
+  if (known) return known;
+  const runs: [number, number, number, number][] = [];
+  for (let width = 1; width <= maxWidth; width++) {
+    const fit = whopFooterFit(lang, width);
+    if (!fit) continue;
+    const last = runs[runs.length - 1];
+    if (last && last[1] === width - 1 && last[2] === fit.inset && last[3] === fit.clip) last[1] = width;
+    else runs.push([width, width, fit.inset, fit.clip]);
+  }
+  fitRuns.set(key, runs);
+  return runs;
+}

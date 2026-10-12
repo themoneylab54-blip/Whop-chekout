@@ -33,6 +33,10 @@ import { canReadShopifyDiscounts } from "@/lib/shopify-discounts";
 import { primaryCountryOf } from "@/lib/early-prepare";
 import { firstPrepareBody, firstPrepareProtection, inlinePrepareScript } from "@/components/checkout/inlinePrepare";
 import { inlineWatchdogScript } from "@/components/checkout/inlineWatchdog";
+import { inlineEarlyWhopScript } from "@/components/checkout/inlineEarlyWhop";
+import { thankYouPath } from "@/components/checkout/thankYouPath";
+import { WHOP_SDK_PATH, whopEmbedFixedAttributes } from "@/components/checkout/whopEmbed";
+import { whopFooterFitRuns } from "@/components/checkout/whopFooterFit";
 import { refreshWhopFooterCheck, whopFooterClipped, whopHostOf } from "@/lib/whop-footer";
 import { checkoutCountries, countryHints, pickFirstCountry, storeMarketOf } from "@/lib/first-country";
 
@@ -257,11 +261,32 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
   // the page's own first prepare, it marks the payment form shown (preparedAt), now as the HTML is read.
   // The protection block's default, as CheckoutView starts it (the block on the page only).
   const firstPrepare = firstPrepareBody(prepareCountry, firstPrepareProtection(layout.blocks));
+  // Whop's card form opened as soon as that prepare answers, before the page runs (see
+  // inlineEarlyWhop): the form the payment panel would open, its footer clipped as it would clip it.
+  const earlyWhop =
+    provider === "whop"
+      ? inlineEarlyWhopScript({
+          sessionId: session.id,
+          attributes: whopEmbedFixedAttributes({
+            locale: theme.language,
+            accentColor: theme.accentColor,
+            borderRadius: theme.radius,
+            submitButton: false,
+            addressForm: false,
+            hideTerms: theme.requireTerms,
+            saveCard,
+          }),
+          returnPath: thankYouPath(session.id, theme.language, false),
+          fit: footerClipped ? whopFooterFitRuns(theme.language) : null,
+          sdk: WHOP_SDK_PATH,
+        })
+      : null;
 
   return (
     <>
       <CheckoutHtmlLang lang={theme.language} />
       <script dangerouslySetInnerHTML={{ __html: inlinePrepareScript(session.id, firstPrepare) }} />
+      {earlyWhop && <script dangerouslySetInnerHTML={{ __html: earlyWhop }} />}
       {/* The page's watchdog: a page whose scripts never start is reported and reloaded once (see inlineWatchdog). */}
       <script dangerouslySetInnerHTML={{ __html: inlineWatchdogScript(session.id, deploymentId()) }} />
       {preconnects.map((p) => (
@@ -318,6 +343,7 @@ export default async function CheckoutPage({ params, searchParams }: PageProps) 
         whopFooterLang={footerClipped ? theme.language : null}
         // The inline first prepare's country: the page's first address (one request for both).
         firstCountry={prepareCountry}
+        earlyWhop={!!earlyWhop}
       />
     </>
   );

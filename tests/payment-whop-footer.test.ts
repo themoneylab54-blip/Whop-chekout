@@ -31,7 +31,7 @@ vi.mock("@whop/checkout/react", async () => {
 });
 
 const { PaymentPanel } = await import("@/components/checkout/Payment");
-const { WHOP_READY_GRACE_MS } = await import("@/components/checkout/WhopFooterClip");
+const { WHOP_READY_GRACE_MS } = await import("@/components/checkout/whopFrame");
 const { LABELS } = await import("@/components/checkout/i18n");
 const theme = { language: "fr", accentColor: "#000", radius: 8, requireTerms: false } as unknown as ComponentProps<typeof PaymentPanel>["theme"];
 
