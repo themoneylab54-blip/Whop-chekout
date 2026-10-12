@@ -6,6 +6,8 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
  */
 
 const shopify = vi.hoisted(() => ({
+  // The storefront domain job (lib/storefront-domain) asks no real Shopify for these made-up shops.
+  getShopInfo: vi.fn(async () => ({ name: "Test", currencyCode: "EUR", primaryDomain: null })),
   createPaidOrder: vi.fn(),
   findOrderForSession: vi.fn(),
   findOrderByPayment: vi.fn(),

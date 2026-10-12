@@ -1,3 +1,5 @@
+import { shopHostname } from "./shop-host";
+
 /*
  * Shopify connection form rules, shared by the dashboard form (live hints) and the server action
  * (the actual decision). Pure: no server-only import, so the client component can use it.
@@ -43,9 +45,13 @@ export function resolveShopDomainInput(input: string, known: { shopDomain?: stri
   if (shop) return { ok: true, shop };
   const host = hostOf(input);
   if (!host) return { ok: false, error: "Domaine manquant : indiquez l'adresse en .myshopify.com de la boutique." };
-  if (looksLikeDomain(host)) {
+  // Checked and compared as its hostname: a domain typed with its accents (sovéline.fr) is the one
+  // Shopify gives in punycode; the messages keep it as typed.
+  const ascii = shopHostname(host) ?? host;
+  if (looksLikeDomain(ascii)) {
     if (known.shopDomain) {
-      const isStorefront = !!known.storefrontHost && bare(known.storefrontHost.toLowerCase()) === bare(host);
+      const storefront = shopHostname(known.storefrontHost);
+      const isStorefront = !!storefront && bare(storefront) === bare(ascii);
       return {
         ok: true,
         shop: known.shopDomain,

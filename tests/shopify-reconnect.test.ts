@@ -10,6 +10,9 @@ import { cleanup, fireEvent, render } from "@testing-library/react";
  * check (token valid? loader present?) with Shopify mocked: ok / revoked / script missing / timeout.
  */
 
+const noted = vi.hoisted(() => vi.fn<(store: unknown, primary: unknown) => Promise<void>>(async () => undefined));
+vi.mock("@/lib/storefront-domain", () => ({ noteStorefrontPrimary: noted }));
+
 const { resolveShopDomainInput, clientSecretHint, hmacMismatchError, normalizeShopDomain, MIN_CLIENT_SECRET_LENGTH } = await import("@/lib/shopify-connect");
 const { verifyWebhookHmac, loaderUrl } = await import("@/lib/shopify");
 const { encrypt } = await import("@/lib/crypto");
@@ -35,6 +38,9 @@ describe("form domain handling", () => {
         expect(r.notice).toMatch(/domaine de votre vitrine.*27vmem-y1\.myshopify\.com/);
       }
     }
+    // Typed with its accents, the punycode domain Shopify gave: the storefront's, said as typed.
+    const accented = resolveShopDomainInput("sovéline.fr", { shopDomain: "yctp21-8n.myshopify.com", storefrontHost: "xn--sovline-dya.fr" });
+    expect(accented).toMatchObject({ ok: true, shop: "yctp21-8n.myshopify.com", notice: expect.stringMatching(/^sovéline\.fr est le domaine de votre vitrine/) });
     // Another public domain: the known shop too, said differently.
     const other = resolveShopDomainInput("autre-site.fr", known);
     expect(other).toMatchObject({ ok: true, shop: "27vmem-y1.myshopify.com" });
@@ -135,15 +141,36 @@ describe("webhook signature", () => {
 });
 
 describe("live status (Shopify mocked)", () => {
-  const store = { id: "st_live", publicId: "pub_live", shopDomain: "live.myshopify.com", shopifyAccessToken: encrypt("tok") };
+  const store = { id: "st_live", publicId: "pub_live", shopDomain: "live.myshopify.com", shopifyAccessToken: encrypt("tok"), storefrontHost: "old.example.com" };
   const fetchMock = vi.fn();
   beforeEach(() => {
     clearShopifyStatus(store.id);
     fetchMock.mockReset();
+    noted.mockClear();
     vi.stubGlobal("fetch", fetchMock);
   });
   afterEach(() => vi.unstubAllGlobals());
-  const answer = (nodes: { src: string }[]) => new Response(JSON.stringify({ data: { shop: { name: "Live" }, scriptTags: { nodes } } }), { status: 200 });
+  const answer = (nodes: { src: string }[], primaryDomain: { host: string; sslEnabled: boolean } | null = null) =>
+    new Response(JSON.stringify({ data: { shop: { name: "Live", primaryDomain }, scriptTags: { nodes } } }), { status: 200 });
+
+  it("the shop's primary domain comes with the answer and is passed on (the store as read); not for a cached, unknown or revoked one", async () => {
+    const primary = { host: "new.example.com", sslEnabled: true };
+    fetchMock.mockResolvedValue(answer([{ src: loaderUrl(store.publicId) }], primary));
+    expect(await shopifyLiveState(store, { now: 1_000 })).toBe("active");
+    expect(String((fetchMock.mock.calls[0][1] as RequestInit).body)).toContain("primaryDomain { host sslEnabled }");
+    await vi.waitFor(() => expect(noted).toHaveBeenCalledWith(store, primary));
+    expect(await shopifyLiveState(store, { now: 2_000 })).toBe("active");
+    fetchMock.mockResolvedValue(answer([], primary));
+    expect(await shopifyLiveState(store, { now: 62_000 })).toBe("script_missing");
+    await vi.waitFor(() => expect(noted).toHaveBeenCalledTimes(2));
+    clearShopifyStatus(store.id);
+    fetchMock.mockResolvedValue(new Response("oops", { status: 503 }));
+    expect(await shopifyLiveState(store)).toBe("unknown");
+    fetchMock.mockResolvedValue(new Response("[API] Invalid API key or access token", { status: 401 }));
+    expect(await shopifyLiveState(store)).toBe("revoked");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(noted).toHaveBeenCalledTimes(2);
+  });
 
   it("token valid and loader present → active (then cached 60 s)", async () => {
     fetchMock.mockResolvedValue(answer([{ src: loaderUrl(store.publicId) }]));

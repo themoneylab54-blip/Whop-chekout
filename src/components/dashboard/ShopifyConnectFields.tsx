@@ -35,6 +35,7 @@ export function ShopifyConnectFields({
 }: {
   defaultShop: string;
   knownShopDomain: string | null;
+  /** The storefront's domain as the merchant reads it (with its accents: shopHostLabel); recognised however typed. */
   storefrontHost: string | null;
   activeClientId: string | null;
   /** Prefill: the active Client ID, else the one of an abandoned first attempt. */

@@ -20,6 +20,9 @@ import { sessionCart, startCartRead } from "@/lib/cart-session";
 import { resolveVisitor, signVisitorId, verifyVisitorId } from "@/lib/visitor";
 import { anyProviderConnected } from "@/lib/payment-provider";
 import { prepareAhead } from "@/lib/early-prepare";
+import { storefrontHosts } from "@/lib/shopify-discounts";
+import { recheckStorefrontHost } from "@/lib/storefront-domain";
+import { shopHostname } from "@/lib/shop-host";
 
 export const OPTIONS = preflight;
 
@@ -194,9 +197,10 @@ async function handle(req: Request) {
   };
   if (earlier) return (await foreign) ? refuseForeign() : sessionResponse(checkoutBaseUrl(store), earlier, visitorId);
 
-  // Only accept return URLs on the shop itself, never an arbitrary redirect target.
-  const allowedHosts = [store.shopDomain, store.storefrontHost].filter((h): h is string => !!h);
-  const safeReturnUrl = returnUrl && isAllowedReturnUrl(returnUrl, allowedHosts) ? returnUrl : null;
+  // Only accept return URLs on the shop itself (its domain, the domain's www / bare twin, its
+  // *.myshopify.com address), never an arbitrary redirect target.
+  const shopHosts = storefrontHosts(store);
+  const safeReturnUrl = returnUrl && isAllowedReturnUrl(returnUrl, shopHosts) ? returnUrl : null;
 
   const cartInput = {
     items,
@@ -209,6 +213,15 @@ async function handle(req: Request) {
   // A request on another checkout domain starts nothing (the host check needs no query on the app's
   // own hosts and the store's domain: the usual case waits for nothing here).
   if (await foreign) return refuseForeign();
+  // A checkout from an https host the store doesn't know (the shop moved to another domain?): Shopify
+  // asked again after the answer, so the next checkouts link back to the shop's current domain (the
+  // host itself is never trusted). After the refusals that need no query (a cart Shopify's checkout
+  // keeps, a checkout switched off, another store's domain), before the cart is priced: a cart refused
+  // from then on still came from the shop. (returnUrl is a valid URL: checked by the body's schema;
+  // one refused on a host of the shop's own, written another way, asks nothing.)
+  const refusedBack = returnUrl && !safeReturnUrl ? new URL(returnUrl) : null;
+  const unknownHost = refusedBack?.protocol === "https:" ? shopHostname(refusedBack.hostname) : null;
+  if (unknownHost && !shopHosts.includes(unknownHost)) after(() => recheckStorefrontHost(store, unknownHost));
   // The Admin API pricing, this visitor's A/B arms (reads only) and the cart re-read (bundle /
   // discount apps; a failed one is journaled) run alongside, each awaited where it is needed: a
   // refused cart leaves them to settle (their failures caught, never an unhandled rejection).

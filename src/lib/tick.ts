@@ -28,6 +28,7 @@ import { recordIncident } from "./incidents";
 import { paymentInfoFromWhop, storeClient, whopCallOptions } from "./whop";
 import { fairByStore, rotateJobs, rotateStores, roundRobinByStore } from "./rotation";
 import { recheckCheckoutDomains } from "./checkout-domain-check";
+import { checkStorefrontDomains } from "./storefront-domain";
 
 export { rotateJobs, rotateStores, roundRobinByStore };
 
@@ -219,6 +220,8 @@ export const TICK_JOBS: JobSpec[] = [
   { name: "leakageAlerts", job: sendLateLeakageAlerts, money: false },
   // Checkout domains (checkout.seyuna.com…): pending ones every 10 min, verified ones hourly (alert when one stops answering); retired ones removed from Vercel after 48 h.
   { name: "checkoutDomains", job: recheckCheckoutDomains, money: false },
+  // The shop's storefront domain as Shopify has it now (a shop moved to another domain): every 6 h per store.
+  { name: "storefrontDomains", job: checkStorefrontDomains, money: false },
   { name: "cleaned", job: cleanup, money: false },
 ];
 

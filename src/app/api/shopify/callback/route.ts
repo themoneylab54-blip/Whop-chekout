@@ -6,6 +6,7 @@ import { env } from "@/lib/env";
 import { currentAdminId } from "@/lib/auth";
 import { checkStoreAccess, OWNER_ONLY_ERROR } from "@/lib/access";
 import { ensureScriptTag, ensureUninstallWebhook, exchangeCodeForToken, getShopInfo, normalizeShopDomain, removeScriptTag, verifyOauthHmac } from "@/lib/shopify";
+import { connectionDomainFields } from "@/lib/storefront-domain";
 import { CONNECTION_KEPT, hmacMismatchError, PENDING_TTL_MS } from "@/lib/shopify-connect";
 import { clearDisabledByUninstall, isDisabledByUninstall } from "@/lib/shopify-uninstall";
 import { storeReady } from "@/lib/payment-provider";
@@ -129,7 +130,9 @@ async function handle(req: Request) {
         shopifyClientSecret: pair.secret,
         shopifyScopes: token.scope,
         shopCurrency: info.currencyCode,
-        storefrontHost: info.primaryDomain?.host ?? null,
+        // The shop's primary domain in the form it is compared in, its check done now (lib/storefront-domain);
+        // a new one still waiting for its certificate: the domain saved for this same shop meanwhile.
+        ...connectionDomainFields(info.primaryDomain, domainChanged ? null : store.storefrontHost, connectedAt.getTime()),
         name: store.name || info.name,
         scriptTagId,
         shopifyConnectedAt: connectedAt,

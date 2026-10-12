@@ -89,6 +89,9 @@ describe.skipIf(!hasDb)("Shopify reconnection (integration)", async () => {
     /** Runs while Shopify « exchanges the code » (something happening meanwhile). */
     onExchange: null as null | (() => Promise<void>),
     loaderSrc: "",
+    /** The shop's primary domain as Shopify gives it, and whether its certificate is issued. */
+    primaryHost: "ColAndCie.com",
+    sslEnabled: true,
   };
   const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input instanceof Request ? input.url : input);
@@ -106,8 +109,9 @@ describe.skipIf(!hasDb)("Shopify reconnection (integration)", async () => {
     }
     if (url.includes("/graphql.json")) {
       const q = String(body.query);
-      if (q.includes("shop {") && q.includes("currencyCode")) return ok({ shop: { name: "Col&Cie", currencyCode: "EUR", primaryDomain: { host: "colandcie.com" } } });
-      if (q.includes("shop { name } scriptTags(")) return ok({ shop: { name: "Col&Cie" }, scriptTags: { nodes: [{ src: shopify.loaderSrc }] } });
+      // Shopify may write the domain in capitals: saved as its hostname (lib/shop-host).
+      if (q.includes("shop {") && q.includes("currencyCode")) return ok({ shop: { name: "Col&Cie", currencyCode: "EUR", primaryDomain: { host: shopify.primaryHost, sslEnabled: shopify.sslEnabled } } });
+      if (q.includes("shop {") && q.includes("scriptTags(")) return ok({ shop: { name: "Col&Cie", primaryDomain: { host: "colandcie.com", sslEnabled: true } }, scriptTags: { nodes: [{ src: shopify.loaderSrc }] } });
       if (q.includes("scriptTagCreate")) return ok({ scriptTagCreate: { scriptTag: { id: "gid://shopify/ScriptTag/NEW" }, userErrors: [] } });
       if (q.includes("scriptTagDelete")) return ok({ scriptTagDelete: { deletedScriptTagId: (body.variables as { id: string }).id, userErrors: [] } });
       if (q.includes("scriptTags(")) return ok({ scriptTags: { nodes: [] } });
@@ -156,6 +160,8 @@ describe.skipIf(!hasDb)("Shopify reconnection (integration)", async () => {
     shopify.calls = [];
     shopify.tokenStatus = 200;
     shopify.onExchange = null;
+    shopify.primaryHost = "ColAndCie.com";
+    shopify.sslEnabled = true;
     vi.stubGlobal("fetch", fetchMock);
     if (!owner) {
       const u = await db.adminUser.create({ data: { email: `${tag}_owner@test.local`, passwordHash: null, role: "owner" } });
@@ -285,6 +291,31 @@ describe.skipIf(!hasDb)("Shopify reconnection (integration)", async () => {
     const res = await callback.GET(new Request(`https://checkout.example.com/api/shopify/callback?${query}`), ctx);
     expect(new URL(res.headers.get("location")!).searchParams.get("connected")).toBe("1");
     expect(await reload(s.id)).toMatchObject({ shopDomain: shop, shopifyClientId: "app-a", storefrontHost: "colandcie.com", shopifyPendingShopDomain: null });
+    // The connection counts as the domain's check: the tick asks again in 6 h.
+    expect((await db.store.findUniqueOrThrow({ where: { id: s.id } })).storefrontHostCheckedAt?.getTime()).toBeGreaterThan(Date.now() - 60_000);
+  });
+
+  it("a new domain still waiting for its certificate at a reconnection: the same shop keeps its domain, another shop never the previous one's", async () => {
+    shopify.primaryHost = "nouveau-domaine.fr";
+    shopify.sslEnabled = false;
+    // The same shop: the domain saved (colandcie.com) kept, the check due again in about 30 min.
+    const same = await connectedStore();
+    expect((await reconnect(same.id, { shopDomain: same.shopDomain!, clientId: "app-a", clientSecret: "" }, SECRET_A)).connected).toBe("1");
+    const kept = await reload(same.id);
+    expect(kept.storefrontHost).toBe("colandcie.com");
+    const dueIn = kept.storefrontHostCheckedAt!.getTime() + 6 * 3600_000 - Date.now();
+    expect(dueIn).toBeGreaterThan(25 * 60_000);
+    expect(dueIn).toBeLessThanOrEqual(30 * 60_000);
+    // Another shop: no domain (its links use its *.myshopify.com address) — never the previous shop's.
+    const moved = await connectedStore();
+    const newShop = `${tag.replace("_", "-")}-elsewhere.myshopify.com`;
+    await reconnect(moved.id, { shopDomain: newShop, clientId: "app-b", clientSecret: SECRET_B }, SECRET_B);
+    expect(await reload(moved.id)).toMatchObject({ shopDomain: newShop, storefrontHost: null });
+    // Its certificate issued: the new domain, whatever the shop.
+    shopify.sslEnabled = true;
+    const later = await connectedStore();
+    await reconnect(later.id, { shopDomain: later.shopDomain!, clientId: "app-a", clientSecret: "" }, SECRET_A);
+    expect((await reload(later.id)).storefrontHost).toBe("nouveau-domaine.fr");
   });
 
   describe("APP_UNINSTALLED webhook", () => {

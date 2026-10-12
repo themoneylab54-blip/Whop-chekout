@@ -114,8 +114,13 @@ model Store {
   shopifyPendingClientSecret String? // encrypted
   shopifyPendingAt           DateTime?
   shopCurrency        String    @default("EUR")
-  // Primary storefront host (custom domain), used to validate return URLs
+  // The shop's primary domain (custom domain) as a URL hostname (punycode): the checkout's links back
+  // to the shop and the return URLs it accepts. Kept as Shopify has it (lib/storefront-domain).
   storefrontHost      String?
+  // What its next check is scheduled from: its last one (backdated for a check to make again soon:
+  // a new domain waiting for its certificate, Shopify briefly unavailable). The tick asks every few
+  // hours, oldest first.
+  storefrontHostCheckedAt DateTime?
   scriptTagId         String?
   shopifyConnectedAt  DateTime?
 

@@ -3,6 +3,7 @@ import { CallStopped, extFetch } from "./ext";
 import type { Store } from "@prisma/client";
 import { shopifyGraphql } from "./shopify";
 import { db } from "./db";
+import { shopHostname } from "./shop-host";
 import { log, recordEvent } from "./log";
 import { recordIncident } from "./incidents";
 import { externalCoveredUntil, externalImportStatus } from "./shopify-history";
@@ -872,21 +873,16 @@ export function sameItems(a: { variantId: string; quantity: number }[], b: { var
  * cart shown in another currency — Shopify Markets — has amounts that aren't the checkout's).
  * Null on any doubt; failures are journaled (the buyer loses the discount).
  */
-/** The shop's own storefront hosts as URL hostnames: its domain (and its www / bare twin), then *.myshopify.com. Pure. */
+/** The shop's own storefront hosts as URL hostnames (see shopHostname): its domain (and its www / bare twin), then *.myshopify.com. Pure. */
 export function storefrontHosts(store: Pick<Store, "shopDomain" | "storefrontHost">): string[] {
   const out: string[] = [];
-  const add = (h: string | null | undefined) => {
-    try {
-      const host = h ? new URL(`https://${h.trim()}`).hostname.toLowerCase() : "";
-      if (host && !out.includes(host)) out.push(host);
-    } catch {
-      /* not a host */
-    }
+  const add = (h: string | null) => {
+    if (h && !out.includes(h)) out.push(h);
   };
-  const domain = store.storefrontHost?.trim().toLowerCase();
+  const domain = shopHostname(store.storefrontHost);
   add(domain);
-  if (domain) add(domain.startsWith("www.") ? domain.slice(4) : `www.${domain}`);
-  add(store.shopDomain);
+  if (domain) add(shopHostname(domain.startsWith("www.") ? domain.slice(4) : `www.${domain}`));
+  add(shopHostname(store.shopDomain));
   return out;
 }
 

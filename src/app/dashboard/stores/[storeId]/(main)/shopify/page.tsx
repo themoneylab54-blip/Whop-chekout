@@ -6,6 +6,7 @@ import { notFound } from "next/navigation";
 import { DirtyForm } from "@/components/dashboard/DirtyForm";
 import { ShopifyConnectFields } from "@/components/dashboard/ShopifyConnectFields";
 import { shopifyLiveState } from "@/lib/shopify-status";
+import { shopHostLabel } from "@/lib/storefront-domain";
 import { requireStoreAccess, roleCan } from "@/lib/access";
 import { OwnerOnlyNote } from "@/components/dashboard/OwnerOnly";
 import { db } from "@/lib/db";
@@ -99,7 +100,7 @@ export default async function ShopifyPage({
             </Suspense>
             {store.storefrontHost && (
               <li className="flex items-start gap-2">
-                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" /> Domaine de la vitrine : {store.storefrontHost}
+                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" /> Domaine de la vitrine : {shopHostLabel(store.storefrontHost)}
               </li>
             )}
           </ul>
@@ -201,7 +202,7 @@ export default async function ShopifyPage({
                 defaultClientId={store.shopifyClientId ?? store.shopifyPendingClientId ?? ""}
                 secretMismatch={sp.reason === "hmac"}
                 knownShopDomain={store.shopDomain}
-                storefrontHost={store.storefrontHost}
+                storefrontHost={store.storefrontHost ? shopHostLabel(store.storefrontHost) : null}
                 activeClientId={store.shopifyClientId}
                 hasStoredSecret={!!store.shopifyClientSecret}
               />

@@ -205,8 +205,9 @@ function assertNoUserErrors(errors: { field?: string[] | null; message: string }
 
 export async function getShopInfo(store: ConnectedStore) {
   const data = await shopifyGraphql<{
-    shop: { name: string; currencyCode: string; primaryDomain: { host: string } | null };
-  }>(store, `query { shop { name currencyCode primaryDomain { host } } }`);
+    // sslEnabled: whether Shopify has issued the domain's certificate (links to it work over https).
+    shop: { name: string; currencyCode: string; primaryDomain: { host: string; sslEnabled: boolean } | null };
+  }>(store, `query { shop { name currencyCode primaryDomain { host sslEnabled } } }`);
   return data.shop;
 }
 

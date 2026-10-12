@@ -52,6 +52,30 @@ export async function rateLimit(key: string, limit: number, windowMs = 60_000): 
 }
 
 /**
+ * Whether `key` already reached `limit` in its current window (this instance's count, then the shared
+ * one), without counting a call: for a limit to look at before spending another. A shared count found
+ * reached is kept in this instance's memory until its window ends (no query again). False if the
+ * database is unreachable.
+ */
+export async function rateLimitReached(key: string, limit: number): Promise<boolean> {
+  const bucket = buckets.get(key);
+  if (bucket && bucket.resetAt > Date.now() && bucket.count >= limit) return true;
+  try {
+    // The window's end as milliseconds left (computed by Postgres, as in rateLimit: no time zone involved).
+    const rows = await db.$queryRaw<{ count: number; left: number }[]>`
+      SELECT "count", (EXTRACT(EPOCH FROM ("resetAt" - (now() AT TIME ZONE 'UTC'))) * 1000)::float8 AS "left"
+      FROM "RateLimit" WHERE "key" = ${key} AND "resetAt" > (now() AT TIME ZONE 'UTC')`;
+    const row = rows[0];
+    if (!row || row.count < limit) return false;
+    buckets.set(key, { count: row.count, resetAt: Date.now() + Number(row.left) });
+    return true;
+  } catch (err) {
+    log.warn("ratelimit.db_failed", "Shared rate limit unavailable, using memory only", { err });
+    return false;
+  }
+}
+
+/**
  * The caller's IP: the headers set by the platform itself first (Vercel's `x-vercel-forwarded-for`,
  * then `x-real-ip`), which a client can't prepend to; else the first X-Forwarded-For entry.
  */

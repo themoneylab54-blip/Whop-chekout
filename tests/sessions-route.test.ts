@@ -6,7 +6,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * limit), and each refusal says whether the loader retries it once on its own (`retryable`) or
  * leaves the cart to Shopify's checkout (`native`), with the store in its log line when known. The
  * host check comes first (no query on the usual hosts); the pricing, the A/B lookups and the cart
- * re-read then run together.
+ * re-read then run together. A return URL is kept only on the shop's own hosts (its domain, the
+ * domain's www / bare twin, its *.myshopify.com address); one from a host the store doesn't know
+ * makes it ask Shopify for its current domain, after the answer.
  */
 
 const mocks = vi.hoisted(() => ({
@@ -20,9 +22,11 @@ const mocks = vi.hoisted(() => ({
   assignCheckoutTests: vi.fn(),
   startCartRead: vi.fn<(store: unknown, input: unknown) => null>(() => null),
   createSession: vi.fn(),
+  afterCallbacks: [] as (() => unknown)[],
+  recheckDomain: vi.fn<(store: unknown, host: string) => Promise<void>>(async () => undefined),
 }));
 
-vi.mock("next/server", async (orig) => ({ ...(await orig<typeof import("next/server")>()), after: () => undefined }));
+vi.mock("next/server", async (orig) => ({ ...(await orig<typeof import("next/server")>()), after: (fn: () => unknown) => void mocks.afterCallbacks.push(fn) }));
 vi.mock("@/lib/db", () => ({
   db: {
     $queryRaw: mocks.queryRaw,
@@ -42,7 +46,7 @@ vi.mock("@/lib/checkout-domain", () => ({ checkoutBaseUrl: () => "https://checko
 // The route gets a promise of its own (a spy's own promise is observed by Vitest, never "unhandled").
 vi.mock("@/lib/shopify", () => ({ priceCart: async (...args: unknown[]) => mocks.priceCart(...args) }));
 vi.mock("@/lib/layout", () => ({ loadInterception: () => ({ excludedHandles: [] }) }));
-vi.mock("@/lib/conversions", () => ({ sendCheckoutConversions: vi.fn() }));
+vi.mock("@/lib/conversions", () => ({ sendCheckoutConversions: vi.fn(async () => undefined) }));
 vi.mock("@/lib/experiments", () => ({ assignVariant: async (...args: unknown[]) => mocks.assignVariant(...args) }));
 vi.mock("@/lib/checkout-tests", () => ({ assignCheckoutTests: async (...args: unknown[]) => mocks.assignCheckoutTests(...args) }));
 vi.mock("@/lib/pricing", () => ({ unsupportedCart: () => null }));
@@ -52,6 +56,7 @@ vi.mock("@/lib/cart-session", () => ({ sessionCart: mocks.sessionCart, startCart
 vi.mock("@/lib/visitor", () => ({ resolveVisitor: () => ({ id: "v_1", token: "v_1.sig" }), signVisitorId: vi.fn(), verifyVisitorId: vi.fn() }));
 vi.mock("@/lib/payment-provider", () => ({ anyProviderConnected: () => true }));
 vi.mock("@/lib/early-prepare", () => ({ prepareAhead: vi.fn() }));
+vi.mock("@/lib/storefront-domain", () => ({ recheckStorefrontHost: mocks.recheckDomain }));
 
 const { POST } = await import("@/app/api/public/sessions/route");
 
@@ -76,6 +81,7 @@ const line = { variantId: "gid://shopify/ProductVariant/11", productHandle: "p11
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.afterCallbacks.length = 0;
 });
 
 describe("sessions route: warm-up", () => {
@@ -247,5 +253,71 @@ describe("sessions route: lookups overlapped", () => {
     } finally {
       process.off("unhandledRejection", onUnhandled);
     }
+  });
+});
+
+describe("sessions route: the shop's return URL and its current domain", () => {
+  /** The store's session request answers `status`, the click coming from `returnUrl`; its saved return URL (if created), and the host Shopify was asked about after the answer (null: not asked). */
+  async function clicked(storeRow: Omit<typeof store, "storefrontHost"> & { storefrontHost: string | null }, returnUrl: string | undefined, opts: { price?: "fails" } = {}) {
+    mocks.findStore.mockResolvedValueOnce(storeRow);
+    if (opts.price === "fails") mocks.priceCart.mockRejectedValueOnce(new Error("Shopify down"));
+    else mocks.priceCart.mockResolvedValueOnce([line]);
+    mocks.sessionCart.mockResolvedValueOnce({ ok: true, lines: [line], cartDiscounts: null, cartContext: null, diagnostic: null });
+    mocks.createSession.mockResolvedValueOnce({ id: "cs_r" });
+    mocks.createSession.mockClear();
+    const res = await post({ ...cart, ...(returnUrl ? { returnUrl } : {}) });
+    // Nothing asked before the answer…
+    expect(mocks.recheckDomain).not.toHaveBeenCalled();
+    const saved = (mocks.createSession.mock.calls.at(-1)?.[0] as { data: { returnUrl: string | null } } | undefined)?.data.returnUrl;
+    // …the callbacks run after it (as Next does).
+    for (const fn of mocks.afterCallbacks.splice(0)) await fn();
+    const call = mocks.recheckDomain.mock.calls[0];
+    expect(mocks.recheckDomain.mock.calls.length).toBeLessThanOrEqual(1);
+    if (call) expect(call[0]).toBe(storeRow);
+    mocks.recheckDomain.mockClear();
+    return { status: res.status, saved, asked: call ? call[1] : null };
+  }
+
+  it("on the shop's domain, its www / bare twin or its *.myshopify.com address: kept, Shopify not asked", async () => {
+    const onDomain = { ...store, storefrontHost: "soveline.fr" };
+    expect(await clicked(onDomain, "https://soveline.fr/cart")).toEqual({ status: 200, saved: "https://soveline.fr/cart", asked: null });
+    expect(await clicked(onDomain, "https://www.soveline.fr/products/selivia")).toEqual({ status: 200, saved: "https://www.soveline.fr/products/selivia", asked: null });
+    expect(await clicked(onDomain, "https://x.myshopify.com/cart")).toEqual({ status: 200, saved: "https://x.myshopify.com/cart", asked: null });
+    // The bare twin of a domain saved with its www.
+    expect(await clicked({ ...store, storefrontHost: "www.soveline.fr" }, "https://soveline.fr/cart")).toEqual({ status: 200, saved: "https://soveline.fr/cart", asked: null });
+  });
+
+  it("a domain saved with its accents is the punycode a browser sends: kept, Shopify not asked", async () => {
+    const accented = { ...store, storefrontHost: "sovéline.fr" };
+    expect(await clicked(accented, "https://xn--sovline-dya.fr/cart")).toEqual({ status: 200, saved: "https://xn--sovline-dya.fr/cart", asked: null });
+    expect(await clicked(accented, "https://www.xn--sovline-dya.fr/")).toEqual({ status: 200, saved: "https://www.xn--sovline-dya.fr/", asked: null });
+  });
+
+  it("from a host the store doesn't know (the shop moved): not kept, Shopify asked about that host with the store as read, after the answer", async () => {
+    const moved = { ...store, storefrontHost: "xn--sovline-dya.fr" };
+    expect(await clicked(moved, "https://soveline.fr/cart")).toEqual({ status: 200, saved: null, asked: "soveline.fr" });
+    expect(await clicked(moved, "https://SOVELINE.fr:443/cart")).toEqual({ status: 200, saved: null, asked: "soveline.fr" });
+  });
+
+  it("a cart then refused (Shopify's pricing failed): Shopify still asked, the click came from the shop", async () => {
+    const moved = { ...store, storefrontHost: "xn--sovline-dya.fr" };
+    expect(await clicked(moved, "https://soveline.fr/cart", { price: "fails" })).toEqual({ status: 502, saved: undefined, asked: "soveline.fr" });
+  });
+
+  it("on another store's checkout domain: refused before anything, Shopify not asked", async () => {
+    mocks.foreignHost.mockResolvedValueOnce(true);
+    const moved = { ...store, storefrontHost: "xn--sovline-dya.fr" };
+    expect(await clicked(moved, "https://soveline.fr/cart")).toEqual({ status: 404, saved: undefined, asked: null });
+  });
+
+  it("no return URL, or one that isn't an https page on a domain: never kept, Shopify never asked", async () => {
+    const onDomain = { ...store, storefrontHost: "soveline.fr" };
+    expect(await clicked(onDomain, undefined)).toEqual({ status: 200, saved: null, asked: null });
+    expect(await clicked(onDomain, "http://soveline.fr/cart")).toEqual({ status: 200, saved: null, asked: null });
+    expect(await clicked(onDomain, "javascript:alert(1)")).toEqual({ status: 200, saved: null, asked: null });
+    expect(await clicked(onDomain, "https://localhost/cart")).toEqual({ status: 200, saved: null, asked: null });
+    expect(await clicked(onDomain, "https://1.2.3.4/cart")).toEqual({ status: 200, saved: null, asked: null });
+    // The shop's own domain written another way (a trailing dot): refused, nothing to ask Shopify.
+    expect(await clicked(onDomain, "https://soveline.fr./cart")).toEqual({ status: 200, saved: null, asked: null });
   });
 });

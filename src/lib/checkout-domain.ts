@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import type { Store } from "@prisma/client";
 import { env } from "./env";
 import { hostnameOf, isAppHost, isLocalHost, operatorHosts } from "./host-guard";
+import { shopHostname } from "./shop-host";
 
 /*
  * Checkout domains: a store's checkout served on its own hostname (checkout.seyuna.com, or
@@ -80,7 +81,8 @@ export function normalizeCheckoutDomain(
   }
   if ((opts.operatorHosts ?? operatorHosts()).includes(ascii)) return { ok: false, error: "Cette adresse est réservée au service : utilisez un sous-domaine de votre site (checkout.maboutique.com)." };
   if (ascii.endsWith(".myshopify.com")) return { ok: false, error: "Une adresse *.myshopify.com appartient à Shopify : utilisez un sous-domaine de votre site (checkout.maboutique.com)." };
-  const storefront = (opts.storefrontHosts ?? []).filter((h): h is string => !!h).map((h) => h.toLowerCase());
+  // The shop's domains in the form the checkout domain is compared in (punycode: shopHostname).
+  const storefront = (opts.storefrontHosts ?? []).map((h) => shopHostname(h)).filter((h): h is string => !!h);
   if (storefront.includes(ascii) || storefront.includes(ascii.replace(/^www\./, "")) || storefront.includes(`www.${ascii}`)) {
     return { ok: false, error: `${ascii} est l'adresse de votre boutique : choisissez un sous-domaine dédié, par exemple checkout.${ascii.replace(/^www\./, "")}` };
   }
